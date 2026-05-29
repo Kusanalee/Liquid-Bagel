@@ -8,10 +8,45 @@ public enum AppSessionState: Equatable, Sendable {
     case mock
     case signedOut
     case loadingCredential
+    case savedCredentialUnvalidated
+    case validatingCredential
+    case validatedReady
     case readyToConnect
     case connecting
     case connected
+    case invalidSession(String)
+    case validationFailed(String)
+    case connectionFailed(String)
+    case keychainFailed(String)
     case failed(String)
+}
+
+public struct LoginMFAChallenge: Hashable, Sendable {
+    public var ticket: String
+    public var allowedMethods: [MFAMethod]
+
+    public init(ticket: String, allowedMethods: [MFAMethod]) {
+        self.ticket = ticket
+        self.allowedMethods = allowedMethods
+    }
+}
+
+public struct LiveVerificationState: Equatable, Sendable {
+    public var credentialLoaded = false
+    public var currentUserFetched = false
+    public var webSocketConnected = false
+    public var authenticated = false
+    public var readyReceived = false
+    public var usersReceived = false
+    public var serversReceived = false
+    public var channelsReceived = false
+    public var selectedChannelAvailable = false
+    public var messageFetchSucceeded = false
+    public var lastRealtimeEventAt: Date?
+    public var lastPingLatencyMilliseconds: Int?
+    public var lastMessageActionResult: String?
+
+    public init() {}
 }
 
 public enum TimelineMessageStatus: Hashable, Sendable {
@@ -541,19 +576,25 @@ public final class AppSessionCoordinator {
     public private(set) var connectionState: RealtimeConnectionState
     public private(set) var diagnostics: RealtimeDiagnostics?
     public private(set) var currentUser: User?
+    public private(set) var validatedSession: ValidatedSession?
+    public private(set) var pendingValidatedSession: ValidatedSession?
+    public private(set) var mfaChallenge: LoginMFAChallenge?
     public private(set) var snapshot: RealtimeSnapshot
     public private(set) var hasSavedCredential: Bool
     public private(set) var lastErrorMessage: String?
+    public private(set) var environment: StoatAPIEnvironment
+    public private(set) var localSessionLabel: String?
+    public private(set) var verificationState: LiveVerificationState
 
     @ObservationIgnored public private(set) var snapshotSource: any ShellSnapshotSource
     @ObservationIgnored public private(set) var apiClient: (any StoatAPIClient)?
     @ObservationIgnored public private(set) var messageActionHandler: any MessageActionHandling
 
     @ObservationIgnored private let tokenStore: any TokenStore
-    @ObservationIgnored private let environment: StoatAPIEnvironment
     @ObservationIgnored private let readyFields: Set<ReadyField>
     @ObservationIgnored private let mockSnapshot: RealtimeSnapshot
     @ObservationIgnored private let mockCurrentUserID: UserID
+    @ObservationIgnored private let sessionValidator: any SessionValidating
     @ObservationIgnored private let apiClientFactory: @Sendable (StoatAPIEnvironment, any CredentialProvider) -> any StoatAPIClient
     @ObservationIgnored private let realtimeClientFactory: @Sendable () -> any StoatRealtimeClient
     @ObservationIgnored private let realtimeStoreFactory: @Sendable () -> RealtimeStateStore
@@ -569,6 +610,7 @@ public final class AppSessionCoordinator {
         readyFields: Set<ReadyField> = Set([.users, .servers, .channels, .members, .emojis, .userSettings, .channelUnreads, .policyChanges]),
         mockSnapshot: RealtimeSnapshot = MockShellData.snapshot,
         mockCurrentUserID: UserID = MockShellData.currentUserID,
+        sessionValidator: (any SessionValidating)? = nil,
         apiClientFactory: @escaping @Sendable (StoatAPIEnvironment, any CredentialProvider) -> any StoatAPIClient = { environment, provider in
             LiveStoatAPIClient(environment: environment, credentialProvider: provider)
         },
@@ -584,6 +626,7 @@ public final class AppSessionCoordinator {
         self.readyFields = readyFields
         self.mockSnapshot = mockSnapshot
         self.mockCurrentUserID = mockCurrentUserID
+        self.sessionValidator = sessionValidator ?? LiveSessionValidator(apiClientFactory: apiClientFactory)
         self.apiClientFactory = apiClientFactory
         self.realtimeClientFactory = realtimeClientFactory
         self.realtimeStoreFactory = realtimeStoreFactory
@@ -592,7 +635,14 @@ public final class AppSessionCoordinator {
         self.connectionState = .idle
         self.snapshot = mockSnapshot
         self.currentUser = mockSnapshot.usersByID[mockCurrentUserID]
+        self.validatedSession = nil
+        self.pendingValidatedSession = nil
+        self.mfaChallenge = nil
         self.hasSavedCredential = false
+        self.lastErrorMessage = nil
+        self.environment = environment
+        self.localSessionLabel = nil
+        self.verificationState = LiveVerificationState()
         self.snapshotSource = MockShellSnapshotSource(snapshot: mockSnapshot)
         self.messageActionHandler = MockMessageActionHandler(currentUserID: mockCurrentUserID)
     }
@@ -610,6 +660,10 @@ public final class AppSessionCoordinator {
         connectionState = .idle
         diagnostics = nil
         lastErrorMessage = nil
+        validatedSession = nil
+        pendingValidatedSession = nil
+        mfaChallenge = nil
+        verificationState = LiveVerificationState()
         snapshot = mockSnapshot
         currentUser = mockSnapshot.usersByID[mockCurrentUserID]
         snapshotSource = MockShellSnapshotSource(snapshot: mockSnapshot)
@@ -620,10 +674,184 @@ public final class AppSessionCoordinator {
 
     public func refreshCredentialAvailability() async {
         do {
-            hasSavedCredential = try await tokenStore.loadCredential() != nil
+            hasSavedCredential = try await loadCredentialForCurrentEnvironment() != nil
+            if mode == .liveManual, sessionState == .signedOut, hasSavedCredential {
+                sessionState = .savedCredentialUnvalidated
+            }
         } catch {
             hasSavedCredential = false
-            lastErrorMessage = "Could not read saved credential: \(error.userFacingMessage)"
+            let message = "Could not read saved credential: \(error.userFacingMessage)"
+            lastErrorMessage = message
+            sessionState = .keychainFailed(message)
+        }
+        verificationState.credentialLoaded = hasSavedCredential
+    }
+
+    public func setEnvironment(_ newEnvironment: StoatAPIEnvironment) async {
+        do {
+            try newEnvironment.validate()
+            await disconnectActiveRealtime()
+            environment = newEnvironment
+            mode = .liveManual
+            sessionState = .signedOut
+            connectionState = .idle
+            diagnostics = nil
+            validatedSession = nil
+            pendingValidatedSession = nil
+            mfaChallenge = nil
+            currentUser = nil
+            lastErrorMessage = nil
+            verificationState = LiveVerificationState()
+            installLiveSafeSnapshot()
+            await refreshCredentialAvailability()
+        } catch {
+            let message = "Custom environment is invalid: \(error.userFacingMessage)"
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
+        }
+    }
+
+    public func validateImportedToken(_ token: String, localLabel: String? = nil) async {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        mode = .liveManual
+        sessionState = .validatingCredential
+        lastErrorMessage = nil
+        pendingValidatedSession = nil
+        mfaChallenge = nil
+        do {
+            let session = try await sessionValidator.validate(credential: .sessionToken(trimmed), environment: environment)
+            pendingValidatedSession = session
+            currentUser = session.currentUser
+            localSessionLabel = localLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+            verificationState.currentUserFetched = true
+            sessionState = .validatedReady
+        } catch {
+            let message = error.userFacingMessage
+            pendingValidatedSession = nil
+            currentUser = nil
+            sessionState = sessionFailureState(for: error, fallback: message)
+            lastErrorMessage = message
+        }
+    }
+
+    public func savePendingValidatedSession() async {
+        guard let pendingValidatedSession else {
+            let message = "Validate a session before saving it."
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
+            return
+        }
+        do {
+            try await saveCredentialForCurrentEnvironment(pendingValidatedSession.credential)
+            validatedSession = pendingValidatedSession
+            self.pendingValidatedSession = nil
+            hasSavedCredential = true
+            verificationState.credentialLoaded = true
+            verificationState.currentUserFetched = true
+            currentUser = pendingValidatedSession.currentUser
+            sessionState = .readyToConnect
+            lastErrorMessage = nil
+        } catch {
+            let message = "Could not save credential to Keychain: \(error.userFacingMessage)"
+            sessionState = .keychainFailed(message)
+            lastErrorMessage = message
+        }
+    }
+
+    public func validateSavedSession() async {
+        mode = .liveManual
+        sessionState = .loadingCredential
+        lastErrorMessage = nil
+        do {
+            guard let credential = try await loadCredentialForCurrentEnvironment() else {
+                hasSavedCredential = false
+                verificationState.credentialLoaded = false
+                sessionState = .signedOut
+                currentUser = nil
+                installLiveSafeSnapshot()
+                return
+            }
+            hasSavedCredential = true
+            verificationState.credentialLoaded = true
+            sessionState = .validatingCredential
+            let session = try await sessionValidator.validate(credential: credential, environment: environment)
+            validatedSession = session
+            currentUser = session.currentUser
+            verificationState.currentUserFetched = true
+            sessionState = .readyToConnect
+        } catch {
+            let message = error.userFacingMessage
+            validatedSession = nil
+            currentUser = nil
+            sessionState = sessionFailureState(for: error, fallback: message)
+            lastErrorMessage = message
+        }
+    }
+
+    public func login(email: String, password: String, friendlyName: String = "Liquid Bagel macOS") async {
+        mode = .liveManual
+        sessionState = .validatingCredential
+        lastErrorMessage = nil
+        mfaChallenge = nil
+        pendingValidatedSession = nil
+        let client = apiClientFactory(environment, StaticCredentialProvider(nil))
+        do {
+            let response = try await client.login(request: SessionLoginRequest(email: email, password: password, friendlyName: friendlyName))
+            await handleLoginResponse(response, friendlyName: friendlyName)
+        } catch {
+            let message = "Login failed: \(error.userFacingMessage)"
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
+        }
+    }
+
+    public func continueLoginMFA(response: MFAResponse, friendlyName: String = "Liquid Bagel macOS") async {
+        guard let mfaChallenge else {
+            let message = "No MFA challenge is waiting."
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
+            return
+        }
+        sessionState = .validatingCredential
+        lastErrorMessage = nil
+        let client = apiClientFactory(environment, StaticCredentialProvider(nil))
+        do {
+            let response = try await client.continueLogin(
+                request: SessionMFALoginRequest(mfaTicket: mfaChallenge.ticket, mfaResponse: response, friendlyName: friendlyName)
+            )
+            await handleLoginResponse(response, friendlyName: friendlyName)
+        } catch {
+            let message = "MFA login failed: \(error.userFacingMessage)"
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
+        }
+    }
+
+    private func handleLoginResponse(_ response: SessionLoginResponse, friendlyName: String) async {
+        switch response {
+        case let .success(success):
+            localSessionLabel = friendlyName
+            mfaChallenge = nil
+            let credential = success.credential
+            do {
+                let session = try await sessionValidator.validate(credential: credential, environment: environment)
+                pendingValidatedSession = session
+                currentUser = session.currentUser
+                verificationState.currentUserFetched = true
+                sessionState = .validatedReady
+            } catch {
+                let message = "Login succeeded, but validation failed: \(error.userFacingMessage)"
+                sessionState = sessionFailureState(for: error, fallback: message)
+                lastErrorMessage = message
+            }
+        case let .mfa(ticket, allowedMethods):
+            mfaChallenge = LoginMFAChallenge(ticket: ticket, allowedMethods: allowedMethods)
+            sessionState = .validationFailed("Multi-factor authentication is required.")
+            lastErrorMessage = nil
+        case let .disabled(userID):
+            let message = "This account is disabled or unavailable. User ID: \(userID.rawValue)"
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
         }
     }
 
@@ -637,7 +865,7 @@ public final class AppSessionCoordinator {
 
         let credential: StoatAuthCredential
         do {
-            guard let loaded = try await tokenStore.loadCredential() else {
+            guard let loaded = try await loadCredentialForCurrentEnvironment() else {
                 hasSavedCredential = false
                 sessionState = .signedOut
                 installLiveSafeSnapshot()
@@ -645,10 +873,13 @@ public final class AppSessionCoordinator {
             }
             credential = loaded
             hasSavedCredential = true
-            sessionState = .readyToConnect
+            verificationState.credentialLoaded = true
+            sessionState = validatedSession == nil ? .validatingCredential : .readyToConnect
         } catch {
             hasSavedCredential = false
-            failLiveSession("Could not load saved credential: \(error.userFacingMessage)")
+            let message = "Could not load saved credential: \(error.userFacingMessage)"
+            sessionState = .keychainFailed(message)
+            failLiveSession(message)
             return
         }
 
@@ -667,11 +898,16 @@ public final class AppSessionCoordinator {
         startObservingRealtime(realtimeClient: realtimeClient, store: store)
 
         do {
-            currentUser = try await apiClient.fetchCurrentUser()
+            let validation = try await sessionValidator.validate(credential: credential, environment: environment)
+            validatedSession = validation
+            currentUser = validation.currentUser
+            verificationState.currentUserFetched = true
             try await realtimeClient.connect(credential: credential, environment: environment, readyFields: readyFields)
         } catch {
             await disconnectActiveRealtime()
-            failLiveSession("Live connection failed: \(error.userFacingMessage)", replaceConnectionState: true)
+            let message = "Live connection failed: \(error.userFacingMessage)"
+            sessionState = .connectionFailed(message)
+            failLiveSession(message, replaceConnectionState: true)
         }
     }
 
@@ -686,6 +922,58 @@ public final class AppSessionCoordinator {
         installLiveSafeSnapshot()
         await refreshCredentialAvailability()
         sessionState = hasSavedCredential ? .readyToConnect : .signedOut
+    }
+
+    public func forgetLocalSession() async {
+        await disconnectActiveRealtime()
+        do {
+            try await clearCredentialForCurrentEnvironment()
+            mode = .liveManual
+            sessionState = .signedOut
+            connectionState = .disconnected(reason: .requested)
+            diagnostics = nil
+            currentUser = nil
+            validatedSession = nil
+            pendingValidatedSession = nil
+            mfaChallenge = nil
+            hasSavedCredential = false
+            verificationState = LiveVerificationState()
+            apiClient = nil
+            messageActionHandler = UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
+            installLiveSafeSnapshot()
+            lastErrorMessage = nil
+        } catch {
+            let message = "Could not delete saved credential: \(error.userFacingMessage)"
+            sessionState = .keychainFailed(message)
+            lastErrorMessage = message
+        }
+    }
+
+    public func revokeCurrentSessionOnServer() async {
+        do {
+            guard let credential = try await loadCredentialForCurrentEnvironment() else {
+                let message = "No saved session is available to revoke."
+                sessionState = .signedOut
+                lastErrorMessage = message
+                return
+            }
+            let client = apiClientFactory(environment, StaticCredentialProvider(credential))
+            try await client.logoutCurrentSession()
+            await forgetLocalSession()
+        } catch {
+            let message = "Server-side session revocation failed: \(error.userFacingMessage)"
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
+        }
+    }
+
+    public func markSelectedChannelMessageFetchSucceeded(channelID: ChannelID, isAvailable: Bool) {
+        verificationState.selectedChannelAvailable = isAvailable
+        verificationState.messageFetchSucceeded = true
+    }
+
+    public func markLastMessageActionResult(_ result: String) {
+        verificationState.lastMessageActionResult = result
     }
 
     public func resetToMock() async {
@@ -703,6 +991,7 @@ public final class AppSessionCoordinator {
                 let snapshot = await store.snapshot()
                 await MainActor.run {
                     self?.snapshot = snapshot
+                    self?.applyVerificationState(event: event, snapshot: snapshot)
                 }
             }
         }
@@ -720,9 +1009,26 @@ public final class AppSessionCoordinator {
             for await diagnostics in realtimeClient.diagnosticsStream {
                 await MainActor.run {
                     self?.diagnostics = diagnostics
+                    self?.verificationState.lastRealtimeEventAt = diagnostics.lastReceivedEventAt
+                    self?.verificationState.lastPingLatencyMilliseconds = diagnostics.lastLatencyMilliseconds
                 }
             }
         }
+    }
+
+    private func applyVerificationState(event: StoatGatewayEvent, snapshot: RealtimeSnapshot) {
+        verificationState.lastRealtimeEventAt = diagnostics?.lastReceivedEventAt ?? Date()
+        switch event {
+        case .authenticated:
+            verificationState.authenticated = true
+        case .ready:
+            verificationState.readyReceived = true
+        default:
+            break
+        }
+        verificationState.usersReceived = !snapshot.usersByID.isEmpty
+        verificationState.serversReceived = !snapshot.serversByID.isEmpty
+        verificationState.channelsReceived = !snapshot.channelsByID.isEmpty
     }
 
     private func applySessionState(for state: RealtimeConnectionState) {
@@ -730,8 +1036,15 @@ public final class AppSessionCoordinator {
         case .ready:
             sessionState = .connected
             lastErrorMessage = nil
+            verificationState.readyReceived = true
+            verificationState.webSocketConnected = true
+            verificationState.authenticated = true
         case .connecting, .connected, .authenticating, .authenticated, .reconnecting:
             sessionState = .connecting
+            verificationState.webSocketConnected = true
+            if case .authenticated = state {
+                verificationState.authenticated = true
+            }
         case let .failed(error):
             failLiveSession(error.userFacingMessage, replaceConnectionState: false)
         case .disconnected:
@@ -744,7 +1057,13 @@ public final class AppSessionCoordinator {
     }
 
     private func failLiveSession(_ message: String, replaceConnectionState: Bool = true) {
-        sessionState = .failed(message)
+        if case .connectionFailed = sessionState {
+            // Preserve the more specific state set by the caller.
+        } else if case .keychainFailed = sessionState {
+            // Preserve the more specific state set by the caller.
+        } else {
+            sessionState = .failed(message)
+        }
         if replaceConnectionState {
             connectionState = .failed(.unknown(message))
         }
@@ -755,6 +1074,45 @@ public final class AppSessionCoordinator {
     private func installLiveSafeSnapshot() {
         snapshot = RealtimeSnapshot()
         snapshotSource = MockShellSnapshotSource(snapshot: snapshot)
+    }
+
+    private var currentCredentialScope: CredentialScope {
+        CredentialScope(environmentID: environment.stableID)
+    }
+
+    private func loadCredentialForCurrentEnvironment() async throws -> StoatAuthCredential? {
+        if let scoped = tokenStore as? any ScopedTokenStore {
+            return try await scoped.loadCredential(scope: currentCredentialScope)
+        }
+        return try await tokenStore.loadCredential()
+    }
+
+    private func saveCredentialForCurrentEnvironment(_ credential: StoatAuthCredential) async throws {
+        if let scoped = tokenStore as? any ScopedTokenStore {
+            try await scoped.saveCredential(credential, scope: currentCredentialScope)
+        } else {
+            try await tokenStore.saveCredential(credential)
+        }
+    }
+
+    private func clearCredentialForCurrentEnvironment() async throws {
+        if let scoped = tokenStore as? any ScopedTokenStore {
+            try await scoped.clearCredential(scope: currentCredentialScope)
+        } else {
+            try await tokenStore.clearCredential()
+        }
+    }
+
+    private func sessionFailureState(for error: Error, fallback: String) -> AppSessionState {
+        if let validationError = error as? SessionValidationError {
+            switch validationError {
+            case .invalidOrExpired:
+                return .invalidSession(fallback)
+            case .forbidden, .missingCredential, .rateLimited, .networkUnavailable, .serverUnavailable, .invalidEnvironment, .failed:
+                return .validationFailed(fallback)
+            }
+        }
+        return .validationFailed(fallback)
     }
 
     private func disconnectActiveRealtime() async {

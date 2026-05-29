@@ -49,6 +49,60 @@ final class StoatAPITests: XCTestCase {
         XCTAssertNil(clearedCredential)
     }
 
+    func testScopedInMemoryTokenStoreSeparatesEnvironments() async throws {
+        let store = InMemoryTokenStore()
+        let production = CredentialScope(environmentID: "production")
+        let custom = CredentialScope(environmentID: "custom-http-localhost-14702")
+
+        try await store.saveCredential(.sessionToken("prod-secret"), scope: production)
+        try await store.saveCredential(.sessionToken("custom-secret"), scope: custom)
+
+        let productionCredential = try await store.loadCredential(scope: production)
+        let customCredential = try await store.loadCredential(scope: custom)
+        XCTAssertEqual(productionCredential?.token, "prod-secret")
+        XCTAssertEqual(customCredential?.token, "custom-secret")
+        try await store.clearCredential(scope: production)
+        let clearedProductionCredential = try await store.loadCredential(scope: production)
+        let remainingCustomCredential = try await store.loadCredential(scope: custom)
+        XCTAssertNil(clearedProductionCredential)
+        XCTAssertEqual(remainingCustomCredential?.token, "custom-secret")
+    }
+
+    func testEnvironmentStableIDAndScopedKeychainAccountNames() throws {
+        let custom = try StoatAPIEnvironment.custom(
+            apiBaseURL: URL(string: "http://localhost:14702")!,
+            eventsURL: URL(string: "ws://localhost:14703")!,
+            mediaBaseURL: URL(string: "http://localhost:14704")!
+        )
+        let scope = CredentialScope(environmentID: custom.stableID, accountUserID: "user-1")
+
+        XCTAssertEqual(StoatAPIEnvironment.production.stableID, "production")
+        XCTAssertTrue(custom.stableID.hasPrefix("custom-"))
+        XCTAssertTrue(scope.keychainAccountName.contains(custom.stableID))
+        XCTAssertTrue(scope.keychainAccountName.contains("user-1"))
+    }
+
+    func testSessionLoginModelsDecodeAndRedactTokens() throws {
+        let data = Data(#"{"result":"Success","_id":"session-1","user_id":"user-1","token":"login-secret","name":"Liquid Bagel macOS","last_seen":"2026-05-29T00:00:00.000Z"}"#.utf8)
+        let response = try JSONDecoder.stoat.decode(SessionLoginResponse.self, from: data)
+
+        guard case let .success(success) = response else {
+            return XCTFail("Expected success")
+        }
+        XCTAssertEqual(success.credential.token, "login-secret")
+        XCTAssertFalse(success.debugDescription.contains("login-secret"))
+
+        let stored = StoredSessionCredential(credential: success.credential, scope: .production, currentUserID: "user-1")
+        XCTAssertFalse(stored.debugDescription.contains("login-secret"))
+    }
+
+    func testSessionValidationErrorMapping() {
+        XCTAssertEqual(LiveSessionValidator.map(.unauthorized), .invalidOrExpired)
+        XCTAssertEqual(LiveSessionValidator.map(.forbidden), .forbidden)
+        XCTAssertEqual(LiveSessionValidator.map(.rateLimited(retryAfterMilliseconds: 1234)), .rateLimited(retryAfterMilliseconds: 1234))
+        XCTAssertEqual(LiveSessionValidator.map(.invalidEnvironment("bad")), .invalidEnvironment("bad"))
+    }
+
     func testRequestBuilderCombinesURLQueryAndAuthentication() throws {
         let request = StoatRequest<User>(
             method: .get,

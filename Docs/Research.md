@@ -164,3 +164,46 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - A previously reported class of issue had sockets appearing alive because `Ready` and ping/pong worked while normal message events did not arrive.
 - Phase 2 does not assume that bug still exists and does not reconnect production users simply because a quiet server has no chat events.
 - Liquid Bagel tracks `lastReceivedEventAt`, `lastPongAt`, `lastNonControlEventAt`, latency, and reconnect attempt so future UI/debug tooling can identify “pongs but no non-control events” without destructive recovery behavior.
+
+## Phase 5 Notes
+
+### Sources inspected
+
+- Official authentication docs: https://developers.stoat.chat/developers/api/authentication/
+- Generated API routes: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/routes.ts
+- Generated API schema: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/schema.ts
+- Official JS SDK login/logout surface: https://raw.githubusercontent.com/stoatchat/javascript-client-sdk/main/src/Client.ts
+- Official web login flow: https://raw.githubusercontent.com/stoatchat/for-web/main/packages/client/components/auth/src/flows/FlowLogin.tsx
+- Official web MFA flow: https://raw.githubusercontent.com/stoatchat/for-web/main/packages/client/components/modal/modals/MFAFlow.tsx
+- Official web session management: https://raw.githubusercontent.com/stoatchat/for-web/main/packages/client/components/app/interface/settings/user/Sessions.tsx
+
+### Verified auth/session behavior
+
+- API authentication still uses `X-Session-Token` for user sessions and `X-Bot-Token` for bots.
+- Current token validation should use the already verified `GET /users/@me` / `fetchCurrentUser()` route.
+- Login is verified as `POST /auth/session/login`.
+- Initial login payload is email/password plus optional `friendly_name`; no username login or hCaptcha field is present in the generated login schema.
+- Login success returns `result: "Success"`, `_id`, `user_id`, `token`, `name`, `last_seen`, optional `origin`, and optional web push subscription.
+- MFA-required login returns `result: "MFA"`, a `ticket`, and `allowed_methods`.
+- MFA continuation reuses `POST /auth/session/login` with `mfa_ticket`, optional `mfa_response`, and optional `friendly_name`.
+- Verified MFA response shapes are one of `password`, `totp_code`, or `recovery_code`.
+- Disabled-account login returns `result: "Disabled"` and `user_id`.
+- Session list is verified as `GET /auth/session/all`, returning `SessionInfo` objects with `_id` and `name`.
+- Current session logout is verified as `POST /auth/session/logout`.
+- Specific session revoke is verified as `DELETE /auth/session/{id}`.
+- Revoke-all is verified as `DELETE /auth/session/all?revoke_self=...`.
+- Session rename is verified as `PATCH /auth/session/{id}` with `friendly_name`.
+
+### Implementation decisions
+
+- Phase 5 implements manual session token import and validation first.
+- Phase 5 also implements the narrow verified email/password login and MFA continuation model, but keeps it explicit and manual.
+- Session credentials are saved only after validation succeeds.
+- Credentials are scoped by environment ID in Keychain so production and custom/self-hosted credentials do not collide.
+- Custom environment preference persistence is deferred because the project has no settings/preferences persistence system yet; custom environment selection is memory-only for Phase 5.
+
+### Remaining uncertainties
+
+- Official docs say users may “authenticate through API” but do not document the login payload directly; the exact login/MFA/session shapes come from generated API/source and official client source.
+- Self-hosted/custom environments are assumed to expose the same auth/session routes when they run the same Stoat backend, but Liquid Bagel does not verify that automatically.
+- hCaptcha, onboarding completion, account flags, and richer login failure handling remain deferred unless official/current client behavior requires them in a later phase.

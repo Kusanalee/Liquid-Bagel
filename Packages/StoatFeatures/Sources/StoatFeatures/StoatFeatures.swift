@@ -222,6 +222,8 @@ public final class MainShellViewModel {
     public var editingDraft: EditingMessageDraft?
     public var pendingDeletion: TimelineMessage?
     public var messageActionStatus: String?
+    public var isCredentialSetupPresented = false
+    public var isTestSendConfirmationPresented = false
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
@@ -461,6 +463,7 @@ public final class MainShellViewModel {
             Task { [weak self] in
                 guard let self else { return }
                 await self.messageController.refreshMessages(channelID: channelID, snapshotMessages: self.snapshot.messagesByChannelID[channelID] ?? [])
+                self.sessionCoordinator?.markSelectedChannelMessageFetchSucceeded(channelID: channelID, isAvailable: self.snapshot.channelsByID[channelID] != nil)
             }
         } else {
             placeholderStatus = "Select a channel before refreshing messages."
@@ -468,7 +471,20 @@ public final class MainShellViewModel {
     }
 
     public func settingsPlaceholder() {
-        placeholderStatus = "Settings remain a placeholder in Phase 3."
+        isCredentialSetupPresented = true
+    }
+
+    public func showCredentialSetup() {
+        isCredentialSetupPresented = true
+    }
+
+    public func confirmLiveVerificationSend() async {
+        guard let channelID = selection.channelID ?? selection.dmChannelID else {
+            messageActionStatus = "Select a channel before sending a verification message."
+            return
+        }
+        await sendDraft(for: channelID)
+        sessionCoordinator?.markLastMessageActionResult(messageActionStatus ?? "Send action attempted.")
     }
 
     public func validateSelection() {
@@ -953,8 +969,22 @@ public struct MainShellView: View {
         .sheet(isPresented: $viewModel.isQuickSwitcherPresented) {
             QuickSwitcherPlaceholderView(viewModel: viewModel)
         }
+        .sheet(isPresented: $viewModel.isCredentialSetupPresented) {
+            CredentialSetupView(viewModel: viewModel)
+        }
         .sheet(item: $viewModel.editingDraft) { _ in
             EditMessageSheet(viewModel: viewModel)
+        }
+        .confirmationDialog(
+            "Send current composer text?",
+            isPresented: $viewModel.isTestSendConfirmationPresented
+        ) {
+            Button("Send Verification Message") {
+                Task { await viewModel.confirmLiveVerificationSend() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This sends the text already in the selected channel composer. Liquid Bagel will not create an automatic test message.")
         }
         .confirmationDialog(
             "Delete this message?",
@@ -1034,6 +1064,14 @@ public struct MainShellView: View {
                 LabeledContent("Credential", value: session.hasSavedCredential ? "Saved" : "Missing")
             }
             Divider()
+            Button("Set Up Session…") {
+                viewModel.showCredentialSetup()
+            }
+            if viewModel.sessionCoordinator?.hasSavedCredential == true {
+                Button("Validate Saved Session") {
+                    Task { await viewModel.sessionCoordinator?.validateSavedSession(); viewModel.syncFromSessionCoordinator() }
+                }
+            }
             if viewModel.sessionCoordinator?.hasSavedCredential == true {
                 Button("Connect Manually") {
                     Task { await viewModel.connectLiveManually() }
@@ -1082,9 +1120,16 @@ public struct MainShellView: View {
         case .mock: "Mock"
         case .signedOut: "Signed Out"
         case .loadingCredential: "Loading Credential"
+        case .savedCredentialUnvalidated: "Saved Credential"
+        case .validatingCredential: "Validating"
+        case .validatedReady: "Validated"
         case .readyToConnect: "Ready"
         case .connecting: "Connecting"
         case .connected: "Connected"
+        case .invalidSession: "Invalid Session"
+        case .validationFailed: "Validation Failed"
+        case .connectionFailed: "Connection Failed"
+        case .keychainFailed: "Keychain Failed"
         case .failed: "Failed"
         }
     }
@@ -1096,6 +1141,326 @@ public struct MainShellView: View {
         case .idle, .disconnected, .failed:
             return false
         }
+    }
+}
+
+public struct CredentialSetupView: View {
+    @Bindable private var viewModel: MainShellViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var token = ""
+    @State private var localLabel = "Main Stoat"
+    @State private var email = ""
+    @State private var password = ""
+    @State private var mfaCode = ""
+    @State private var selectedMFAMethod: MFAMethod = .totp
+    @State private var useCustomEnvironment = false
+    @State private var apiURL: String
+    @State private var eventsURL: String
+    @State private var mediaURL: String
+    @State private var environmentError: String?
+    @State private var confirmForget = false
+    @State private var confirmRevoke = false
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+        let environment = viewModel.sessionCoordinator?.environment ?? .production
+        _apiURL = State(initialValue: environment.apiBaseURL.absoluteString)
+        _eventsURL = State(initialValue: environment.eventsURL.absoluteString)
+        _mediaURL = State(initialValue: environment.mediaBaseURL?.absoluteString ?? "")
+        _useCustomEnvironment = State(initialValue: !environment.isProduction)
+    }
+
+    public var body: some View {
+        Form {
+            Section("Session") {
+                sessionStatusRows
+                HStack {
+                    Button("Validate Saved Session") {
+                        Task {
+                            await viewModel.sessionCoordinator?.validateSavedSession()
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                    .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true)
+
+                    Button("Connect Manually") {
+                        Task { await viewModel.connectLiveManually() }
+                    }
+                    .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true || isDisconnectable)
+
+                    Button("Disconnect") {
+                        Task { await viewModel.disconnectLive() }
+                    }
+                    .disabled(!isDisconnectable)
+                }
+                HStack {
+                    Button("Forget Session", role: .destructive) {
+                        confirmForget = true
+                    }
+                    .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true)
+
+                    Button("Revoke Session on Server", role: .destructive) {
+                        confirmRevoke = true
+                    }
+                    .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true)
+
+                    Button("Reset to Mock") {
+                        Task { await viewModel.resetToMock() }
+                    }
+                }
+            }
+
+            Section("Manual Token Import") {
+                TextField("Local label", text: $localLabel)
+                SecureField("Session token", text: $token)
+                HStack {
+                    Button("Validate") {
+                        Task {
+                            let submitted = token
+                            token = ""
+                            await viewModel.sessionCoordinator?.validateImportedToken(submitted, localLabel: localLabel)
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                    .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    Button("Save") {
+                        Task {
+                            await viewModel.sessionCoordinator?.savePendingValidatedSession()
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                    .disabled(viewModel.sessionCoordinator?.pendingValidatedSession == nil)
+                }
+            }
+
+            Section("Login") {
+                TextField("Email", text: $email)
+                    .textContentType(.emailAddress)
+                SecureField("Password", text: $password)
+                Button("Login") {
+                    Task {
+                        let submittedPassword = password
+                        password = ""
+                        await viewModel.sessionCoordinator?.login(email: email, password: submittedPassword, friendlyName: localLabel.isEmpty ? "Liquid Bagel macOS" : localLabel)
+                        viewModel.syncFromSessionCoordinator()
+                    }
+                }
+                .disabled(email.isEmpty || password.isEmpty)
+
+                if let challenge = viewModel.sessionCoordinator?.mfaChallenge {
+                    Picker("MFA Method", selection: $selectedMFAMethod) {
+                        ForEach(challenge.allowedMethods, id: \.self) { method in
+                            Text(mfaMethodTitle(method)).tag(method)
+                        }
+                    }
+                    SecureField("MFA code or password", text: $mfaCode)
+                    Button("Continue MFA") {
+                        Task {
+                            let submitted = mfaCode
+                            mfaCode = ""
+                            await viewModel.sessionCoordinator?.continueLoginMFA(
+                                response: mfaResponse(method: selectedMFAMethod, value: submitted),
+                                friendlyName: localLabel.isEmpty ? "Liquid Bagel macOS" : localLabel
+                            )
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                    .disabled(mfaCode.isEmpty)
+                }
+            }
+
+            Section("Environment") {
+                Toggle("Use custom environment", isOn: $useCustomEnvironment)
+                if useCustomEnvironment {
+                    TextField("API base URL", text: $apiURL)
+                    TextField("Events WebSocket URL", text: $eventsURL)
+                    TextField("Media base URL (optional)", text: $mediaURL)
+                } else {
+                    LabeledContent("API", value: StoatAPIEnvironment.production.apiBaseURL.absoluteString)
+                    LabeledContent("Events", value: StoatAPIEnvironment.production.eventsURL.absoluteString)
+                }
+                if let environmentError {
+                    Text(environmentError).foregroundStyle(.red)
+                }
+                ForEach((viewModel.sessionCoordinator?.environment.securityWarnings() ?? []), id: \.self) { warning in
+                    Text(warning).foregroundStyle(.orange)
+                }
+                Button("Apply Environment") {
+                    applyEnvironment()
+                }
+            }
+
+            Section("Live Verification") {
+                verificationRows
+                HStack {
+                    Button("Reload Selected Channel Messages") {
+                        viewModel.refreshPlaceholder()
+                    }
+                    Button("Send Composer Text") {
+                        viewModel.isTestSendConfirmationPresented = true
+                    }
+                    .disabled(!viewModel.composerReadiness(for: viewModel.selection.channelID ?? viewModel.selection.dmChannelID).canSend)
+                }
+            }
+
+            Section("Safe Diagnostics") {
+                LabeledContent("Credential", value: viewModel.sessionCoordinator?.hasSavedCredential == true ? "Saved" : "Missing")
+                LabeledContent("Environment ID", value: viewModel.sessionCoordinator?.environment.stableID ?? "production")
+                if let latency = viewModel.effectiveDiagnostics?.lastLatencyMilliseconds {
+                    LabeledContent("Ping latency", value: "\(latency) ms")
+                }
+                if let lastError = viewModel.sessionCoordinator?.lastErrorMessage {
+                    Text(lastError)
+                        .foregroundStyle(.secondary)
+                }
+                Text("Tokens are never shown in this panel.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+        .frame(width: 680, height: 760)
+        .confirmationDialog("Forget saved session?", isPresented: $confirmForget) {
+            Button("Forget Session", role: .destructive) {
+                Task {
+                    await viewModel.sessionCoordinator?.forgetLocalSession()
+                    viewModel.syncFromSessionCoordinator()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This deletes the Keychain credential for the selected environment and disconnects live realtime.")
+        }
+        .confirmationDialog("Revoke session on server?", isPresented: $confirmRevoke) {
+            Button("Revoke Session", role: .destructive) {
+                Task {
+                    await viewModel.sessionCoordinator?.revokeCurrentSessionOnServer()
+                    viewModel.syncFromSessionCoordinator()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This asks Stoat to invalidate this session, then removes the local Keychain credential if the server accepts the request.")
+        }
+    }
+
+    @ViewBuilder private var sessionStatusRows: some View {
+        LabeledContent("Mode", value: runtimeModeText)
+        LabeledContent("State", value: sessionStateText)
+        LabeledContent("Environment", value: viewModel.sessionCoordinator?.environment.isProduction == true ? "Production" : "Custom")
+        if let user = viewModel.sessionCoordinator?.currentUser {
+            LabeledContent("Current user", value: user.displayName ?? user.username)
+        }
+    }
+
+    @ViewBuilder private var verificationRows: some View {
+        let state = viewModel.sessionCoordinator?.verificationState ?? LiveVerificationState()
+        VerificationRow(title: "Credential loaded", isComplete: state.credentialLoaded)
+        VerificationRow(title: "Current user fetched", isComplete: state.currentUserFetched)
+        VerificationRow(title: "WebSocket connected", isComplete: state.webSocketConnected)
+        VerificationRow(title: "Authenticated", isComplete: state.authenticated)
+        VerificationRow(title: "Ready received", isComplete: state.readyReceived)
+        VerificationRow(title: "Users received", isComplete: state.usersReceived)
+        VerificationRow(title: "Servers received", isComplete: state.serversReceived)
+        VerificationRow(title: "Channels received", isComplete: state.channelsReceived)
+        VerificationRow(title: "Selected channel available", isComplete: state.selectedChannelAvailable)
+        VerificationRow(title: "Message fetch succeeded", isComplete: state.messageFetchSucceeded)
+        if let lastRealtimeEventAt = state.lastRealtimeEventAt {
+            LabeledContent("Last realtime event", value: lastRealtimeEventAt.formatted(date: .omitted, time: .standard))
+        }
+        if let lastPingLatencyMilliseconds = state.lastPingLatencyMilliseconds {
+            LabeledContent("Last ping latency", value: "\(lastPingLatencyMilliseconds) ms")
+        }
+        if let lastMessageActionResult = state.lastMessageActionResult {
+            LabeledContent("Last message action", value: lastMessageActionResult)
+        }
+    }
+
+    private var isDisconnectable: Bool {
+        switch viewModel.effectiveConnectionState {
+        case .connecting, .connected, .authenticating, .authenticated, .ready, .reconnecting:
+            true
+        case .idle, .disconnected, .failed:
+            false
+        }
+    }
+
+    private var runtimeModeText: String {
+        switch viewModel.effectiveRuntimeMode {
+        case .mock: "Mock"
+        case .liveManual: "Live Manual"
+        }
+    }
+
+    private var sessionStateText: String {
+        switch viewModel.effectiveSessionState {
+        case .mock: "Mock"
+        case .signedOut: "Signed Out"
+        case .loadingCredential: "Loading Credential"
+        case .savedCredentialUnvalidated: "Saved Credential"
+        case .validatingCredential: "Validating"
+        case .validatedReady: "Validated"
+        case .readyToConnect: "Ready"
+        case .connecting: "Connecting"
+        case .connected: "Connected"
+        case .invalidSession: "Invalid Session"
+        case .validationFailed: "Validation Failed"
+        case .connectionFailed: "Connection Failed"
+        case .keychainFailed: "Keychain Failed"
+        case .failed: "Failed"
+        }
+    }
+
+    private func applyEnvironment() {
+        environmentError = nil
+        let environment: StoatAPIEnvironment
+        do {
+            if useCustomEnvironment {
+                guard let api = URL(string: apiURL), let events = URL(string: eventsURL) else {
+                    throw StoatAPIError.invalidEnvironment("API and events URLs must be valid.")
+                }
+                let media = mediaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : URL(string: mediaURL)
+                environment = try StoatAPIEnvironment.custom(apiBaseURL: api, eventsURL: events, mediaBaseURL: media ?? nil)
+            } else {
+                environment = .production
+                apiURL = environment.apiBaseURL.absoluteString
+                eventsURL = environment.eventsURL.absoluteString
+                mediaURL = environment.mediaBaseURL?.absoluteString ?? ""
+            }
+            Task {
+                await viewModel.sessionCoordinator?.setEnvironment(environment)
+                viewModel.syncFromSessionCoordinator()
+            }
+        } catch {
+            environmentError = error.userFacingMessage
+        }
+    }
+
+    private func mfaMethodTitle(_ method: MFAMethod) -> String {
+        switch method {
+        case .password: "Password"
+        case .recovery: "Recovery Code"
+        case .totp: "Authenticator App"
+        }
+    }
+
+    private func mfaResponse(method: MFAMethod, value: String) -> MFAResponse {
+        switch method {
+        case .password: .password(value)
+        case .recovery: .recoveryCode(value)
+        case .totp: .totpCode(value)
+        }
+    }
+}
+
+private struct VerificationRow: View {
+    var title: String
+    var isComplete: Bool
+
+    var body: some View {
+        LabeledContent(title, value: isComplete ? "Passed" : "Waiting")
+            .foregroundStyle(isComplete ? .primary : .secondary)
     }
 }
 
@@ -1229,13 +1594,17 @@ public struct ChannelListView: View {
             switch viewModel.effectiveSessionState {
             case .connected:
                 return "Live Manual · connected"
-            case .connecting, .loadingCredential:
+            case .connecting, .loadingCredential, .validatingCredential:
                 return "Live Manual · connecting"
             case .signedOut:
                 return "Live Manual · no credential"
-            case .readyToConnect:
+            case .readyToConnect, .validatedReady:
                 return "Live Manual · ready"
-            case .failed:
+            case .savedCredentialUnvalidated:
+                return "Live Manual · saved credential"
+            case .invalidSession:
+                return "Live Manual · invalid session"
+            case .validationFailed, .connectionFailed, .keychainFailed, .failed:
                 return "Live Manual · failed"
             case .mock:
                 return "Mock runtime · no live connection"
@@ -1832,9 +2201,10 @@ public struct LiquidBagelSettingsView: View {
                 LabeledContent("Media", value: PhaseOneStatus.current.environment.mediaBaseURL?.absoluteString ?? "Not configured")
             }
             Section("Status") {
-                LabeledContent("App phase", value: "Phase 4")
+                LabeledContent("App phase", value: "Phase 5")
                 LabeledContent("Runtime", value: "Mock by default, Live Manual only")
-                LabeledContent("Persistence", value: "Deferred")
+                LabeledContent("Credentials", value: "Keychain scoped by environment")
+                LabeledContent("Custom environment", value: "Memory-only")
             }
         }
         .formStyle(.grouped)
@@ -1889,4 +2259,44 @@ public typealias PhaseFourStatus = PhaseOneStatus
     MainShellView(viewModel: MainShellViewModel(selection: ShellSelection(space: .server("01HX0000000000000000000201"), serverID: "01HX0000000000000000000201", channelID: "01HX0000000000000000000101", isMemberPanelVisible: false), snapshot: MockShellData.snapshot, runtimeMode: .mock))
         .preferredColorScheme(.dark)
         .frame(width: 980, height: 640)
+}
+
+@available(macOS 15.0, *)
+#Preview("Credential Setup - No Credential") {
+    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .signedOut, currentUser: nil))
+}
+
+@available(macOS 15.0, *)
+#Preview("Credential Setup - Token Entry") {
+    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .signedOut, currentUser: nil))
+}
+
+@available(macOS 15.0, *)
+#Preview("Credential Setup - Validating") {
+    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .validatingCredential, currentUser: nil))
+}
+
+@available(macOS 15.0, *)
+#Preview("Credential Setup - Validation Failed") {
+    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .validationFailed("The session could not be validated."), currentUser: nil))
+}
+
+@available(macOS 15.0, *)
+#Preview("Credential Setup - Ready") {
+    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .readyToConnect, currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID]))
+}
+
+@available(macOS 15.0, *)
+#Preview("Credential Setup - Connected Diagnostics") {
+    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .connected, currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID]))
+}
+
+@available(macOS 15.0, *)
+#Preview("Credential Setup - Invalid Session") {
+    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .invalidSession("The saved session expired."), currentUser: nil))
+}
+
+@available(macOS 15.0, *)
+#Preview("Credential Setup - Custom Environment") {
+    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .savedCredentialUnvalidated, currentUser: nil))
 }

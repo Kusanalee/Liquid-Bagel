@@ -77,6 +77,37 @@ public enum StoatAuthCredential: Codable, Hashable, Sendable, CustomDebugStringC
     }
 }
 
+public struct StoredSessionCredential: Codable, Hashable, Sendable, CustomDebugStringConvertible {
+    public var credential: StoatAuthCredential
+    public var scope: CredentialScope
+    public var currentUserID: UserID?
+    public var localLabel: String?
+    public var savedAt: Date
+    public var validatedAt: Date?
+
+    public init(
+        credential: StoatAuthCredential,
+        scope: CredentialScope,
+        currentUserID: UserID? = nil,
+        localLabel: String? = nil,
+        savedAt: Date = Date(),
+        validatedAt: Date? = nil
+    ) {
+        self.credential = credential
+        self.scope = scope
+        self.currentUserID = currentUserID
+        self.localLabel = localLabel
+        self.savedAt = savedAt
+        self.validatedAt = validatedAt
+    }
+
+    public var redactedDescription: String {
+        "StoredSessionCredential(credential: \(credential.redactedDescription), scope: \(scope), currentUserID: \(currentUserID?.rawValue ?? "nil"), localLabel: \(localLabel ?? "nil"))"
+    }
+
+    public var debugDescription: String { redactedDescription }
+}
+
 public protocol CredentialProvider: Sendable {
     func credential() async throws -> StoatAuthCredential?
 }
@@ -102,5 +133,19 @@ public struct TokenStoreCredentialProvider: CredentialProvider {
 
     public func credential() async throws -> StoatAuthCredential? {
         try await tokenStore.loadCredential()
+    }
+}
+
+public struct ScopedTokenStoreCredentialProvider: CredentialProvider {
+    private let tokenStore: any ScopedTokenStore
+    private let scope: CredentialScope
+
+    public init(tokenStore: any ScopedTokenStore, scope: CredentialScope) {
+        self.tokenStore = tokenStore
+        self.scope = scope
+    }
+
+    public func credential() async throws -> StoatAuthCredential? {
+        try await tokenStore.loadCredential(scope: scope)
     }
 }

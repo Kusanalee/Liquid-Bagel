@@ -234,6 +234,117 @@ final class StoatFeaturesTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testManualTokenImportSavesOnlyAfterValidationSucceeds() async throws {
+        let store = InMemoryTokenStore()
+        let validator = StubSessionValidator(user: User(id: "user-validated", username: "validated"))
+        let session = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: validator,
+            apiClientFactory: { _, _ in RecordingAPIClient() }
+        )
+
+        await session.validateImportedToken("secret-token", localLabel: "Main Stoat")
+        XCTAssertEqual(session.sessionState, .validatedReady)
+        let beforeSaveCredential = try await store.loadCredential(scope: .production)
+        XCTAssertNil(beforeSaveCredential)
+
+        await session.savePendingValidatedSession()
+
+        let afterSaveCredential = try await store.loadCredential(scope: .production)
+        XCTAssertEqual(afterSaveCredential?.token, "secret-token")
+        XCTAssertEqual(session.sessionState, .readyToConnect)
+    }
+
+    @MainActor
+    func testFailedValidationDoesNotSaveToken() async throws {
+        let store = InMemoryTokenStore()
+        let validator = StubSessionValidator(error: SessionValidationError.invalidOrExpired)
+        let session = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: validator,
+            apiClientFactory: { _, _ in RecordingAPIClient() }
+        )
+
+        await session.validateImportedToken("bad-token")
+
+        let savedCredential = try await store.loadCredential(scope: .production)
+        XCTAssertNil(savedCredential)
+        if case .invalidSession = session.sessionState {
+            XCTAssertTrue(true)
+        } else {
+            XCTFail("Expected invalid session state")
+        }
+    }
+
+    @MainActor
+    func testValidateSavedSessionDoesNotAutoConnect() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
+        let session = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(user: User(id: "saved-user", username: "saved")),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+
+        await session.validateSavedSession()
+
+        XCTAssertEqual(session.sessionState, .readyToConnect)
+        XCTAssertEqual(session.currentUser?.id, "saved-user")
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 0)
+    }
+
+    @MainActor
+    func testForgetSessionDisconnectsAndClearsScopedCredential() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
+        let session = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+
+        await session.connectLiveManually()
+        await session.forgetLocalSession()
+
+        let savedCredential = try await store.loadCredential(scope: .production)
+        XCTAssertNil(savedCredential)
+        XCTAssertEqual(session.sessionState, .signedOut)
+        let disconnectCallCount = await realtime.disconnectCallCount
+        XCTAssertGreaterThanOrEqual(disconnectCallCount, 1)
+    }
+
+    @MainActor
+    func testResetToMockPreservesSavedCredential() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let session = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() }
+        )
+
+        await session.resetToMock()
+
+        XCTAssertEqual(session.mode, .mock)
+        let savedCredential = try await store.loadCredential(scope: .production)
+        XCTAssertEqual(savedCredential?.token, "token")
+    }
+
+    @MainActor
+    func testLiveVerificationStateCanRecordHarnessChecks() {
+        let session = AppSessionCoordinator()
+
+        session.markSelectedChannelMessageFetchSucceeded(channelID: "channel", isAvailable: true)
+        session.markLastMessageActionResult("Send action attempted.")
+
+        XCTAssertTrue(session.verificationState.selectedChannelAvailable)
+        XCTAssertTrue(session.verificationState.messageFetchSucceeded)
+        XCTAssertEqual(session.verificationState.lastMessageActionResult, "Send action attempted.")
+    }
+
     func testMockSnapshotSourceEmitsInitialSnapshot() async {
         var iterator = MockShellSnapshotSource(snapshot: MockShellData.snapshot).snapshots.makeAsyncIterator()
         let snapshot = await iterator.next()
@@ -650,5 +761,25 @@ private actor RecordingAPIClient: StoatAPIClient {
 
     func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile {
         UploadedFile(id: "file")
+    }
+}
+
+private struct StubSessionValidator: SessionValidating {
+    var user: User
+    var error: (any Error & Sendable)?
+
+    init(
+        user: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
+        error: (any Error & Sendable)? = nil
+    ) {
+        self.user = user
+        self.error = error
+    }
+
+    func validate(credential: StoatAuthCredential, environment: StoatAPIEnvironment) async throws -> ValidatedSession {
+        if let error {
+            throw error
+        }
+        return ValidatedSession(credential: credential, currentUser: user, environment: environment)
     }
 }

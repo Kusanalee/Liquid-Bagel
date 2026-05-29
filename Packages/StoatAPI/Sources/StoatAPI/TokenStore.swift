@@ -8,11 +8,38 @@ public protocol TokenStore: Sendable {
     func clearCredential() async throws
 }
 
-public actor InMemoryTokenStore: TokenStore {
+public struct CredentialScope: Codable, Hashable, Sendable {
+    public var environmentID: String
+    public var accountUserID: UserID?
+
+    public init(environmentID: String, accountUserID: UserID? = nil) {
+        self.environmentID = environmentID
+        self.accountUserID = accountUserID
+    }
+
+    public static let production = CredentialScope(environmentID: StoatAPIEnvironment.production.stableID)
+
+    public var keychainAccountName: String {
+        let user = accountUserID?.rawValue ?? "default"
+        return "credential.\(environmentID).\(user)"
+    }
+}
+
+public protocol ScopedTokenStore: TokenStore {
+    func loadCredential(scope: CredentialScope) async throws -> StoatAuthCredential?
+    func saveCredential(_ credential: StoatAuthCredential, scope: CredentialScope) async throws
+    func clearCredential(scope: CredentialScope) async throws
+}
+
+public actor InMemoryTokenStore: ScopedTokenStore {
     private var credential: StoatAuthCredential?
+    private var scopedCredentials: [CredentialScope: StoatAuthCredential] = [:]
 
     public init(credential: StoatAuthCredential? = nil) {
         self.credential = credential
+        if let credential {
+            self.scopedCredentials[.production] = credential
+        }
     }
 
     public func loadCredential() async throws -> StoatAuthCredential? {
@@ -26,6 +53,24 @@ public actor InMemoryTokenStore: TokenStore {
     public func clearCredential() async throws {
         credential = nil
     }
+
+    public func loadCredential(scope: CredentialScope) async throws -> StoatAuthCredential? {
+        scopedCredentials[scope]
+    }
+
+    public func saveCredential(_ credential: StoatAuthCredential, scope: CredentialScope) async throws {
+        scopedCredentials[scope] = credential
+        if scope == .production {
+            self.credential = credential
+        }
+    }
+
+    public func clearCredential(scope: CredentialScope) async throws {
+        scopedCredentials.removeValue(forKey: scope)
+        if scope == .production {
+            credential = nil
+        }
+    }
 }
 
 public enum KeychainTokenStoreError: Error, Equatable, Sendable {
@@ -35,7 +80,7 @@ public enum KeychainTokenStoreError: Error, Equatable, Sendable {
     case unexpectedData
 }
 
-public actor KeychainTokenStore: TokenStore {
+public actor KeychainTokenStore: ScopedTokenStore {
     public static let defaultService = "LiquidBagel.Stoat"
 
     private let service: String
@@ -56,7 +101,15 @@ public actor KeychainTokenStore: TokenStore {
     }
 
     public func loadCredential() async throws -> StoatAuthCredential? {
-        var query = baseQuery()
+        try await loadCredential(account: account)
+    }
+
+    public func loadCredential(scope: CredentialScope) async throws -> StoatAuthCredential? {
+        try await loadCredential(account: scope.keychainAccountName)
+    }
+
+    private func loadCredential(account: String) async throws -> StoatAuthCredential? {
+        var query = baseQuery(account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
@@ -80,6 +133,14 @@ public actor KeychainTokenStore: TokenStore {
     }
 
     public func saveCredential(_ credential: StoatAuthCredential) async throws {
+        try await saveCredential(credential, account: account)
+    }
+
+    public func saveCredential(_ credential: StoatAuthCredential, scope: CredentialScope) async throws {
+        try await saveCredential(credential, account: scope.keychainAccountName)
+    }
+
+    private func saveCredential(_ credential: StoatAuthCredential, account: String) async throws {
         let data: Data
         do {
             data = try encoder.encode(credential)
@@ -87,14 +148,14 @@ public actor KeychainTokenStore: TokenStore {
             throw KeychainTokenStoreError.encodingFailed(error.localizedDescription)
         }
 
-        var query = baseQuery()
+        var query = baseQuery(account: account)
         query[kSecValueData as String] = data
         query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
         let status = SecItemAdd(query as CFDictionary, nil)
         if status == errSecDuplicateItem {
             let updateStatus = SecItemUpdate(
-                baseQuery() as CFDictionary,
+                baseQuery(account: account) as CFDictionary,
                 [kSecValueData as String: data] as CFDictionary
             )
             guard updateStatus == errSecSuccess else {
@@ -108,13 +169,21 @@ public actor KeychainTokenStore: TokenStore {
     }
 
     public func clearCredential() async throws {
-        let status = SecItemDelete(baseQuery() as CFDictionary)
+        try await clearCredential(account: account)
+    }
+
+    public func clearCredential(scope: CredentialScope) async throws {
+        try await clearCredential(account: scope.keychainAccountName)
+    }
+
+    private func clearCredential(account: String) async throws {
+        let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainTokenStoreError.unexpectedStatus(status)
         }
     }
 
-    private func baseQuery() -> [String: Any] {
+    private func baseQuery(account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

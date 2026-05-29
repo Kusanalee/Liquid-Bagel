@@ -12,6 +12,26 @@ public struct StoatAPIEnvironment: Codable, Hashable, Sendable {
         set { eventsURL = newValue }
     }
 
+    public var stableID: String {
+        if self == .production {
+            return "production"
+        }
+        let raw = [
+            apiBaseURL.absoluteString,
+            eventsURL.absoluteString,
+            mediaBaseURL?.absoluteString ?? "none"
+        ].joined(separator: "|").lowercased()
+        let allowed = CharacterSet.alphanumerics
+        let scalars = raw.unicodeScalars.map { scalar in
+            allowed.contains(scalar) ? Character(scalar).description : "-"
+        }.joined()
+        return "custom-" + scalars.replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
+    }
+
+    public var isProduction: Bool {
+        stableID == "production"
+    }
+
     public init(
         apiBaseURL: URL,
         eventsURL: URL,
@@ -62,6 +82,16 @@ public struct StoatAPIEnvironment: Codable, Hashable, Sendable {
         try appBaseURL.map { try validateHTTPURL($0, name: "appBaseURL") }
     }
 
+    public func securityWarnings() -> [String] {
+        var warnings: [String] = []
+        appendHTTPWarning(for: apiBaseURL, name: "API", warnings: &warnings)
+        appendWebSocketWarning(for: eventsURL, name: "Events", warnings: &warnings)
+        if let mediaBaseURL {
+            appendHTTPWarning(for: mediaBaseURL, name: "Media", warnings: &warnings)
+        }
+        return warnings
+    }
+
     private func validateHTTPURL(_ url: URL, name: String) throws {
         guard let scheme = url.scheme?.lowercased(), let host = url.host, !host.isEmpty else {
             throw StoatAPIError.invalidEnvironment("\(name) must include a scheme and host")
@@ -85,5 +115,18 @@ public struct StoatAPIEnvironment: Codable, Hashable, Sendable {
     private func isLocalhost(_ host: String) -> Bool {
         host == "localhost" || host == "127.0.0.1" || host == "::1"
     }
-}
 
+    private func appendHTTPWarning(for url: URL, name: String, warnings: inout [String]) {
+        guard let scheme = url.scheme?.lowercased(), let host = url.host, !isLocalhost(host), scheme == "http" else {
+            return
+        }
+        warnings.append("\(name) uses HTTP for a remote host.")
+    }
+
+    private func appendWebSocketWarning(for url: URL, name: String, warnings: inout [String]) {
+        guard let scheme = url.scheme?.lowercased(), let host = url.host, !isLocalhost(host), scheme == "ws" else {
+            return
+        }
+        warnings.append("\(name) uses WS for a remote host.")
+    }
+}

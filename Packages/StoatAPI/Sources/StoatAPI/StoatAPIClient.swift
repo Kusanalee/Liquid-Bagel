@@ -16,6 +16,43 @@ public protocol StoatAPIClient: Sendable {
     func pinMessage(channelID: ChannelID, messageID: MessageID) async throws
     func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws
     func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile
+    func login(request: SessionLoginRequest) async throws -> SessionLoginResponse
+    func continueLogin(request: SessionMFALoginRequest) async throws -> SessionLoginResponse
+    func logoutCurrentSession() async throws
+    func fetchSessions() async throws -> [SessionInfo]
+    func revokeSession(id: SessionID) async throws
+    func revokeAllSessions(revokeSelf: Bool) async throws
+    func renameSession(id: SessionID, friendlyName: String) async throws -> SessionInfo
+}
+
+public extension StoatAPIClient {
+    func login(request: SessionLoginRequest) async throws -> SessionLoginResponse {
+        throw StoatAPIError.unimplementedEndpoint("Session login is not implemented by this API client.")
+    }
+
+    func continueLogin(request: SessionMFALoginRequest) async throws -> SessionLoginResponse {
+        throw StoatAPIError.unimplementedEndpoint("MFA login is not implemented by this API client.")
+    }
+
+    func logoutCurrentSession() async throws {
+        throw StoatAPIError.unimplementedEndpoint("Session logout is not implemented by this API client.")
+    }
+
+    func fetchSessions() async throws -> [SessionInfo] {
+        throw StoatAPIError.unimplementedEndpoint("Session listing is not implemented by this API client.")
+    }
+
+    func revokeSession(id: SessionID) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Session revocation is not implemented by this API client.")
+    }
+
+    func revokeAllSessions(revokeSelf: Bool) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Session revocation is not implemented by this API client.")
+    }
+
+    func renameSession(id: SessionID, friendlyName: String) async throws -> SessionInfo {
+        throw StoatAPIError.unimplementedEndpoint("Session rename is not implemented by this API client.")
+    }
 }
 
 public actor LiveStoatAPIClient: StoatAPIClient {
@@ -163,6 +200,60 @@ public actor LiveStoatAPIClient: StoatAPIClient {
         )
     }
 
+    public func login(request: SessionLoginRequest) async throws -> SessionLoginResponse {
+        try await perform(
+            StoatRequest<SessionLoginResponse>(
+                method: .post,
+                path: "/auth/session/login",
+                body: .json(try encoder.encode(request)),
+                requiresAuthentication: false
+            )
+        )
+    }
+
+    public func continueLogin(request: SessionMFALoginRequest) async throws -> SessionLoginResponse {
+        try await perform(
+            StoatRequest<SessionLoginResponse>(
+                method: .post,
+                path: "/auth/session/login",
+                body: .json(try encoder.encode(request)),
+                requiresAuthentication: false
+            )
+        )
+    }
+
+    public func logoutCurrentSession() async throws {
+        _ = try await perform(StoatRequest<EmptyResponse>(method: .post, path: "/auth/session/logout"))
+    }
+
+    public func fetchSessions() async throws -> [SessionInfo] {
+        try await perform(StoatRequest<[SessionInfo]>(method: .get, path: "/auth/session/all"))
+    }
+
+    public func revokeSession(id: SessionID) async throws {
+        _ = try await perform(StoatRequest<EmptyResponse>(method: .delete, path: "/auth/session/\(id.rawValue.stoatPathComponentEscaped)"))
+    }
+
+    public func revokeAllSessions(revokeSelf: Bool) async throws {
+        _ = try await perform(
+            StoatRequest<EmptyResponse>(
+                method: .delete,
+                path: "/auth/session/all",
+                queryItems: [URLQueryItem(name: "revoke_self", value: revokeSelf ? "true" : "false")]
+            )
+        )
+    }
+
+    public func renameSession(id: SessionID, friendlyName: String) async throws -> SessionInfo {
+        try await perform(
+            StoatRequest<SessionInfo>(
+                method: .patch,
+                path: "/auth/session/\(id.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(SessionEditRequest(friendlyName: friendlyName)))
+            )
+        )
+    }
+
     private func perform<Response: Decodable & Sendable>(_ request: StoatRequest<Response>) async throws -> Response {
         let credential = request.requiresAuthentication ? try await credentialProvider.credential() : nil
         let urlRequest = try requestBuilder.build(request, credential: credential)
@@ -171,3 +262,10 @@ public actor LiveStoatAPIClient: StoatAPIClient {
     }
 }
 
+private struct SessionEditRequest: Encodable {
+    var friendlyName: String
+
+    private enum CodingKeys: String, CodingKey {
+        case friendlyName = "friendly_name"
+    }
+}
