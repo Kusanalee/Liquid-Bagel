@@ -96,6 +96,83 @@ final class StoatAPITests: XCTestCase {
         XCTAssertFalse(stored.debugDescription.contains("login-secret"))
     }
 
+    func testSessionListEndpointRequest() async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"[{"_id":"01J00000000000000000000001","name":"Mac"}]"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        let sessions = try await client.fetchSessions()
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+
+        XCTAssertEqual(sessions.first?.name, "Mac")
+        XCTAssertEqual(request.httpMethod, "GET")
+        XCTAssertEqual(request.url?.path, "/auth/session/all")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
+    }
+
+    func testSessionRenameEndpointRequest() async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"{"_id":"session-1","name":"Renamed"}"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        let session = try await client.renameSession(id: "session-1", friendlyName: "Renamed")
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let body = String(data: try XCTUnwrap(request.httpBody), encoding: .utf8)
+
+        XCTAssertEqual(session.name, "Renamed")
+        XCTAssertEqual(request.httpMethod, "PATCH")
+        XCTAssertEqual(request.url?.path, "/auth/session/session-1")
+        XCTAssertTrue(body?.contains(#""friendly_name":"Renamed""#) == true)
+    }
+
+    func testSessionRevokeEndpointRequests() async throws {
+        let revokeTransport = RecordingHTTPTransport(statusCode: 204)
+        let revokeClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: revokeTransport
+        )
+
+        try await revokeClient.revokeSession(id: "session-1")
+        let capturedRevokeRequest = await revokeTransport.lastRequest()
+        let revokeRequest = try XCTUnwrap(capturedRevokeRequest)
+        XCTAssertEqual(revokeRequest.httpMethod, "DELETE")
+        XCTAssertEqual(revokeRequest.url?.path, "/auth/session/session-1")
+
+        let revokeAllTransport = RecordingHTTPTransport(statusCode: 204)
+        let revokeAllClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: revokeAllTransport
+        )
+
+        try await revokeAllClient.revokeAllSessions(revokeSelf: false)
+        let capturedRevokeAllRequest = await revokeAllTransport.lastRequest()
+        let revokeAllRequest = try XCTUnwrap(capturedRevokeAllRequest)
+        XCTAssertEqual(revokeAllRequest.httpMethod, "DELETE")
+        XCTAssertEqual(revokeAllRequest.url?.path, "/auth/session/all")
+        XCTAssertEqual(URLComponents(url: try XCTUnwrap(revokeAllRequest.url), resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "revoke_self" }?.value, "false")
+    }
+
+    func testCurrentSessionLogoutEndpointRequest() async throws {
+        let transport = RecordingHTTPTransport(statusCode: 204)
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        try await client.logoutCurrentSession()
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/auth/session/logout")
+    }
+
     func testSessionValidationErrorMapping() {
         XCTAssertEqual(LiveSessionValidator.map(.unauthorized), .invalidOrExpired)
         XCTAssertEqual(LiveSessionValidator.map(.forbidden), .forbidden)
@@ -245,5 +322,25 @@ final class StoatAPITests: XCTestCase {
             return try Data(contentsOf: modelURL)
         }
         throw XCTSkip("Missing fixture \(name).json")
+    }
+}
+
+private actor RecordingHTTPTransport: HTTPTransport {
+    private var requests: [URLRequest] = []
+    private let statusCode: Int
+    private let data: Data
+
+    init(statusCode: Int = 200, data: Data = Data()) {
+        self.statusCode = statusCode
+        self.data = data
+    }
+
+    func data(for request: URLRequest) async throws -> StoatHTTPResponse {
+        requests.append(request)
+        return StoatHTTPResponse(statusCode: statusCode, data: data)
+    }
+
+    func lastRequest() -> URLRequest? {
+        requests.last
     }
 }

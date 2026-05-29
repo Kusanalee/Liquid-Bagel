@@ -17,6 +17,13 @@ public enum AppRuntimeMode: Codable, Hashable, Sendable {
     case liveManual
 }
 
+public enum SettingsSectionTab: String, Codable, Hashable, Sendable, CaseIterable {
+    case account
+    case sessions
+    case connection
+    case developer
+}
+
 public enum ShellSpace: Codable, Hashable, Sendable {
     case home
     case server(ServerID)
@@ -224,6 +231,9 @@ public final class MainShellViewModel {
     public var messageActionStatus: String?
     public var isCredentialSetupPresented = false
     public var isTestSendConfirmationPresented = false
+    public var selectedSettingsTab: SettingsSectionTab = .account
+    public var messageDensity: MessageDensityPreference = .comfortable
+    public var reduceGlassIntensity = false
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
@@ -446,6 +456,12 @@ public final class MainShellViewModel {
 
     public func toggleMemberPanel() {
         selection.isMemberPanelVisible.toggle()
+        Task { [weak self] in
+            guard let self else { return }
+            await self.sessionCoordinator?.updatePreferences { preferences in
+                preferences.memberPanelVisible = self.selection.isMemberPanelVisible
+            }
+        }
     }
 
     public func showQuickSwitcher() {
@@ -471,10 +487,22 @@ public final class MainShellViewModel {
     }
 
     public func settingsPlaceholder() {
+        selectedSettingsTab = .account
         isCredentialSetupPresented = true
     }
 
     public func showCredentialSetup() {
+        selectedSettingsTab = .developer
+        isCredentialSetupPresented = true
+    }
+
+    public func showConnectionSettings() {
+        selectedSettingsTab = .connection
+        isCredentialSetupPresented = true
+    }
+
+    public func showAccountSessions() {
+        selectedSettingsTab = .account
         isCredentialSetupPresented = true
     }
 
@@ -545,6 +573,9 @@ public final class MainShellViewModel {
         connectionState = sessionCoordinator.connectionState
         diagnostics = sessionCoordinator.diagnostics
         currentUser = sessionCoordinator.currentUser
+        selection.isMemberPanelVisible = sessionCoordinator.preferences.memberPanelVisible
+        messageDensity = sessionCoordinator.preferences.messageDensity
+        reduceGlassIntensity = sessionCoordinator.preferences.reduceGlassIntensity
         snapshot = sessionCoordinator.snapshot
         messageActionHandler = sessionCoordinator.messageActionHandler
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
@@ -970,7 +1001,7 @@ public struct MainShellView: View {
             QuickSwitcherPlaceholderView(viewModel: viewModel)
         }
         .sheet(isPresented: $viewModel.isCredentialSetupPresented) {
-            CredentialSetupView(viewModel: viewModel)
+            AccountConnectionSettingsView(viewModel: viewModel)
         }
         .sheet(item: $viewModel.editingDraft) { _ in
             EditMessageSheet(viewModel: viewModel)
@@ -1031,7 +1062,7 @@ public struct MainShellView: View {
             ToolbarItemGroup {
                 Button { viewModel.showQuickSwitcher() } label: { Label("Quick Switcher", systemImage: "magnifyingglass") }
                 Button { viewModel.toggleMemberPanel() } label: { Label("Toggle Members", systemImage: "sidebar.right") }
-                Button { viewModel.settingsPlaceholder() } label: { Label("Settings", systemImage: "gearshape") }
+                Button { viewModel.showAccountSessions() } label: { Label("Settings", systemImage: "gearshape") }
             }
         }
     }
@@ -1064,8 +1095,16 @@ public struct MainShellView: View {
                 LabeledContent("Credential", value: session.hasSavedCredential ? "Saved" : "Missing")
             }
             Divider()
-            Button("Set Up Session…") {
-                viewModel.showCredentialSetup()
+            Button("Account & Sessions…") {
+                viewModel.showAccountSessions()
+            }
+            Button("Connection Settings…") {
+                viewModel.showConnectionSettings()
+            }
+            if viewModel.sessionCoordinator?.preferences.showDeveloperRuntimeControls != false {
+                Button("Developer Verification…") {
+                    viewModel.showCredentialSetup()
+                }
             }
             if viewModel.sessionCoordinator?.hasSavedCredential == true {
                 Button("Validate Saved Session") {
@@ -1091,7 +1130,7 @@ public struct MainShellView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, StoatSpacing.small)
                 .padding(.vertical, StoatSpacing.xSmall)
-                .background(Color.primary.opacity(0.06), in: Capsule())
+        .background(Color.primary.opacity(viewModel.reduceGlassIntensity ? 0.10 : 0.06), in: Capsule())
         }
         .menuStyle(.borderlessButton)
         .accessibilityLabel("Runtime \(runtimeModeText), connection state \(connectionText)")
@@ -1753,7 +1792,7 @@ public struct MessageTimelineView: View {
 
     public var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            LazyVStack(alignment: .leading, spacing: viewModel.messageDensity == .compact ? StoatSpacing.small : StoatSpacing.medium) {
                 if viewModel.selectedChannel == nil {
                     EmptyStateView(title: "Choose a channel", message: "Pick a server channel or DM to open the timeline.")
                         .frame(maxWidth: .infinity)

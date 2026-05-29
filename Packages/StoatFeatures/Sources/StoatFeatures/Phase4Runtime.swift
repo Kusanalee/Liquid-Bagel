@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import StoatAPI
 import StoatModels
+import StoatPersistence
 import StoatRealtime
 
 public enum AppSessionState: Equatable, Sendable {
@@ -583,6 +584,8 @@ public final class AppSessionCoordinator {
     public private(set) var hasSavedCredential: Bool
     public private(set) var lastErrorMessage: String?
     public private(set) var environment: StoatAPIEnvironment
+    public private(set) var preferences: AppPreferences
+    public private(set) var preferenceErrorMessage: String?
     public private(set) var localSessionLabel: String?
     public private(set) var verificationState: LiveVerificationState
 
@@ -591,6 +594,7 @@ public final class AppSessionCoordinator {
     @ObservationIgnored public private(set) var messageActionHandler: any MessageActionHandling
 
     @ObservationIgnored private let tokenStore: any TokenStore
+    @ObservationIgnored private let preferencesStore: any AppPreferencesStore
     @ObservationIgnored private let readyFields: Set<ReadyField>
     @ObservationIgnored private let mockSnapshot: RealtimeSnapshot
     @ObservationIgnored private let mockCurrentUserID: UserID
@@ -606,6 +610,7 @@ public final class AppSessionCoordinator {
 
     public init(
         tokenStore: any TokenStore = KeychainTokenStore(),
+        preferencesStore: any AppPreferencesStore = UserDefaultsAppPreferencesStore(),
         environment: StoatAPIEnvironment = .production,
         readyFields: Set<ReadyField> = Set([.users, .servers, .channels, .members, .emojis, .userSettings, .channelUnreads, .policyChanges]),
         mockSnapshot: RealtimeSnapshot = MockShellData.snapshot,
@@ -622,6 +627,7 @@ public final class AppSessionCoordinator {
         }
     ) {
         self.tokenStore = tokenStore
+        self.preferencesStore = preferencesStore
         self.environment = environment
         self.readyFields = readyFields
         self.mockSnapshot = mockSnapshot
@@ -641,6 +647,8 @@ public final class AppSessionCoordinator {
         self.hasSavedCredential = false
         self.lastErrorMessage = nil
         self.environment = environment
+        self.preferences = .defaults
+        self.preferenceErrorMessage = nil
         self.localSessionLabel = nil
         self.verificationState = LiveVerificationState()
         self.snapshotSource = MockShellSnapshotSource(snapshot: mockSnapshot)
@@ -654,6 +662,13 @@ public final class AppSessionCoordinator {
     }
 
     public func startMockSession() async {
+        await startMockSession(loadStoredPreferences: true)
+    }
+
+    private func startMockSession(loadStoredPreferences: Bool) async {
+        if loadStoredPreferences {
+            await loadPreferences()
+        }
         await disconnectActiveRealtime()
         mode = .mock
         sessionState = .mock
@@ -670,6 +685,49 @@ public final class AppSessionCoordinator {
         apiClient = nil
         messageActionHandler = MockMessageActionHandler(currentUserID: mockCurrentUserID)
         await refreshCredentialAvailability()
+        if hasSavedCredential {
+            sessionState = .readyToConnect
+        }
+    }
+
+    public func loadPreferences() async {
+        do {
+            let loaded = try await preferencesStore.loadPreferences()
+            preferences = loaded
+            environment = loaded.selectedEnvironment
+            preferenceErrorMessage = nil
+        } catch {
+            preferences = .defaults
+            environment = .production
+            let message = "Could not load preferences: \(error.userFacingMessage)"
+            preferenceErrorMessage = message
+            lastErrorMessage = message
+        }
+    }
+
+    public func savePreferences(_ newPreferences: AppPreferences) async {
+        do {
+            let validated = try newPreferences.validated()
+            preferences = validated
+            try await preferencesStore.savePreferences(validated)
+            preferenceErrorMessage = nil
+        } catch {
+            let message = "Could not save preferences: \(error.userFacingMessage)"
+            preferenceErrorMessage = message
+            lastErrorMessage = message
+        }
+    }
+
+    public func updatePreferences(_ update: (inout AppPreferences) throws -> Void) async {
+        var updated = preferences
+        do {
+            try update(&updated)
+            await savePreferences(updated)
+        } catch {
+            let message = "Could not update preferences: \(error.userFacingMessage)"
+            preferenceErrorMessage = message
+            lastErrorMessage = message
+        }
     }
 
     public func refreshCredentialAvailability() async {
@@ -690,6 +748,13 @@ public final class AppSessionCoordinator {
     public func setEnvironment(_ newEnvironment: StoatAPIEnvironment) async {
         do {
             try newEnvironment.validate()
+            if !preferences.environmentProfiles.contains(where: { $0.environment == newEnvironment }) {
+                let profile = try EnvironmentProfile.custom(name: "Custom Environment", environment: newEnvironment)
+                preferences = try preferences.upserting(profile: profile).withSelectedEnvironmentID(profile.id)
+            } else if let profile = preferences.environmentProfiles.first(where: { $0.environment == newEnvironment }) {
+                preferences = preferences.withSelectedEnvironmentID(profile.id)
+            }
+            await savePreferences(preferences)
             await disconnectActiveRealtime()
             environment = newEnvironment
             mode = .liveManual
@@ -706,6 +771,49 @@ public final class AppSessionCoordinator {
             await refreshCredentialAvailability()
         } catch {
             let message = "Custom environment is invalid: \(error.userFacingMessage)"
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
+        }
+    }
+
+    public func selectEnvironmentProfile(id: String) async {
+        guard let profile = preferences.environmentProfiles.first(where: { $0.id == id }) else {
+            let message = "Environment profile was not found."
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
+            return
+        }
+        var updated = preferences.withSelectedEnvironmentID(profile.id)
+        updated.preferredLaunchMode = .rememberLastButDoNotConnect
+        await savePreferences(updated)
+        await setEnvironment(profile.environment)
+    }
+
+    public func upsertEnvironmentProfile(_ profile: EnvironmentProfile) async {
+        do {
+            let updated = try preferences.upserting(profile: profile).withSelectedEnvironmentID(profile.id)
+            await savePreferences(updated)
+            await setEnvironment(profile.environment)
+        } catch {
+            let message = "Could not save environment profile: \(error.userFacingMessage)"
+            sessionState = .validationFailed(message)
+            lastErrorMessage = message
+        }
+    }
+
+    public func deleteEnvironmentProfile(id: String, forgetCredential: Bool = false) async {
+        do {
+            let deletingSelected = preferences.lastSelectedEnvironmentID == id || environment.stableID == id
+            if forgetCredential {
+                try await clearCredential(environmentID: id)
+            }
+            let updated = try preferences.deletingProfile(id: id)
+            await savePreferences(updated)
+            if deletingSelected {
+                await setEnvironment(.production)
+            }
+        } catch {
+            let message = "Could not delete environment profile: \(error.userFacingMessage)"
             sessionState = .validationFailed(message)
             lastErrorMessage = message
         }
@@ -785,6 +893,22 @@ public final class AppSessionCoordinator {
             currentUser = nil
             sessionState = sessionFailureState(for: error, fallback: message)
             lastErrorMessage = message
+        }
+    }
+
+    public func credentialForCurrentEnvironment() async throws -> StoatAuthCredential? {
+        try await loadCredentialForCurrentEnvironment()
+    }
+
+    public func credentialExists(environmentID: String) async -> Bool {
+        do {
+            if let scoped = tokenStore as? any ScopedTokenStore {
+                return try await scoped.loadCredential(scope: CredentialScope(environmentID: environmentID)) != nil
+            }
+            guard environmentID == StoatAPIEnvironment.production.stableID else { return false }
+            return try await tokenStore.loadCredential() != nil
+        } catch {
+            return false
         }
     }
 
@@ -977,7 +1101,7 @@ public final class AppSessionCoordinator {
     }
 
     public func resetToMock() async {
-        await startMockSession()
+        await startMockSession(loadStoredPreferences: false)
     }
 
     private func startObservingRealtime(realtimeClient: any StoatRealtimeClient, store: RealtimeStateStore) {
@@ -1096,8 +1220,12 @@ public final class AppSessionCoordinator {
     }
 
     private func clearCredentialForCurrentEnvironment() async throws {
+        try await clearCredential(environmentID: environment.stableID)
+    }
+
+    public func clearCredential(environmentID: String) async throws {
         if let scoped = tokenStore as? any ScopedTokenStore {
-            try await scoped.clearCredential(scope: currentCredentialScope)
+            try await scoped.clearCredential(scope: CredentialScope(environmentID: environmentID))
         } else {
             try await tokenStore.clearCredential()
         }

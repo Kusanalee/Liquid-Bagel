@@ -207,3 +207,24 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Official docs say users may “authenticate through API” but do not document the login payload directly; the exact login/MFA/session shapes come from generated API/source and official client source.
 - Self-hosted/custom environments are assumed to expose the same auth/session routes when they run the same Stoat backend, but Liquid Bagel does not verify that automatically.
 - hCaptcha, onboarding completion, account flags, and richer login failure handling remain deferred unless official/current client behavior requires them in a later phase.
+
+## Phase 6 Notes
+
+### Session management re-check
+
+- Current generated API routes still expose:
+  - `GET /auth/session/all`
+  - `PATCH /auth/session/{id}` with `friendly_name`
+  - `DELETE /auth/session/{id}`
+  - `DELETE /auth/session/all?revoke_self=...`
+  - `POST /auth/session/logout`
+- Current generated schema still defines `SessionInfo` as `_id` and `name` only. It does not expose a token, `current`, `created_at`, or `updated_at` field.
+- The official web client identifies the current session by comparing each session ID to the client's locally held `sessionId`; Liquid Bagel should do the same when the saved credential includes a session ID.
+- The official SDK derives session creation time from the ULID session ID. Liquid Bagel may display that derived created time when decoding succeeds, but should not claim an API-provided timestamp.
+- The official web client's “Log Out Other Sessions” behavior maps to deleting all sessions with `revoke_self=false`.
+
+### Phase 6 safety implications
+
+- Session IDs are acceptable for internal matching and shortened display, but broad diagnostics should continue to avoid raw full session IDs.
+- If a manually imported token has no session ID, Liquid Bagel can list sessions but cannot mark the current session with certainty.
+- Revoke-all-other-sessions is verified and safe when called with `revoke_self=false`; revoke-self behavior should remain behind explicit current-session logout/revoke confirmation.

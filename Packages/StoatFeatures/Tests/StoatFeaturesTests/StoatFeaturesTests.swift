@@ -1,5 +1,6 @@
 import StoatModels
 import StoatAPI
+import StoatPersistence
 import StoatRealtime
 import XCTest
 @testable import StoatFeatures
@@ -297,6 +298,94 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testStartupLoadsPreferencesButStaysMock() async throws {
+        let custom = try EnvironmentProfile.custom(
+            name: "Local",
+            environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:14702")!, eventsURL: URL(string: "ws://localhost:14703")!)
+        )
+        let preferences = try AppPreferences.defaults.upserting(profile: custom).withSelectedEnvironmentID(custom.id)
+        let session = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            preferencesStore: InMemoryAppPreferencesStore(preferences: preferences),
+            apiClientFactory: { _, _ in RecordingAPIClient() }
+        )
+
+        await session.startMockSession()
+
+        XCTAssertEqual(session.mode, .mock)
+        XCTAssertEqual(session.environment, custom.environment)
+        XCTAssertEqual(session.preferences.lastSelectedEnvironmentID, custom.id)
+    }
+
+    @MainActor
+    func testStartupSavedCredentialBecomesReadyWithoutConnecting() async throws {
+        let custom = try EnvironmentProfile.custom(
+            name: "Local",
+            environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:14702")!, eventsURL: URL(string: "ws://localhost:14703")!)
+        )
+        let preferences = try AppPreferences.defaults.upserting(profile: custom).withSelectedEnvironmentID(custom.id)
+        let store = InMemoryTokenStore()
+        try await store.saveCredential(.sessionToken("custom-token"), scope: CredentialScope(environmentID: custom.id))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
+        let session = AppSessionCoordinator(
+            tokenStore: store,
+            preferencesStore: InMemoryAppPreferencesStore(preferences: preferences),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+
+        await session.startMockSession()
+
+        XCTAssertEqual(session.mode, .mock)
+        XCTAssertEqual(session.sessionState, .readyToConnect)
+        XCTAssertTrue(session.hasSavedCredential)
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 0)
+    }
+
+    @MainActor
+    func testEnvironmentSwitchingUsesScopedCredentialAvailabilityAndPersistsSelection() async throws {
+        let custom = try EnvironmentProfile.custom(
+            name: "Local",
+            environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:14702")!, eventsURL: URL(string: "ws://localhost:14703")!)
+        )
+        let preferences = try AppPreferences.defaults.upserting(profile: custom)
+        let preferencesStore = InMemoryAppPreferencesStore(preferences: preferences)
+        let tokenStore = InMemoryTokenStore()
+        try await tokenStore.saveCredential(.sessionToken("custom-token"), scope: CredentialScope(environmentID: custom.id))
+        let session = AppSessionCoordinator(
+            tokenStore: tokenStore,
+            preferencesStore: preferencesStore,
+            apiClientFactory: { _, _ in RecordingAPIClient() }
+        )
+
+        await session.startMockSession()
+        await session.selectEnvironmentProfile(id: custom.id)
+
+        XCTAssertEqual(session.preferences.lastSelectedEnvironmentID, custom.id)
+        XCTAssertTrue(session.hasSavedCredential)
+
+        await session.selectEnvironmentProfile(id: "production")
+        XCTAssertFalse(session.hasSavedCredential)
+        let saved = try await preferencesStore.loadPreferences()
+        XCTAssertEqual(saved.lastSelectedEnvironmentID, "production")
+    }
+
+    @MainActor
+    func testPreferenceSaveFailureSurfacesWithoutCrashing() async {
+        let session = AppSessionCoordinator(
+            preferencesStore: InMemoryAppPreferencesStore(saveError: MessageActionError.unavailable("save failed")),
+            apiClientFactory: { _, _ in RecordingAPIClient() }
+        )
+
+        await session.updatePreferences { preferences in
+            preferences.memberPanelVisible = false
+        }
+
+        XCTAssertTrue(session.preferenceErrorMessage?.contains("save failed") == true)
+    }
+
+    @MainActor
     func testForgetSessionDisconnectsAndClearsScopedCredential() async throws {
         let store = InMemoryTokenStore(credential: .sessionToken("token"))
         let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
@@ -343,6 +432,102 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(session.verificationState.selectedChannelAvailable)
         XCTAssertTrue(session.verificationState.messageFetchSucceeded)
         XCTAssertEqual(session.verificationState.lastMessageActionResult, "Send action attempted.")
+    }
+
+    @MainActor
+    func testAccountSessionViewModelLoadsRenamesAndRevokesSessions() async throws {
+        let currentID: SessionID = "01J00000000000000000000001"
+        let otherID: SessionID = "01J00000010000000000000001"
+        let manager = MockSessionManager(sessions: [
+            SessionInfo(id: currentID, name: "Mac"),
+            SessionInfo(id: otherID, name: "Phone")
+        ])
+        let model = AccountSessionViewModel(
+            currentUser: User(id: "user", username: "test"),
+            currentSessionID: currentID,
+            sessionManager: manager,
+            credentialProvider: { .userSession(token: "secret", sessionID: currentID) }
+        )
+
+        await model.refreshSessions()
+        XCTAssertEqual(model.sessionsState.sessions.count, 2)
+        XCTAssertTrue(model.sessionsState.sessions.first { $0.id == currentID }?.isCurrent == true)
+
+        await model.renameSession(id: otherID, friendlyName: "Tablet")
+        let renamed = await manager.renamedSessions
+        XCTAssertEqual(renamed.first?.1, "Tablet")
+
+        await model.revokeSession(id: otherID)
+        let revoked = await manager.revokedSessionIDs
+        XCTAssertEqual(revoked, [otherID])
+    }
+
+    @MainActor
+    func testAccountSessionViewModelStatesAndValidation() async {
+        let empty = AccountSessionViewModel(
+            sessionManager: MockSessionManager(),
+            credentialProvider: { .sessionToken("secret") }
+        )
+
+        await empty.refreshSessions()
+        XCTAssertEqual(empty.sessionsState, .empty)
+
+        await empty.renameSession(id: "session", friendlyName: "   ")
+        XCTAssertTrue(empty.errorMessage?.contains("cannot be blank") == true)
+
+        let failing = AccountSessionViewModel(
+            sessionManager: MockSessionManager(error: MessageActionError.unavailable("api failed")),
+            credentialProvider: { .sessionToken("secret") }
+        )
+        await failing.refreshSessions()
+        if case let .failed(message) = failing.sessionsState {
+            XCTAssertTrue(message.contains("api failed"))
+        } else {
+            XCTFail("Expected failed session state")
+        }
+    }
+
+    @MainActor
+    func testRevokeAllOtherSessionsUsesRevokeSelfFalse() async {
+        let manager = MockSessionManager(sessions: [
+            SessionInfo(id: "01J00000000000000000000001", name: "Mac"),
+            SessionInfo(id: "01J00000010000000000000001", name: "Phone")
+        ])
+        let model = AccountSessionViewModel(
+            currentSessionID: "01J00000000000000000000001",
+            sessionManager: manager,
+            credentialProvider: { .userSession(token: "secret", sessionID: "01J00000000000000000000001") }
+        )
+
+        await model.refreshSessions()
+        await model.revokeAllOtherSessions()
+
+        let arguments = await manager.revokeAllArguments
+        XCTAssertEqual(arguments, [false])
+    }
+
+    @MainActor
+    func testConnectionSettingsViewModelSavesSelectedEnvironmentAndValidationErrors() async throws {
+        let store = InMemoryAppPreferencesStore()
+        let model = ConnectionSettingsViewModel(preferencesStore: store)
+
+        await model.addEnvironment(name: "Local", apiURL: "http://localhost:14702", eventsURL: "ws://localhost:14703")
+        let selected = try XCTUnwrap(model.selectedEnvironmentID)
+        let saved = try await store.loadPreferences()
+
+        XCTAssertEqual(saved.lastSelectedEnvironmentID, selected)
+
+        await model.addEnvironment(name: "Bad", apiURL: "http://example.com", eventsURL: "wss://events.example.com")
+        XCTAssertNotNil(model.errorMessage)
+    }
+
+    func testPhase6UIHelpersAreSafe() {
+        let id: SessionID = "01J00000000000000000000001"
+
+        XCTAssertEqual(Phase6UIHelpers.shortenedSessionID(id), "01J000...0001")
+        XCTAssertEqual(Phase6UIHelpers.credentialPresenceLabel(hasCredential: true), "Credential saved for this environment")
+        XCTAssertFalse(Phase6UIHelpers.credentialPresenceLabel(hasCredential: true).localizedCaseInsensitiveContains("secret"))
+        XCTAssertFalse(Phase6UIHelpers.safeDiagnostics("X-Session-Token: secret").contains("secret"))
     }
 
     func testMockSnapshotSourceEmitsInitialSnapshot() async {

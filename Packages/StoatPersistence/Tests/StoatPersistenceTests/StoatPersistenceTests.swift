@@ -1,4 +1,6 @@
 import XCTest
+import StoatAPI
+import StoatModels
 @testable import StoatPersistence
 
 final class StoatPersistenceTests: XCTestCase {
@@ -7,5 +9,108 @@ final class StoatPersistenceTests: XCTestCase {
         let user = try await repository.cachedCurrentUser()
 
         XCTAssertNil(user)
+    }
+
+    func testDefaultPreferencesIncludeProductionProfile() throws {
+        let preferences = try AppPreferences.defaults.validated()
+
+        XCTAssertEqual(preferences.preferredLaunchMode, .mock)
+        XCTAssertEqual(preferences.selectedEnvironmentProfile.id, "production")
+        XCTAssertTrue(preferences.environmentProfiles.contains { $0.isProduction && $0.environment == .production })
+    }
+
+    func testPreferencesRoundTripThroughUserDefaultsStore() async throws {
+        let store = UserDefaultsAppPreferencesStore(suiteName: "LiquidBagelTests.\(UUID().uuidString)")
+        let custom = try EnvironmentProfile.custom(
+            name: "Local",
+            environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:14702")!, eventsURL: URL(string: "ws://localhost:14703")!)
+        )
+        let preferences = try AppPreferences.defaults
+            .upserting(profile: custom)
+            .withSelectedEnvironmentID(custom.id)
+
+        try await store.savePreferences(preferences)
+        let loaded = try await store.loadPreferences()
+
+        XCTAssertEqual(loaded.lastSelectedEnvironmentID, custom.id)
+        XCTAssertEqual(loaded.environmentProfiles.first { $0.id == custom.id }?.name, "Local")
+    }
+
+    func testResetPreferencesRestoresDefaults() async throws {
+        let store = UserDefaultsAppPreferencesStore(suiteName: "LiquidBagelTests.\(UUID().uuidString)")
+        var preferences = AppPreferences.defaults
+        preferences.memberPanelVisible = false
+        try await store.savePreferences(preferences)
+
+        try await store.resetPreferences()
+        let loaded = try await store.loadPreferences()
+
+        XCTAssertEqual(loaded.preferredLaunchMode, .mock)
+        XCTAssertTrue(loaded.memberPanelVisible)
+        XCTAssertEqual(loaded.environmentProfiles.map(\.id), ["production"])
+    }
+
+    func testSerializedPreferencesDoNotContainTokenLikeFields() async throws {
+        let store = UserDefaultsAppPreferencesStore(suiteName: "LiquidBagelTests.\(UUID().uuidString)")
+        try await store.savePreferences(.defaults)
+
+        let encoded = await store.encodedPreferencesData()
+        let data = try XCTUnwrap(encoded)
+        let string = try XCTUnwrap(String(data: data, encoding: .utf8))
+
+        XCTAssertFalse(string.localizedCaseInsensitiveContains("token"))
+        XCTAssertFalse(string.localizedCaseInsensitiveContains("secret"))
+        XCTAssertFalse(string.localizedCaseInsensitiveContains("credential"))
+    }
+
+    func testLastSelectedEnvironmentPersists() throws {
+        let custom = try EnvironmentProfile.custom(
+            name: "Dev",
+            environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:3000")!, eventsURL: URL(string: "ws://localhost:3001")!)
+        )
+        let preferences = try AppPreferences.defaults.upserting(profile: custom).withSelectedEnvironmentID(custom.id)
+
+        XCTAssertEqual(preferences.selectedEnvironmentProfile.id, custom.id)
+        XCTAssertEqual(preferences.selectedEnvironment.apiBaseURL.host(), "localhost")
+    }
+
+    func testCustomProfileAddUpdateDeleteRules() throws {
+        let first = try EnvironmentProfile.custom(
+            name: "Dev",
+            environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:3000")!, eventsURL: URL(string: "ws://localhost:3001")!)
+        )
+        let preferences = try AppPreferences.defaults.upserting(profile: first)
+        let renamed = try first.updating(name: "Dev Renamed", environment: first.environment)
+
+        XCTAssertEqual(renamed.id, first.id)
+        XCTAssertEqual(renamed.name, "Dev Renamed")
+
+        let changed = try first.updating(
+            name: "Other",
+            environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:4000")!, eventsURL: URL(string: "ws://localhost:4001")!)
+        )
+        XCTAssertNotEqual(changed.id, first.id)
+
+        let deleted = try preferences.deletingProfile(id: first.id)
+        XCTAssertNil(deleted.environmentProfiles.first { $0.id == first.id })
+        XCTAssertTrue(deleted.environmentProfiles.contains { $0.isProduction })
+    }
+
+    func testProductionProfileCannotBeDeleted() {
+        XCTAssertThrowsError(try AppPreferences.defaults.deletingProfile(id: "production")) { error in
+            XCTAssertEqual(error as? PersistenceError, .productionProfileCannotBeDeleted)
+        }
+    }
+
+    func testUnsafeRemoteURLValidationFailsAndLocalhostPasses() throws {
+        XCTAssertThrowsError(try StoatAPIEnvironment.custom(
+            apiBaseURL: URL(string: "http://example.com")!,
+            eventsURL: URL(string: "wss://events.example.com")!
+        ))
+
+        XCTAssertNoThrow(try StoatAPIEnvironment.custom(
+            apiBaseURL: URL(string: "http://localhost:14702")!,
+            eventsURL: URL(string: "ws://localhost:14703")!
+        ))
     }
 }

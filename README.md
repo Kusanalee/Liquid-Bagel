@@ -1,6 +1,6 @@
 # Liquid Bagel
 
-Liquid Bagel is a native macOS SwiftUI client skeleton for Stoat. Phase 1 establishes verified model, REST API, authentication-storage, request-building, response-decoding, upload, and mock-client foundations while keeping the app UI intentionally lightweight.
+Liquid Bagel is a native macOS SwiftUI client skeleton for Stoat. It now includes verified model/API/realtime foundations, an explicit mock-safe runtime, manual credential setup, safe non-token preference persistence, and focused account/session management.
 
 ## Requirements
 
@@ -26,13 +26,13 @@ The check script runs every local Swift package test target, then builds the mac
 - `App/`: thin macOS SwiftUI app shell.
 - `Packages/StoatModels`: core Stoat value models, ID wrappers, config decoding, and permission bitmasks.
 - `Packages/StoatAPI`: REST API environment, auth credentials, Keychain-backed token storage, request/response handling, upload scaffolding, live client, and mock client.
-- `Packages/StoatRealtime`: placeholder realtime event and Ready-field types.
-- `Packages/StoatPersistence`: placeholder cache repository boundary.
+- `Packages/StoatRealtime`: realtime WebSocket client, event decoding, diagnostics, and state store.
+- `Packages/StoatPersistence`: safe app preferences, environment profiles, and placeholder cache repository boundary.
 - `Packages/StoatDesignSystem`: initial glass styling tokens and components.
 - `Packages/StoatUI`: placeholder native chat shell UI.
 - `Packages/StoatFeatures`: feature facade used by the app target.
 - `Docs/Research.md`: Stoat docs/source research notes.
-- `Docs/Phase1.md`: Phase 1 implementation summary and Phase 2 handoff.
+- `Docs/Phase1.md` ... `Docs/Phase6.md`: phase implementation summaries and handoff notes.
 
 ## Phase Roadmap
 
@@ -40,8 +40,10 @@ The check script runs every local Swift package test target, then builds the mac
 2. Phase 1: verified models, API foundation, login/session token storage abstraction.
 3. Phase 2: realtime WebSocket foundation.
 4. Phase 3: main UI shell connected to state.
-5. Phase 4+: messaging, media, friends/DMs, settings, macOS integration, and hardening.
+5. Phase 4: controlled live manual runtime and message actions.
+6. Phase 5: manual credential import, login/MFA, Keychain scoping, and verification.
+7. Phase 6: safe preferences, environment profiles, account summary, and session management.
 
 ## Current Limits
 
-No real Stoat credentials are required to run the app. The visible shell uses `MockStoatAPIClient`; the live REST client is available for verified endpoints but there is no login UI yet. Realtime sockets, full persistence, full chat UI, and live server/channel hydration are deferred to later phases.
+No real Stoat credentials are required to run the app. The app launches in mock mode, never auto-connects to live Stoat, and stores session tokens only in Keychain. Uploads/media UI, notifications, persistent message cache, friends/discover APIs, voice, and broad server/channel settings are deferred.
