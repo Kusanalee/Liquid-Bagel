@@ -1,6 +1,6 @@
 # Liquid Bagel
 
-Liquid Bagel is a native macOS SwiftUI client skeleton for Stoat. Phase 0 establishes the project shape, local package boundaries, and a buildable placeholder app without implementing live API, realtime, persistence, login, or Keychain behavior yet.
+Liquid Bagel is a native macOS SwiftUI client skeleton for Stoat. Phase 1 establishes verified model, REST API, authentication-storage, request-building, response-decoding, upload, and mock-client foundations while keeping the app UI intentionally lightweight.
 
 ## Requirements
 
@@ -24,14 +24,15 @@ The check script runs every local Swift package test target, then builds the mac
 ## Structure
 
 - `App/`: thin macOS SwiftUI app shell.
-- `Packages/StoatModels`: placeholder core model and ID types.
-- `Packages/StoatAPI`: placeholder API environment, auth credential, and client protocol.
+- `Packages/StoatModels`: core Stoat value models, ID wrappers, config decoding, and permission bitmasks.
+- `Packages/StoatAPI`: REST API environment, auth credentials, Keychain-backed token storage, request/response handling, upload scaffolding, live client, and mock client.
 - `Packages/StoatRealtime`: placeholder realtime event and Ready-field types.
 - `Packages/StoatPersistence`: placeholder cache repository boundary.
 - `Packages/StoatDesignSystem`: initial glass styling tokens and components.
 - `Packages/StoatUI`: placeholder native chat shell UI.
 - `Packages/StoatFeatures`: feature facade used by the app target.
-- `Docs/Research.md`: Phase 0 Stoat docs/source research notes.
+- `Docs/Research.md`: Stoat docs/source research notes.
+- `Docs/Phase1.md`: Phase 1 implementation summary and Phase 2 handoff.
 
 ## Phase Roadmap
 
@@ -43,4 +44,4 @@ The check script runs every local Swift package test target, then builds the mac
 
 ## Current Limits
 
-No real Stoat credentials are required or used. Network clients, Keychain storage, realtime sockets, local persistence, and message actions are intentionally placeholders until the API details are verified in Phase 1.
+No real Stoat credentials are required to run the app. The visible shell uses `MockStoatAPIClient`; the live REST client is available for verified endpoints but there is no login UI yet. Realtime sockets, full persistence, full chat UI, and live server/channel hydration are deferred to later phases.

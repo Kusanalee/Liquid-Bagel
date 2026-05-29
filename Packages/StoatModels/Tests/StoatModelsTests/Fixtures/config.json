@@ -1,0 +1,88 @@
+{
+  "revolt": "0.13.7",
+  "features": {
+    "captcha": {
+      "enabled": true,
+      "key": "mock-key"
+    },
+    "email": true,
+    "invite_only": false,
+    "autumn": {
+      "enabled": true,
+      "url": "https://cdn.stoatusercontent.com"
+    },
+    "january": {
+      "enabled": true,
+      "url": "https://proxy.stoatusercontent.com"
+    },
+    "livekit": {
+      "enabled": true,
+      "nodes": [
+        {
+          "name": "worldwide",
+          "lat": 0.0,
+          "lon": 0.0,
+          "public_url": "wss://01.hel-fi.voip.stoat.chat"
+        }
+      ]
+    },
+    "limits": {
+      "global": {
+        "group_size": 100,
+        "message_embeds": 5,
+        "message_replies": 5,
+        "message_reactions": 20,
+        "server_emoji": 100,
+        "server_roles": 200,
+        "server_channels": 200,
+        "body_limit_size": 20000000,
+        "restrict_server_creation": [],
+        "new_user_hours": 72
+      },
+      "new_user": {
+        "outgoing_friend_requests": 5,
+        "bots": 2,
+        "message_length": 2000,
+        "message_attachments": 5,
+        "servers": 50,
+        "voice_quality": 16000,
+        "video": false,
+        "video_resolution": [1080, 720],
+        "video_aspect_ratio": [0.3, 2.5],
+        "file_upload_size_limits": {
+          "attachments": 20000000
+        }
+      },
+      "default": {
+        "outgoing_friend_requests": 10,
+        "bots": 5,
+        "message_length": 2000,
+        "message_attachments": 5,
+        "servers": 100,
+        "voice_quality": 16000,
+        "video": false,
+        "video_resolution": [1280, 720],
+        "video_aspect_ratio": [0.3, 2.5],
+        "file_upload_size_limits": {
+          "attachments": 20000000
+        }
+      }
+    },
+    "legal_links": {
+      "terms_of_service": "",
+      "privacy_policy": "",
+      "guidelines": ""
+    }
+  },
+  "ws": "wss://events.stoat.chat",
+  "app": "https://stoat.chat",
+  "vapid": "mock-vapid",
+  "build": {
+    "commit_sha": "<failed to generate>",
+    "commit_timestamp": "<failed to generate>",
+    "semver": "<failed to generate>",
+    "origin_url": "<failed to generate>",
+    "timestamp": "<failed to generate>"
+  }
+}
+

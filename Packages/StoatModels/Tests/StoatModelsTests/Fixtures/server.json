@@ -1,0 +1,38 @@
+{
+  "_id": "01HX0000000000000000000201",
+  "owner": "01HX0000000000000000000001",
+  "name": "Bagel Lab",
+  "description": "Phase 1 fixture server",
+  "channels": [
+    "01HX0000000000000000000101",
+    "01HX0000000000000000000102"
+  ],
+  "categories": [
+    {
+      "id": "cat-core",
+      "title": "Core",
+      "channels": [
+        "01HX0000000000000000000101"
+      ]
+    }
+  ],
+  "roles": {
+    "01HX0000000000000000000301": {
+      "_id": "01HX0000000000000000000301",
+      "name": "Core Crew",
+      "permissions": {
+        "a": 138412032,
+        "d": 0
+      },
+      "colour": "#ffcc66",
+      "hoist": true,
+      "rank": 1
+    }
+  },
+  "default_permissions": 138412032,
+  "flags": 0,
+  "nsfw": false,
+  "analytics": false,
+  "discoverable": false
+}
+

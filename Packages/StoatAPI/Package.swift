@@ -15,6 +15,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "StoatAPI", dependencies: ["StoatModels"]),
-        .testTarget(name: "StoatAPITests", dependencies: ["StoatAPI"])
+        .testTarget(
+            name: "StoatAPITests",
+            dependencies: ["StoatAPI"],
+            resources: [.process("Fixtures")]
+        )
     ]
 )

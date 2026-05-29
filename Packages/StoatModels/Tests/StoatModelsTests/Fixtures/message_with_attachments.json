@@ -1,0 +1,34 @@
+{
+  "_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+  "channel": "01HX0000000000000000000101",
+  "author": "01HX0000000000000000000001",
+  "content": "Attached a file.",
+  "attachments": [
+    {
+      "_id": "file-attachment-1",
+      "tag": "attachments",
+      "filename": "notes.png",
+      "metadata": {
+        "type": "Image",
+        "width": 640,
+        "height": 480,
+        "thumbhash": [1, 2, 3],
+        "animated": false
+      },
+      "content_type": "image/png",
+      "size": 12345,
+      "message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+    }
+  ],
+  "embeds": [
+    {
+      "type": "Text",
+      "title": "Fixture Embed",
+      "description": "A small text embed",
+      "colour": "#ffaa00"
+    }
+  ],
+  "reactions": {},
+  "flags": 1
+}
+

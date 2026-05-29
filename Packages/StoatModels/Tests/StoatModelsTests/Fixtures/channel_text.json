@@ -1,0 +1,24 @@
+{
+  "_id": "01HX0000000000000000000101",
+  "channel_type": "TextChannel",
+  "server": "01HX0000000000000000000201",
+  "name": "general",
+  "description": "Fixture text channel",
+  "last_message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "default_permissions": {
+    "a": 138412032,
+    "d": 0
+  },
+  "role_permissions": {
+    "01HX0000000000000000000301": {
+      "a": 4194304,
+      "d": 0
+    }
+  },
+  "nsfw": false,
+  "voice": {
+    "max_users": 8
+  },
+  "slowmode": 3
+}
+

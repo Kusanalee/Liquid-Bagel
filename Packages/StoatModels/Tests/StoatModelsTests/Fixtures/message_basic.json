@@ -1,0 +1,24 @@
+{
+  "_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "nonce": "client-nonce-1",
+  "channel": "01HX0000000000000000000101",
+  "author": "01HX0000000000000000000001",
+  "content": "Hello from a fixture.",
+  "mentions": [
+    "01HX0000000000000000000002"
+  ],
+  "role_mentions": [
+    "01HX0000000000000000000301"
+  ],
+  "replies": [],
+  "reactions": {},
+  "interactions": {
+    "reactions": [
+      "🥯"
+    ],
+    "restrict_reactions": false
+  },
+  "pinned": false,
+  "flags": 0
+}
+

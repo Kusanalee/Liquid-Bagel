@@ -12,6 +12,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "StoatModels"),
-        .testTarget(name: "StoatModelsTests", dependencies: ["StoatModels"])
+        .testTarget(
+            name: "StoatModelsTests",
+            dependencies: ["StoatModels"],
+            resources: [.process("Fixtures")]
+        )
     ]
 )

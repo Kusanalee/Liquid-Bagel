@@ -44,3 +44,73 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Confirm model fields for users, servers, channels, messages, members, roles, permissions, relationships, attachments, embeds, and user settings.
 - Confirm media upload tags and returned file metadata beyond the documented `{ "id": "0" }` shape.
 - Confirm any source/docs conflicts and prefer source code when live behavior or generated API types disagree.
+
+## Phase 1 Notes
+
+### Sources inspected
+
+- Official endpoint docs: https://developers.stoat.chat/developers/endpoints/
+- Official authentication docs: https://developers.stoat.chat/developers/api/authentication/
+- Official file upload docs: https://developers.stoat.chat/developers/api/uploading-files/
+- Official rate-limit docs: https://developers.stoat.chat/developers/api/ratelimits/
+- Official permission docs: https://developers.stoat.chat/developers/api/permissions/
+- Live API root: `GET https://api.stoat.chat/`
+- Generated API/OpenAPI package: `stoatchat/javascript-client-api` at `366e0882d50d61c977883deb30fe6aa6eec71a73`
+- Official JS SDK: `stoatchat/javascript-client-sdk` at `3453407ba83a6364e470f2c64e2c839e1c74a9bc`
+- Backend source: `stoatchat/stoatchat` at `bd987bf72aedb8271846629e05f072247179a22d`
+
+### Endpoint defaults
+
+- Current docs and live root confirm API `https://api.stoat.chat` and events `wss://events.stoat.chat`.
+- Live root returns `features.autumn.url = https://cdn.stoatusercontent.com`, `features.january.url = https://proxy.stoatusercontent.com`, and `app = https://stoat.chat`.
+- Conflict: `javascript-client-api/src/baseURL.ts` still auto-generates `https://api.revolt.chat`.
+- Conflict: `javascript-client-sdk/src/Client.ts` still defaults to `https://stoat.chat/api`; Phase 1 uses the current Stoat docs/live root as the least risky default.
+
+### Authentication
+
+- Official docs confirm user auth through `X-Session-Token` and bot auth through `X-Bot-Token`.
+- Upload service OpenAPI also advertises both `session_token` and `bot_token` security schemes.
+- Delta OpenAPI uses lowercase `x-session-token` in the security scheme; HTTP headers are case-insensitive, but Liquid Bagel sends the documented `X-Session-Token` / `X-Bot-Token` names.
+
+### Models and routes implemented
+
+- Core model shapes were taken from OpenAPI schemas plus backend `crates/core/models/src/v0/*`.
+- Implemented verified live REST routes:
+  - `GET /`
+  - `GET /users/@me`
+  - `GET /channels/{target}`
+  - `GET /channels/{target}/messages`
+  - `POST /channels/{target}/messages`
+  - `PATCH /channels/{target}/messages/{msg}`
+  - `DELETE /channels/{target}/messages/{msg}`
+  - `PUT /channels/{target}/messages/{msg}/reactions/{emoji}`
+  - `DELETE /channels/{target}/messages/{msg}/reactions/{emoji}`
+  - `POST /channels/{target}/messages/{msg}/pin`
+  - `DELETE /channels/{target}/messages/{msg}/pin`
+  - media upload `POST {autumn}/{tag}` with multipart field `file`
+- Deferred live list methods:
+  - `fetchServers()` and all-channel `fetchChannels()` throw `unimplementedEndpoint` in the live client because no verified REST route lists the current user's servers/channels. Realtime `Ready` is the documented source for those collections and belongs in Phase 2.
+
+### Uploads
+
+- Upload tags verified from Autumn OpenAPI/source: `attachments`, `avatars`, `backgrounds`, `icons`, `banners`, `emojis`.
+- Upload request is `multipart/form-data` with a single `file` field.
+- Upload response is `{ "id": "<file id>" }`; Liquid Bagel exposes this as `UploadedFile`.
+
+### Rate limits
+
+- Docs confirm fixed-window buckets and headers `X-RateLimit-Limit`, `X-RateLimit-Bucket`, `X-RateLimit-Remaining`, `X-RateLimit-Reset-After`.
+- `429` bodies contain `retry_after` in milliseconds.
+- Conflict: public docs list `/auth` limit as `3`; backend `crates/delta/src/util/ratelimits.rs` currently returns `15` for `auth`. Phase 1 only parses metadata and does not implement scheduling.
+
+### Permissions
+
+- Public permission docs list allocated bits through `MoveMembers` (`1 << 35`).
+- SDK/backend source additionally define `Listen` (`1 << 36`), `MentionEveryone` (`1 << 37`), `MentionRoles` (`1 << 38`), and `BypassSlowmode` (`1 << 39`).
+- Liquid Bagel includes the documented bits plus these source-confirmed newer bits, using `UInt64` to preserve voice/video and future high bits.
+
+### Open questions
+
+- Full login/session creation, hCaptcha behavior, MFA, and session invalidation are not implemented in Phase 1.
+- Full server/channel permission resolution is documented but intentionally deferred.
+- Realtime `Ready` hydration is required before the live app can list servers/channels without mocks.

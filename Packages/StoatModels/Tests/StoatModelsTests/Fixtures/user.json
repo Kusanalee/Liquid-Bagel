@@ -1,0 +1,22 @@
+{
+  "_id": "01HX0000000000000000000001",
+  "username": "liquidbagel",
+  "discriminator": "0001",
+  "display_name": "Liquid Bagel",
+  "relations": [
+    {
+      "_id": "01HX0000000000000000000002",
+      "status": "Friend"
+    }
+  ],
+  "badges": 0,
+  "status": {
+    "text": "Kneading native macOS",
+    "presence": "Online"
+  },
+  "flags": 0,
+  "privileged": false,
+  "relationship": "User",
+  "online": true
+}
+

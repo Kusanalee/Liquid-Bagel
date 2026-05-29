@@ -1,0 +1,11 @@
+{
+  "_id": "01HX0000000000000000000104",
+  "channel_type": "DirectMessage",
+  "active": true,
+  "recipients": [
+    "01HX0000000000000000000001",
+    "01HX0000000000000000000003"
+  ],
+  "last_message_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+}
+

@@ -1,0 +1,173 @@
+import Foundation
+import StoatModels
+
+public protocol StoatAPIClient: Sendable {
+    func fetchRootConfiguration() async throws -> StoatConfig
+    func fetchCurrentUser() async throws -> User
+    func fetchServers() async throws -> [Server]
+    func fetchChannels() async throws -> [Channel]
+    func fetchChannel(id: ChannelID) async throws -> Channel
+    func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message]
+    func sendMessage(channelID: ChannelID, draft: MessageDraft) async throws -> Message
+    func editMessage(channelID: ChannelID, messageID: MessageID, draft: MessageEditDraft) async throws -> Message
+    func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws
+    func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws
+    func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String, removeAll: Bool) async throws
+    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws
+    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws
+    func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile
+}
+
+public actor LiveStoatAPIClient: StoatAPIClient {
+    private let environment: StoatAPIEnvironment
+    private let credentialProvider: any CredentialProvider
+    private let transport: any HTTPTransport
+    private let encoder: JSONEncoder
+    private let responseDecoder: StoatResponseDecoder
+    private let requestBuilder: StoatRequestBuilder
+
+    public init(
+        environment: StoatAPIEnvironment = .production,
+        credentialProvider: any CredentialProvider = StaticCredentialProvider(nil),
+        transport: any HTTPTransport = URLSessionHTTPTransport(),
+        decoder: JSONDecoder = .stoat,
+        encoder: JSONEncoder = .stoat
+    ) {
+        self.environment = environment
+        self.credentialProvider = credentialProvider
+        self.transport = transport
+        self.encoder = encoder
+        self.responseDecoder = StoatResponseDecoder(decoder: decoder)
+        self.requestBuilder = StoatRequestBuilder(environment: environment)
+    }
+
+    public func fetchRootConfiguration() async throws -> StoatConfig {
+        try await perform(StoatRequest<StoatConfig>(method: .get, path: "/", requiresAuthentication: false))
+    }
+
+    public func fetchCurrentUser() async throws -> User {
+        try await perform(StoatRequest<User>(method: .get, path: "/users/@me"))
+    }
+
+    public func fetchServers() async throws -> [Server] {
+        throw StoatAPIError.unimplementedEndpoint("No verified REST route lists the current user's servers; use Ready over realtime in Phase 2.")
+    }
+
+    public func fetchChannels() async throws -> [Channel] {
+        throw StoatAPIError.unimplementedEndpoint("No verified REST route lists all current-user channels; use Ready/users/dms plus server channels later.")
+    }
+
+    public func fetchChannel(id: ChannelID) async throws -> Channel {
+        try await perform(StoatRequest<Channel>(method: .get, path: "/channels/\(id.rawValue.stoatPathComponentEscaped)"))
+    }
+
+    public func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message] {
+        var queryItems: [URLQueryItem] = []
+        if let before {
+            queryItems.append(URLQueryItem(name: "before", value: before.rawValue))
+        }
+        if let after {
+            queryItems.append(URLQueryItem(name: "after", value: after.rawValue))
+        }
+        if let limit {
+            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        let response = try await perform(
+            StoatRequest<BulkMessageResponse>(
+                method: .get,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages",
+                queryItems: queryItems
+            )
+        )
+        return response.messages
+    }
+
+    public func sendMessage(channelID: ChannelID, draft: MessageDraft) async throws -> Message {
+        var headers: [String: String] = [:]
+        if let nonce = draft.nonce {
+            headers["Idempotency-Key"] = nonce
+        }
+        return try await perform(
+            StoatRequest<Message>(
+                method: .post,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages",
+                body: .json(try encoder.encode(draft)),
+                headers: headers
+            )
+        )
+    }
+
+    public func editMessage(channelID: ChannelID, messageID: MessageID, draft: MessageEditDraft) async throws -> Message {
+        try await perform(
+            StoatRequest<Message>(
+                method: .patch,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages/\(messageID.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        let request = StoatRequest<EmptyResponse>(
+            method: .delete,
+            path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages/\(messageID.rawValue.stoatPathComponentEscaped)"
+        )
+        _ = try await perform(request)
+    }
+
+    public func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
+        let request = StoatRequest<EmptyResponse>(
+            method: .put,
+            path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages/\(messageID.rawValue.stoatPathComponentEscaped)/reactions/\(emoji.stoatPathComponentEscaped)"
+        )
+        _ = try await perform(request)
+    }
+
+    public func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String, removeAll: Bool) async throws {
+        var queryItems: [URLQueryItem] = []
+        if removeAll {
+            queryItems.append(URLQueryItem(name: "remove_all", value: "true"))
+        }
+        let request = StoatRequest<EmptyResponse>(
+            method: .delete,
+            path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages/\(messageID.rawValue.stoatPathComponentEscaped)/reactions/\(emoji.stoatPathComponentEscaped)",
+            queryItems: queryItems
+        )
+        _ = try await perform(request)
+    }
+
+    public func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        let request = StoatRequest<EmptyResponse>(
+            method: .post,
+            path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages/\(messageID.rawValue.stoatPathComponentEscaped)/pin"
+        )
+        _ = try await perform(request)
+    }
+
+    public func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        let request = StoatRequest<EmptyResponse>(
+            method: .delete,
+            path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages/\(messageID.rawValue.stoatPathComponentEscaped)/pin"
+        )
+        _ = try await perform(request)
+    }
+
+    public func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile {
+        try await perform(
+            StoatRequest<UploadedFile>(
+                base: .media,
+                method: .post,
+                path: "/\(tag.rawAPIValue)",
+                body: MultipartFormData.fileBody(data: data, filename: filename, mimeType: mimeType)
+            )
+        )
+    }
+
+    private func perform<Response: Decodable & Sendable>(_ request: StoatRequest<Response>) async throws -> Response {
+        let credential = request.requiresAuthentication ? try await credentialProvider.credential() : nil
+        let urlRequest = try requestBuilder.build(request, credential: credential)
+        let httpResponse = try await transport.data(for: urlRequest)
+        return try responseDecoder.decode(Response.self, from: httpResponse)
+    }
+}
+
