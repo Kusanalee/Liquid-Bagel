@@ -11,10 +11,15 @@ let package = Package(
         .library(name: "StoatRealtime", targets: ["StoatRealtime"])
     ],
     dependencies: [
-        .package(path: "../StoatModels")
+        .package(path: "../StoatModels"),
+        .package(path: "../StoatAPI")
     ],
     targets: [
-        .target(name: "StoatRealtime", dependencies: ["StoatModels"]),
-        .testTarget(name: "StoatRealtimeTests", dependencies: ["StoatRealtime"])
+        .target(name: "StoatRealtime", dependencies: ["StoatModels", "StoatAPI"]),
+        .testTarget(
+            name: "StoatRealtimeTests",
+            dependencies: ["StoatRealtime"],
+            resources: [.process("Fixtures")]
+        )
     ]
 )

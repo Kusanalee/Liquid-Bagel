@@ -114,3 +114,53 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Full login/session creation, hCaptcha behavior, MFA, and session invalidation are not implemented in Phase 1.
 - Full server/channel permission resolution is documented but intentionally deferred.
 - Realtime `Ready` hydration is required before the live app can list servers/channels without mocks.
+
+## Phase 2 Notes
+
+### Sources inspected
+
+- Official establishing-a-connection docs: https://developers.stoat.chat/developers/events/establishing/
+- Official events protocol docs: https://developers.stoat.chat/developers/events/protocol/
+- Official JS SDK event client at `stoatchat/javascript-client-sdk` commit `3453407ba83a6364e470f2c64e2c839e1c74a9bc`
+- Official web client at `stoatchat/for-web` commit `8ca71f2a6c5d8faf0531fe337594408b7ce91879a`
+- Backend Bonfire/WebSocket source at `stoatchat/stoatchat` commit `bd987bf72aedb8271846629e05f072247179a22d`
+
+### Connection and authentication
+
+- The WebSocket URL is discovered from the API root/config. Current docs and Phase 1 environment source of truth use `wss://events.stoat.chat` for production.
+- Bonfire supports `version`, `format`, `token`, and repeated `ready` query parameters.
+- `version=1` is optional today but the docs recommend setting it because it may become mandatory.
+- `format=json` is supported and is the only Phase 2 transport format implemented by Liquid Bagel.
+- Authentication can be done with a `token` query parameter or by sending a client-to-server `Authenticate` event. Liquid Bagel defaults to sending `Authenticate` after the socket opens so session tokens do not appear in URLs or logs. Query-token auth exists only as an explicit fallback path and must be redacted from diagnostics.
+- After authentication, Bonfire sends `Authenticated`, then a `Ready` event. The JS SDK historically treats connection as fully connected when `Ready` arrives.
+- Clients should send `Ping` every 10 to 30 seconds. Liquid Bagel defaults to 20 seconds and tracks matching `Pong` latency.
+
+### Ready fields
+
+- Repeated `ready` query parameters are supported.
+- Supported documented fields are `users`, `servers`, `channels`, `members`, `emojis`, `user_settings`, `channel_unreads`, and `policy_changes`.
+- Backend source also has `voice_states`, but Phase 2 intentionally defers voice and does not request or model it.
+- Backend defaults send most fields if no `ready` parameter is present, but `channel_unreads` defaults false. Liquid Bagel explicitly sends requested Phase 2 fields.
+- `user_settings` is source-confirmed as an object/record (`UserSettings`), not an array. Phase 2 decodes it as `UserSettings` backed by `JSONValue`.
+
+### Event protocol details
+
+- Client-to-server events implemented: `Authenticate`, `BeginTyping`, `EndTyping`, `Ping`, and `Subscribe`.
+- Source-confirmed server `Error` events use a `data` field containing the error code; older docs examples may use `error`.
+- `Bulk` contains `v`, and Liquid Bagel decodes it recursively and emits public events flattened.
+- Implemented server events include `Authenticated`, `Logout`, `Pong`, `Ready`, message create/update/append/delete/reaction events, channel create/update/delete/group/typing/ack events, server create/update/delete/member/role events, user update/relationship/presence/settings/platform wipe events, emoji create/update/delete, and forwarded auth session events.
+- Unknown valid event types decode to `.unknown(type:raw:)`; malformed JSON still throws.
+- Source-confirmed newer or deferred events such as voice, webhook, report, slowmode, and role-rank events are preserved as unknown events for Phase 2 rather than modeled as product features.
+
+### Subscribe behavior
+
+- Normal users do not receive all server-fanned `UserUpdate` events by default.
+- Clients may send `Subscribe` for server `UserUpdate` events.
+- Documentation says subscriptions expire within 15 minutes, only 5 active subscriptions are allowed, bot sessions are unaffected, clients should only send `Subscribe` while focused, and should aim for at most one subscribe every 10 minutes per server.
+- Phase 2 includes a small `ServerSubscriptionManager` that enforces the local focused/rate/cap rules, but app focus wiring is deferred.
+
+### Diagnostics and ghost-state note
+
+- A previously reported class of issue had sockets appearing alive because `Ready` and ping/pong worked while normal message events did not arrive.
+- Phase 2 does not assume that bug still exists and does not reconnect production users simply because a quiet server has no chat events.
+- Liquid Bagel tracks `lastReceivedEventAt`, `lastPongAt`, `lastNonControlEventAt`, latency, and reconnect attempt so future UI/debug tooling can identify “pongs but no non-control events” without destructive recovery behavior.

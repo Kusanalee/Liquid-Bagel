@@ -1,0 +1,1 @@
+{"type":"ServerCreate","id":"server2","server":{"_id":"server2","owner":"user1","name":"Other","channels":["channel2"],"default_permissions":0},"channels":[{"_id":"channel2","channel_type":"TextChannel","server":"server2","name":"main"}],"emojis":[]}

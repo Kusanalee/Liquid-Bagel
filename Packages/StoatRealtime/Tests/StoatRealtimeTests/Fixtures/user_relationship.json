@@ -1,0 +1,1 @@
+{"type":"UserRelationship","id":"user2","user":{"_id":"user2","username":"friend","discriminator":"0002","relationship":"Friend"}}

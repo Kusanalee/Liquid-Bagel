@@ -1,0 +1,1 @@
+{"type":"MessageAppend","id":"msg1","channel":"channel1","append":{"embeds":[{"type":"Text","title":"embed"}]}}
