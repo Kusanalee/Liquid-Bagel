@@ -50,6 +50,45 @@ public struct LiveVerificationState: Equatable, Sendable {
     public init() {}
 }
 
+public struct LiveHydrationStatus: Hashable, Sendable {
+    public var readyReceived: Bool
+    public var userCount: Int
+    public var serverCount: Int
+    public var channelCount: Int
+    public var memberCount: Int
+    public var unreadCount: Int
+    public var selectedServerAvailable: Bool
+    public var selectedChannelAvailable: Bool
+    public var warning: String?
+    public var lastHydratedAt: Date?
+
+    public init(
+        readyReceived: Bool = false,
+        userCount: Int = 0,
+        serverCount: Int = 0,
+        channelCount: Int = 0,
+        memberCount: Int = 0,
+        unreadCount: Int = 0,
+        selectedServerAvailable: Bool = false,
+        selectedChannelAvailable: Bool = false,
+        warning: String? = nil,
+        lastHydratedAt: Date? = nil
+    ) {
+        self.readyReceived = readyReceived
+        self.userCount = userCount
+        self.serverCount = serverCount
+        self.channelCount = channelCount
+        self.memberCount = memberCount
+        self.unreadCount = unreadCount
+        self.selectedServerAvailable = selectedServerAvailable
+        self.selectedChannelAvailable = selectedChannelAvailable
+        self.warning = warning
+        self.lastHydratedAt = lastHydratedAt
+    }
+
+    public static let empty = LiveHydrationStatus()
+}
+
 public enum TimelineMessageStatus: Hashable, Sendable {
     case confirmed
     case pending
@@ -588,6 +627,8 @@ public final class AppSessionCoordinator {
     public private(set) var preferenceErrorMessage: String?
     public private(set) var localSessionLabel: String?
     public private(set) var verificationState: LiveVerificationState
+    public private(set) var hydrationStatus: LiveHydrationStatus
+    public private(set) var liveConnectionGeneration: Int
 
     @ObservationIgnored public private(set) var snapshotSource: any ShellSnapshotSource
     @ObservationIgnored public private(set) var apiClient: (any StoatAPIClient)?
@@ -651,6 +692,8 @@ public final class AppSessionCoordinator {
         self.preferenceErrorMessage = nil
         self.localSessionLabel = nil
         self.verificationState = LiveVerificationState()
+        self.hydrationStatus = .empty
+        self.liveConnectionGeneration = 0
         self.snapshotSource = MockShellSnapshotSource(snapshot: mockSnapshot)
         self.messageActionHandler = MockMessageActionHandler(currentUserID: mockCurrentUserID)
     }
@@ -679,6 +722,7 @@ public final class AppSessionCoordinator {
         pendingValidatedSession = nil
         mfaChallenge = nil
         verificationState = LiveVerificationState()
+        hydrationStatus = .empty
         snapshot = mockSnapshot
         currentUser = mockSnapshot.usersByID[mockCurrentUserID]
         snapshotSource = MockShellSnapshotSource(snapshot: mockSnapshot)
@@ -767,6 +811,7 @@ public final class AppSessionCoordinator {
             currentUser = nil
             lastErrorMessage = nil
             verificationState = LiveVerificationState()
+            hydrationStatus = .empty
             installLiveSafeSnapshot()
             await refreshCredentialAvailability()
         } catch {
@@ -1008,6 +1053,7 @@ public final class AppSessionCoordinator {
         }
 
         sessionState = .connecting
+        liveConnectionGeneration += 1
         let provider = StaticCredentialProvider(credential)
         let apiClient = apiClientFactory(environment, provider)
         let realtimeClient = realtimeClientFactory()
@@ -1033,6 +1079,10 @@ public final class AppSessionCoordinator {
             sessionState = .connectionFailed(message)
             failLiveSession(message, replaceConnectionState: true)
         }
+    }
+
+    public func reconnectLiveManually() async {
+        await connectLiveManually()
     }
 
     public func disconnectLive() async {
@@ -1062,6 +1112,7 @@ public final class AppSessionCoordinator {
             mfaChallenge = nil
             hasSavedCredential = false
             verificationState = LiveVerificationState()
+            hydrationStatus = .empty
             apiClient = nil
             messageActionHandler = UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
             installLiveSafeSnapshot()
@@ -1147,7 +1198,11 @@ public final class AppSessionCoordinator {
             verificationState.authenticated = true
         case .ready:
             verificationState.readyReceived = true
+            updateHydrationStatus(snapshot: snapshot, readyReceived: true)
         default:
+            if verificationState.readyReceived {
+                updateHydrationStatus(snapshot: snapshot, readyReceived: true)
+            }
             break
         }
         verificationState.usersReceived = !snapshot.usersByID.isEmpty
@@ -1163,6 +1218,7 @@ public final class AppSessionCoordinator {
             verificationState.readyReceived = true
             verificationState.webSocketConnected = true
             verificationState.authenticated = true
+            updateHydrationStatus(snapshot: snapshot, readyReceived: true)
         case .connecting, .connected, .authenticating, .authenticated, .reconnecting:
             sessionState = .connecting
             verificationState.webSocketConnected = true
@@ -1198,6 +1254,41 @@ public final class AppSessionCoordinator {
     private func installLiveSafeSnapshot() {
         snapshot = RealtimeSnapshot()
         snapshotSource = MockShellSnapshotSource(snapshot: snapshot)
+        hydrationStatus = .empty
+    }
+
+    public func updateHydrationSelectionAvailability(serverAvailable: Bool, channelAvailable: Bool, warning: String?) {
+        hydrationStatus.selectedServerAvailable = serverAvailable
+        hydrationStatus.selectedChannelAvailable = channelAvailable
+        hydrationStatus.warning = warning ?? hydrationStatus.warning
+    }
+
+    private func updateHydrationStatus(snapshot: RealtimeSnapshot, readyReceived: Bool) {
+        let textChannelCount = snapshot.channelsByID.values.filter { channel in
+            channel.kind == .textChannel || channel.kind == .group || channel.kind == .savedMessages
+        }.count
+        let warning: String?
+        if !readyReceived {
+            warning = "Waiting for realtime data"
+        } else if snapshot.serversByID.isEmpty {
+            warning = "No servers available"
+        } else if textChannelCount == 0 {
+            warning = "No text channels available"
+        } else {
+            warning = nil
+        }
+        hydrationStatus = LiveHydrationStatus(
+            readyReceived: readyReceived,
+            userCount: snapshot.usersByID.count,
+            serverCount: snapshot.serversByID.count,
+            channelCount: snapshot.channelsByID.count,
+            memberCount: snapshot.membersByServerAndUserID.count,
+            unreadCount: snapshot.unreadsByChannelID.count,
+            selectedServerAvailable: hydrationStatus.selectedServerAvailable,
+            selectedChannelAvailable: hydrationStatus.selectedChannelAvailable,
+            warning: warning,
+            lastHydratedAt: readyReceived ? Date() : hydrationStatus.lastHydratedAt
+        )
     }
 
     private var currentCredentialScope: CredentialScope {

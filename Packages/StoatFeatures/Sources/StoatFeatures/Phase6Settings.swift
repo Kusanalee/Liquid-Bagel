@@ -3,6 +3,7 @@ import Observation
 import StoatAPI
 import StoatModels
 import StoatPersistence
+import StoatRealtime
 
 public protocol SessionManaging: Sendable {
     func listSessions(environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws -> [SessionInfo]
@@ -494,10 +495,39 @@ public enum Phase6UIHelpers {
 
     public static func safeDiagnostics(_ text: String) -> String {
         var output = text
-        for pattern in ["token=[^\\s,]+", "X-Session-Token: [^\\s,]+", "X-Bot-Token: [^\\s,]+"] {
+        for pattern in ["token=[^\\s,]+", "token: [^\\s,]+", "X-Session-Token: [^\\s,]+", "X-Bot-Token: [^\\s,]+"] {
             output = output.replacingOccurrences(of: pattern, with: "token=<redacted>", options: .regularExpression)
         }
         return output
+    }
+
+    public static func hydrationLabel(_ status: LiveHydrationStatus) -> String {
+        if !status.readyReceived { return "Waiting for realtime data" }
+        if let warning = status.warning { return warning }
+        return "Ready hydrated \(status.serverCount) servers and \(status.channelCount) channels"
+    }
+
+    public static func connectionHealthText(state: RealtimeConnectionState, diagnostics: RealtimeDiagnostics?, hydration: LiveHydrationStatus) -> String {
+        switch state {
+        case .ready:
+            return hydration.readyReceived ? "Live connection ready" : "Connected, waiting for Ready"
+        case .connecting:
+            return "Opening realtime connection"
+        case .connected, .authenticating, .authenticated:
+            return "Authenticating realtime connection"
+        case let .reconnecting(attempt, _):
+            return "Reconnecting, attempt \(attempt)"
+        case .disconnected:
+            return "Disconnected"
+        case let .failed(error):
+            return safeDiagnostics("Failed: \(error.userFacingMessage)")
+        case .idle:
+            return "Idle"
+        }
+    }
+
+    public static func environmentDisplayName(_ environment: StoatAPIEnvironment, preferences: AppPreferences) -> String {
+        preferences.environmentProfiles.first { $0.environment == environment }.map(environmentDisplayName) ?? (environment.isProduction ? "Stoat Production" : "Custom")
     }
 }
 

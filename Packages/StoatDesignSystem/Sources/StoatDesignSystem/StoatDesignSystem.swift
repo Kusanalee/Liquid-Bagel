@@ -116,10 +116,69 @@ public enum StoatAccessibility {
         if mentionCount > 0 { parts.append(StoatBadges.mentionAccessibilityLabel(count: mentionCount)) }
         return parts.joined(separator: ", ")
     }
+
+    public static func channelLabel(name: String, unreadCount: Int = 0, mentionCount: Int = 0, isSelected: Bool = false, isDisabled: Bool = false) -> String {
+        var parts = [selectedLabel(name, isSelected: isSelected)]
+        if unreadCount > 0 { parts.append(StoatBadges.unreadAccessibilityLabel(count: unreadCount)) }
+        if mentionCount > 0 { parts.append(StoatBadges.mentionAccessibilityLabel(count: mentionCount)) }
+        if isDisabled { parts.append("unavailable") }
+        return parts.joined(separator: ", ")
+    }
+
+    public static func messageLabel(author: String, timestamp: String, content: String, isEdited: Bool = false, status: String? = nil, isSelected: Bool = false) -> String {
+        var parts = [author, timestamp, content.isEmpty ? "message" : content]
+        if isEdited { parts.append("edited") }
+        if let status, !status.isEmpty { parts.append(status) }
+        if isSelected { parts.append("selected") }
+        return parts.joined(separator: ", ")
+    }
+
+    public static func composerLabel(isEnabled: Bool, disabledReason: String?) -> String {
+        if isEnabled { return "Message composer" }
+        return ["Message composer disabled", disabledReason].compactMap { $0 }.joined(separator: ", ")
+    }
+
+    public static func runtimeLabel(mode: String, connection: String, health: String? = nil) -> String {
+        ["Runtime \(mode)", "connection state \(connection)", health].compactMap { $0 }.joined(separator: ", ")
+    }
+}
+
+public enum StoatDensityStyle: Sendable {
+    public static func timelineSpacing(for preference: String) -> CGFloat {
+        preference == "compact" ? StoatSpacing.small : StoatSpacing.medium
+    }
+
+    public static func messageVerticalPadding(for preference: String) -> CGFloat {
+        preference == "compact" ? StoatSpacing.xxSmall : StoatSpacing.small
+    }
+}
+
+public struct StoatMaterialStyle: Hashable, Sendable {
+    public var usesMaterial: Bool
+    public var backgroundOpacity: Double
+    public var strokeOpacity: Double
+
+    public init(usesMaterial: Bool, backgroundOpacity: Double, strokeOpacity: Double) {
+        self.usesMaterial = usesMaterial
+        self.backgroundOpacity = backgroundOpacity
+        self.strokeOpacity = strokeOpacity
+    }
+
+    public static func resolved(reduceTransparency: Bool, increaseContrast: Bool, reduceGlassIntensity: Bool) -> StoatMaterialStyle {
+        if reduceTransparency {
+            return StoatMaterialStyle(usesMaterial: false, backgroundOpacity: 1, strokeOpacity: increaseContrast ? 0.42 : 0.24)
+        }
+        return StoatMaterialStyle(
+            usesMaterial: !reduceGlassIntensity,
+            backgroundOpacity: reduceGlassIntensity ? 0.12 : 0.04,
+            strokeOpacity: increaseContrast ? 0.38 : 0.18
+        )
+    }
 }
 
 public struct GlassBackground: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     private let material: StoatGlassMaterial
     private let radius: CGFloat
@@ -132,15 +191,20 @@ public struct GlassBackground: ViewModifier {
     }
 
     public func body(content: Content) -> some View {
+        let style = StoatMaterialStyle.resolved(
+            reduceTransparency: reduceTransparency,
+            increaseContrast: colorSchemeContrast == .increased,
+            reduceGlassIntensity: false
+        )
         content
             .background {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .fill(reduceTransparency ? Color(nsColor: .controlBackgroundColor) : Color.clear)
+                    .fill(reduceTransparency ? Color(nsColor: .controlBackgroundColor) : Color.primary.opacity(style.backgroundOpacity))
                     .modifier(MaterialFallback(material: material, radius: radius, reduceTransparency: reduceTransparency))
             }
             .overlay {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(strokeOpacity), lineWidth: 1)
+                    .strokeBorder(Color.primary.opacity(max(strokeOpacity, style.strokeOpacity)), lineWidth: colorSchemeContrast == .increased ? 1.5 : 1)
             }
     }
 }

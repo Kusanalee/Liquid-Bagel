@@ -42,6 +42,7 @@ public struct GlassPanel<Content: View>: View {
 }
 
 public struct GlassSidebar<Content: View>: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     private let content: Content
 
     public init(@ViewBuilder content: () -> Content) {
@@ -50,11 +51,12 @@ public struct GlassSidebar<Content: View>: View {
 
     public var body: some View {
         content
-            .background(.thinMaterial)
+            .background(reduceTransparency ? AnyShapeStyle(Color(nsColor: .controlBackgroundColor)) : AnyShapeStyle(.thinMaterial))
     }
 }
 
 public struct GlassToolbar<Content: View>: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     private let content: Content
 
     public init(@ViewBuilder content: () -> Content) {
@@ -65,7 +67,7 @@ public struct GlassToolbar<Content: View>: View {
         content
             .frame(height: 52)
             .padding(.horizontal, StoatSpacing.large)
-            .background(.bar)
+            .background(reduceTransparency ? AnyShapeStyle(Color(nsColor: .windowBackgroundColor)) : AnyShapeStyle(.bar))
     }
 }
 
@@ -138,6 +140,7 @@ public struct GlassComposer: View {
     private let disabledReason: String?
     private let isSending: Bool
     private let canAttach: Bool
+    private let focusRequestID: Int
     private let onSend: () -> Void
     private let onFocus: () -> Void
 
@@ -149,6 +152,7 @@ public struct GlassComposer: View {
         disabledReason: String? = nil,
         isSending: Bool = false,
         canAttach: Bool = false,
+        focusRequestID: Int = 0,
         onSend: @escaping () -> Void = {},
         onFocus: @escaping () -> Void = {}
     ) {
@@ -159,6 +163,7 @@ public struct GlassComposer: View {
         self.disabledReason = disabledReason
         self.isSending = isSending
         self.canAttach = canAttach
+        self.focusRequestID = focusRequestID
         self.onSend = onSend
         self.onFocus = onFocus
     }
@@ -168,7 +173,7 @@ public struct GlassComposer: View {
             HStack(alignment: .bottom, spacing: StoatSpacing.medium) {
                 GlassIconButton(canAttach ? "Attach file unavailable in Phase 4" : "Attach file unavailable", systemImage: "paperclip", isDisabled: true) {}
                 ZStack(alignment: .topLeading) {
-                    ComposerTextInput(text: $text, isEnabled: isEnabled, onSubmit: onSend, onFocus: onFocus)
+                    ComposerTextInput(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSend, onFocus: onFocus)
                         .frame(minHeight: 34, maxHeight: 92)
                     if text.isEmpty {
                         Text(placeholder)
@@ -191,7 +196,8 @@ public struct GlassComposer: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(isEnabled ? "Message composer" : "Message composer disabled")
+        .accessibilityLabel(StoatAccessibility.composerLabel(isEnabled: isEnabled, disabledReason: disabledReason))
+        .accessibilityHint(isEnabled ? "Press Return to send, Shift Return for a new line" : (disabledReason ?? "Composer is unavailable"))
         .help(disabledReason ?? placeholder)
     }
 }
@@ -199,12 +205,13 @@ public struct GlassComposer: View {
 private struct ComposerTextInput: View {
     @Binding var text: String
     let isEnabled: Bool
+    let focusRequestID: Int
     let onSubmit: () -> Void
     let onFocus: () -> Void
 
     var body: some View {
         #if canImport(AppKit)
-        ComposerTextView(text: $text, isEnabled: isEnabled, onSubmit: onSubmit, onFocus: onFocus)
+        ComposerTextView(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSubmit, onFocus: onFocus)
             .font(.body)
         #else
         TextEditor(text: $text)
@@ -219,6 +226,7 @@ private struct ComposerTextInput: View {
 private struct ComposerTextView: NSViewRepresentable {
     @Binding var text: String
     let isEnabled: Bool
+    let focusRequestID: Int
     let onSubmit: () -> Void
     let onFocus: () -> Void
 
@@ -252,6 +260,12 @@ private struct ComposerTextView: NSViewRepresentable {
         }
         textView.isEditable = isEnabled
         textView.textColor = isEnabled ? .labelColor : .secondaryLabelColor
+        if isEnabled, context.coordinator.lastFocusRequestID != focusRequestID {
+            context.coordinator.lastFocusRequestID = focusRequestID
+            DispatchQueue.main.async {
+                nsView.window?.makeFirstResponder(textView)
+            }
+        }
         context.coordinator.text = $text
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onFocus = onFocus
@@ -261,6 +275,7 @@ private struct ComposerTextView: NSViewRepresentable {
         var text: Binding<String>
         var onSubmit: () -> Void
         var onFocus: () -> Void
+        var lastFocusRequestID = 0
 
         init(text: Binding<String>, onSubmit: @escaping () -> Void, onFocus: @escaping () -> Void) {
             self.text = text
@@ -450,11 +465,15 @@ public struct MessageRow: View {
     private let message: Message
     private let author: User?
     private let showsHeader: Bool
+    private let statusText: String?
+    private let isSelected: Bool
 
-    public init(message: Message, author: User?, showsHeader: Bool = true) {
+    public init(message: Message, author: User?, showsHeader: Bool = true, statusText: String? = nil, isSelected: Bool = false) {
         self.message = message
         self.author = author
         self.showsHeader = showsHeader
+        self.statusText = statusText
+        self.isSelected = isSelected
     }
 
     public var body: some View {
@@ -519,8 +538,9 @@ public struct MessageRow: View {
             }
         }
         .padding(.vertical, showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall)
+        .background(isSelected ? Color.accentColor.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(authorName), \(message.content ?? "message")")
+        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, status: statusText, isSelected: isSelected))
     }
 
     private var authorName: String {
@@ -635,7 +655,8 @@ public struct ChannelRow: View {
             Button("Channel settings unavailable in Phase 3") {}
                 .disabled(true)
         }
-        .accessibilityLabel(StoatAccessibility.selectedLabel(channel.displayName, isSelected: isSelected))
+        .accessibilityLabel(StoatAccessibility.channelLabel(name: channel.displayName, unreadCount: unreadCount, mentionCount: mentionCount, isSelected: isSelected, isDisabled: isDisabled))
+        .accessibilityHint(isDisabled ? "Voice channels are deferred in this phase" : "Open channel")
     }
 
     private var isDisabled: Bool { channel.kind == .voiceChannel }
@@ -697,6 +718,7 @@ public struct ServerRailItem: View {
                 .disabled(true)
         }
         .accessibilityLabel(StoatAccessibility.serverLabel(name: title, unreadCount: unreadCount, mentionCount: mentionCount, isSelected: isSelected))
+        .accessibilityHint(isDisabled ? "Unavailable in this phase" : "Open server or route")
     }
 
     @ViewBuilder private var icon: some View {

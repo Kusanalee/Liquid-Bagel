@@ -210,6 +210,11 @@ private struct AccountSettingsTab: View {
                         Task { await viewModel.disconnectLive() }
                     }
                     .disabled(!isDisconnectable)
+
+                    Button("Reconnect") {
+                        Task { await viewModel.reconnectLiveManually() }
+                    }
+                    .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true || isConnecting)
                 }
                 HStack {
                     Button("Forget Local Session", role: .destructive) {
@@ -225,6 +230,36 @@ private struct AccountSettingsTab: View {
                     Button("Reset to Mock") {
                         Task { await viewModel.resetToMock() }
                     }
+                }
+            }
+
+            Section("Connection Health") {
+                if let coordinator = viewModel.sessionCoordinator {
+                    LabeledContent("Health", value: Phase6UIHelpers.connectionHealthText(state: coordinator.connectionState, diagnostics: coordinator.diagnostics, hydration: coordinator.hydrationStatus))
+                    LabeledContent("Hydration", value: Phase6UIHelpers.hydrationLabel(coordinator.hydrationStatus))
+                    LabeledContent("Mode", value: viewModel.effectiveRuntimeMode == .liveManual ? "Live Manual" : "Mock")
+                    LabeledContent("Ready", value: coordinator.hydrationStatus.readyReceived ? "Received" : "Waiting")
+                    LabeledContent("Servers", value: "\(coordinator.hydrationStatus.serverCount)")
+                    LabeledContent("Channels", value: "\(coordinator.hydrationStatus.channelCount)")
+                    LabeledContent("Members", value: "\(coordinator.hydrationStatus.memberCount)")
+                    if let connectedAt = coordinator.diagnostics?.connectedAt {
+                        LabeledContent("Last connected", value: connectedAt.formatted(date: .abbreviated, time: .standard))
+                    }
+                    if let readyAt = coordinator.diagnostics?.readyAt {
+                        LabeledContent("Last Ready", value: readyAt.formatted(date: .abbreviated, time: .standard))
+                    }
+                    if let eventAt = coordinator.diagnostics?.lastReceivedEventAt {
+                        LabeledContent("Last event", value: eventAt.formatted(date: .abbreviated, time: .standard))
+                    }
+                    if let nonControlAt = coordinator.diagnostics?.lastNonControlEventAt {
+                        LabeledContent("Last non-control event", value: nonControlAt.formatted(date: .abbreviated, time: .standard))
+                    }
+                    if let latency = coordinator.diagnostics?.lastLatencyMilliseconds {
+                        LabeledContent("Ping latency", value: "\(latency) ms")
+                    }
+                    LabeledContent("Reconnect attempts", value: "\(coordinator.diagnostics?.reconnectAttempt ?? 0)")
+                } else {
+                    ContentUnavailableView("Connection unavailable", systemImage: "network.slash")
                 }
             }
         }
@@ -273,6 +308,15 @@ private struct AccountSettingsTab: View {
         case .connecting, .connected, .authenticating, .authenticated, .ready, .reconnecting:
             return true
         case .idle, .disconnected, .failed:
+            return false
+        }
+    }
+
+    private var isConnecting: Bool {
+        switch viewModel.effectiveConnectionState {
+        case .connecting, .connected, .authenticating, .authenticated, .reconnecting:
+            return true
+        case .idle, .ready, .disconnected, .failed:
             return false
         }
     }

@@ -21,4 +21,13 @@ final class StoatUITests: XCTestCase {
         XCTAssertTrue(label.contains("2 unread messages"))
         XCTAssertTrue(label.contains("1 mention"))
     }
+
+    func testPhase8AccessibilityLabelsIncludeDisabledReasons() {
+        let composer = StoatAccessibility.composerLabel(isEnabled: false, disabledReason: "Connect Live Manual before sending.")
+        XCTAssertTrue(composer.contains("disabled"))
+        XCTAssertTrue(composer.contains("Connect Live Manual"))
+
+        let channel = StoatAccessibility.channelLabel(name: "voice", isDisabled: true)
+        XCTAssertTrue(channel.contains("unavailable"))
+    }
 }

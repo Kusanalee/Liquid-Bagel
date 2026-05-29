@@ -73,6 +73,180 @@ public struct ShellSelection: Codable, Hashable, Sendable {
     }
 }
 
+public struct ShellSelectionRestorationResult: Hashable, Sendable {
+    public var selection: ShellSelection
+    public var selectedServerAvailable: Bool
+    public var selectedChannelAvailable: Bool
+    public var message: String?
+
+    public init(
+        selection: ShellSelection,
+        selectedServerAvailable: Bool,
+        selectedChannelAvailable: Bool,
+        message: String? = nil
+    ) {
+        self.selection = selection
+        self.selectedServerAvailable = selectedServerAvailable
+        self.selectedChannelAvailable = selectedChannelAvailable
+        self.message = message
+    }
+}
+
+public struct ShellSelectionRestorer: Sendable {
+    public init() {}
+
+    public func restore(
+        preferredSelection: ShellSelection?,
+        preferences: AppPreferences,
+        snapshot: RealtimeSnapshot,
+        mode: AppRuntimeMode
+    ) -> ShellSelectionRestorationResult {
+        guard mode == .liveManual else {
+            return ShellSelectionRestorationResult(
+                selection: preferredSelection ?? ShellSelection(isMemberPanelVisible: preferences.memberPanelVisible),
+                selectedServerAvailable: true,
+                selectedChannelAvailable: true
+            )
+        }
+
+        let base = preferredSelection ?? ShellSelection(isMemberPanelVisible: preferences.memberPanelVisible)
+        if snapshot.serversByID.isEmpty {
+            return ShellSelectionRestorationResult(
+                selection: ShellSelection(space: .home, isMemberPanelVisible: preferences.memberPanelVisible),
+                selectedServerAvailable: false,
+                selectedChannelAvailable: false,
+                message: "No servers available"
+            )
+        }
+
+        if (base.space == .home || base.space == .discover),
+           preferences.lastSelectedServerID == nil,
+           preferences.lastSelectedChannelID == nil {
+            if firstServerWithVisibleTextChannel(snapshot: snapshot) != nil {
+                return ShellSelectionRestorationResult(
+                    selection: ShellSelection(space: base.space, isMemberPanelVisible: preferences.memberPanelVisible),
+                    selectedServerAvailable: true,
+                    selectedChannelAvailable: true
+                )
+            }
+        }
+
+        let preferredServerID = preferences.lastSelectedServerID ?? base.serverID
+        let preferredChannelID = preferences.lastSelectedChannelID ?? base.channelID
+
+        if let serverID = preferredServerID, snapshot.serversByID[serverID] != nil {
+            return restore(inServer: serverID, preferredChannelID: preferredChannelID, preferences: preferences, snapshot: snapshot, preferredServerWasAvailable: true)
+        }
+
+        if let channelID = preferredChannelID,
+           let channel = snapshot.channelsByID[channelID],
+           let serverID = channel.serverID,
+           snapshot.serversByID[serverID] != nil,
+           isVisibleTextChannel(channel) {
+            return ShellSelectionRestorationResult(
+                selection: ShellSelection(
+                    space: .server(serverID),
+                    serverID: serverID,
+                    channelID: channelID,
+                    isMemberPanelVisible: preferences.memberPanelVisible
+                ),
+                selectedServerAvailable: true,
+                selectedChannelAvailable: true
+            )
+        }
+
+        guard let fallback = firstServerWithVisibleTextChannel(snapshot: snapshot) else {
+            let server = orderedServers(snapshot: snapshot).first
+            return ShellSelectionRestorationResult(
+                selection: ShellSelection(
+                    space: server.map { .server($0.id) } ?? .home,
+                    serverID: server?.id,
+                    isMemberPanelVisible: preferences.memberPanelVisible
+                ),
+                selectedServerAvailable: false,
+                selectedChannelAvailable: false,
+                message: "No text channels available"
+            )
+        }
+
+        return ShellSelectionRestorationResult(
+            selection: ShellSelection(
+                space: .server(fallback.server.id),
+                serverID: fallback.server.id,
+                channelID: fallback.channel.id,
+                isMemberPanelVisible: preferences.memberPanelVisible
+            ),
+            selectedServerAvailable: false,
+            selectedChannelAvailable: false,
+            message: "Selected channel no longer exists"
+        )
+    }
+
+    private func restore(
+        inServer serverID: ServerID,
+        preferredChannelID: ChannelID?,
+        preferences: AppPreferences,
+        snapshot: RealtimeSnapshot,
+        preferredServerWasAvailable: Bool
+    ) -> ShellSelectionRestorationResult {
+        if let channelID = preferredChannelID,
+           let channel = snapshot.channelsByID[channelID],
+           channel.serverID == serverID,
+           isVisibleTextChannel(channel) {
+            return ShellSelectionRestorationResult(
+                selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID, isMemberPanelVisible: preferences.memberPanelVisible),
+                selectedServerAvailable: true,
+                selectedChannelAvailable: true
+            )
+        }
+
+        if let channel = firstVisibleTextChannel(in: serverID, snapshot: snapshot) {
+            return ShellSelectionRestorationResult(
+                selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channel.id, isMemberPanelVisible: preferences.memberPanelVisible),
+                selectedServerAvailable: preferredServerWasAvailable,
+                selectedChannelAvailable: false,
+                message: "Selected channel no longer exists"
+            )
+        }
+
+        return ShellSelectionRestorationResult(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, isMemberPanelVisible: preferences.memberPanelVisible),
+            selectedServerAvailable: preferredServerWasAvailable,
+            selectedChannelAvailable: false,
+            message: "No text channels available"
+        )
+    }
+
+    private func firstServerWithVisibleTextChannel(snapshot: RealtimeSnapshot) -> (server: Server, channel: Channel)? {
+        for server in orderedServers(snapshot: snapshot) {
+            if let channel = firstVisibleTextChannel(in: server.id, snapshot: snapshot) {
+                return (server, channel)
+            }
+        }
+        return nil
+    }
+
+    private func firstVisibleTextChannel(in serverID: ServerID, snapshot: RealtimeSnapshot) -> Channel? {
+        let server = snapshot.serversByID[serverID]
+        let channels = snapshot.channelsByID.values.filter { $0.serverID == serverID }
+        let ordered: [Channel]
+        if let ids = server?.channelIDs, !ids.isEmpty {
+            ordered = ids.compactMap { id in channels.first { $0.id == id } }
+        } else {
+            ordered = channels.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+        }
+        return ordered.first(where: isVisibleTextChannel)
+    }
+
+    private func orderedServers(snapshot: RealtimeSnapshot) -> [Server] {
+        snapshot.serversByID.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func isVisibleTextChannel(_ channel: Channel) -> Bool {
+        channel.kind == .textChannel || channel.kind == .group || channel.kind == .savedMessages
+    }
+}
+
 public struct MessageGroup: Hashable, Sendable, Identifiable {
     public var id: String
     public var authorID: UserID
@@ -222,12 +396,17 @@ public final class MainShellViewModel {
     public var sessionCoordinator: AppSessionCoordinator?
     public var messageController: ChannelMessageController
     public var isQuickSwitcherPresented = false
+    public var quickSwitcherViewModel: QuickSwitcherViewModel
     public var placeholderStatus: String?
     public var shouldFocusComposer = false
+    public var composerFocusRequestID = 0
+    public var focusTarget: ShellFocusTarget?
+    public var previousFocusTarget: ShellFocusTarget?
     public var composerDrafts: [ChannelID: String] = [:]
     public var composerError: String?
     public var editingDraft: EditingMessageDraft?
     public var pendingDeletion: TimelineMessage?
+    public var timelineSelection = TimelineSelection()
     public var messageActionStatus: String?
     public var isCredentialSetupPresented = false
     public var isTestSendConfirmationPresented = false
@@ -242,6 +421,9 @@ public final class MainShellViewModel {
     @ObservationIgnored private var activeTypingChannelID: ChannelID?
     @ObservationIgnored private var lastTypingBeginAt: [ChannelID: Date] = [:]
     @ObservationIgnored private var locallyClearedUnreadChannelIDs: Set<ChannelID> = []
+    @ObservationIgnored private var restoredLiveConnectionGeneration: Int?
+    @ObservationIgnored private let selectionRestorer = ShellSelectionRestorer()
+    @ObservationIgnored private let navigationHelper = ShellNavigationHelper()
 
     public init(
         selection: ShellSelection = ShellSelection(),
@@ -266,6 +448,13 @@ public final class MainShellViewModel {
         self.sessionCoordinator = sessionCoordinator
         self.messageController = messageController ?? ChannelMessageController(runtimeMode: runtimeMode, currentUserID: currentUser?.id ?? MockShellData.currentUserID)
         self.messageActionHandler = messageActionHandler ?? MockMessageActionHandler(currentUserID: currentUser?.id ?? MockShellData.currentUserID)
+        self.quickSwitcherViewModel = QuickSwitcherViewModel(snapshot: snapshot, selection: selection)
+        self.quickSwitcherViewModel = QuickSwitcherViewModel(
+            snapshot: snapshot,
+            selection: selection,
+            canPerform: { [weak self] command in self?.canPerform(command) ?? false },
+            disabledReason: { [weak self] command in self?.disabledReason(for: command) }
+        )
         validateSelection()
         self.messageController.hydrate(from: snapshot)
         if let snapshotSource {
@@ -388,7 +577,9 @@ public final class MainShellViewModel {
         selection.serverID = nil
         selection.channelID = nil
         selection.dmChannelID = nil
+        clearTimelineSelection()
         placeholderStatus = nil
+        persistLiveSelectionIfNeeded()
     }
 
     public func selectDiscover() {
@@ -397,7 +588,9 @@ public final class MainShellViewModel {
         selection.serverID = nil
         selection.channelID = nil
         selection.dmChannelID = nil
+        clearTimelineSelection()
         placeholderStatus = nil
+        persistLiveSelectionIfNeeded()
     }
 
     public func selectDirectMessages() {
@@ -406,9 +599,11 @@ public final class MainShellViewModel {
         selection.serverID = nil
         selection.channelID = nil
         selection.dmChannelID = snapshot.channelsByID.values.first { $0.kind == .directMessage }?.id
+        clearTimelineSelection()
         placeholderStatus = nil
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
+        persistLiveSelectionIfNeeded()
     }
 
     public func selectServer(_ id: ServerID) {
@@ -421,15 +616,19 @@ public final class MainShellViewModel {
         selection.serverID = id
         selection.channelID = firstVisibleTextChannel(in: id)?.id
         selection.dmChannelID = nil
+        clearTimelineSelection()
         placeholderStatus = nil
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
+        persistLiveSelectionIfNeeded()
     }
 
     public func selectServer(atOneBasedIndex index: Int) {
-        let zeroBased = index - 1
-        guard servers.indices.contains(zeroBased) else { return }
-        selectServer(servers[zeroBased].id)
+        guard let server = navigationHelper.server(atOneBasedIndex: index, snapshot: snapshot) else {
+            placeholderStatus = "No server at shortcut \(index)."
+            return
+        }
+        selectServer(server.id)
     }
 
     public func selectChannel(_ id: ChannelID) {
@@ -449,9 +648,12 @@ public final class MainShellViewModel {
             selection.channelID = nil
             selection.dmChannelID = id
         }
+        clearTimelineSelection()
         placeholderStatus = nil
+        requestFocus(.timeline)
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
+        persistLiveSelectionIfNeeded()
     }
 
     public func toggleMemberPanel() {
@@ -465,16 +667,63 @@ public final class MainShellViewModel {
     }
 
     public func showQuickSwitcher() {
+        previousFocusTarget = focusTarget
+        requestFocus(.quickSwitcher)
+        quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
         isQuickSwitcherPresented = true
-        placeholderStatus = "Quick switcher is a Phase 3 placeholder."
+        placeholderStatus = nil
+    }
+
+    public func closeQuickSwitcher() {
+        isQuickSwitcherPresented = false
+        requestFocus(previousFocusTarget ?? .timeline)
     }
 
     public func focusComposer() {
         shouldFocusComposer.toggle()
+        composerFocusRequestID += 1
+        requestFocus(.composer)
         placeholderStatus = selectedChannel == nil ? "Select a channel before focusing the composer." : nil
     }
 
     public func refreshPlaceholder() {
+        refreshCurrentContext()
+    }
+
+    public func refreshCurrentContext() {
+        switch effectiveRuntimeMode {
+        case .mock:
+            if let channelID = selection.channelID ?? selection.dmChannelID {
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.messageController.refreshMessages(channelID: channelID, snapshotMessages: self.snapshot.messagesByChannelID[channelID] ?? [])
+                    self.placeholderStatus = "Mock data refreshed"
+                }
+            } else {
+                placeholderStatus = "Mock data refreshed"
+            }
+        case .liveManual:
+            switch effectiveConnectionState {
+            case .ready:
+                if let channelID = selection.channelID ?? selection.dmChannelID {
+                    Task { [weak self] in
+                        guard let self else { return }
+                        await self.messageController.refreshMessages(channelID: channelID, snapshotMessages: self.snapshot.messagesByChannelID[channelID] ?? [])
+                        self.sessionCoordinator?.markSelectedChannelMessageFetchSucceeded(channelID: channelID, isAvailable: self.snapshot.channelsByID[channelID] != nil)
+                        self.placeholderStatus = self.messageController.lastErrorByChannelID[channelID] == nil ? "Channel messages refreshed" : nil
+                    }
+                } else {
+                    placeholderStatus = "Live status refreshed"
+                }
+            case .disconnected, .failed, .idle:
+                placeholderStatus = "Reconnect to refresh live state"
+            case .connecting, .connected, .authenticating, .authenticated, .reconnecting:
+                placeholderStatus = "Waiting for realtime data"
+            }
+        }
+    }
+
+    public func legacyRefreshSelectedChannel() {
         if let channelID = selection.channelID ?? selection.dmChannelID {
             Task { [weak self] in
                 guard let self else { return }
@@ -554,6 +803,13 @@ public final class MainShellViewModel {
         syncFromSessionCoordinator()
     }
 
+    public func reconnectLiveManually() async {
+        guard let sessionCoordinator else { return }
+        placeholderStatus = nil
+        await sessionCoordinator.reconnectLiveManually()
+        syncFromSessionCoordinator()
+    }
+
     public func disconnectLive() async {
         guard let sessionCoordinator else { return }
         await sessionCoordinator.disconnectLive()
@@ -587,7 +843,11 @@ public final class MainShellViewModel {
         observe(snapshotSource: sessionCoordinator.snapshotSource)
         validateSelection()
         messageController.hydrate(from: snapshot)
+        quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
         scheduleSelectedChannelLoad()
+        if sessionCoordinator.mode != .liveManual {
+            restoredLiveConnectionGeneration = nil
+        }
     }
 
     public func observe(snapshotSource: any ShellSnapshotSource) {
@@ -731,6 +991,7 @@ public final class MainShellViewModel {
         do {
             try await messageActionHandler.deleteMessage(channelID: pendingDeletion.message.channelID, messageID: pendingDeletion.message.id)
             messageController.removeMessage(channelID: pendingDeletion.message.channelID, messageID: pendingDeletion.message.id)
+            reconcileTimelineSelection()
             self.pendingDeletion = nil
             messageActionStatus = nil
         } catch {
@@ -757,8 +1018,14 @@ public final class MainShellViewModel {
     public func copyMessage(_ message: Message) {
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(message.content ?? message.id.rawValue, forType: .string)
+        NSPasteboard.general.setString(Self.copyableContent(for: message), forType: .string)
         #endif
+    }
+
+    public static func copyableContent(for message: Message) -> String {
+        if let content = message.content, !content.isEmpty { return content }
+        if let system = message.system?.content, !system.isEmpty { return system }
+        return ""
     }
 
     public func typingUsers(for channelID: ChannelID?) -> [User] {
@@ -779,6 +1046,171 @@ public final class MainShellViewModel {
             return ChannelUnread(id: unread.id, lastMessageID: nil, mentions: unread.mentions)
         }
         return unread
+    }
+
+    public func requestFocus(_ target: ShellFocusTarget?) {
+        if focusTarget != target {
+            previousFocusTarget = focusTarget
+        }
+        focusTarget = target
+    }
+
+    public func selectNextServer() {
+        guard let server = navigationHelper.adjacentServer(from: selection.serverID, direction: 1, snapshot: snapshot) else {
+            placeholderStatus = "No next server."
+            return
+        }
+        selectServer(server.id)
+    }
+
+    public func selectPreviousServer() {
+        guard let server = navigationHelper.adjacentServer(from: selection.serverID, direction: -1, snapshot: snapshot) else {
+            placeholderStatus = "No previous server."
+            return
+        }
+        selectServer(server.id)
+    }
+
+    public func selectNextChannel() {
+        guard let channel = navigationHelper.adjacentChannel(from: selection.channelID, serverID: selection.serverID, direction: 1, snapshot: snapshot) else {
+            placeholderStatus = "No next channel."
+            return
+        }
+        selectChannel(channel.id)
+    }
+
+    public func selectPreviousChannel() {
+        guard let channel = navigationHelper.adjacentChannel(from: selection.channelID, serverID: selection.serverID, direction: -1, snapshot: snapshot) else {
+            placeholderStatus = "No previous channel."
+            return
+        }
+        selectChannel(channel.id)
+    }
+
+    public func selectNextUnreadChannel() {
+        guard let channel = navigationHelper.adjacentUnreadChannel(from: selection.channelID, serverID: selection.serverID, direction: 1, snapshot: snapshot, unreadProvider: unread(for:)) else {
+            placeholderStatus = "No next unread channel."
+            return
+        }
+        selectChannel(channel.id)
+    }
+
+    public func selectPreviousUnreadChannel() {
+        guard let channel = navigationHelper.adjacentUnreadChannel(from: selection.channelID, serverID: selection.serverID, direction: -1, snapshot: snapshot, unreadProvider: unread(for:)) else {
+            placeholderStatus = "No previous unread channel."
+            return
+        }
+        selectChannel(channel.id)
+    }
+
+    public func selectNextMessage() {
+        selectAdjacentMessage(direction: 1)
+    }
+
+    public func selectPreviousMessage() {
+        selectAdjacentMessage(direction: -1)
+    }
+
+    public func jumpToNewestMessage() {
+        guard let newest = selectedTimelineMessages.last else {
+            placeholderStatus = "No message to select."
+            return
+        }
+        timelineSelection = TimelineSelection(channelID: newest.message.channelID, messageID: newest.message.id)
+        requestFocus(.timeline)
+    }
+
+    public var selectedTimelineMessage: TimelineMessage? {
+        guard let messageID = timelineSelection.messageID else { return nil }
+        return selectedTimelineMessages.first { $0.message.id == messageID }
+    }
+
+    public func clearTimelineSelection() {
+        timelineSelection = TimelineSelection()
+    }
+
+    public func reconcileTimelineSelection() {
+        let activeChannelID = selection.channelID ?? selection.dmChannelID
+        guard timelineSelection.channelID == activeChannelID,
+              let selectedID = timelineSelection.messageID
+        else {
+            clearTimelineSelection()
+            return
+        }
+        let messages = selectedTimelineMessages
+        guard !messages.contains(where: { $0.message.id == selectedID }) else { return }
+        timelineSelection = TimelineSelection(channelID: activeChannelID, messageID: messages.last?.message.id)
+    }
+
+    public func copySelectedMessage() {
+        guard let message = selectedTimelineMessage?.message else {
+            placeholderStatus = "No selected message to copy."
+            return
+        }
+        copyMessage(message)
+        messageActionStatus = "Message copied"
+    }
+
+    public func editSelectedMessage() {
+        guard let selectedTimelineMessage, canEdit(selectedTimelineMessage.message) else {
+            placeholderStatus = "Selected message cannot be edited."
+            return
+        }
+        beginEditing(selectedTimelineMessage)
+    }
+
+    public func deleteSelectedMessage() {
+        guard let selectedTimelineMessage, canDelete(selectedTimelineMessage.message) else {
+            placeholderStatus = "Selected message cannot be deleted."
+            return
+        }
+        requestDelete(selectedTimelineMessage)
+    }
+
+    public func reactToSelectedMessage(_ emoji: String) {
+        guard let selectedTimelineMessage, canReact(to: selectedTimelineMessage.message) else {
+            placeholderStatus = "Selected message cannot be reacted to."
+            return
+        }
+        Task { [weak self] in
+            await self?.toggleReaction(emoji, on: selectedTimelineMessage)
+        }
+    }
+
+    public func retrySelectedMessage() {
+        guard let selectedTimelineMessage else {
+            placeholderStatus = "No selected message to retry."
+            return
+        }
+        if case .failed = selectedTimelineMessage.status {
+            Task { [weak self] in
+                await self?.retry(selectedTimelineMessage)
+            }
+        } else {
+            placeholderStatus = "Selected message does not need retry."
+        }
+    }
+
+    private func selectAdjacentMessage(direction: Int) {
+        let messages = selectedTimelineMessages
+        guard !messages.isEmpty else {
+            placeholderStatus = "No message to select."
+            return
+        }
+        let activeChannelID = selection.channelID ?? selection.dmChannelID
+        let nextIndex: Int
+        if let selectedID = timelineSelection.messageID,
+           let currentIndex = messages.firstIndex(where: { $0.message.id == selectedID }) {
+            nextIndex = currentIndex + (direction >= 0 ? 1 : -1)
+        } else {
+            nextIndex = direction >= 0 ? 0 : messages.count - 1
+        }
+        guard messages.indices.contains(nextIndex) else {
+            placeholderStatus = direction >= 0 ? "No next message." : "No previous message."
+            return
+        }
+        timelineSelection = TimelineSelection(channelID: activeChannelID, messageID: messages[nextIndex].message.id)
+        requestFocus(.timeline)
     }
 
     private func firstVisibleTextChannel(in serverID: ServerID) -> Channel? {
@@ -808,9 +1240,67 @@ public final class MainShellViewModel {
     private func applySnapshot(_ snapshot: RealtimeSnapshot) {
         self.snapshot = snapshot
         messageController.hydrate(from: snapshot)
-        validateSelection()
+        restoreOrValidateSelection()
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
+        reconcileTimelineSelection()
+        quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+    }
+
+    private func restoreOrValidateSelection() {
+        guard let coordinator = sessionCoordinator,
+              coordinator.mode == .liveManual,
+              coordinator.hydrationStatus.readyReceived
+        else {
+            validateSelection()
+            return
+        }
+
+        if restoredLiveConnectionGeneration != coordinator.liveConnectionGeneration {
+            let result = selectionRestorer.restore(
+                preferredSelection: selection,
+                preferences: coordinator.preferences,
+                snapshot: snapshot,
+                mode: coordinator.mode
+            )
+            selection = result.selection
+            placeholderStatus = result.message
+            coordinator.updateHydrationSelectionAvailability(
+                serverAvailable: result.selectedServerAvailable,
+                channelAvailable: result.selectedChannelAvailable,
+                warning: result.message
+            )
+            restoredLiveConnectionGeneration = coordinator.liveConnectionGeneration
+            persistLiveSelectionIfNeeded()
+        } else {
+            validateSelection()
+            let serverAvailable = selection.serverID.map { snapshot.serversByID[$0] != nil } ?? true
+            let channelAvailable = selection.channelID.map { snapshot.channelsByID[$0] != nil } ?? true
+            coordinator.updateHydrationSelectionAvailability(
+                serverAvailable: serverAvailable,
+                channelAvailable: channelAvailable,
+                warning: channelAvailable ? nil : "Channel no longer exists"
+            )
+        }
+    }
+
+    private func persistLiveSelectionIfNeeded() {
+        guard let coordinator = sessionCoordinator,
+              coordinator.mode == .liveManual,
+              coordinator.hydrationStatus.readyReceived
+        else {
+            return
+        }
+        let serverID = selection.serverID
+        let channelID = selection.channelID
+        guard serverID == nil || snapshot.serversByID[serverID!] != nil else { return }
+        guard channelID == nil || snapshot.channelsByID[channelID!] != nil else { return }
+        Task { [weak coordinator] in
+            await coordinator?.updatePreferences { preferences in
+                preferences.lastSelectedServerID = serverID
+                preferences.lastSelectedChannelID = channelID
+            }
+        }
     }
 
     private func scheduleSelectedChannelLoad() {
@@ -864,14 +1354,171 @@ public final class MainShellViewModel {
     }
 }
 
-public enum ShellCommandNotification {
-    public static let quickSwitcher = Notification.Name("LiquidBagelShowQuickSwitcher")
-    public static let focusComposer = Notification.Name("LiquidBagelFocusComposer")
-    public static let refresh = Notification.Name("LiquidBagelRefresh")
-    public static let toggleMembers = Notification.Name("LiquidBagelToggleMembers")
-    public static let settings = Notification.Name("LiquidBagelShowSettingsPlaceholder")
-    public static func selectServer(_ index: Int) -> Notification.Name {
-        Notification.Name("LiquidBagelSelectServer\(index)")
+extension MainShellViewModel: AppCommandHandling {
+    public func canPerform(_ command: AppCommand) -> Bool {
+        switch command {
+        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover:
+            return true
+        case .focusComposer:
+            return selectedChannel != nil || selection.dmChannelID != nil
+        case .reconnect:
+            return sessionCoordinator?.hasSavedCredential == true && !isConnecting
+        case .disconnect:
+            return isDisconnectable
+        case .resetToMock:
+            return effectiveRuntimeMode != .mock || effectiveConnectionState != .idle
+        case .toggleDeveloperControls:
+            return sessionCoordinator != nil
+        case let .selectServer(index):
+            return navigationHelper.server(atOneBasedIndex: index, snapshot: snapshot) != nil
+        case let .selectChannel(channelID):
+            return snapshot.channelsByID[channelID].map(navigationHelper.isSelectable) == true
+        case .selectNextServer:
+            return navigationHelper.adjacentServer(from: selection.serverID, direction: 1, snapshot: snapshot) != nil
+        case .selectPreviousServer:
+            return navigationHelper.adjacentServer(from: selection.serverID, direction: -1, snapshot: snapshot) != nil
+        case .selectNextChannel:
+            return focusTarget != .composer && focusTarget != .quickSwitcher && navigationHelper.adjacentChannel(from: selection.channelID, serverID: selection.serverID, direction: 1, snapshot: snapshot) != nil
+        case .selectPreviousChannel:
+            return focusTarget != .composer && focusTarget != .quickSwitcher && navigationHelper.adjacentChannel(from: selection.channelID, serverID: selection.serverID, direction: -1, snapshot: snapshot) != nil
+        case .selectNextUnreadChannel:
+            return focusTarget != .composer && focusTarget != .quickSwitcher && navigationHelper.adjacentUnreadChannel(from: selection.channelID, serverID: selection.serverID, direction: 1, snapshot: snapshot, unreadProvider: unread(for:)) != nil
+        case .selectPreviousUnreadChannel:
+            return focusTarget != .composer && focusTarget != .quickSwitcher && navigationHelper.adjacentUnreadChannel(from: selection.channelID, serverID: selection.serverID, direction: -1, snapshot: snapshot, unreadProvider: unread(for:)) != nil
+        case .selectNextMessage, .selectPreviousMessage, .jumpToNewestMessage:
+            return focusTarget != .composer && focusTarget != .quickSwitcher && !selectedTimelineMessages.isEmpty
+        case .copySelectedMessage:
+            return selectedTimelineMessage != nil
+        case .editSelectedMessage:
+            return selectedTimelineMessage.map { canEdit($0.message) } == true
+        case .deleteSelectedMessage:
+            return selectedTimelineMessage.map { canDelete($0.message) } == true
+        case let .reactToSelectedMessage(emoji):
+            return !emoji.isEmpty && selectedTimelineMessage.map { canReact(to: $0.message) } == true
+        case .retrySelectedMessage:
+            guard let selectedTimelineMessage else { return false }
+            if case .failed = selectedTimelineMessage.status { return true }
+            return false
+        }
+    }
+
+    public func disabledReason(for command: AppCommand) -> String? {
+        guard !canPerform(command) else { return nil }
+        switch command {
+        case .focusComposer:
+            return "Select a channel before focusing the composer."
+        case .reconnect:
+            return sessionCoordinator?.hasSavedCredential == true ? "Realtime is already connecting." : "No saved credential for this environment."
+        case .disconnect:
+            return "No live realtime session is connected."
+        case .resetToMock:
+            return "Already using mock runtime."
+        case .selectServer:
+            return "That server shortcut has no visible server."
+        case .selectChannel:
+            return "That channel is unavailable."
+        case .selectNextChannel, .selectPreviousChannel, .selectNextUnreadChannel, .selectPreviousUnreadChannel, .selectNextMessage, .selectPreviousMessage, .jumpToNewestMessage:
+            return focusTarget == .composer || focusTarget == .quickSwitcher ? "Keyboard navigation is paused while typing." : "No selectable target."
+        case .copySelectedMessage, .editSelectedMessage, .deleteSelectedMessage, .reactToSelectedMessage, .retrySelectedMessage:
+            return "No compatible message is selected."
+        default:
+            return "Unavailable."
+        }
+    }
+
+    public func perform(_ command: AppCommand) {
+        guard canPerform(command) || command == .closeTransientUI else {
+            placeholderStatus = disabledReason(for: command)
+            return
+        }
+        switch command {
+        case .openQuickSwitcher:
+            showQuickSwitcher()
+        case .focusComposer:
+            focusComposer()
+        case .refresh:
+            refreshCurrentContext()
+        case .reconnect:
+            Task { [weak self] in await self?.reconnectLiveManually() }
+        case .disconnect:
+            Task { [weak self] in await self?.disconnectLive() }
+        case .resetToMock:
+            Task { [weak self] in await self?.resetToMock() }
+        case .openAccountSettings:
+            showAccountSessions()
+        case .openConnectionSettings:
+            showConnectionSettings()
+        case .toggleMemberPanel:
+            toggleMemberPanel()
+        case .toggleDeveloperControls:
+            Task { [weak self] in
+                guard let self else { return }
+                await self.sessionCoordinator?.updatePreferences { preferences in
+                    preferences.showDeveloperRuntimeControls.toggle()
+                }
+                self.syncFromSessionCoordinator()
+            }
+        case let .selectServer(index):
+            selectServer(atOneBasedIndex: index)
+        case let .selectChannel(channelID):
+            selectChannel(channelID)
+        case .selectNextServer:
+            selectNextServer()
+        case .selectPreviousServer:
+            selectPreviousServer()
+        case .selectNextChannel:
+            selectNextChannel()
+        case .selectPreviousChannel:
+            selectPreviousChannel()
+        case .selectNextUnreadChannel:
+            selectNextUnreadChannel()
+        case .selectPreviousUnreadChannel:
+            selectPreviousUnreadChannel()
+        case .jumpToHome:
+            selectHome()
+        case .jumpToDiscover:
+            selectDiscover()
+        case .selectNextMessage:
+            selectNextMessage()
+        case .selectPreviousMessage:
+            selectPreviousMessage()
+        case .jumpToNewestMessage:
+            jumpToNewestMessage()
+        case .copySelectedMessage:
+            copySelectedMessage()
+        case .editSelectedMessage:
+            editSelectedMessage()
+        case .deleteSelectedMessage:
+            deleteSelectedMessage()
+        case let .reactToSelectedMessage(emoji):
+            reactToSelectedMessage(emoji)
+        case .retrySelectedMessage:
+            retrySelectedMessage()
+        case .closeTransientUI:
+            if isQuickSwitcherPresented {
+                closeQuickSwitcher()
+            } else {
+                requestFocus(nil)
+            }
+        }
+    }
+
+    private var isDisconnectable: Bool {
+        switch effectiveConnectionState {
+        case .connecting, .connected, .authenticating, .authenticated, .ready, .reconnecting:
+            return true
+        case .idle, .disconnected, .failed:
+            return false
+        }
+    }
+
+    private var isConnecting: Bool {
+        switch effectiveConnectionState {
+        case .connecting, .connected, .authenticating, .authenticated, .reconnecting:
+            return true
+        case .idle, .ready, .disconnected, .failed:
+            return false
+        }
     }
 }
 
@@ -998,7 +1645,7 @@ public struct MainShellView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .sheet(isPresented: $viewModel.isQuickSwitcherPresented) {
-            QuickSwitcherPlaceholderView(viewModel: viewModel)
+            QuickSwitcherView(viewModel: viewModel)
         }
         .sheet(isPresented: $viewModel.isCredentialSetupPresented) {
             AccountConnectionSettingsView(viewModel: viewModel)
@@ -1044,12 +1691,10 @@ public struct MainShellView: View {
                     .transition(.opacity)
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.quickSwitcher)) { _ in viewModel.showQuickSwitcher() }
-        .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.focusComposer)) { _ in viewModel.focusComposer() }
-        .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.refresh)) { _ in viewModel.refreshPlaceholder() }
-        .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.toggleMembers)) { _ in viewModel.toggleMemberPanel() }
-        .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.settings)) { _ in viewModel.settingsPlaceholder() }
-        .modifier(ServerShortcutReceiver(viewModel: viewModel))
+        .focusedSceneValue(\.appCommandHandler, viewModel)
+        .onExitCommand {
+            viewModel.perform(.closeTransientUI)
+        }
         .onAppear { viewModel.validateSelection() }
         .toolbar {
             ToolbarItem(placement: .principal) {
@@ -1060,9 +1705,9 @@ public struct MainShellView: View {
                 }
             }
             ToolbarItemGroup {
-                Button { viewModel.showQuickSwitcher() } label: { Label("Quick Switcher", systemImage: "magnifyingglass") }
-                Button { viewModel.toggleMemberPanel() } label: { Label("Toggle Members", systemImage: "sidebar.right") }
-                Button { viewModel.showAccountSessions() } label: { Label("Settings", systemImage: "gearshape") }
+                Button { viewModel.perform(.openQuickSwitcher) } label: { Label("Quick Switcher", systemImage: "magnifyingglass") }
+                Button { viewModel.perform(.toggleMemberPanel) } label: { Label("Toggle Members", systemImage: "sidebar.right") }
+                Button { viewModel.perform(.openAccountSettings) } label: { Label("Settings", systemImage: "gearshape") }
             }
         }
     }
@@ -1085,14 +1730,25 @@ public struct MainShellView: View {
             LabeledContent("Mode", value: runtimeModeText)
             LabeledContent("Session", value: sessionStateText)
             LabeledContent("Connection", value: connectionText)
+            LabeledContent("Health", value: Phase6UIHelpers.connectionHealthText(state: viewModel.effectiveConnectionState, diagnostics: viewModel.effectiveDiagnostics, hydration: viewModel.sessionCoordinator?.hydrationStatus ?? .empty))
             if let latency = viewModel.effectiveDiagnostics?.lastLatencyMilliseconds {
                 LabeledContent("Latency", value: "\(latency) ms")
+            }
+            if let ready = viewModel.effectiveDiagnostics?.readyAt {
+                LabeledContent("Last Ready", value: ready.formatted(date: .omitted, time: .standard))
             }
             if let lastEvent = viewModel.effectiveDiagnostics?.lastReceivedEventAt {
                 LabeledContent("Last Event", value: lastEvent.formatted(date: .omitted, time: .standard))
             }
+            if let hydration = viewModel.sessionCoordinator?.hydrationStatus {
+                LabeledContent("Hydration", value: Phase6UIHelpers.hydrationLabel(hydration))
+            }
             if let session = viewModel.sessionCoordinator {
                 LabeledContent("Credential", value: session.hasSavedCredential ? "Saved" : "Missing")
+                LabeledContent("Environment", value: Phase6UIHelpers.environmentDisplayName(session.environment, preferences: session.preferences))
+                if let user = session.currentUser {
+                    LabeledContent("Current User", value: user.displayName ?? user.username)
+                }
             }
             Divider()
             Button("Account & Sessions…") {
@@ -1117,6 +1773,13 @@ public struct MainShellView: View {
                 }
                 .disabled(isDisconnectable)
             }
+            Button("Reconnect") {
+                Task { await viewModel.reconnectLiveManually() }
+            }
+            .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true || isConnecting)
+            Button("Refresh Selected Channel") {
+                viewModel.refreshCurrentContext()
+            }
             Button("Disconnect") {
                 Task { await viewModel.disconnectLive() }
             }
@@ -1133,7 +1796,16 @@ public struct MainShellView: View {
         .background(Color.primary.opacity(viewModel.reduceGlassIntensity ? 0.10 : 0.06), in: Capsule())
         }
         .menuStyle(.borderlessButton)
-        .accessibilityLabel("Runtime \(runtimeModeText), connection state \(connectionText)")
+        .accessibilityLabel(StoatAccessibility.runtimeLabel(
+            mode: runtimeModeText,
+            connection: connectionText,
+            health: Phase6UIHelpers.connectionHealthText(
+                state: viewModel.effectiveConnectionState,
+                diagnostics: viewModel.effectiveDiagnostics,
+                hydration: viewModel.sessionCoordinator?.hydrationStatus ?? .empty
+            )
+        ))
+        .accessibilityHint("Open runtime and connection actions")
     }
 
     private var connectionText: String {
@@ -1178,6 +1850,15 @@ public struct MainShellView: View {
         case .connecting, .connected, .authenticating, .authenticated, .ready, .reconnecting:
             return true
         case .idle, .disconnected, .failed:
+            return false
+        }
+    }
+
+    private var isConnecting: Bool {
+        switch viewModel.effectiveConnectionState {
+        case .connecting, .connected, .authenticating, .authenticated, .reconnecting:
+            return true
+        case .idle, .ready, .disconnected, .failed:
             return false
         }
     }
@@ -1231,6 +1912,10 @@ public struct CredentialSetupView: View {
                         Task { await viewModel.disconnectLive() }
                     }
                     .disabled(!isDisconnectable)
+                    Button("Reconnect") {
+                        Task { await viewModel.reconnectLiveManually() }
+                    }
+                    .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true || isConnecting)
                 }
                 HStack {
                     Button("Forget Session", role: .destructive) {
@@ -1334,8 +2019,12 @@ public struct CredentialSetupView: View {
                 verificationRows
                 HStack {
                     Button("Reload Selected Channel Messages") {
-                        viewModel.refreshPlaceholder()
+                        viewModel.refreshCurrentContext()
                     }
+                    Button("Reconnect") {
+                        Task { await viewModel.reconnectLiveManually() }
+                    }
+                    .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true || isConnecting)
                     Button("Send Composer Text") {
                         viewModel.isTestSendConfirmationPresented = true
                     }
@@ -1345,7 +2034,25 @@ public struct CredentialSetupView: View {
 
             Section("Safe Diagnostics") {
                 LabeledContent("Credential", value: viewModel.sessionCoordinator?.hasSavedCredential == true ? "Saved" : "Missing")
-                LabeledContent("Environment ID", value: viewModel.sessionCoordinator?.environment.stableID ?? "production")
+                if let coordinator = viewModel.sessionCoordinator {
+                    LabeledContent("Environment", value: Phase6UIHelpers.environmentDisplayName(coordinator.environment, preferences: coordinator.preferences))
+                    LabeledContent("Environment ID", value: coordinator.environment.stableID)
+                    LabeledContent("Health", value: Phase6UIHelpers.connectionHealthText(state: coordinator.connectionState, diagnostics: coordinator.diagnostics, hydration: coordinator.hydrationStatus))
+                    LabeledContent("Hydration", value: Phase6UIHelpers.hydrationLabel(coordinator.hydrationStatus))
+                    LabeledContent("Servers", value: "\(coordinator.hydrationStatus.serverCount)")
+                    LabeledContent("Channels", value: "\(coordinator.hydrationStatus.channelCount)")
+                    LabeledContent("Unreads", value: "\(coordinator.hydrationStatus.unreadCount)")
+                    LabeledContent("Ready received", value: coordinator.hydrationStatus.readyReceived ? "Yes" : "No")
+                    LabeledContent("Selected server", value: coordinator.hydrationStatus.selectedServerAvailable ? "Available" : "Unavailable")
+                    LabeledContent("Selected channel", value: coordinator.hydrationStatus.selectedChannelAvailable ? "Available" : "Unavailable")
+                    if let hydrated = coordinator.hydrationStatus.lastHydratedAt {
+                        LabeledContent("Last Ready", value: hydrated.formatted(date: .abbreviated, time: .standard))
+                    }
+                    if case let .reconnecting(attempt, delay) = coordinator.connectionState {
+                        LabeledContent("Reconnect attempt", value: "\(attempt)")
+                        LabeledContent("Next retry", value: "\(Int(Self.seconds(delay).rounded()))s")
+                    }
+                }
                 if let latency = viewModel.effectiveDiagnostics?.lastLatencyMilliseconds {
                     LabeledContent("Ping latency", value: "\(latency) ms")
                 }
@@ -1425,6 +2132,15 @@ public struct CredentialSetupView: View {
         }
     }
 
+    private var isConnecting: Bool {
+        switch viewModel.effectiveConnectionState {
+        case .connecting, .connected, .authenticating, .authenticated, .reconnecting:
+            true
+        case .idle, .ready, .disconnected, .failed:
+            false
+        }
+    }
+
     private var runtimeModeText: String {
         switch viewModel.effectiveRuntimeMode {
         case .mock: "Mock"
@@ -1491,6 +2207,11 @@ public struct CredentialSetupView: View {
         case .totp: .totpCode(value)
         }
     }
+
+    private static func seconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1_000_000_000_000_000_000
+    }
 }
 
 private struct VerificationRow: View {
@@ -1500,23 +2221,6 @@ private struct VerificationRow: View {
     var body: some View {
         LabeledContent(title, value: isComplete ? "Passed" : "Waiting")
             .foregroundStyle(isComplete ? .primary : .secondary)
-    }
-}
-
-private struct ServerShortcutReceiver: ViewModifier {
-    let viewModel: MainShellViewModel
-
-    func body(content: Content) -> some View {
-        content
-            .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.selectServer(1))) { _ in viewModel.selectServer(atOneBasedIndex: 1) }
-            .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.selectServer(2))) { _ in viewModel.selectServer(atOneBasedIndex: 2) }
-            .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.selectServer(3))) { _ in viewModel.selectServer(atOneBasedIndex: 3) }
-            .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.selectServer(4))) { _ in viewModel.selectServer(atOneBasedIndex: 4) }
-            .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.selectServer(5))) { _ in viewModel.selectServer(atOneBasedIndex: 5) }
-            .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.selectServer(6))) { _ in viewModel.selectServer(atOneBasedIndex: 6) }
-            .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.selectServer(7))) { _ in viewModel.selectServer(atOneBasedIndex: 7) }
-            .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.selectServer(8))) { _ in viewModel.selectServer(atOneBasedIndex: 8) }
-            .onReceive(NotificationCenter.default.publisher(for: ShellCommandNotification.selectServer(9))) { _ in viewModel.selectServer(atOneBasedIndex: 9) }
     }
 }
 
@@ -1685,8 +2389,16 @@ public struct ChannelListView: View {
                 }
             } else if let serverID = viewModel.selection.serverID {
                 section("Channels") {
-                    ForEach(viewModel.channels(for: serverID)) { channel in
-                        channelRow(channel)
+                    let channels = viewModel.channels(for: serverID)
+                    if channels.isEmpty {
+                        Text("No text channels available")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, StoatSpacing.medium)
+                    } else {
+                        ForEach(channels) { channel in
+                            channelRow(channel)
+                        }
                     }
                 }
             }
@@ -1771,6 +2483,7 @@ public struct ChatPlaceholderView: View {
                     disabledReason: sendReadiness.canSend ? nil : sendReadiness.reason,
                     isSending: viewModel.messageController.sendingChannelIDs.contains(channel.id),
                     canAttach: viewModel.canUploadFiles(in: channel),
+                    focusRequestID: viewModel.composerFocusRequestID,
                     onSend: {
                         Task { await viewModel.sendDraft(for: channel.id) }
                     }
@@ -1794,7 +2507,7 @@ public struct MessageTimelineView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: viewModel.messageDensity == .compact ? StoatSpacing.small : StoatSpacing.medium) {
                 if viewModel.selectedChannel == nil {
-                    EmptyStateView(title: "Choose a channel", message: "Pick a server channel or DM to open the timeline.")
+                    EmptyStateView(title: emptyTitle, message: emptyMessage)
                         .frame(maxWidth: .infinity)
                 } else {
                     timelineContent
@@ -1836,6 +2549,32 @@ public struct MessageTimelineView: View {
         case .loadingOlder:
             timelineMessages(showLoadOlder: false, isLoadingOlder: true)
         }
+    }
+
+    private var emptyTitle: String {
+        if viewModel.effectiveRuntimeMode == .liveManual,
+           viewModel.sessionCoordinator?.hydrationStatus.readyReceived != true {
+            return "Waiting for realtime data"
+        }
+        if viewModel.effectiveRuntimeMode == .liveManual,
+           viewModel.snapshot.serversByID.isEmpty {
+            return "No servers available"
+        }
+        if viewModel.selection.serverID != nil {
+            return "No text channels available"
+        }
+        return "Choose a channel"
+    }
+
+    private var emptyMessage: String {
+        if viewModel.effectiveRuntimeMode == .liveManual,
+           viewModel.effectiveConnectionState != .ready {
+            return "Reconnect to refresh live state."
+        }
+        if viewModel.selection.serverID != nil {
+            return "This server has no visible text channels in the current live snapshot."
+        }
+        return "Pick a server channel or DM to open the timeline."
     }
 
     @ViewBuilder private func timelineMessages(showLoadOlder: Bool, isLoadingOlder: Bool) -> some View {
@@ -1934,7 +2673,17 @@ public struct TimelineMessageGroupView: View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(group.messages.enumerated()), id: \.element.id) { index, timelineMessage in
                 VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-                    MessageRow(message: timelineMessage.message, author: author, showsHeader: index == 0)
+                    MessageRow(
+                        message: timelineMessage.message,
+                        author: author,
+                        showsHeader: index == 0,
+                        statusText: accessibilityStatus(for: timelineMessage),
+                        isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id
+                    )
+                    .onTapGesture {
+                        viewModel.timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id)
+                        viewModel.requestFocus(.timeline)
+                    }
                         .contextMenu {
                             Button("Copy Message") {
                                 viewModel.copyMessage(timelineMessage.message)
@@ -1993,6 +2742,17 @@ public struct TimelineMessageGroupView: View {
                 .buttonStyle(.borderless)
             }
             .padding(.leading, StoatSize.avatar + StoatSpacing.medium)
+        }
+    }
+
+    private func accessibilityStatus(for timelineMessage: TimelineMessage) -> String? {
+        switch timelineMessage.status {
+        case .confirmed:
+            return nil
+        case .pending:
+            return "sending"
+        case .failed:
+            return "failed to send"
         }
     }
 }
@@ -2107,7 +2867,7 @@ public struct HomeView: View {
                     GlassPanel {
                         VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                             Text("Current User").font(.headline)
-                            if let user = viewModel.snapshot.usersByID[MockShellData.currentUserID] {
+                            if let user = viewModel.currentUserID.flatMap({ viewModel.snapshot.usersByID[$0] }) ?? viewModel.currentUser {
                                 MemberRow(user: user, subtitle: user.status?.text)
                             }
                         }
@@ -2204,28 +2964,154 @@ public struct DiscoverPlaceholderView: View {
     }
 }
 
-public struct QuickSwitcherPlaceholderView: View {
-    private let viewModel: MainShellViewModel
+public struct QuickSwitcherView: View {
+    @Bindable private var viewModel: MainShellViewModel
+    @FocusState private var searchFocused: Bool
 
     public init(viewModel: MainShellViewModel) {
         self.viewModel = viewModel
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.large) {
-            Text("Quick Switcher")
-                .font(.title2.weight(.semibold))
-            GlassSearchField(title: "Search is unavailable in Phase 3") {}
-            ForEach(viewModel.servers.prefix(5)) { server in
-                Button(server.name) {
-                    viewModel.selectServer(server.id)
-                    viewModel.isQuickSwitcherPresented = false
+        VStack(spacing: 0) {
+            HStack(spacing: StoatSpacing.small) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Jump to server, channel, or command", text: $viewModel.quickSwitcherViewModel.query)
+                    .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                    .onSubmit { activateSelectedResult() }
+            }
+            .padding(StoatSpacing.large)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                    if viewModel.quickSwitcherViewModel.results.isEmpty {
+                        EmptyStateView(title: "No local results", message: "Try a server, channel, or command name.", systemImage: "magnifyingglass")
+                            .frame(maxWidth: .infinity)
+                            .padding(StoatSpacing.xLarge)
+                    } else {
+                        ForEach(Array(viewModel.quickSwitcherViewModel.results.enumerated()), id: \.element.id) { index, result in
+                            QuickSwitcherResultRow(
+                                result: result,
+                                isSelected: index == viewModel.quickSwitcherViewModel.selectedIndex
+                            ) {
+                                viewModel.quickSwitcherViewModel.selectedIndex = index
+                                activate(result)
+                            }
+                        }
+                    }
                 }
-                .buttonStyle(GlassButtonStyle(selected: viewModel.selection.serverID == server.id))
+                .padding(StoatSpacing.small)
             }
         }
-        .padding(StoatSpacing.xLarge)
-        .frame(width: 440)
+        .frame(width: 520, height: 460)
+        .onAppear {
+            viewModel.quickSwitcherViewModel.update(snapshot: viewModel.snapshot, selection: viewModel.selection)
+            searchFocused = true
+        }
+        .onMoveCommand { direction in
+            switch direction {
+            case .up:
+                viewModel.quickSwitcherViewModel.moveSelection(-1)
+            case .down:
+                viewModel.quickSwitcherViewModel.moveSelection(1)
+            default:
+                break
+            }
+        }
+        .onExitCommand {
+            viewModel.perform(.closeTransientUI)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Quick switcher")
+    }
+
+    private func activateSelectedResult() {
+        guard let result = viewModel.quickSwitcherViewModel.selectedResult else { return }
+        activate(result)
+    }
+
+    private func activate(_ result: QuickSwitcherResult) {
+        guard let command = viewModel.quickSwitcherViewModel.command(for: result) else {
+            viewModel.placeholderStatus = result.disabledReason ?? "Result is unavailable."
+            return
+        }
+        viewModel.perform(command)
+        viewModel.closeQuickSwitcher()
+    }
+}
+
+private struct QuickSwitcherResultRow: View {
+    let result: QuickSwitcherResult
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: StoatSpacing.medium) {
+                Image(systemName: iconName)
+                    .frame(width: 22)
+                    .foregroundStyle(result.isEnabled ? .secondary : .tertiary)
+                VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                    Text(result.title)
+                        .font(.callout.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                    if let subtitle = subtitleText {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(subtitleColor)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer()
+                if let badgeText = result.badgeText {
+                    Text(badgeText)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, StoatSpacing.small)
+                        .padding(.vertical, StoatSpacing.xxSmall)
+                        .background(Color.primary.opacity(0.08), in: Capsule())
+                }
+            }
+            .padding(.horizontal, StoatSpacing.medium)
+            .frame(minHeight: 44)
+            .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(!result.isEnabled)
+        .accessibilityLabel(result.accessibilityLabel)
+        .accessibilityValue(isSelected ? "Selected" : "")
+        .accessibilityHint(result.isEnabled ? "Press Return to activate" : (result.disabledReason ?? "Unavailable"))
+    }
+
+    private var subtitleText: String? {
+        result.disabledReason ?? result.subtitle
+    }
+
+    private var subtitleColor: Color {
+        result.disabledReason == nil ? Color.secondary : Color.red
+    }
+
+    private var iconName: String {
+        switch result.kind {
+        case .server:
+            return "circle.grid.2x2.fill"
+        case .channel:
+            return "number"
+        case .directMessage:
+            return "person"
+        case .command:
+            return "command"
+        case .route(.home):
+            return "house.fill"
+        case .route(.discover):
+            return "safari"
+        case .route:
+            return "arrow.turn.down.right"
+        }
     }
 }
 
@@ -2294,6 +3180,40 @@ public typealias PhaseFourStatus = PhaseOneStatus
 }
 
 @available(macOS 15.0, *)
+#Preview("Quick Switcher") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.showQuickSwitcher()
+    return QuickSwitcherView(viewModel: model)
+}
+
+@available(macOS 15.0, *)
+#Preview("Focused Composer") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selectServer(model.servers[0].id)
+    model.focusComposer()
+    return ChatPlaceholderView(viewModel: model)
+        .frame(width: 760, height: 620)
+}
+
+@available(macOS 15.0, *)
+#Preview("Selected Message") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selectServer(model.servers[0].id)
+    model.jumpToNewestMessage()
+    return MessageTimelineView(viewModel: model)
+        .frame(width: 760, height: 520)
+}
+
+@available(macOS 15.0, *)
+#Preview("Compact Density") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selectServer(model.servers[0].id)
+    model.messageDensity = .compact
+    return ChatPlaceholderView(viewModel: model)
+        .frame(width: 760, height: 620)
+}
+
+@available(macOS 15.0, *)
 #Preview("Member Panel Hidden") {
     MainShellView(viewModel: MainShellViewModel(selection: ShellSelection(space: .server("01HX0000000000000000000201"), serverID: "01HX0000000000000000000201", channelID: "01HX0000000000000000000101", isMemberPanelVisible: false), snapshot: MockShellData.snapshot, runtimeMode: .mock))
         .preferredColorScheme(.dark)
@@ -2338,4 +3258,41 @@ public typealias PhaseFourStatus = PhaseOneStatus
 @available(macOS 15.0, *)
 #Preview("Credential Setup - Custom Environment") {
     CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .savedCredentialUnvalidated, currentUser: nil))
+}
+
+@available(macOS 15.0, *)
+#Preview("Live Manual - Ready To Connect") {
+    MainShellView(viewModel: MainShellViewModel(snapshot: RealtimeSnapshot(), runtimeMode: .liveManual, sessionState: .readyToConnect, currentUser: nil))
+        .frame(width: 1180, height: 760)
+}
+
+@available(macOS 15.0, *)
+#Preview("Live Manual - Connecting") {
+    MainShellView(viewModel: MainShellViewModel(snapshot: RealtimeSnapshot(), connectionState: .authenticating, runtimeMode: .liveManual, sessionState: .connecting, currentUser: nil))
+        .frame(width: 1180, height: 760)
+}
+
+@available(macOS 15.0, *)
+#Preview("Live Manual - Ready Snapshot") {
+    MainShellView(viewModel: MainShellViewModel(
+        selection: ShellSelection(space: .server("01HX0000000000000000000201"), serverID: "01HX0000000000000000000201", channelID: "01HX0000000000000000000101"),
+        snapshot: MockShellData.snapshot,
+        connectionState: .ready,
+        runtimeMode: .liveManual,
+        sessionState: .connected,
+        currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID]
+    ))
+    .frame(width: 1180, height: 760)
+}
+
+@available(macOS 15.0, *)
+#Preview("Live Manual - No Servers") {
+    MainShellView(viewModel: MainShellViewModel(snapshot: RealtimeSnapshot(), connectionState: .ready, runtimeMode: .liveManual, sessionState: .connected, currentUser: nil))
+        .frame(width: 1180, height: 760)
+}
+
+@available(macOS 15.0, *)
+#Preview("Live Manual - Reconnecting") {
+    MainShellView(viewModel: MainShellViewModel(snapshot: MockShellData.snapshot, connectionState: .reconnecting(attempt: 2, nextDelay: .seconds(4)), runtimeMode: .liveManual, sessionState: .connecting, currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID]))
+        .frame(width: 1180, height: 760)
 }

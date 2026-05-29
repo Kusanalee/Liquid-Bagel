@@ -17,4 +17,31 @@ final class StoatDesignSystemTests: XCTestCase {
         XCTAssertEqual(StoatBadges.mentionAccessibilityLabel(count: 1), "1 mention")
         XCTAssertEqual(StoatBadges.unreadAccessibilityLabel(count: 3), "3 unread messages")
     }
+
+    func testPhase8AccessibilityHelperText() {
+        let channel = StoatAccessibility.channelLabel(name: "general", unreadCount: 1, mentionCount: 2, isSelected: true)
+        XCTAssertTrue(channel.contains("selected"))
+        XCTAssertTrue(channel.contains("1 unread message"))
+        XCTAssertTrue(channel.contains("2 mentions"))
+
+        let message = StoatAccessibility.messageLabel(author: "Liquid Bagel", timestamp: "9:41 AM", content: "hello", isEdited: true, status: "failed", isSelected: true)
+        XCTAssertTrue(message.contains("edited"))
+        XCTAssertTrue(message.contains("failed"))
+        XCTAssertTrue(message.contains("selected"))
+
+        let runtime = StoatAccessibility.runtimeLabel(mode: "Live Manual", connection: "Ready", health: "Live connection ready")
+        XCTAssertFalse(runtime.localizedCaseInsensitiveContains("token"))
+    }
+
+    func testPhase8AdaptiveStyleHelpers() {
+        XCTAssertEqual(StoatDensityStyle.timelineSpacing(for: "compact"), StoatSpacing.small)
+        XCTAssertEqual(StoatDensityStyle.timelineSpacing(for: "comfortable"), StoatSpacing.medium)
+
+        let solid = StoatMaterialStyle.resolved(reduceTransparency: true, increaseContrast: true, reduceGlassIntensity: false)
+        XCTAssertFalse(solid.usesMaterial)
+        XCTAssertGreaterThan(solid.strokeOpacity, 0.3)
+
+        let reducedGlass = StoatMaterialStyle.resolved(reduceTransparency: false, increaseContrast: false, reduceGlassIntensity: true)
+        XCTAssertFalse(reducedGlass.usesMaterial)
+    }
 }
