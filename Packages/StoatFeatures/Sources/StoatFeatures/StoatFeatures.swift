@@ -8,9 +8,13 @@ import StoatRealtime
 import StoatUI
 import SwiftUI
 
+#if canImport(AppKit)
+import AppKit
+#endif
+
 public enum AppRuntimeMode: Codable, Hashable, Sendable {
     case mock
-    case livePreviewDisabled
+    case liveManual
 }
 
 public enum ShellSpace: Codable, Hashable, Sendable {
@@ -123,6 +127,81 @@ public enum MessageGrouping {
     }
 }
 
+public struct TimelineMessageGroup: Hashable, Sendable, Identifiable {
+    public var id: String
+    public var authorID: UserID
+    public var channelID: ChannelID
+    public var messages: [TimelineMessage]
+    public var startsAt: Date
+
+    public init(id: String, authorID: UserID, channelID: ChannelID, messages: [TimelineMessage], startsAt: Date) {
+        self.id = id
+        self.authorID = authorID
+        self.channelID = channelID
+        self.messages = messages
+        self.startsAt = startsAt
+    }
+}
+
+public enum TimelineMessageGrouping {
+    public static func group(_ messages: [TimelineMessage], threshold: TimeInterval = MessageGrouping.defaultThreshold) -> [TimelineMessageGroup] {
+        let sorted = messages.sorted { timestamp(for: $0.message) < timestamp(for: $1.message) }
+        var groups: [TimelineMessageGroup] = []
+
+        for timelineMessage in sorted {
+            let message = timelineMessage.message
+            let messageDate = timestamp(for: message)
+            guard var last = groups.last,
+                  let previous = last.messages.last
+            else {
+                groups.append(makeGroup(timelineMessage, startsAt: messageDate))
+                continue
+            }
+
+            let previousMessage = previous.message
+            let previousDate = timestamp(for: previousMessage)
+            let canGroup = previousMessage.authorID == message.authorID
+                && previousMessage.channelID == message.channelID
+                && previousMessage.system == nil
+                && message.system == nil
+                && previousMessage.replies?.isEmpty != false
+                && message.replies?.isEmpty != false
+                && previous.status == .confirmed
+                && timelineMessage.status == .confirmed
+                && messageDate.timeIntervalSince(previousDate) <= threshold
+
+            if canGroup {
+                last.messages.append(timelineMessage)
+                groups[groups.count - 1] = last
+            } else {
+                groups.append(makeGroup(timelineMessage, startsAt: messageDate))
+            }
+        }
+
+        return groups
+    }
+
+    private static func makeGroup(_ timelineMessage: TimelineMessage, startsAt: Date) -> TimelineMessageGroup {
+        let message = timelineMessage.message
+        return TimelineMessageGroup(id: "\(message.channelID.rawValue)-\(message.id.rawValue)", authorID: message.authorID, channelID: message.channelID, messages: [timelineMessage], startsAt: startsAt)
+    }
+
+    private static func timestamp(for message: Message) -> Date {
+        message.createdAt ?? Date.distantFuture
+    }
+}
+
+public struct EditingMessageDraft: Hashable, Sendable, Identifiable {
+    public var id: MessageID { message.id }
+    public var message: Message
+    public var content: String
+
+    public init(message: Message, content: String) {
+        self.message = message
+        self.content = content
+    }
+}
+
 @MainActor
 @Observable
 public final class MainShellViewModel {
@@ -131,23 +210,61 @@ public final class MainShellViewModel {
     public var connectionState: RealtimeConnectionState
     public var diagnostics: RealtimeDiagnostics?
     public var runtimeMode: AppRuntimeMode
+    public var sessionState: AppSessionState
+    public var currentUser: User?
+    public var sessionCoordinator: AppSessionCoordinator?
+    public var messageController: ChannelMessageController
     public var isQuickSwitcherPresented = false
     public var placeholderStatus: String?
     public var shouldFocusComposer = false
+    public var composerDrafts: [ChannelID: String] = [:]
+    public var composerError: String?
+    public var editingDraft: EditingMessageDraft?
+    public var pendingDeletion: TimelineMessage?
+    public var messageActionStatus: String?
+
+    @ObservationIgnored public var messageActionHandler: any MessageActionHandling
+    @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
+    @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
+    @ObservationIgnored private var typingEndTask: Task<Void, Never>?
+    @ObservationIgnored private var activeTypingChannelID: ChannelID?
+    @ObservationIgnored private var lastTypingBeginAt: [ChannelID: Date] = [:]
+    @ObservationIgnored private var locallyClearedUnreadChannelIDs: Set<ChannelID> = []
 
     public init(
         selection: ShellSelection = ShellSelection(),
         snapshot: RealtimeSnapshot = MockShellData.snapshot,
         connectionState: RealtimeConnectionState = .idle,
         diagnostics: RealtimeDiagnostics? = nil,
-        runtimeMode: AppRuntimeMode = .mock
+        runtimeMode: AppRuntimeMode = .mock,
+        sessionState: AppSessionState = .mock,
+        currentUser: User? = nil,
+        sessionCoordinator: AppSessionCoordinator? = nil,
+        snapshotSource: (any ShellSnapshotSource)? = nil,
+        messageController: ChannelMessageController? = nil,
+        messageActionHandler: (any MessageActionHandling)? = nil
     ) {
         self.selection = selection
         self.snapshot = snapshot
         self.connectionState = connectionState
         self.diagnostics = diagnostics
         self.runtimeMode = runtimeMode
+        self.sessionState = sessionState
+        self.currentUser = currentUser ?? snapshot.usersByID[MockShellData.currentUserID]
+        self.sessionCoordinator = sessionCoordinator
+        self.messageController = messageController ?? ChannelMessageController(runtimeMode: runtimeMode, currentUserID: currentUser?.id ?? MockShellData.currentUserID)
+        self.messageActionHandler = messageActionHandler ?? MockMessageActionHandler(currentUserID: currentUser?.id ?? MockShellData.currentUserID)
         validateSelection()
+        self.messageController.hydrate(from: snapshot)
+        if let snapshotSource {
+            observe(snapshotSource: snapshotSource)
+        }
+    }
+
+    deinit {
+        snapshotObservationTask?.cancel()
+        selectedChannelLoadTask?.cancel()
+        typingEndTask?.cancel()
     }
 
     public var servers: [Server] {
@@ -166,11 +283,55 @@ public final class MainShellViewModel {
 
     public var selectedMessages: [Message] {
         guard let channelID = selection.channelID ?? selection.dmChannelID else { return [] }
+        let timelineMessages = selectedTimelineMessages
+        if !timelineMessages.isEmpty {
+            return timelineMessages.map(\.message)
+        }
         return snapshot.messagesByChannelID[channelID] ?? []
     }
 
     public var selectedMessageGroups: [MessageGroup] {
         MessageGrouping.group(selectedMessages)
+    }
+
+    public var selectedTimelineMessages: [TimelineMessage] {
+        guard let channelID = selection.channelID ?? selection.dmChannelID else { return [] }
+        let stateMessages = messageController.state(for: channelID).timelineMessages
+        if !stateMessages.isEmpty {
+            return stateMessages
+        }
+        return (snapshot.messagesByChannelID[channelID] ?? []).map { TimelineMessage(message: $0) }
+    }
+
+    public var selectedTimelineMessageGroups: [TimelineMessageGroup] {
+        TimelineMessageGrouping.group(selectedTimelineMessages)
+    }
+
+    public var selectedChannelMessageState: ChannelMessageState {
+        messageController.state(for: selection.channelID ?? selection.dmChannelID)
+    }
+
+    public var effectiveRuntimeMode: AppRuntimeMode {
+        sessionCoordinator?.mode ?? runtimeMode
+    }
+
+    public var effectiveSessionState: AppSessionState {
+        sessionCoordinator?.sessionState ?? sessionState
+    }
+
+    public var effectiveConnectionState: RealtimeConnectionState {
+        sessionCoordinator?.connectionState ?? connectionState
+    }
+
+    public var effectiveDiagnostics: RealtimeDiagnostics? {
+        sessionCoordinator?.diagnostics ?? diagnostics
+    }
+
+    public var currentUserID: UserID? {
+        if effectiveRuntimeMode == .mock {
+            return (sessionCoordinator?.currentUser ?? currentUser)?.id ?? MockShellData.currentUserID
+        }
+        return sessionCoordinator?.currentUser?.id ?? currentUser?.id
     }
 
     public var title: String {
@@ -210,6 +371,7 @@ public final class MainShellViewModel {
     }
 
     public func selectHome() {
+        endTypingForActiveChannel()
         selection.space = .home
         selection.serverID = nil
         selection.channelID = nil
@@ -218,6 +380,7 @@ public final class MainShellViewModel {
     }
 
     public func selectDiscover() {
+        endTypingForActiveChannel()
         selection.space = .discover
         selection.serverID = nil
         selection.channelID = nil
@@ -226,14 +389,18 @@ public final class MainShellViewModel {
     }
 
     public func selectDirectMessages() {
+        endTypingForActiveChannel()
         selection.space = .directMessages
         selection.serverID = nil
         selection.channelID = nil
         selection.dmChannelID = snapshot.channelsByID.values.first { $0.kind == .directMessage }?.id
         placeholderStatus = nil
+        acknowledgeSelectedChannel()
+        scheduleSelectedChannelLoad()
     }
 
     public func selectServer(_ id: ServerID) {
+        endTypingForActiveChannel()
         guard snapshot.serversByID[id] != nil else {
             validateSelection()
             return
@@ -243,6 +410,8 @@ public final class MainShellViewModel {
         selection.channelID = firstVisibleTextChannel(in: id)?.id
         selection.dmChannelID = nil
         placeholderStatus = nil
+        acknowledgeSelectedChannel()
+        scheduleSelectedChannelLoad()
     }
 
     public func selectServer(atOneBasedIndex index: Int) {
@@ -252,6 +421,7 @@ public final class MainShellViewModel {
     }
 
     public func selectChannel(_ id: ChannelID) {
+        endTypingForActiveChannel()
         guard let channel = snapshot.channelsByID[id] else {
             validateSelection()
             return
@@ -268,6 +438,8 @@ public final class MainShellViewModel {
             selection.dmChannelID = id
         }
         placeholderStatus = nil
+        acknowledgeSelectedChannel()
+        scheduleSelectedChannelLoad()
     }
 
     public func toggleMemberPanel() {
@@ -285,7 +457,14 @@ public final class MainShellViewModel {
     }
 
     public func refreshPlaceholder() {
-        placeholderStatus = "Live refresh/reconnect is deferred until credential-driven realtime wiring."
+        if let channelID = selection.channelID ?? selection.dmChannelID {
+            Task { [weak self] in
+                guard let self else { return }
+                await self.messageController.refreshMessages(channelID: channelID, snapshotMessages: self.snapshot.messagesByChannelID[channelID] ?? [])
+            }
+        } else {
+            placeholderStatus = "Select a channel before refreshing messages."
+        }
     }
 
     public func settingsPlaceholder() {
@@ -295,7 +474,11 @@ public final class MainShellViewModel {
     public func validateSelection() {
         switch selection.space {
         case .home, .discover, .directMessages:
-            break
+            if selection.space == .directMessages,
+               let dmChannelID = selection.dmChannelID,
+               snapshot.channelsByID[dmChannelID] == nil {
+                selection.dmChannelID = snapshot.channelsByID.values.first { $0.kind == .directMessage }?.id
+            }
         case let .server(serverID):
             if snapshot.serversByID[serverID] == nil {
                 selectHome()
@@ -310,8 +493,327 @@ public final class MainShellViewModel {
         }
     }
 
+    public func attachSessionCoordinator(_ coordinator: AppSessionCoordinator) {
+        sessionCoordinator = coordinator
+        syncFromSessionCoordinator()
+    }
+
+    public func startMockSession() async {
+        guard let sessionCoordinator else { return }
+        await sessionCoordinator.startMockSession()
+        syncFromSessionCoordinator()
+    }
+
+    public func connectLiveManually() async {
+        guard let sessionCoordinator else { return }
+        await sessionCoordinator.connectLiveManually()
+        syncFromSessionCoordinator()
+    }
+
+    public func disconnectLive() async {
+        guard let sessionCoordinator else { return }
+        await sessionCoordinator.disconnectLive()
+        syncFromSessionCoordinator()
+    }
+
+    public func resetToMock() async {
+        guard let sessionCoordinator else { return }
+        await sessionCoordinator.resetToMock()
+        syncFromSessionCoordinator()
+    }
+
+    public func syncFromSessionCoordinator() {
+        guard let sessionCoordinator else { return }
+        runtimeMode = sessionCoordinator.mode
+        sessionState = sessionCoordinator.sessionState
+        connectionState = sessionCoordinator.connectionState
+        diagnostics = sessionCoordinator.diagnostics
+        currentUser = sessionCoordinator.currentUser
+        snapshot = sessionCoordinator.snapshot
+        messageActionHandler = sessionCoordinator.messageActionHandler
+        let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
+        messageController.configure(
+            runtimeMode: sessionCoordinator.mode,
+            apiClient: liveAPIClient,
+            currentUserID: sessionCoordinator.currentUser?.id ?? (sessionCoordinator.mode == .mock ? MockShellData.currentUserID : nil)
+        )
+        observe(snapshotSource: sessionCoordinator.snapshotSource)
+        validateSelection()
+        messageController.hydrate(from: snapshot)
+        scheduleSelectedChannelLoad()
+    }
+
+    public func observe(snapshotSource: any ShellSnapshotSource) {
+        snapshotObservationTask?.cancel()
+        snapshotObservationTask = Task { [weak self] in
+            let current = await snapshotSource.currentSnapshot()
+            await MainActor.run {
+                self?.applySnapshot(current)
+            }
+            for await snapshot in snapshotSource.snapshots {
+                await MainActor.run {
+                    self?.applySnapshot(snapshot)
+                }
+            }
+        }
+    }
+
+    public func draft(for channelID: ChannelID?) -> String {
+        guard let channelID else { return "" }
+        return composerDrafts[channelID, default: ""]
+    }
+
+    public func updateDraft(_ draft: String, for channelID: ChannelID?) {
+        guard let channelID else { return }
+        composerDrafts[channelID] = draft
+        scheduleTyping(for: channelID, draft: draft)
+    }
+
+    public func composerReadiness(for channelID: ChannelID?) -> (canSend: Bool, reason: String) {
+        guard let channelID, let channel = snapshot.channelsByID[channelID] else {
+            return (false, "Select a channel to send a message.")
+        }
+        let draft = draft(for: channelID).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !draft.isEmpty else {
+            return (false, "Write a message to send.")
+        }
+        guard isRuntimeSendCapable else {
+            return (false, effectiveRuntimeMode == .mock ? "Mock runtime is unavailable." : "Connect Live Manual before sending.")
+        }
+        if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
+            return (false, "You do not have permission to send messages here.")
+        }
+        if messageController.sendingChannelIDs.contains(channelID) {
+            return (false, "Sending the previous message.")
+        }
+        return (true, "Send message")
+    }
+
+    public func composerInputReadiness(for channelID: ChannelID?) -> (isEnabled: Bool, reason: String) {
+        guard let channelID, let channel = snapshot.channelsByID[channelID] else {
+            return (false, "Select a channel to send a message.")
+        }
+        guard isRuntimeSendCapable else {
+            return (false, effectiveRuntimeMode == .mock ? "Mock runtime is unavailable." : "Connect Live Manual before sending.")
+        }
+        if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
+            return (false, "You do not have permission to send messages here.")
+        }
+        if messageController.sendingChannelIDs.contains(channelID) {
+            return (false, "Sending the previous message.")
+        }
+        return (true, "Message #\(channel.displayName)")
+    }
+
+    public func canUploadFiles(in channel: Channel?) -> Bool {
+        guard let channel else { return false }
+        guard let permissions = resolvedPermissions(for: channel) else { return true }
+        return permissions.contains(.uploadFiles)
+    }
+
+    public func canReact(to message: Message) -> Bool {
+        guard let channel = snapshot.channelsByID[message.channelID] else { return false }
+        guard isRuntimeSendCapable else { return false }
+        guard let permissions = resolvedPermissions(for: channel) else { return true }
+        return permissions.contains(.react)
+    }
+
+    public func canEdit(_ message: Message) -> Bool {
+        currentUserID == message.authorID && isRuntimeSendCapable
+    }
+
+    public func canDelete(_ message: Message) -> Bool {
+        guard isRuntimeSendCapable else { return false }
+        if currentUserID == message.authorID { return true }
+        guard let channel = snapshot.channelsByID[message.channelID],
+              let permissions = resolvedPermissions(for: channel)
+        else { return false }
+        return permissions.contains(.manageMessages)
+    }
+
+    public func sendDraft(for channelID: ChannelID?) async {
+        guard let channelID else { return }
+        let readiness = composerReadiness(for: channelID)
+        guard readiness.canSend else {
+            composerError = readiness.reason
+            return
+        }
+        let content = draft(for: channelID).trimmingCharacters(in: .whitespacesAndNewlines)
+        composerDrafts[channelID] = ""
+        composerError = nil
+        _ = await messageController.sendMessage(channelID: channelID, content: content, handler: messageActionHandler)
+    }
+
+    public func retry(_ timelineMessage: TimelineMessage) async {
+        _ = await messageController.retrySend(timelineMessage, handler: messageActionHandler)
+    }
+
+    public func loadOlderSelectedMessages() async {
+        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        await messageController.loadOlderMessages(channelID: channelID)
+    }
+
+    public func beginEditing(_ timelineMessage: TimelineMessage) {
+        guard canEdit(timelineMessage.message) else { return }
+        editingDraft = EditingMessageDraft(message: timelineMessage.message, content: timelineMessage.message.content ?? "")
+    }
+
+    public func saveEditingDraft() async {
+        guard let editingDraft else { return }
+        do {
+            let edited = try await messageActionHandler.editMessage(
+                channelID: editingDraft.message.channelID,
+                messageID: editingDraft.message.id,
+                content: editingDraft.content
+            )
+            messageController.applyEditedMessage(edited)
+            self.editingDraft = nil
+            messageActionStatus = nil
+        } catch {
+            messageActionStatus = "Edit failed: \(error.userFacingMessage)"
+        }
+    }
+
+    public func requestDelete(_ timelineMessage: TimelineMessage) {
+        guard canDelete(timelineMessage.message) else { return }
+        pendingDeletion = timelineMessage
+    }
+
+    public func confirmPendingDelete() async {
+        guard let pendingDeletion else { return }
+        do {
+            try await messageActionHandler.deleteMessage(channelID: pendingDeletion.message.channelID, messageID: pendingDeletion.message.id)
+            messageController.removeMessage(channelID: pendingDeletion.message.channelID, messageID: pendingDeletion.message.id)
+            self.pendingDeletion = nil
+            messageActionStatus = nil
+        } catch {
+            messageActionStatus = "Delete failed: \(error.userFacingMessage)"
+        }
+    }
+
+    public func toggleReaction(_ emoji: String, on timelineMessage: TimelineMessage) async {
+        guard canReact(to: timelineMessage.message), let currentUserID else { return }
+        let hasReacted = timelineMessage.message.reactions[emoji]?.contains(currentUserID) == true
+        do {
+            if hasReacted {
+                try await messageActionHandler.removeReaction(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, emoji: emoji)
+            } else {
+                try await messageActionHandler.addReaction(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, emoji: emoji)
+            }
+            messageController.applyReaction(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, emoji: emoji, userID: currentUserID, isAdding: !hasReacted)
+            messageActionStatus = nil
+        } catch {
+            messageActionStatus = "Reaction failed: \(error.userFacingMessage)"
+        }
+    }
+
+    public func copyMessage(_ message: Message) {
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message.content ?? message.id.rawValue, forType: .string)
+        #endif
+    }
+
+    public func typingUsers(for channelID: ChannelID?) -> [User] {
+        guard let channelID else { return [] }
+        let currentUserID = currentUserID
+        return (snapshot.typingUsersByChannelID[channelID] ?? [])
+            .filter { $0 != currentUserID }
+            .compactMap { snapshot.usersByID[$0] }
+            .sorted { ($0.displayName ?? $0.username) < ($1.displayName ?? $1.username) }
+    }
+
+    public func unread(for channelID: ChannelID) -> ChannelUnread? {
+        guard let unread = snapshot.unreadsByChannelID[channelID] else { return nil }
+        if locallyClearedUnreadChannelIDs.contains(channelID) || selection.channelID == channelID || selection.dmChannelID == channelID {
+            if unread.mentions.isEmpty {
+                return nil
+            }
+            return ChannelUnread(id: unread.id, lastMessageID: nil, mentions: unread.mentions)
+        }
+        return unread
+    }
+
     private func firstVisibleTextChannel(in serverID: ServerID) -> Channel? {
         channels(for: serverID).first { $0.kind == .textChannel || $0.kind == .group || $0.kind == .savedMessages }
+    }
+
+    private var isRuntimeSendCapable: Bool {
+        switch effectiveRuntimeMode {
+        case .mock:
+            return true
+        case .liveManual:
+            return effectiveSessionState == .connected
+        }
+    }
+
+    private func resolvedPermissions(for channel: Channel) -> Permissions? {
+        if let permissions = channel.permissions {
+            return permissions
+        }
+        if let serverID = channel.serverID,
+           let server = snapshot.serversByID[serverID] {
+            return server.defaultPermissions
+        }
+        return nil
+    }
+
+    private func applySnapshot(_ snapshot: RealtimeSnapshot) {
+        self.snapshot = snapshot
+        messageController.hydrate(from: snapshot)
+        validateSelection()
+        acknowledgeSelectedChannel()
+        scheduleSelectedChannelLoad()
+    }
+
+    private func scheduleSelectedChannelLoad() {
+        selectedChannelLoadTask?.cancel()
+        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        let snapshotMessages = snapshot.messagesByChannelID[channelID] ?? []
+        selectedChannelLoadTask = Task { [weak self] in
+            guard let self else { return }
+            await self.messageController.loadInitialIfNeeded(channelID: channelID, snapshotMessages: snapshotMessages)
+        }
+    }
+
+    private func acknowledgeSelectedChannel() {
+        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        locallyClearedUnreadChannelIDs.insert(channelID)
+    }
+
+    private func scheduleTyping(for channelID: ChannelID, draft: String) {
+        guard isRuntimeSendCapable else { return }
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            endTypingForActiveChannel()
+            return
+        }
+
+        let now = Date()
+        if activeTypingChannelID != channelID || now.timeIntervalSince(lastTypingBeginAt[channelID] ?? .distantPast) > 8 {
+            activeTypingChannelID = channelID
+            lastTypingBeginAt[channelID] = now
+            Task { [handler = messageActionHandler] in
+                try? await handler.beginTyping(channelID: channelID)
+            }
+        }
+
+        typingEndTask?.cancel()
+        typingEndTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            await MainActor.run {
+                guard let self, self.activeTypingChannelID == channelID else { return }
+                self.endTypingForActiveChannel()
+            }
+        }
+    }
+
+    private func endTypingForActiveChannel() {
+        typingEndTask?.cancel()
+        guard let channelID = activeTypingChannelID else { return }
+        activeTypingChannelID = nil
+        Task { [handler = messageActionHandler] in
+            try? await handler.endTyping(channelID: channelID)
+        }
     }
 }
 
@@ -405,20 +907,28 @@ public enum MockShellData {
 }
 
 public struct LiquidBagelRootView: View {
+    @State private var sessionCoordinator: AppSessionCoordinator
     @State private var viewModel: MainShellViewModel
 
-    public init(viewModel: MainShellViewModel = MainShellViewModel(runtimeMode: .mock)) {
+    public init(
+        viewModel: MainShellViewModel = MainShellViewModel(runtimeMode: .mock),
+        sessionCoordinator: AppSessionCoordinator = AppSessionCoordinator()
+    ) {
+        _sessionCoordinator = State(initialValue: sessionCoordinator)
         _viewModel = State(initialValue: viewModel)
     }
 
     public var body: some View {
         MainShellView(viewModel: viewModel)
+            .task {
+                viewModel.attachSessionCoordinator(sessionCoordinator)
+                await viewModel.startMockSession()
+            }
     }
 }
 
 public struct MainShellView: View {
     @Bindable private var viewModel: MainShellViewModel
-    @State private var draft = ""
 
     public init(viewModel: MainShellViewModel) {
         self.viewModel = viewModel
@@ -443,8 +953,27 @@ public struct MainShellView: View {
         .sheet(isPresented: $viewModel.isQuickSwitcherPresented) {
             QuickSwitcherPlaceholderView(viewModel: viewModel)
         }
+        .sheet(item: $viewModel.editingDraft) { _ in
+            EditMessageSheet(viewModel: viewModel)
+        }
+        .confirmationDialog(
+            "Delete this message?",
+            isPresented: Binding(
+                get: { viewModel.pendingDeletion != nil },
+                set: { if !$0 { viewModel.pendingDeletion = nil } }
+            )
+        ) {
+            Button("Delete Message", role: .destructive) {
+                Task { await viewModel.confirmPendingDelete() }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingDeletion = nil
+            }
+        } message: {
+            Text("This removes the message from the local timeline after the API confirms deletion.")
+        }
         .overlay(alignment: .bottom) {
-            if let status = viewModel.placeholderStatus {
+            if let status = viewModel.placeholderStatus ?? viewModel.messageActionStatus ?? viewModel.composerError ?? viewModel.sessionCoordinator?.lastErrorMessage {
                 Text(status)
                     .font(.caption)
                     .padding(.horizontal, StoatSpacing.medium)
@@ -486,28 +1015,86 @@ public struct MainShellView: View {
         case .directMessages:
             FriendsPlaceholderView(viewModel: viewModel)
         case .server:
-            ChatPlaceholderView(viewModel: viewModel, draft: $draft)
+            ChatPlaceholderView(viewModel: viewModel)
         }
     }
 
     private var connectionChip: some View {
-        Text(connectionText)
-            .font(.caption.weight(.medium))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, StoatSpacing.small)
-            .padding(.vertical, StoatSpacing.xSmall)
-            .background(Color.primary.opacity(0.06), in: Capsule())
-            .accessibilityLabel("Connection state \(connectionText)")
+        Menu {
+            LabeledContent("Mode", value: runtimeModeText)
+            LabeledContent("Session", value: sessionStateText)
+            LabeledContent("Connection", value: connectionText)
+            if let latency = viewModel.effectiveDiagnostics?.lastLatencyMilliseconds {
+                LabeledContent("Latency", value: "\(latency) ms")
+            }
+            if let lastEvent = viewModel.effectiveDiagnostics?.lastReceivedEventAt {
+                LabeledContent("Last Event", value: lastEvent.formatted(date: .omitted, time: .standard))
+            }
+            if let session = viewModel.sessionCoordinator {
+                LabeledContent("Credential", value: session.hasSavedCredential ? "Saved" : "Missing")
+            }
+            Divider()
+            if viewModel.sessionCoordinator?.hasSavedCredential == true {
+                Button("Connect Manually") {
+                    Task { await viewModel.connectLiveManually() }
+                }
+                .disabled(isDisconnectable)
+            }
+            Button("Disconnect") {
+                Task { await viewModel.disconnectLive() }
+            }
+            .disabled(!isDisconnectable)
+            Button("Reset to Mock") {
+                Task { await viewModel.resetToMock() }
+            }
+        } label: {
+            Text("\(runtimeModeText) · \(connectionText)")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, StoatSpacing.small)
+                .padding(.vertical, StoatSpacing.xSmall)
+                .background(Color.primary.opacity(0.06), in: Capsule())
+        }
+        .menuStyle(.borderlessButton)
+        .accessibilityLabel("Runtime \(runtimeModeText), connection state \(connectionText)")
     }
 
     private var connectionText: String {
-        switch viewModel.connectionState {
+        switch viewModel.effectiveConnectionState {
         case .idle: "Mock"
         case .ready: "Ready"
         case .connecting, .authenticating, .authenticated, .connected: "Connecting"
         case .reconnecting: "Reconnecting"
         case .disconnected: "Offline"
         case .failed: "Failed"
+        }
+    }
+
+    private var runtimeModeText: String {
+        switch viewModel.effectiveRuntimeMode {
+        case .mock: "Mock"
+        case .liveManual: "Live Manual"
+        }
+    }
+
+    private var sessionStateText: String {
+        switch viewModel.effectiveSessionState {
+        case .mock: "Mock"
+        case .signedOut: "Signed Out"
+        case .loadingCredential: "Loading Credential"
+        case .readyToConnect: "Ready"
+        case .connecting: "Connecting"
+        case .connected: "Connected"
+        case .failed: "Failed"
+        }
+    }
+
+    private var isDisconnectable: Bool {
+        switch viewModel.effectiveConnectionState {
+        case .connecting, .connected, .authenticating, .authenticated, .ready, .reconnecting:
+            return true
+        case .idle, .disconnected, .failed:
+            return false
         }
     }
 }
@@ -565,13 +1152,14 @@ public struct ServerRailView: View {
 
     private func unreadCount(for server: Server) -> Int {
         server.channelIDs.reduce(0) { count, channelID in
-            count + (viewModel.snapshot.unreadsByChannelID[channelID] == nil ? 0 : 1)
+            let unread = viewModel.unread(for: channelID)
+            return count + (unread?.lastMessageID == nil ? 0 : 1)
         }
     }
 
     private func mentionCount(for server: Server) -> Int {
         server.channelIDs.reduce(0) { count, channelID in
-            count + (viewModel.snapshot.unreadsByChannelID[channelID]?.mentions.count ?? 0)
+            count + (viewModel.unread(for: channelID)?.mentions.count ?? 0)
         }
     }
 }
@@ -617,7 +1205,7 @@ public struct ChannelListView: View {
             Text(headerTitle)
                 .font(StoatTypography.sidebarHeader)
                 .lineLimit(1)
-            Text("Mock shell · no live connection")
+            Text(runtimeSubtitle)
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -630,6 +1218,28 @@ public struct ChannelListView: View {
         case .discover: "Discover"
         case .directMessages: "Direct Messages"
         case .server: viewModel.selectedServer?.name ?? "Server"
+        }
+    }
+
+    private var runtimeSubtitle: String {
+        switch viewModel.effectiveRuntimeMode {
+        case .mock:
+            return "Mock runtime · no live connection"
+        case .liveManual:
+            switch viewModel.effectiveSessionState {
+            case .connected:
+                return "Live Manual · connected"
+            case .connecting, .loadingCredential:
+                return "Live Manual · connecting"
+            case .signedOut:
+                return "Live Manual · no credential"
+            case .readyToConnect:
+                return "Live Manual · ready"
+            case .failed:
+                return "Live Manual · failed"
+            case .mock:
+                return "Mock runtime · no live connection"
+            }
         }
     }
 
@@ -690,7 +1300,7 @@ public struct ChannelListView: View {
     }
 
     private func channelRow(_ channel: Channel) -> some View {
-        let unread = viewModel.snapshot.unreadsByChannelID[channel.id]
+        let unread = viewModel.unread(for: channel.id)
         return ChannelRow(channel: channel, isSelected: viewModel.selection.channelID == channel.id, unreadCount: unread == nil ? 0 : 1, mentionCount: unread?.mentions.count ?? 0) {
             viewModel.selectChannel(channel.id)
         }
@@ -717,11 +1327,9 @@ private struct SidebarButton: View {
 
 public struct ChatPlaceholderView: View {
     private let viewModel: MainShellViewModel
-    @Binding private var draft: String
 
-    public init(viewModel: MainShellViewModel, draft: Binding<String>) {
+    public init(viewModel: MainShellViewModel) {
         self.viewModel = viewModel
-        self._draft = draft
     }
 
     public var body: some View {
@@ -742,7 +1350,23 @@ public struct ChatPlaceholderView: View {
             }
             MessageTimelineView(viewModel: viewModel)
             if let channel = viewModel.selectedChannel {
-                GlassComposer(text: $draft, placeholder: "Message #\(channel.displayName)") {
+                let sendReadiness = viewModel.composerReadiness(for: channel.id)
+                let inputReadiness = viewModel.composerInputReadiness(for: channel.id)
+                GlassComposer(
+                    text: Binding(
+                        get: { viewModel.draft(for: channel.id) },
+                        set: { viewModel.updateDraft($0, for: channel.id) }
+                    ),
+                    placeholder: inputReadiness.isEnabled ? "Message #\(channel.displayName)" : inputReadiness.reason,
+                    isEnabled: inputReadiness.isEnabled,
+                    canSend: sendReadiness.canSend,
+                    disabledReason: sendReadiness.canSend ? nil : sendReadiness.reason,
+                    isSending: viewModel.messageController.sendingChannelIDs.contains(channel.id),
+                    canAttach: viewModel.canUploadFiles(in: channel),
+                    onSend: {
+                        Task { await viewModel.sendDraft(for: channel.id) }
+                    }
+                ) {
                     viewModel.focusComposer()
                 }
                 .padding([.horizontal, .bottom], StoatSpacing.large)
@@ -762,16 +1386,10 @@ public struct MessageTimelineView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: StoatSpacing.medium) {
                 if viewModel.selectedChannel == nil {
-                    EmptyStateView(title: "Choose a channel", message: "Pick a server channel or DM to preview the Phase 3 timeline.")
-                        .frame(maxWidth: .infinity)
-                } else if viewModel.selectedMessageGroups.isEmpty {
-                    EmptyStateView(title: "Nothing here yet", message: "This mock channel has no messages.")
+                    EmptyStateView(title: "Choose a channel", message: "Pick a server channel or DM to open the timeline.")
                         .frame(maxWidth: .infinity)
                 } else {
-                    unreadSeparator
-                    ForEach(viewModel.selectedMessageGroups) { group in
-                        MessageGroupView(id: group.id, messages: group.messages, author: viewModel.snapshot.usersByID[group.authorID])
-                    }
+                    timelineContent
                 }
             }
             .padding(StoatSpacing.xLarge)
@@ -779,15 +1397,228 @@ public struct MessageTimelineView: View {
         }
     }
 
-    private var unreadSeparator: some View {
-        HStack {
-            Rectangle().frame(height: 1).foregroundStyle(Color.red.opacity(0.5))
-            Text("Unread preview")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.red)
-            Rectangle().frame(height: 1).foregroundStyle(Color.red.opacity(0.5))
+    @ViewBuilder private var timelineContent: some View {
+        switch viewModel.selectedChannelMessageState {
+        case .idle, .loading:
+            if viewModel.selectedTimelineMessages.isEmpty {
+                LoadingStateView()
+                    .frame(maxWidth: .infinity)
+            } else {
+                timelineMessages(showLoadOlder: false, isLoadingOlder: false)
+            }
+        case .empty:
+            EmptyStateView(title: "Nothing here yet", message: "No messages are loaded for this channel.")
+                .frame(maxWidth: .infinity)
+        case let .failed(message, cachedMessages):
+            if cachedMessages.isEmpty {
+                ErrorStateView(message)
+                    .frame(maxWidth: .infinity)
+                retryButton
+            } else {
+                inlineError(message)
+                timelineMessages(showLoadOlder: false, isLoadingOlder: false)
+            }
+        case let .loaded(messages, hasMoreBefore):
+            if messages.isEmpty {
+                EmptyStateView(title: "Nothing here yet", message: "No messages are loaded for this channel.")
+                    .frame(maxWidth: .infinity)
+            } else {
+                timelineMessages(showLoadOlder: hasMoreBefore, isLoadingOlder: false)
+            }
+        case .loadingOlder:
+            timelineMessages(showLoadOlder: false, isLoadingOlder: true)
         }
-        .accessibilityLabel("Unread messages preview separator")
+    }
+
+    @ViewBuilder private func timelineMessages(showLoadOlder: Bool, isLoadingOlder: Bool) -> some View {
+        if isLoadingOlder {
+            ProgressView("Loading older messages")
+                .controlSize(.small)
+                .frame(maxWidth: .infinity)
+        } else if showLoadOlder {
+            Button {
+                Task { await viewModel.loadOlderSelectedMessages() }
+            } label: {
+                Label("Load Older Messages", systemImage: "arrow.up.to.line")
+            }
+            .buttonStyle(GlassButtonStyle())
+            .frame(maxWidth: .infinity)
+        }
+        unreadSeparator
+        ForEach(viewModel.selectedTimelineMessageGroups) { group in
+            TimelineMessageGroupView(group: group, author: viewModel.snapshot.usersByID[group.authorID], viewModel: viewModel)
+        }
+        typingIndicator
+    }
+
+    private var retryButton: some View {
+        Button {
+            viewModel.refreshPlaceholder()
+        } label: {
+            Label("Retry", systemImage: "arrow.clockwise")
+        }
+        .buttonStyle(GlassButtonStyle())
+        .frame(maxWidth: .infinity)
+    }
+
+    private func inlineError(_ message: String) -> some View {
+        HStack(spacing: StoatSpacing.small) {
+            Image(systemName: "exclamationmark.triangle")
+            Text(message)
+                .lineLimit(2)
+            Spacer()
+            Button("Retry") {
+                viewModel.refreshPlaceholder()
+            }
+            .buttonStyle(GlassButtonStyle())
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(StoatSpacing.medium)
+        .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
+    }
+
+    @ViewBuilder private var typingIndicator: some View {
+        let users = viewModel.typingUsers(for: viewModel.selection.channelID ?? viewModel.selection.dmChannelID)
+        if !users.isEmpty {
+            Text(typingText(users))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.top, StoatSpacing.small)
+        }
+    }
+
+    private func typingText(_ users: [User]) -> String {
+        let names = users.map { $0.displayName ?? $0.username }
+        if names.count == 1 {
+            return "\(names[0]) is typing..."
+        }
+        return "\(names.prefix(2).joined(separator: ", ")) are typing..."
+    }
+
+    @ViewBuilder private var unreadSeparator: some View {
+        if let channelID = viewModel.selection.channelID ?? viewModel.selection.dmChannelID,
+           viewModel.unread(for: channelID) != nil {
+            HStack {
+                Rectangle().frame(height: 1).foregroundStyle(Color.red.opacity(0.5))
+                Text("Unread")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.red)
+                Rectangle().frame(height: 1).foregroundStyle(Color.red.opacity(0.5))
+            }
+            .accessibilityLabel("Unread messages separator")
+        }
+    }
+}
+
+public struct TimelineMessageGroupView: View {
+    private let group: TimelineMessageGroup
+    private let author: User?
+    private let viewModel: MainShellViewModel
+
+    public init(group: TimelineMessageGroup, author: User?, viewModel: MainShellViewModel) {
+        self.group = group
+        self.author = author
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(group.messages.enumerated()), id: \.element.id) { index, timelineMessage in
+                VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                    MessageRow(message: timelineMessage.message, author: author, showsHeader: index == 0)
+                        .contextMenu {
+                            Button("Copy Message") {
+                                viewModel.copyMessage(timelineMessage.message)
+                            }
+                            if viewModel.canEdit(timelineMessage.message) {
+                                Button("Edit Message") {
+                                    viewModel.beginEditing(timelineMessage)
+                                }
+                            }
+                            if viewModel.canDelete(timelineMessage.message) {
+                                Button("Delete Message", role: .destructive) {
+                                    viewModel.requestDelete(timelineMessage)
+                                }
+                            }
+                            if viewModel.canReact(to: timelineMessage.message) {
+                                Divider()
+                                ForEach(["👍", "❤️", "😂"], id: \.self) { emoji in
+                                    Button("React \(emoji)") {
+                                        Task { await viewModel.toggleReaction(emoji, on: timelineMessage) }
+                                    }
+                                }
+                            }
+                            #if DEBUG
+                            Button("Copy Message ID") {
+                                #if canImport(AppKit)
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(timelineMessage.message.id.rawValue, forType: .string)
+                                #endif
+                            }
+                            #endif
+                        }
+                    statusView(for: timelineMessage)
+                }
+            }
+        }
+        .id(group.id)
+    }
+
+    @ViewBuilder private func statusView(for timelineMessage: TimelineMessage) -> some View {
+        switch timelineMessage.status {
+        case .confirmed:
+            EmptyView()
+        case .pending:
+            Text("Sending...")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.leading, StoatSize.avatar + StoatSpacing.medium)
+        case let .failed(message):
+            HStack(spacing: StoatSpacing.small) {
+                Text("Failed: \(message)")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                Button("Retry") {
+                    Task { await viewModel.retry(timelineMessage) }
+                }
+                .buttonStyle(.borderless)
+            }
+            .padding(.leading, StoatSize.avatar + StoatSpacing.medium)
+        }
+    }
+}
+
+public struct EditMessageSheet: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            Text("Edit Message")
+                .font(.headline)
+            TextEditor(text: Binding(
+                get: { viewModel.editingDraft?.content ?? "" },
+                set: { viewModel.editingDraft?.content = $0 }
+            ))
+            .frame(minHeight: 120)
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    viewModel.editingDraft = nil
+                }
+                Button("Save") {
+                    Task { await viewModel.saveEditingDraft() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(viewModel.editingDraft?.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false)
+            }
+        }
+        .padding(StoatSpacing.xLarge)
+        .frame(width: 460)
     }
 }
 
@@ -1001,8 +1832,8 @@ public struct LiquidBagelSettingsView: View {
                 LabeledContent("Media", value: PhaseOneStatus.current.environment.mediaBaseURL?.absoluteString ?? "Not configured")
             }
             Section("Status") {
-                LabeledContent("App phase", value: "Phase 3")
-                LabeledContent("Runtime", value: "Mock shell, no live auto-connect")
+                LabeledContent("App phase", value: "Phase 4")
+                LabeledContent("Runtime", value: "Mock by default, Live Manual only")
                 LabeledContent("Persistence", value: "Deferred")
             }
         }
@@ -1031,6 +1862,7 @@ public struct PhaseOneStatus: Equatable, Sendable {
 
 public typealias PhaseZeroStatus = PhaseOneStatus
 public typealias PhaseThreeStatus = PhaseOneStatus
+public typealias PhaseFourStatus = PhaseOneStatus
 
 @available(macOS 15.0, *)
 #Preview("Shell Dark") {

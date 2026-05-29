@@ -1,4 +1,6 @@
 import StoatModels
+import StoatAPI
+import StoatRealtime
 import XCTest
 @testable import StoatFeatures
 
@@ -152,6 +154,294 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(MessageGrouping.group(messages).map(\.messages.count), [2, 1])
     }
 
+    @MainActor
+    func testSessionStartsInMockModeAndDoesNotAutoConnect() async throws {
+        let realtime = RecordingRealtimeClient()
+        let session = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+
+        XCTAssertEqual(session.mode, .mock)
+        XCTAssertEqual(session.sessionState, .mock)
+        await session.startMockSession()
+
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 0)
+        XCTAssertEqual(session.snapshot, MockShellData.snapshot)
+    }
+
+    @MainActor
+    func testMissingCredentialProducesSignedOutStateWithoutConnecting() async throws {
+        let realtime = RecordingRealtimeClient()
+        let session = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+
+        await session.connectLiveManually()
+
+        XCTAssertEqual(session.mode, .liveManual)
+        XCTAssertEqual(session.sessionState, .signedOut)
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 0)
+    }
+
+    @MainActor
+    func testManualConnectAndDisconnectUseRealtimeClientMock() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.connecting, .ready])
+        let api = RecordingAPIClient()
+        let session = AppSessionCoordinator(
+            tokenStore: store,
+            apiClientFactory: { _, _ in api },
+            realtimeClientFactory: { realtime }
+        )
+
+        await session.connectLiveManually()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 1)
+        XCTAssertEqual(session.sessionState, .connected)
+
+        await session.disconnectLive()
+
+        let disconnectCallCount = await realtime.disconnectCallCount
+        XCTAssertEqual(disconnectCallCount, 1)
+        XCTAssertEqual(session.sessionState, .readyToConnect)
+    }
+
+    @MainActor
+    func testInvalidSessionSurfacesFailedState() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.failed(.authenticationFailed(.invalidSession))])
+        let session = AppSessionCoordinator(
+            tokenStore: store,
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+
+        await session.connectLiveManually()
+        try await Task.sleep(for: .milliseconds(30))
+
+        if case let .failed(message) = session.sessionState {
+            XCTAssertFalse(message.isEmpty)
+        } else {
+            XCTFail("Expected failed session state")
+        }
+    }
+
+    func testMockSnapshotSourceEmitsInitialSnapshot() async {
+        var iterator = MockShellSnapshotSource(snapshot: MockShellData.snapshot).snapshots.makeAsyncIterator()
+        let snapshot = await iterator.next()
+
+        XCTAssertEqual(snapshot, MockShellData.snapshot)
+    }
+
+    @MainActor
+    func testViewModelObservesSnapshotAndKeepsValidSelection() async throws {
+        let source = MutableSnapshotSource(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, snapshotSource: source)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let selected = try XCTUnwrap(model.selection.channelID)
+
+        source.yield(MockShellData.snapshot)
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(model.selection.channelID, selected)
+    }
+
+    @MainActor
+    func testDeletedSelectedChannelFallsBackSafely() async throws {
+        let source = MutableSnapshotSource(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, snapshotSource: source)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let deleted = try XCTUnwrap(model.selection.channelID)
+        var snapshot = MockShellData.snapshot
+        snapshot.channelsByID.removeValue(forKey: deleted)
+        snapshot.serversByID[server.id]?.channelIDs.removeAll { $0 == deleted }
+
+        source.yield(snapshot)
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertNotEqual(model.selection.channelID, deleted)
+        XCTAssertNotNil(model.selection.channelID)
+    }
+
+    @MainActor
+    func testDeletedSelectedServerFallsBackHome() async throws {
+        let source = MutableSnapshotSource(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, snapshotSource: source)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        var snapshot = MockShellData.snapshot
+        snapshot.serversByID.removeValue(forKey: server.id)
+
+        source.yield(snapshot)
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(model.selection.space, .home)
+    }
+
+    @MainActor
+    func testMessageLoadingUsesSnapshotInMockModeAndDoesNotCallAPI() async {
+        let api = RecordingAPIClient()
+        let controller = ChannelMessageController(runtimeMode: .mock, apiClient: api)
+        let channelID = MockShellData.snapshot.messagesByChannelID.keys.first!
+
+        await controller.loadInitialMessages(channelID: channelID, snapshotMessages: MockShellData.snapshot.messagesByChannelID[channelID] ?? [])
+
+        XCTAssertTrue(controller.state(for: channelID).hasMessages)
+        let fetchMessagesCallCount = await api.fetchMessagesCallCount
+        XCTAssertEqual(fetchMessagesCallCount, 0)
+    }
+
+    @MainActor
+    func testLiveMessageLoadingFetchesPaginatesDedupesAndSorts() async {
+        let channelID: ChannelID = "channel"
+        let older = message(id: ulid(milliseconds: 1_000), author: "a", channel: channelID)
+        let newer = message(id: ulid(milliseconds: 2_000), author: "a", channel: channelID)
+        let api = RecordingAPIClient(messagesByChannel: [channelID: [older, newer, newer]])
+        let controller = ChannelMessageController(runtimeMode: .liveManual, apiClient: api, currentUserID: "a", pageSize: 2)
+
+        await controller.loadInitialMessages(channelID: channelID, snapshotMessages: [])
+
+        XCTAssertEqual(controller.state(for: channelID).timelineMessages.map(\.message.id), [older.id, newer.id])
+        let firstFetchMessagesCallCount = await api.fetchMessagesCallCount
+        XCTAssertEqual(firstFetchMessagesCallCount, 1)
+
+        await controller.loadOlderMessages(channelID: channelID)
+        let secondFetchMessagesCallCount = await api.fetchMessagesCallCount
+        XCTAssertEqual(secondFetchMessagesCallCount, 2)
+    }
+
+    @MainActor
+    func testFailedLiveLoadKeepsCachedMessages() async {
+        let channelID: ChannelID = "channel"
+        let cached = message(id: ulid(milliseconds: 1_000), author: "a", channel: channelID)
+        let api = RecordingAPIClient(messagesByChannel: [channelID: [cached]], fetchError: MessageActionError.unavailable("boom"))
+        let controller = ChannelMessageController(runtimeMode: .liveManual, apiClient: api, currentUserID: "a")
+
+        await controller.loadInitialMessages(channelID: channelID, snapshotMessages: [cached])
+
+        if case let .failed(message, cachedMessages) = controller.state(for: channelID) {
+            XCTAssertTrue(message.contains("boom"))
+            XCTAssertEqual(cachedMessages.map(\.message.id), [cached.id])
+        } else {
+            XCTFail("Expected failed state")
+        }
+    }
+
+    @MainActor
+    func testComposerDraftsSendSuccessAndEchoDedupe() async {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let channelID = model.selection.channelID!
+        model.updateDraft("hello", for: channelID)
+
+        await model.sendDraft(for: channelID)
+        let sent = model.selectedTimelineMessages.filter { $0.message.content == "hello" }
+
+        XCTAssertEqual(model.draft(for: channelID), "")
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?.status, .confirmed)
+
+        model.messageController.hydrate(from: RealtimeSnapshot(messagesByChannelID: [channelID: sent.map(\.message)]))
+        XCTAssertEqual(model.selectedTimelineMessages.filter { $0.message.content == "hello" }.count, 1)
+    }
+
+    @MainActor
+    func testFailedSendMarksTimelineMessageFailed() async {
+        let handler = MockMessageActionHandler(sendError: MessageActionError.unavailable("send failed"))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let channelID = model.selection.channelID!
+        model.updateDraft("hello", for: channelID)
+
+        await model.sendDraft(for: channelID)
+
+        XCTAssertTrue(model.selectedTimelineMessages.contains { if case .failed = $0.status { true } else { false } })
+    }
+
+    @MainActor
+    func testDraftsArePerChannelAndEmptyDraftCannotSend() async {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channels = model.channels(for: model.servers.first { $0.name == "Bagel Lab" }!.id).filter { $0.kind == .textChannel }
+
+        model.updateDraft("one", for: channels[0].id)
+        model.updateDraft("two", for: channels[1].id)
+
+        XCTAssertEqual(model.draft(for: channels[0].id), "one")
+        XCTAssertEqual(model.draft(for: channels[1].id), "two")
+        XCTAssertFalse(model.composerReadiness(for: channels[0].id).canSend == false)
+
+        model.updateDraft("   ", for: channels[0].id)
+        XCTAssertFalse(model.composerReadiness(for: channels[0].id).canSend)
+    }
+
+    @MainActor
+    func testEditDeleteAndReactionActionsCallHandler() async {
+        let handler = MockMessageActionHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let ownMessage = model.selectedTimelineMessages.first { $0.message.authorID == MockShellData.currentUserID }!
+
+        model.beginEditing(ownMessage)
+        model.editingDraft?.content = "edited"
+        await model.saveEditingDraft()
+        model.requestDelete(ownMessage)
+        await model.confirmPendingDelete()
+        await model.toggleReaction("👍", on: ownMessage)
+
+        let editedCount = await handler.editedMessages.count
+        let deletedCount = await handler.deletedMessages.count
+        let reactionCount = await handler.addedReactions.count
+        XCTAssertEqual(editedCount, 1)
+        XCTAssertEqual(deletedCount, 1)
+        XCTAssertEqual(reactionCount, 1)
+    }
+
+    @MainActor
+    func testTypingBeginDoesNotSpamAndChannelSwitchEndsTyping() async throws {
+        let handler = MockMessageActionHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let channelID = model.selection.channelID!
+
+        model.updateDraft("h", for: channelID)
+        model.updateDraft("he", for: channelID)
+        try await Task.sleep(for: .milliseconds(30))
+        model.selectHome()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let events = await handler.typingEvents
+        XCTAssertEqual(events.filter { if case .beginTyping = $0 { true } else { false } }.count, 1)
+        XCTAssertEqual(events.filter { if case .endTyping = $0 { true } else { false } }.count, 1)
+    }
+
+    @MainActor
+    func testCurrentUserExcludedFromTypingDisplayAndUnreadClearsOnSelection() {
+        var snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let channelID = server.channelIDs[1]
+        snapshot.typingUsersByChannelID[channelID, default: []].insert(MockShellData.currentUserID)
+        let model = MainShellViewModel(snapshot: snapshot)
+
+        model.selectChannel(channelID)
+
+        XCTAssertFalse(model.typingUsers(for: channelID).contains { $0.id == MockShellData.currentUserID })
+        XCTAssertNil(model.unread(for: channelID)?.lastMessageID)
+    }
+
     private func message(
         id: String,
         author: UserID,
@@ -180,5 +470,185 @@ final class StoatFeaturesTests: XCTestCase {
             value /= 32
         }
         return String(chars) + "0000000000000000"
+    }
+}
+
+private final class TestStreamHub<Element: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [UUID: AsyncStream<Element>.Continuation] = [:]
+
+    func stream() -> AsyncStream<Element> {
+        AsyncStream { continuation in
+            let id = UUID()
+            lock.lock()
+            continuations[id] = continuation
+            lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                self?.lock.lock()
+                self?.continuations.removeValue(forKey: id)
+                self?.lock.unlock()
+            }
+        }
+    }
+
+    func yield(_ value: Element) {
+        lock.lock()
+        let continuations = Array(continuations.values)
+        lock.unlock()
+        continuations.forEach { $0.yield(value) }
+    }
+}
+
+private final class MutableSnapshotSource: ShellSnapshotSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private let hub = TestStreamHub<RealtimeSnapshot>()
+    private var snapshot: RealtimeSnapshot
+
+    init(snapshot: RealtimeSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    var snapshots: AsyncStream<RealtimeSnapshot> {
+        hub.stream()
+    }
+
+    func currentSnapshot() async -> RealtimeSnapshot {
+        lock.withLock { snapshot }
+    }
+
+    func yield(_ snapshot: RealtimeSnapshot) {
+        lock.withLock {
+            self.snapshot = snapshot
+        }
+        hub.yield(snapshot)
+    }
+}
+
+private actor RecordingRealtimeClient: StoatRealtimeClient {
+    nonisolated var connectionState: AsyncStream<RealtimeConnectionState> { stateHub.stream() }
+    nonisolated var events: AsyncStream<StoatGatewayEvent> { eventHub.stream() }
+    nonisolated var diagnosticsStream: AsyncStream<RealtimeDiagnostics> { diagnosticsHub.stream() }
+
+    private let stateHub = TestStreamHub<RealtimeConnectionState>()
+    private let eventHub = TestStreamHub<StoatGatewayEvent>()
+    private let diagnosticsHub = TestStreamHub<RealtimeDiagnostics>()
+    private let statesOnConnect: [RealtimeConnectionState]
+
+    private(set) var connectCallCount = 0
+    private(set) var disconnectCallCount = 0
+    private(set) var sentEvents: [ClientGatewayEvent] = []
+
+    init(statesOnConnect: [RealtimeConnectionState] = []) {
+        self.statesOnConnect = statesOnConnect
+    }
+
+    func connect(credential: StoatAuthCredential, environment: StoatAPIEnvironment, readyFields: Set<ReadyField>) async throws {
+        connectCallCount += 1
+        for state in statesOnConnect {
+            stateHub.yield(state)
+        }
+    }
+
+    func disconnect() async {
+        disconnectCallCount += 1
+        stateHub.yield(.disconnected(reason: .requested))
+    }
+
+    func send(_ event: ClientGatewayEvent) async throws {
+        sentEvents.append(event)
+    }
+}
+
+private actor RecordingAPIClient: StoatAPIClient {
+    private(set) var fetchMessagesCallCount = 0
+    private(set) var sentDrafts: [(ChannelID, MessageDraft)] = []
+    private(set) var editedMessages: [(ChannelID, MessageID, MessageEditDraft)] = []
+    private(set) var deletedMessages: [(ChannelID, MessageID)] = []
+    private(set) var addedReactions: [(ChannelID, MessageID, String)] = []
+    private(set) var removedReactions: [(ChannelID, MessageID, String)] = []
+
+    private let currentUser: User
+    private var messagesByChannel: [ChannelID: [Message]]
+    private let fetchError: (any Error & Sendable)?
+
+    init(
+        currentUser: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
+        messagesByChannel: [ChannelID: [Message]] = [:],
+        fetchError: (any Error & Sendable)? = nil
+    ) {
+        self.currentUser = currentUser
+        self.messagesByChannel = messagesByChannel
+        self.fetchError = fetchError
+    }
+
+    func fetchRootConfiguration() async throws -> StoatConfig {
+        throw StoatAPIError.unimplementedEndpoint("test")
+    }
+
+    func fetchCurrentUser() async throws -> User {
+        currentUser
+    }
+
+    func fetchServers() async throws -> [Server] {
+        []
+    }
+
+    func fetchChannels() async throws -> [Channel] {
+        []
+    }
+
+    func fetchChannel(id: ChannelID) async throws -> Channel {
+        throw StoatAPIError.notFound
+    }
+
+    func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message] {
+        fetchMessagesCallCount += 1
+        if let fetchError {
+            throw fetchError
+        }
+        var messages = messagesByChannel[channelID] ?? []
+        messages.sort { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
+        if let before, let index = messages.firstIndex(where: { $0.id == before }) {
+            messages = Array(messages[..<index])
+        }
+        if let after, let index = messages.firstIndex(where: { $0.id == after }) {
+            messages = Array(messages[messages.index(after: index)...])
+        }
+        if let limit, messages.count > limit {
+            messages = Array(messages.prefix(limit))
+        }
+        return messages
+    }
+
+    func sendMessage(channelID: ChannelID, draft: MessageDraft) async throws -> Message {
+        sentDrafts.append((channelID, draft))
+        let message = Message(id: "01J00000100000000000000001", channelID: channelID, authorID: currentUser.id, content: draft.content, nonce: draft.nonce)
+        messagesByChannel[channelID, default: []].append(message)
+        return message
+    }
+
+    func editMessage(channelID: ChannelID, messageID: MessageID, draft: MessageEditDraft) async throws -> Message {
+        editedMessages.append((channelID, messageID, draft))
+        return Message(id: messageID, channelID: channelID, authorID: currentUser.id, content: draft.content, editedAt: Date())
+    }
+
+    func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        deletedMessages.append((channelID, messageID))
+    }
+
+    func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
+        addedReactions.append((channelID, messageID, emoji))
+    }
+
+    func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String, removeAll: Bool) async throws {
+        removedReactions.append((channelID, messageID, emoji))
+    }
+
+    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+
+    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+
+    func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile {
+        UploadedFile(id: "file")
     }
 }

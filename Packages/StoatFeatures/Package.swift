@@ -30,6 +30,6 @@ let package = Package(
                 "StoatUI"
             ]
         ),
-        .testTarget(name: "StoatFeaturesTests", dependencies: ["StoatFeatures"])
+        .testTarget(name: "StoatFeaturesTests", dependencies: ["StoatFeatures", "StoatAPI", "StoatRealtime"])
     ]
 )

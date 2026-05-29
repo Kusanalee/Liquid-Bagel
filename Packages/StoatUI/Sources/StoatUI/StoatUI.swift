@@ -2,6 +2,10 @@ import StoatDesignSystem
 import StoatModels
 import SwiftUI
 
+#if canImport(AppKit)
+import AppKit
+#endif
+
 public struct StoatUISnapshot: Equatable, Sendable {
     public var currentUser: User?
     public var users: [User]
@@ -130,26 +134,42 @@ public struct GlassComposer: View {
     @Binding private var text: String
     private let placeholder: String
     private let isEnabled: Bool
+    private let canSend: Bool
+    private let disabledReason: String?
+    private let isSending: Bool
+    private let canAttach: Bool
+    private let onSend: () -> Void
     private let onFocus: () -> Void
 
-    public init(text: Binding<String>, placeholder: String, isEnabled: Bool = true, onFocus: @escaping () -> Void = {}) {
+    public init(
+        text: Binding<String>,
+        placeholder: String,
+        isEnabled: Bool = true,
+        canSend: Bool = false,
+        disabledReason: String? = nil,
+        isSending: Bool = false,
+        canAttach: Bool = false,
+        onSend: @escaping () -> Void = {},
+        onFocus: @escaping () -> Void = {}
+    ) {
         self._text = text
         self.placeholder = placeholder
         self.isEnabled = isEnabled
+        self.canSend = canSend
+        self.disabledReason = disabledReason
+        self.isSending = isSending
+        self.canAttach = canAttach
+        self.onSend = onSend
         self.onFocus = onFocus
     }
 
     public var body: some View {
         GlassPanel(material: .composer, padding: StoatSpacing.medium) {
             HStack(alignment: .bottom, spacing: StoatSpacing.medium) {
-                GlassIconButton("Attach file unavailable in Phase 3", systemImage: "paperclip", isDisabled: true) {}
+                GlassIconButton(canAttach ? "Attach file unavailable in Phase 4" : "Attach file unavailable", systemImage: "paperclip", isDisabled: true) {}
                 ZStack(alignment: .topLeading) {
-                    TextEditor(text: $text)
-                        .font(.body)
+                    ComposerTextInput(text: $text, isEnabled: isEnabled, onSubmit: onSend, onFocus: onFocus)
                         .frame(minHeight: 34, maxHeight: 92)
-                        .scrollContentBackground(.hidden)
-                        .disabled(!isEnabled)
-                        .onTapGesture(perform: onFocus)
                     if text.isEmpty {
                         Text(placeholder)
                             .foregroundStyle(.secondary)
@@ -158,14 +178,120 @@ public struct GlassComposer: View {
                             .allowsHitTesting(false)
                     }
                 }
-                GlassIconButton("Emoji unavailable in Phase 3", systemImage: "face.smiling", isDisabled: true) {}
-                GlassIconButton("Sending unavailable in Phase 3", systemImage: "arrow.up.circle.fill", isDisabled: true) {}
+                GlassIconButton("Emoji unavailable in Phase 4", systemImage: "face.smiling", isDisabled: true) {}
+                if isSending {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 30, height: 30)
+                } else {
+                    GlassIconButton(disabledReason ?? "Send Message", systemImage: "arrow.up.circle.fill", isDisabled: !canSend) {
+                        onSend()
+                    }
+                }
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Message composer placeholder")
+        .accessibilityLabel(isEnabled ? "Message composer" : "Message composer disabled")
+        .help(disabledReason ?? placeholder)
     }
 }
+
+private struct ComposerTextInput: View {
+    @Binding var text: String
+    let isEnabled: Bool
+    let onSubmit: () -> Void
+    let onFocus: () -> Void
+
+    var body: some View {
+        #if canImport(AppKit)
+        ComposerTextView(text: $text, isEnabled: isEnabled, onSubmit: onSubmit, onFocus: onFocus)
+            .font(.body)
+        #else
+        TextEditor(text: $text)
+            .font(.body)
+            .disabled(!isEnabled)
+            .onTapGesture(perform: onFocus)
+        #endif
+    }
+}
+
+#if canImport(AppKit)
+private struct ComposerTextView: NSViewRepresentable {
+    @Binding var text: String
+    let isEnabled: Bool
+    let onSubmit: () -> Void
+    let onFocus: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, onSubmit: onSubmit, onFocus: onFocus)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        guard let textView = scrollView.documentView as? NSTextView else {
+            return scrollView
+        }
+        textView.delegate = context.coordinator
+        textView.drawsBackground = false
+        textView.isRichText = false
+        textView.font = .preferredFont(forTextStyle: .body)
+        textView.textContainerInset = NSSize(width: 0, height: 6)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.textContainer?.widthTracksTextView = true
+        textView.string = text
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        guard let textView = nsView.documentView as? NSTextView else { return }
+        if textView.string != text {
+            textView.string = text
+        }
+        textView.isEditable = isEnabled
+        textView.textColor = isEnabled ? .labelColor : .secondaryLabelColor
+        context.coordinator.text = $text
+        context.coordinator.onSubmit = onSubmit
+        context.coordinator.onFocus = onFocus
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var text: Binding<String>
+        var onSubmit: () -> Void
+        var onFocus: () -> Void
+
+        init(text: Binding<String>, onSubmit: @escaping () -> Void, onFocus: @escaping () -> Void) {
+            self.text = text
+            self.onSubmit = onSubmit
+            self.onFocus = onFocus
+        }
+
+        func textDidBeginEditing(_ notification: Notification) {
+            onFocus()
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            text.wrappedValue = textView.string
+        }
+
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            guard commandSelector == #selector(NSResponder.insertNewline(_:)) else {
+                return false
+            }
+            if NSEvent.modifierFlags.contains(.shift) {
+                textView.insertNewlineIgnoringFieldEditor(nil)
+                text.wrappedValue = textView.string
+            } else {
+                onSubmit()
+            }
+            return true
+        }
+    }
+}
+#endif
 
 public struct AvatarView: View {
     private let title: String

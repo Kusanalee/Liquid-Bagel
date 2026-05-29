@@ -5,6 +5,7 @@ import StoatModels
 public protocol StoatRealtimeClient: Sendable {
     var connectionState: AsyncStream<RealtimeConnectionState> { get }
     var events: AsyncStream<StoatGatewayEvent> { get }
+    var diagnosticsStream: AsyncStream<RealtimeDiagnostics> { get }
 
     func connect(
         credential: StoatAuthCredential,
@@ -384,4 +385,3 @@ private struct DesiredConnection: Sendable {
     var environment: StoatAPIEnvironment
     var readyFields: Set<ReadyField>
 }
-
