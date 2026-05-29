@@ -28,6 +28,27 @@ struct AppCommands: Commands {
                 post(.liquidBagelRefresh)
             }
             .keyboardShortcut("r", modifiers: [.command])
+
+            Button("Toggle Member Panel") {
+                post(.liquidBagelToggleMembers)
+            }
+            .keyboardShortcut("m", modifiers: [.command, .shift])
+        }
+
+        CommandGroup(after: .appSettings) {
+            Button("Liquid Bagel Settings Placeholder") {
+                post(.liquidBagelShowSettingsPlaceholder)
+            }
+            .keyboardShortcut(",", modifiers: [.command])
+        }
+
+        CommandMenu("Servers") {
+            ForEach(1...9, id: \.self) { index in
+                Button("Select Server \(index)") {
+                    post(Notification.Name("LiquidBagelSelectServer\(index)"))
+                }
+                .keyboardShortcut(KeyEquivalent(Character(String(index))), modifiers: [.command])
+            }
         }
     }
 
@@ -41,4 +62,6 @@ extension Notification.Name {
     static let liquidBagelShowQuickSwitcher = Notification.Name("LiquidBagelShowQuickSwitcher")
     static let liquidBagelFocusComposer = Notification.Name("LiquidBagelFocusComposer")
     static let liquidBagelRefresh = Notification.Name("LiquidBagelRefresh")
+    static let liquidBagelToggleMembers = Notification.Name("LiquidBagelToggleMembers")
+    static let liquidBagelShowSettingsPlaceholder = Notification.Name("LiquidBagelShowSettingsPlaceholder")
 }

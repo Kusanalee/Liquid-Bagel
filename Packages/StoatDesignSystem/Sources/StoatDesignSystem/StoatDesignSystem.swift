@@ -1,6 +1,7 @@
 import SwiftUI
 
 public enum StoatSpacing {
+    public static let xxSmall: CGFloat = 2
     public static let xSmall: CGFloat = 4
     public static let small: CGFloat = 8
     public static let medium: CGFloat = 12
@@ -10,45 +11,181 @@ public enum StoatSpacing {
 }
 
 public enum StoatRadius {
+    public static let small: CGFloat = 6
     public static let control: CGFloat = 8
-    public static let panel: CGFloat = 16
-    public static let avatar: CGFloat = 10
+    public static let row: CGFloat = 8
+    public static let panel: CGFloat = 14
+    public static let largePanel: CGFloat = 18
+    public static let avatar: CGFloat = 12
+    public static let capsule: CGFloat = 999
+}
+
+public enum StoatSize {
+    public static let serverRailWidth: CGFloat = 72
+    public static let channelSidebarWidth: CGFloat = 260
+    public static let memberPanelWidth: CGFloat = 240
+    public static let serverIcon: CGFloat = 46
+    public static let avatar: CGFloat = 38
+    public static let compactAvatar: CGFloat = 28
+    public static let minimumRowHeight: CGFloat = 34
+}
+
+public enum StoatTypography {
+    public static let sidebarHeader = Font.title3.weight(.semibold)
+    public static let section = Font.caption.weight(.semibold)
+    public static let row = Font.callout
+    public static let rowSelected = Font.callout.weight(.semibold)
+    public static let messageAuthor = Font.subheadline.weight(.semibold)
+    public static let messageBody = Font.body
+    public static let metadata = Font.caption
+}
+
+public enum StoatGlassMaterial: Sendable {
+    case rail
+    case sidebar
+    case panel
+    case composer
+    case toolbar
+    case popover
+
+    public var material: Material {
+        switch self {
+        case .rail: .regularMaterial
+        case .sidebar: .thinMaterial
+        case .panel: .thinMaterial
+        case .composer: .regularMaterial
+        case .toolbar: .bar
+        case .popover: .regularMaterial
+        }
+    }
+}
+
+public enum StoatElevation {
+    public static let panelShadowColor = Color.black.opacity(0.16)
+    public static let softShadowColor = Color.black.opacity(0.08)
+    public static let panelRadius: CGFloat = 18
+    public static let softRadius: CGFloat = 8
 }
 
 public enum StoatAnimation {
-    public static let quick = Animation.snappy(duration: 0.18)
-    public static let standard = Animation.smooth(duration: 0.28)
+    public static let quick = Animation.snappy(duration: 0.16)
+    public static let standard = Animation.smooth(duration: 0.24)
+
+    public static func allowed(_ reduceMotion: Bool, _ animation: Animation = standard) -> Animation? {
+        reduceMotion ? nil : animation
+    }
 }
 
-public struct GlassPanel<Content: View>: View {
-    private let content: Content
-
-    public init(@ViewBuilder content: () -> Content) {
-        self.content = content()
+public enum StoatBadges {
+    public static func displayCount(_ count: Int) -> String {
+        if count <= 0 { return "" }
+        if count > 99 { return "99+" }
+        return String(count)
     }
 
-    public var body: some View {
+    public static func mentionAccessibilityLabel(count: Int) -> String {
+        count == 1 ? "1 mention" : "\(count) mentions"
+    }
+
+    public static func unreadAccessibilityLabel(count: Int) -> String {
+        count == 1 ? "1 unread message" : "\(count) unread messages"
+    }
+}
+
+public enum StoatInitials {
+    public static func make(_ text: String, fallback: String = "?") -> String {
+        let words = text
+            .split { !$0.isLetter && !$0.isNumber }
+            .filter { !$0.isEmpty }
+        let letters = words.prefix(2).compactMap(\.first)
+        if letters.isEmpty {
+            return String(fallback.prefix(2)).uppercased()
+        }
+        return String(letters).uppercased()
+    }
+}
+
+public enum StoatAccessibility {
+    public static func selectedLabel(_ label: String, isSelected: Bool) -> String {
+        isSelected ? "\(label), selected" : label
+    }
+
+    public static func serverLabel(name: String, unreadCount: Int = 0, mentionCount: Int = 0, isSelected: Bool = false) -> String {
+        var parts = [selectedLabel(name, isSelected: isSelected)]
+        if unreadCount > 0 { parts.append(StoatBadges.unreadAccessibilityLabel(count: unreadCount)) }
+        if mentionCount > 0 { parts.append(StoatBadges.mentionAccessibilityLabel(count: mentionCount)) }
+        return parts.joined(separator: ", ")
+    }
+}
+
+public struct GlassBackground: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    private let material: StoatGlassMaterial
+    private let radius: CGFloat
+    private let strokeOpacity: Double
+
+    public init(material: StoatGlassMaterial = .panel, radius: CGFloat = StoatRadius.panel, strokeOpacity: Double = 0.18) {
+        self.material = material
+        self.radius = radius
+        self.strokeOpacity = strokeOpacity
+    }
+
+    public func body(content: Content) -> some View {
         content
-            .padding(StoatSpacing.large)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+            .background {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .fill(reduceTransparency ? Color(nsColor: .controlBackgroundColor) : Color.clear)
+                    .modifier(MaterialFallback(material: material, radius: radius, reduceTransparency: reduceTransparency))
             }
-            .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
+            .overlay {
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(strokeOpacity), lineWidth: 1)
+            }
+    }
+}
+
+private struct MaterialFallback: ViewModifier {
+    let material: StoatGlassMaterial
+    let radius: CGFloat
+    let reduceTransparency: Bool
+
+    func body(content: Content) -> some View {
+        if reduceTransparency {
+            content
+        } else {
+            content.background(material.material, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        }
+    }
+}
+
+public extension View {
+    func stoatGlass(_ material: StoatGlassMaterial = .panel, radius: CGFloat = StoatRadius.panel, strokeOpacity: Double = 0.18) -> some View {
+        modifier(GlassBackground(material: material, radius: radius, strokeOpacity: strokeOpacity))
     }
 }
 
 public struct GlassButtonStyle: ButtonStyle {
-    public init() {}
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private let selected: Bool
+
+    public init(selected: Bool = false) {
+        self.selected = selected
+    }
 
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.body.weight(.medium))
+            .font(.body.weight(selected ? .semibold : .medium))
             .padding(.horizontal, StoatSpacing.medium)
             .padding(.vertical, StoatSpacing.small)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
-            .opacity(configuration.isPressed ? 0.72 : 1)
-            .animation(StoatAnimation.quick, value: configuration.isPressed)
+            .background(selected ? Color.accentColor.opacity(0.24) : Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                    .strokeBorder(selected ? Color.accentColor.opacity(0.5) : Color.primary.opacity(0.08))
+            }
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .opacity(configuration.isPressed ? 0.78 : 1)
+            .animation(StoatAnimation.allowed(reduceMotion, .snappy(duration: 0.12)), value: configuration.isPressed)
     }
 }
