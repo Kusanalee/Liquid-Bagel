@@ -29,6 +29,9 @@ public enum AppCommand: Hashable, Sendable {
     case selectPreviousMessage
     case jumpToNewestMessage
     case jumpToFirstUnreadMessage
+    case replyToSelectedMessage
+    case cancelReply
+    case focusTimeline
     case copySelectedMessage
     case copySelectedMessageID
     case editSelectedMessage
@@ -67,16 +70,6 @@ public enum ShellFocusTarget: Hashable, Sendable {
     case composer
     case quickSwitcher
     case memberPanel
-}
-
-public struct TimelineSelection: Hashable, Sendable {
-    public var channelID: ChannelID?
-    public var messageID: MessageID?
-
-    public init(channelID: ChannelID? = nil, messageID: MessageID? = nil) {
-        self.channelID = channelID
-        self.messageID = messageID
-    }
 }
 
 public enum QuickSwitcherResultKind: Hashable, Sendable {
@@ -200,7 +193,7 @@ public final class QuickSwitcherViewModel {
     public var results: [QuickSwitcherResult] {
         let all = indexedResults()
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return Array(all.prefix(12)) }
+        guard !needle.isEmpty else { return Array(all.prefix(16)) }
         return all.filter { result in
             [result.title, result.subtitle, result.badgeText].compactMap { $0 }.contains { $0.localizedCaseInsensitiveContains(needle) }
         }
@@ -289,6 +282,9 @@ public final class QuickSwitcherViewModel {
     private func commandResults() -> [QuickSwitcherResult] {
         [
             commandResult(.focusComposer, title: "Focus Composer", subtitle: "Move keyboard focus to the message composer"),
+            commandResult(.focusTimeline, title: "Focus Timeline", subtitle: "Move keyboard focus to the message timeline"),
+            commandResult(.replyToSelectedMessage, title: "Reply to Message", subtitle: "Reply to the focused message"),
+            commandResult(.cancelReply, title: "Cancel Reply", subtitle: "Clear the active reply context"),
             commandResult(.refresh, title: "Refresh", subtitle: "Refresh the current runtime context"),
             commandResult(.reconnect, title: "Reconnect", subtitle: "Explicitly reconnect Live Manual"),
             commandResult(.disconnect, title: "Disconnect", subtitle: "Disconnect the live realtime session"),

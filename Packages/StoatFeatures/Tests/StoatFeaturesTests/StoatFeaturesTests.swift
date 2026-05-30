@@ -1178,6 +1178,102 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.timelineSelection.messageID, model.firstUnreadMessageID(for: channel.id))
     }
 
+    func testPhase10ViewportReducerCreatesDeterministicScrollIntents() {
+        let channelID: ChannelID = "channel"
+        let first = TimelineMessage(message: message(id: ulid(milliseconds: 1_000), author: "user", channel: channelID))
+        let second = TimelineMessage(message: message(id: ulid(milliseconds: 2_000), author: "user", channel: channelID))
+        let reducer = TimelineViewportReducer()
+
+        var state = reducer.channelSelected(channelID: channelID, messages: [first, second], firstUnreadMessageID: first.message.id)
+        XCTAssertEqual(state.pendingScrollIntent, .message(first.message.id, anchor: .bottom, reason: .channelSelected))
+
+        state = reducer.jumpNewest(state, newestMessageID: second.message.id)
+        XCTAssertEqual(state.pendingScrollIntent, .newest(reason: .jumpCommand))
+        XCTAssertTrue(state.isAtNewest)
+
+        state.isAtNewest = false
+        state = reducer.newMessage(state, newestMessageID: "new-message", isActiveChannel: true)
+        XCTAssertNil(state.pendingScrollIntent == .message("new-message", anchor: .bottom, reason: .newMessage) ? state.pendingScrollIntent : nil)
+        XCTAssertTrue(state.hasNewerMessagesIndicator)
+
+        state = reducer.preserveAfterPrepend(state, previousOldestID: first.message.id)
+        XCTAssertEqual(state.pendingScrollIntent, .preservePositionAfterPrepend(previousOldestID: first.message.id))
+    }
+
+    @MainActor
+    func testPhase10ReplyContextComposerAndSendPayload() async throws {
+        let handler = MockMessageActionHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        model.selectServer(model.servers[0].id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        let target = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
+
+        model.beginReply(to: target)
+        XCTAssertEqual(model.replyContext(for: channelID)?.messageID, target.message.id)
+        XCTAssertEqual(model.timelineSelection.focus.mode, .replying)
+        XCTAssertTrue(model.composerDraftState(for: channelID).shouldMentionReplyAuthor)
+
+        model.updateReplyMentionPreference(false, for: channelID)
+        model.updateDraft("reply body", for: channelID)
+        await model.sendDraft(for: channelID)
+
+        let sent = await handler.sentMessages
+        XCTAssertEqual(sent.last?.replies, [target.message.id])
+        XCTAssertNil(model.replyContext(for: channelID))
+    }
+
+    @MainActor
+    func testPhase10CancelReplyPreservesDraftAndCommandsGateWhileTyping() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        let target = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
+
+        model.updateDraft("keep me", for: channelID)
+        model.beginReply(to: target)
+        XCTAssertTrue(model.canPerform(.cancelReply))
+        model.cancelReply(for: channelID)
+
+        XCTAssertEqual(model.draft(for: channelID), "keep me")
+        XCTAssertNil(model.replyContext(for: channelID))
+        model.timelineSelection = TimelineSelection(channelID: channelID, messageID: target.message.id)
+        model.focusComposer()
+        XCTAssertFalse(model.canPerform(.replyToSelectedMessage))
+    }
+
+    @MainActor
+    func testPhase10LiveAckDebouncesAndClearsMentionAfterSuccess() async throws {
+        let channelID = try XCTUnwrap(MockShellData.snapshot.channelsByID.values.first { $0.displayName == "macos-native" }?.id)
+        let sender = RecordingChannelAckSender()
+        let model = MainShellViewModel(
+            snapshot: MockShellData.snapshot,
+            runtimeMode: .liveManual,
+            sessionState: .connected,
+            channelAckSender: sender
+        )
+
+        model.selectChannel(channelID)
+        model.updateTimelineAtNewest(true)
+        try await Task.sleep(for: .milliseconds(1700))
+
+        let acks = await sender.acks
+        XCTAssertEqual(acks.last?.0, channelID)
+        XCTAssertEqual(acks.last?.1, model.selectedTimelineMessages.last?.message.id)
+        XCTAssertEqual(model.localReadStates[channelID]?.mentionCount, 0)
+    }
+
+    @MainActor
+    func testPhase10MissingFirstUnreadIsRecoverableStatus() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channel = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "macos-native" })
+        model.selectChannel(channel.id)
+        model.localReadStates[channel.id] = LocalReadState(channelID: channel.id, firstUnreadMessageID: "missing", unreadCount: 1, mentionCount: 1)
+
+        model.jumpToFirstUnreadMessage()
+
+        XCTAssertEqual(model.placeholderStatus, "Unread message is not loaded.")
+    }
+
     private func message(
         id: String,
         author: UserID,

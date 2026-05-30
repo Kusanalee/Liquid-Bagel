@@ -228,3 +228,30 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Session IDs are acceptable for internal matching and shortened display, but broad diagnostics should continue to avoid raw full session IDs.
 - If a manually imported token has no session ID, Liquid Bagel can list sessions but cannot mark the current session with certainty.
 - Revoke-all-other-sessions is verified and safe when called with `revoke_self=false`; revoke-self behavior should remain behind explicit current-session logout/revoke confirmation.
+
+## Phase 10 Notes
+
+### Sources inspected
+
+- Generated API routes: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/routes.ts
+- Generated API schema: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/schema.ts
+- Official web client text channel behavior: https://github.com/stoatchat/for-web/blob/main/packages/client/src/interface/channels/text/TextChannel.tsx
+- Official JS SDK channel/message ack behavior: https://github.com/stoatchat/javascript-client-sdk/blob/main/src/classes/Channel.ts
+- Backend channel ack route: https://github.com/stoatchat/stoatchat/blob/main/crates/delta/src/routes/channels/channel_ack.rs
+- Backend unread update behavior: https://github.com/stoatchat/stoatchat/blob/main/crates/core/database/src/models/channel_unreads/ops/mongodb.rs
+
+### Verified read acknowledgement behavior
+
+- Channel read acknowledgement is verified as `PUT /channels/{target}/ack/{message}`.
+- The route takes channel ID and message ID in the path, returns 204, and has no JSON request body.
+- Backend source rejects bot users for channel ack.
+- Backend unread state sets `last_id` to the acked message ID and removes mention IDs less than or equal to the acked message ID.
+- The official SDK locally clears channel mentions when acknowledging and debounces network ack sends at about 1.5 seconds with an upper limit around 4 seconds.
+- The official web client sends channel ack automatically only when the channel is unread, the client is focused, and the text timeline is at the end; its jump-end command also sends ack before scrolling to the bottom.
+- `ChannelAck` remains the receive-side realtime event for other-client/server state updates and carries channel ID, user ID, and `message_id`.
+
+### Phase 10 implementation decision
+
+- Liquid Bagel implements only the narrow channel ack route, scoped to the active selected channel in Live Manual.
+- Server-wide ack remains deferred.
+- Mention clearing is allowed after a successful live ack or equivalent verified ack state, but local-only mock behavior continues to avoid claiming server acknowledgement.

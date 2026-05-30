@@ -483,7 +483,7 @@ public enum MessageActionError: Error, Equatable, Sendable, LocalizedError {
 }
 
 public protocol MessageActionHandling: Sendable {
-    func sendMessage(channelID: ChannelID, content: String, nonce: String?) async throws -> Message
+    func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?) async throws -> Message
     func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws
     func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws
@@ -517,7 +517,7 @@ public actor MockMessageActionHandler: MessageActionHandling {
         sendError = error
     }
 
-    public func sendMessage(channelID: ChannelID, content: String, nonce: String?) async throws -> Message {
+    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil) async throws -> Message {
         if let sendError {
             throw sendError
         }
@@ -527,7 +527,8 @@ public actor MockMessageActionHandler: MessageActionHandling {
             channelID: channelID,
             authorID: currentUserID,
             content: content,
-            nonce: nonce
+            nonce: nonce,
+            replies: replies?.map(\.id)
         )
         sentMessages.append(message)
         return message
@@ -588,8 +589,8 @@ public actor LiveMessageActionHandler: MessageActionHandling {
         self.realtimeClient = realtimeClient
     }
 
-    public func sendMessage(channelID: ChannelID, content: String, nonce: String?) async throws -> Message {
-        try await apiClient.sendMessage(channelID: channelID, draft: MessageDraft(content: content, nonce: nonce))
+    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil) async throws -> Message {
+        try await apiClient.sendMessage(channelID: channelID, draft: MessageDraft(content: content, nonce: nonce, replies: replies))
     }
 
     public func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
@@ -632,7 +633,7 @@ public actor UnavailableMessageActionHandler: MessageActionHandling {
         self.message = message
     }
 
-    public func sendMessage(channelID: ChannelID, content: String, nonce: String?) async throws -> Message {
+    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil) async throws -> Message {
         throw MessageActionError.unavailable(message)
     }
 
@@ -789,7 +790,7 @@ public final class ChannelMessageController {
         await loadInitialMessages(channelID: channelID, snapshotMessages: snapshotMessages)
     }
 
-    public func sendMessage(channelID: ChannelID, content: String, handler: any MessageActionHandling) async -> Bool {
+    public func sendMessage(channelID: ChannelID, content: String, replies: [MessageReply]? = nil, handler: any MessageActionHandling) async -> Bool {
         guard let currentUserID else {
             apply(.initialLoadFailed(MessageActionError.missingCurrentUser.userFacingMessage), channelID: channelID)
             return false
@@ -802,7 +803,8 @@ public final class ChannelMessageController {
                 channelID: channelID,
                 authorID: currentUserID,
                 content: content,
-                nonce: nonce
+                nonce: nonce,
+                replies: replies?.map(\.id)
             ),
             status: .pending
         )
@@ -810,7 +812,7 @@ public final class ChannelMessageController {
         sendingChannelIDs.insert(channelID)
 
         do {
-            let confirmed = try await handler.sendMessage(channelID: channelID, content: content, nonce: nonce)
+            let confirmed = try await handler.sendMessage(channelID: channelID, content: content, nonce: nonce, replies: replies)
             sendingChannelIDs.remove(channelID)
             apply(.sendConfirmed(message: confirmed, nonce: nonce), channelID: channelID)
             lastErrorByChannelID[channelID] = nil
@@ -826,7 +828,8 @@ public final class ChannelMessageController {
     public func retrySend(_ timelineMessage: TimelineMessage, handler: any MessageActionHandling) async -> Bool {
         guard let content = timelineMessage.message.content else { return false }
         apply(.discardLocalMessage(timelineMessage.message.id), channelID: timelineMessage.message.channelID)
-        return await sendMessage(channelID: timelineMessage.message.channelID, content: content, handler: handler)
+        let replies = timelineMessage.message.replies?.map { MessageReply(id: $0, mention: true) }
+        return await sendMessage(channelID: timelineMessage.message.channelID, content: content, replies: replies, handler: handler)
     }
 
     public func markRetryStarted(_ timelineMessage: TimelineMessage) {

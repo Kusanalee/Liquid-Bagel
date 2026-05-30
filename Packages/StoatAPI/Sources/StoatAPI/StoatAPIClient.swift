@@ -11,6 +11,7 @@ public protocol StoatAPIClient: Sendable {
     func sendMessage(channelID: ChannelID, draft: MessageDraft) async throws -> Message
     func editMessage(channelID: ChannelID, messageID: MessageID, draft: MessageEditDraft) async throws -> Message
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws
+    func ackChannel(channelID: ChannelID, messageID: MessageID) async throws
     func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws
     func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String, removeAll: Bool) async throws
     func pinMessage(channelID: ChannelID, messageID: MessageID) async throws
@@ -26,6 +27,10 @@ public protocol StoatAPIClient: Sendable {
 }
 
 public extension StoatAPIClient {
+    func ackChannel(channelID: ChannelID, messageID: MessageID) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Channel read acknowledgement is not implemented by this API client.")
+    }
+
     func login(request: SessionLoginRequest) async throws -> SessionLoginResponse {
         throw StoatAPIError.unimplementedEndpoint("Session login is not implemented by this API client.")
     }
@@ -148,6 +153,14 @@ public actor LiveStoatAPIClient: StoatAPIClient {
         let request = StoatRequest<EmptyResponse>(
             method: .delete,
             path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages/\(messageID.rawValue.stoatPathComponentEscaped)"
+        )
+        _ = try await perform(request)
+    }
+
+    public func ackChannel(channelID: ChannelID, messageID: MessageID) async throws {
+        let request = StoatRequest<EmptyResponse>(
+            method: .put,
+            path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/ack/\(messageID.rawValue.stoatPathComponentEscaped)"
         )
         _ = try await perform(request)
     }

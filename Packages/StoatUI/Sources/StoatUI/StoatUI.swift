@@ -140,63 +140,102 @@ public struct GlassComposer: View {
     private let disabledReason: String?
     private let isSending: Bool
     private let canAttach: Bool
+    private let replyAuthor: String?
+    private let replyPreview: String?
+    @Binding private var shouldMentionReplyAuthor: Bool
     private let focusRequestID: Int
+    private let onCancelReply: () -> Void
     private let onSend: () -> Void
     private let onFocus: () -> Void
 
     public init(
         text: Binding<String>,
+        shouldMentionReplyAuthor: Binding<Bool> = .constant(true),
         placeholder: String,
         isEnabled: Bool = true,
         canSend: Bool = false,
         disabledReason: String? = nil,
         isSending: Bool = false,
         canAttach: Bool = false,
+        replyAuthor: String? = nil,
+        replyPreview: String? = nil,
         focusRequestID: Int = 0,
+        onCancelReply: @escaping () -> Void = {},
         onSend: @escaping () -> Void = {},
         onFocus: @escaping () -> Void = {}
     ) {
         self._text = text
+        self._shouldMentionReplyAuthor = shouldMentionReplyAuthor
         self.placeholder = placeholder
         self.isEnabled = isEnabled
         self.canSend = canSend
         self.disabledReason = disabledReason
         self.isSending = isSending
         self.canAttach = canAttach
+        self.replyAuthor = replyAuthor
+        self.replyPreview = replyPreview
         self.focusRequestID = focusRequestID
+        self.onCancelReply = onCancelReply
         self.onSend = onSend
         self.onFocus = onFocus
     }
 
     public var body: some View {
         GlassPanel(material: .composer, padding: StoatSpacing.medium) {
-            HStack(alignment: .bottom, spacing: StoatSpacing.medium) {
-                GlassIconButton(canAttach ? "Attach file unavailable in Phase 4" : "Attach file unavailable", systemImage: "paperclip", isDisabled: true) {}
-                ZStack(alignment: .topLeading) {
-                    ComposerTextInput(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSend, onFocus: onFocus)
-                        .frame(minHeight: 34, maxHeight: 92)
-                    if text.isEmpty {
-                        Text(placeholder)
+            VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                if let replyAuthor, let replyPreview {
+                    HStack(spacing: StoatSpacing.small) {
+                        Image(systemName: "arrowshape.turn.up.left.fill")
                             .foregroundStyle(.secondary)
-                            .padding(.top, 8)
-                            .padding(.leading, 5)
-                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                            Text("Replying to \(replyAuthor)")
+                                .font(.caption.weight(.semibold))
+                            Text(replyPreview)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        Toggle("Mention", isOn: $shouldMentionReplyAuthor)
+                            .toggleStyle(.checkbox)
+                            .font(.caption)
+                        GlassIconButton("Cancel Reply", systemImage: "xmark", action: onCancelReply)
                     }
+                    .padding(.horizontal, StoatSpacing.small)
+                    .padding(.vertical, StoatSpacing.xSmall)
+                    .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(StoatAccessibility.replyContextLabel(author: replyAuthor, preview: replyPreview, mentionsAuthor: shouldMentionReplyAuthor))
                 }
-                GlassIconButton("Emoji unavailable in Phase 4", systemImage: "face.smiling", isDisabled: true) {}
-                if isSending {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 30, height: 30)
-                } else {
-                    GlassIconButton(disabledReason ?? "Send Message", systemImage: "arrow.up.circle.fill", isDisabled: !canSend) {
-                        onSend()
+                HStack(alignment: .bottom, spacing: StoatSpacing.medium) {
+                    GlassIconButton(canAttach ? "Attach file unavailable in Phase 4" : "Attach file unavailable", systemImage: "paperclip", isDisabled: true) {}
+                    ZStack(alignment: .topLeading) {
+                        ComposerTextInput(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSend, onFocus: onFocus)
+                            .frame(minHeight: 34, maxHeight: 92)
+                        if text.isEmpty {
+                            Text(placeholder)
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 8)
+                                .padding(.leading, 5)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    GlassIconButton("Emoji unavailable in Phase 4", systemImage: "face.smiling", isDisabled: true) {}
+                    if isSending {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(width: 30, height: 30)
+                    } else {
+                        GlassIconButton(disabledReason ?? "Send Message", systemImage: "arrow.up.circle.fill", isDisabled: !canSend) {
+                            onSend()
+                        }
                     }
                 }
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(StoatAccessibility.composerLabel(isEnabled: isEnabled, disabledReason: disabledReason))
+        .accessibilityLabel(StoatAccessibility.composerLabel(isEnabled: isEnabled, disabledReason: disabledReason, replyAuthor: replyAuthor))
         .accessibilityHint(isEnabled ? "Press Return to send, Shift Return for a new line" : (disabledReason ?? "Composer is unavailable"))
         .help(disabledReason ?? placeholder)
     }
@@ -467,13 +506,17 @@ public struct MessageRow: View {
     private let showsHeader: Bool
     private let statusText: String?
     private let isSelected: Bool
+    private let isFocused: Bool
+    private let replyPreview: String?
 
-    public init(message: Message, author: User?, showsHeader: Bool = true, statusText: String? = nil, isSelected: Bool = false) {
+    public init(message: Message, author: User?, showsHeader: Bool = true, statusText: String? = nil, isSelected: Bool = false, isFocused: Bool = false, replyPreview: String? = nil) {
         self.message = message
         self.author = author
         self.showsHeader = showsHeader
         self.statusText = statusText
         self.isSelected = isSelected
+        self.isFocused = isFocused
+        self.replyPreview = replyPreview
     }
 
     public var body: some View {
@@ -514,6 +557,22 @@ public struct MessageRow: View {
                         .font(.callout.italic())
                         .foregroundStyle(.secondary)
                 }
+                if let replyPreview {
+                    HStack(spacing: StoatSpacing.xSmall) {
+                        Image(systemName: "arrowshape.turn.up.left")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        Text(replyPreview)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .padding(.horizontal, StoatSpacing.small)
+                    .padding(.vertical, StoatSpacing.xxSmall)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+                    .accessibilityLabel(StoatAccessibility.replyPreviewLabel(replyPreview))
+                }
                 if let content = message.content, !content.isEmpty {
                     Text(content)
                         .font(StoatTypography.messageBody)
@@ -546,9 +605,15 @@ public struct MessageRow: View {
             }
         }
         .padding(.vertical, showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall)
-        .background(isSelected ? Color.accentColor.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
+        .background(isSelected || isFocused ? Color.accentColor.opacity(isFocused ? 0.16 : 0.10) : Color.clear, in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
+        .overlay {
+            if isFocused {
+                RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous)
+                    .strokeBorder(Color.accentColor.opacity(0.45), lineWidth: 1)
+            }
+        }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: message.reactions.values.reduce(0) { $0 + $1.count }, status: statusText, isSelected: isSelected))
+        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: message.reactions.values.reduce(0) { $0 + $1.count }, status: statusText, isSelected: isSelected, isFocused: isFocused, replyPreview: replyPreview))
     }
 
     private var authorName: String {

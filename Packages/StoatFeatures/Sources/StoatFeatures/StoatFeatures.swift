@@ -406,14 +406,14 @@ public final class MainShellViewModel {
     public var composerFocusRequestID = 0
     public var focusTarget: ShellFocusTarget?
     public var previousFocusTarget: ShellFocusTarget?
-    public var composerDrafts: [ChannelID: String] = [:]
+    public var composerDrafts: [ChannelID: ComposerDraftState] = [:]
     public var composerError: String?
     public var editingDraft: EditingMessageDraft?
     public var inlineEditState: InlineEditState?
     public var pendingDeletion: TimelineMessage?
     public var timelineSelection = TimelineSelection()
+    public var timelineViewport = TimelineViewportState()
     public var localReadStates: [ChannelID: LocalReadState] = [:]
-    public var scrollTargetMessageID: MessageID?
     public var messageActionStatus: String?
     public var isCredentialSetupPresented = false
     public var isTestSendConfirmationPresented = false
@@ -422,16 +422,20 @@ public final class MainShellViewModel {
     public var reduceGlassIntensity = false
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
+    @ObservationIgnored public var channelAckSender: any ChannelAckSending
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
     @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
+    @ObservationIgnored private var ackTask: Task<Void, Never>?
     @ObservationIgnored private var activeTypingChannelID: ChannelID?
     @ObservationIgnored private var lastTypingBeginAt: [ChannelID: Date] = [:]
+    @ObservationIgnored private var lastAckedMessageByChannelID: [ChannelID: MessageID] = [:]
     @ObservationIgnored private var locallyClearedUnreadChannelIDs: Set<ChannelID> = []
     @ObservationIgnored private var restoredLiveConnectionGeneration: Int?
     @ObservationIgnored private var previousSnapshot = RealtimeSnapshot()
     @ObservationIgnored private let selectionRestorer = ShellSelectionRestorer()
     @ObservationIgnored private let navigationHelper = ShellNavigationHelper()
+    @ObservationIgnored private let viewportReducer = TimelineViewportReducer()
 
     public init(
         selection: ShellSelection = ShellSelection(),
@@ -444,7 +448,8 @@ public final class MainShellViewModel {
         sessionCoordinator: AppSessionCoordinator? = nil,
         snapshotSource: (any ShellSnapshotSource)? = nil,
         messageController: ChannelMessageController? = nil,
-        messageActionHandler: (any MessageActionHandling)? = nil
+        messageActionHandler: (any MessageActionHandling)? = nil,
+        channelAckSender: (any ChannelAckSending)? = nil
     ) {
         self.selection = selection
         self.snapshot = snapshot
@@ -456,6 +461,7 @@ public final class MainShellViewModel {
         self.sessionCoordinator = sessionCoordinator
         self.messageController = messageController ?? ChannelMessageController(runtimeMode: runtimeMode, currentUserID: currentUser?.id ?? MockShellData.currentUserID)
         self.messageActionHandler = messageActionHandler ?? MockMessageActionHandler(currentUserID: currentUser?.id ?? MockShellData.currentUserID)
+        self.channelAckSender = channelAckSender ?? NoopChannelAckSender()
         self.previousSnapshot = snapshot
         self.quickSwitcherViewModel = QuickSwitcherViewModel(snapshot: snapshot, selection: selection)
         self.quickSwitcherViewModel = QuickSwitcherViewModel(
@@ -475,6 +481,7 @@ public final class MainShellViewModel {
         snapshotObservationTask?.cancel()
         selectedChannelLoadTask?.cancel()
         typingEndTask?.cancel()
+        ackTask?.cancel()
     }
 
     public var servers: [Server] {
@@ -626,6 +633,7 @@ public final class MainShellViewModel {
         selection.channelID = firstVisibleTextChannel(in: id)?.id
         selection.dmChannelID = nil
         clearTimelineSelection()
+        updateViewportForSelectedChannel()
         placeholderStatus = nil
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
@@ -658,6 +666,7 @@ public final class MainShellViewModel {
             selection.dmChannelID = id
         }
         clearTimelineSelection()
+        updateViewportForSelectedChannel()
         placeholderStatus = nil
         requestFocus(.timeline)
         acknowledgeSelectedChannel()
@@ -844,6 +853,7 @@ public final class MainShellViewModel {
         snapshot = sessionCoordinator.snapshot
         messageActionHandler = sessionCoordinator.messageActionHandler
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
+        channelAckSender = liveAPIClient.map { LiveChannelAckSender(apiClient: $0) } ?? NoopChannelAckSender()
         messageController.configure(
             runtimeMode: sessionCoordinator.mode,
             apiClient: liveAPIClient,
@@ -876,13 +886,45 @@ public final class MainShellViewModel {
 
     public func draft(for channelID: ChannelID?) -> String {
         guard let channelID else { return "" }
-        return composerDrafts[channelID, default: ""]
+        return composerDraftState(for: channelID).text
     }
 
     public func updateDraft(_ draft: String, for channelID: ChannelID?) {
         guard let channelID else { return }
-        composerDrafts[channelID] = draft
+        var state = composerDraftState(for: channelID)
+        state.text = draft
+        composerDrafts[channelID] = state
         scheduleTyping(for: channelID, draft: draft)
+    }
+
+    public func composerDraftState(for channelID: ChannelID?) -> ComposerDraftState {
+        guard let channelID else {
+            return ComposerDraftState(channelID: "")
+        }
+        return composerDrafts[channelID] ?? ComposerDraftState(channelID: channelID)
+    }
+
+    public func replyContext(for channelID: ChannelID?) -> ReplyContext? {
+        composerDraftState(for: channelID).replyContext
+    }
+
+    public func updateReplyMentionPreference(_ shouldMention: Bool, for channelID: ChannelID?) {
+        guard let channelID else { return }
+        var state = composerDraftState(for: channelID)
+        state.shouldMentionReplyAuthor = shouldMention
+        composerDrafts[channelID] = state
+    }
+
+    public func cancelReply(for channelID: ChannelID?) {
+        guard let channelID else { return }
+        var state = composerDraftState(for: channelID)
+        state.replyContext = nil
+        state.shouldMentionReplyAuthor = true
+        composerDrafts[channelID] = state
+        if timelineSelection.focus.mode == .replying {
+            timelineSelection.focus.mode = timelineSelection.messageID == nil ? .none : .selected
+        }
+        requestFocus(.composer)
     }
 
     public func composerReadiness(for channelID: ChannelID?) -> (canSend: Bool, reason: String) {
@@ -972,6 +1014,34 @@ public final class MainShellViewModel {
         return permissions.contains(.manageMessages)
     }
 
+    public func canReply(to timelineMessage: TimelineMessage) -> Bool {
+        guard timelineMessage.status == .confirmed else { return false }
+        guard timelineMessage.message.system == nil else { return false }
+        guard snapshot.channelsByID[timelineMessage.message.channelID] != nil else { return false }
+        return isRuntimeSendCapable
+    }
+
+    public func beginReply(to timelineMessage: TimelineMessage, source: MessageFocusSource = .keyboard) {
+        guard canReply(to: timelineMessage) else {
+            placeholderStatus = "Selected message cannot be replied to."
+            return
+        }
+        let author = snapshot.usersByID[timelineMessage.message.authorID]
+        let authorName = timelineMessage.message.masquerade?.name ?? author?.displayName ?? author?.username ?? timelineMessage.message.authorID.rawValue
+        var draftState = composerDraftState(for: timelineMessage.message.channelID)
+        draftState.replyContext = ReplyContext(
+            channelID: timelineMessage.message.channelID,
+            messageID: timelineMessage.message.id,
+            authorDisplayName: authorName,
+            contentPreview: Self.replyPreviewText(for: timelineMessage.message)
+        )
+        draftState.shouldMentionReplyAuthor = true
+        composerDrafts[timelineMessage.message.channelID] = draftState
+        timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: source, mode: .replying)
+        timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: timelineMessage.message.id, reason: .jumpCommand)
+        focusComposer()
+    }
+
     public func sendDraft(for channelID: ChannelID?) async {
         guard let channelID else { return }
         let readiness = composerReadiness(for: channelID)
@@ -980,21 +1050,28 @@ public final class MainShellViewModel {
             return
         }
         let content = draft(for: channelID).trimmingCharacters(in: .whitespacesAndNewlines)
-        composerDrafts[channelID] = ""
+        let draftState = composerDraftState(for: channelID)
+        let replies = draftState.replyContext.map { [MessageReply(id: $0.messageID, mention: draftState.shouldMentionReplyAuthor)] }
+        composerDrafts[channelID] = ComposerDraftState(channelID: channelID)
         composerError = nil
-        if await messageController.sendMessage(channelID: channelID, content: content, handler: messageActionHandler) {
+        if await messageController.sendMessage(channelID: channelID, content: content, replies: replies, handler: messageActionHandler) {
             acknowledgeSelectedChannel()
         }
     }
 
     public func retry(_ timelineMessage: TimelineMessage) async {
         messageController.markRetryStarted(timelineMessage)
+        timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: .keyboard, mode: .failedRecovery)
+        timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: timelineMessage.message.id, reason: .retrySend)
         _ = await messageController.retrySend(timelineMessage, handler: messageActionHandler)
+        reconcileTimelineSelection()
     }
 
     public func loadOlderSelectedMessages() async {
         guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        let previousOldest = selectedTimelineMessages.first?.message.id
         await messageController.loadOlderMessages(channelID: channelID)
+        timelineViewport = viewportReducer.preserveAfterPrepend(timelineViewport, previousOldestID: previousOldest)
     }
 
     public func beginEditing(_ timelineMessage: TimelineMessage) {
@@ -1007,7 +1084,8 @@ public final class MainShellViewModel {
             draftContent: content
         )
         editingDraft = EditingMessageDraft(message: timelineMessage.message, content: content)
-        timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id)
+        timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: .keyboard, mode: .editing)
+        timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: timelineMessage.message.id, reason: .jumpCommand)
         requestFocus(.inlineEdit)
     }
 
@@ -1027,7 +1105,9 @@ public final class MainShellViewModel {
             messageController.discardLocalMessage(localFailed)
             inlineEditState = nil
             editingDraft = nil
-            composerDrafts[editState.channelID] = editState.draftContent
+            var draftState = composerDraftState(for: editState.channelID)
+            draftState.text = editState.draftContent
+            composerDrafts[editState.channelID] = draftState
             await sendDraft(for: editState.channelID)
             requestFocus(.timeline)
             return
@@ -1044,6 +1124,7 @@ public final class MainShellViewModel {
             )
             messageController.applyEditedMessage(edited)
             reconcileTimelineSelection(replacementHint: edited.id)
+            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: edited.id, reason: .editComplete)
             inlineEditState = nil
             self.editingDraft = nil
             messageActionStatus = nil
@@ -1115,7 +1196,8 @@ public final class MainShellViewModel {
             draftContent: content
         )
         editingDraft = EditingMessageDraft(message: timelineMessage.message, content: content)
-        timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id)
+        timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: .keyboard, mode: .failedRecovery)
+        timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: timelineMessage.message.id, reason: .retrySend)
         requestFocus(.inlineEdit)
     }
 
@@ -1177,6 +1259,13 @@ public final class MainShellViewModel {
         if let content = message.content, !content.isEmpty { return content }
         if let system = message.system?.content, !system.isEmpty { return system }
         return ""
+    }
+
+    public static func replyPreviewText(for message: Message, maxLength: Int = 96) -> String {
+        let raw = copyableContent(for: message).trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = raw.isEmpty ? "Message" : raw
+        guard fallback.count > maxLength else { return fallback }
+        return String(fallback.prefix(maxLength)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
     }
 
     public var isDeveloperControlsEnabled: Bool {
@@ -1285,9 +1374,10 @@ public final class MainShellViewModel {
             placeholderStatus = "No message to select."
             return
         }
-        timelineSelection = TimelineSelection(channelID: newest.message.channelID, messageID: newest.message.id)
-        scrollTargetMessageID = newest.message.id
+        timelineSelection = TimelineSelection(channelID: newest.message.channelID, messageID: newest.message.id, source: .scrollJump)
+        timelineViewport = viewportReducer.jumpNewest(timelineViewport, newestMessageID: newest.message.id)
         requestFocus(.timeline)
+        acknowledgeSelectedChannel()
     }
 
     public func jumpToFirstUnreadMessage() {
@@ -1299,11 +1389,11 @@ public final class MainShellViewModel {
         guard let unreadID = firstUnreadMessageID(for: activeChannelID),
               selectedTimelineMessages.contains(where: { $0.message.id == unreadID })
         else {
-            placeholderStatus = "No unread marker in this channel."
+            placeholderStatus = firstUnreadMessageID(for: activeChannelID) == nil ? "No unread marker in this channel." : "Unread message is not loaded."
             return
         }
-        timelineSelection = TimelineSelection(channelID: activeChannelID, messageID: unreadID)
-        scrollTargetMessageID = unreadID
+        timelineSelection = TimelineSelection(channelID: activeChannelID, messageID: unreadID, source: .scrollJump)
+        timelineViewport = viewportReducer.jumpFirstUnread(timelineViewport, unreadMessageID: unreadID, loadedMessageIDs: Set(selectedTimelineMessages.map(\.message.id)))
         requestFocus(.timeline)
     }
 
@@ -1314,6 +1404,30 @@ public final class MainShellViewModel {
 
     public func clearTimelineSelection() {
         timelineSelection = TimelineSelection()
+    }
+
+    public func updateViewportForSelectedChannel() {
+        let channelID = selection.channelID ?? selection.dmChannelID
+        timelineViewport = viewportReducer.channelSelected(
+            channelID: channelID,
+            messages: selectedTimelineMessages,
+            firstUnreadMessageID: channelID.flatMap { firstUnreadMessageID(for: $0) }
+        )
+    }
+
+    public func consumeScrollIntent() {
+        timelineViewport.pendingScrollIntent = nil
+    }
+
+    public func updateTimelineAtNewest(_ isAtNewest: Bool) {
+        timelineViewport.isAtNewest = isAtNewest
+        if isAtNewest {
+            timelineViewport.hasNewerMessagesIndicator = false
+            if let channelID = selection.channelID ?? selection.dmChannelID {
+                acknowledgeSelectedChannel()
+                scheduleLiveAckIfNeeded(channelID: channelID)
+            }
+        }
     }
 
     public func reconcileTimelineSelection(deletedHint: MessageID? = nil, replacementHint: MessageID? = nil) {
@@ -1336,7 +1450,10 @@ public final class MainShellViewModel {
         } else {
             fallback = messages.last
         }
-        timelineSelection = TimelineSelection(channelID: activeChannelID, messageID: fallback?.message.id)
+        timelineSelection = TimelineSelection(channelID: activeChannelID, messageID: fallback?.message.id, source: .realtimeFallback)
+        if let messageID = fallback?.message.id {
+            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: messageID, reason: .deleteFallback)
+        }
     }
 
     public func copySelectedMessage() {
@@ -1557,6 +1674,9 @@ public final class MainShellViewModel {
         selectedChannelLoadTask = Task { [weak self] in
             guard let self else { return }
             await self.messageController.loadInitialIfNeeded(channelID: channelID, snapshotMessages: snapshotMessages)
+            if self.timelineViewport.channelID != channelID || self.timelineViewport.pendingScrollIntent == nil {
+                self.updateViewportForSelectedChannel()
+            }
         }
     }
 
@@ -1576,6 +1696,36 @@ public final class MainShellViewModel {
         messageController.moveUnreadMarker(channelID: channelID, messageID: firstUnread)
         messageController.markRead(channelID: channelID, lastReadMessageID: newest)
         locallyClearedUnreadChannelIDs.insert(channelID)
+        scheduleLiveAckIfNeeded(channelID: channelID)
+    }
+
+    private func scheduleLiveAckIfNeeded(channelID: ChannelID) {
+        guard effectiveRuntimeMode == .liveManual,
+              effectiveSessionState == .connected,
+              timelineViewport.isAtNewest,
+              let messageID = messageController.state(for: channelID).timelineMessages.last?.message.id ?? snapshot.unreadsByChannelID[channelID]?.lastMessageID,
+              lastAckedMessageByChannelID[channelID] != messageID
+        else {
+            return
+        }
+        ackTask?.cancel()
+        ackTask = Task { [weak self, sender = channelAckSender] in
+            try? await Task.sleep(for: .milliseconds(1500))
+            do {
+                try await sender.ackChannel(channelID: channelID, messageID: messageID)
+                await MainActor.run {
+                    self?.lastAckedMessageByChannelID[channelID] = messageID
+                    if var state = self?.localReadStates[channelID] {
+                        state.mentionCount = 0
+                        self?.localReadStates[channelID] = state
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self?.messageActionStatus = "Read acknowledgement failed: \(error.userFacingMessage)"
+                }
+            }
+        }
     }
 
     private func scheduleTyping(for channelID: ChannelID, draft: String) {
@@ -1617,7 +1767,7 @@ public final class MainShellViewModel {
 extension MainShellViewModel: AppCommandHandling {
     public func canPerform(_ command: AppCommand) -> Bool {
         switch command {
-        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover:
+        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover, .focusTimeline:
             return true
         case .focusComposer:
             return selectedChannel != nil || selection.dmChannelID != nil
@@ -1650,6 +1800,10 @@ extension MainShellViewModel: AppCommandHandling {
         case .jumpToFirstUnreadMessage:
             guard let channelID = selection.channelID ?? selection.dmChannelID else { return false }
             return !isTextEntryFocused && firstUnreadMessageID(for: channelID) != nil
+        case .replyToSelectedMessage:
+            return !isTextEntryFocused && selectedTimelineMessage.map { canReply(to: $0) } == true
+        case .cancelReply:
+            return replyContext(for: selection.channelID ?? selection.dmChannelID) != nil
         case .copySelectedMessage:
             return !isTextEntryFocused && selectedTimelineMessage != nil
         case .copySelectedMessageID:
@@ -1690,10 +1844,12 @@ extension MainShellViewModel: AppCommandHandling {
             return "That channel is unavailable."
         case .selectNextChannel, .selectPreviousChannel, .selectNextUnreadChannel, .selectPreviousUnreadChannel, .selectNextMessage, .selectPreviousMessage, .jumpToNewestMessage, .jumpToFirstUnreadMessage:
             return isTextEntryFocused ? "Keyboard navigation is paused while typing." : "No selectable target."
-        case .copySelectedMessage, .copySelectedMessageID, .editSelectedMessage, .deleteSelectedMessage, .reactToSelectedMessage, .retrySelectedMessage, .discardSelectedFailedMessage, .editAndRetrySelectedFailedMessage, .pinOrUnpinSelectedMessage:
+        case .copySelectedMessage, .copySelectedMessageID, .editSelectedMessage, .deleteSelectedMessage, .reactToSelectedMessage, .retrySelectedMessage, .discardSelectedFailedMessage, .editAndRetrySelectedFailedMessage, .pinOrUnpinSelectedMessage, .replyToSelectedMessage:
             if isTextEntryFocused { return "Message actions are paused while typing." }
             if command == .copySelectedMessageID && !isDeveloperControlsEnabled { return "Developer controls are disabled." }
             return "No compatible message is selected."
+        case .cancelReply:
+            return "No reply is active."
         default:
             return "Unavailable."
         }
@@ -1709,6 +1865,8 @@ extension MainShellViewModel: AppCommandHandling {
             showQuickSwitcher()
         case .focusComposer:
             focusComposer()
+        case .focusTimeline:
+            requestFocus(.timeline)
         case .refresh:
             refreshCurrentContext()
         case .reconnect:
@@ -1759,6 +1917,12 @@ extension MainShellViewModel: AppCommandHandling {
             jumpToNewestMessage()
         case .jumpToFirstUnreadMessage:
             jumpToFirstUnreadMessage()
+        case .replyToSelectedMessage:
+            if let selectedTimelineMessage {
+                beginReply(to: selectedTimelineMessage)
+            }
+        case .cancelReply:
+            cancelReply(for: selection.channelID ?? selection.dmChannelID)
         case .copySelectedMessage:
             copySelectedMessage()
         case .copySelectedMessageID:
@@ -2758,10 +2922,15 @@ public struct ChatPlaceholderView: View {
             if let channel = viewModel.selectedChannel {
                 let sendReadiness = viewModel.composerReadiness(for: channel.id)
                 let inputReadiness = viewModel.composerInputReadiness(for: channel.id)
+                let draftState = viewModel.composerDraftState(for: channel.id)
                 GlassComposer(
                     text: Binding(
                         get: { viewModel.draft(for: channel.id) },
                         set: { viewModel.updateDraft($0, for: channel.id) }
+                    ),
+                    shouldMentionReplyAuthor: Binding(
+                        get: { viewModel.composerDraftState(for: channel.id).shouldMentionReplyAuthor },
+                        set: { viewModel.updateReplyMentionPreference($0, for: channel.id) }
                     ),
                     placeholder: inputReadiness.isEnabled ? "Message #\(channel.displayName)" : inputReadiness.reason,
                     isEnabled: inputReadiness.isEnabled,
@@ -2769,7 +2938,12 @@ public struct ChatPlaceholderView: View {
                     disabledReason: sendReadiness.canSend ? nil : sendReadiness.reason,
                     isSending: viewModel.messageController.sendingChannelIDs.contains(channel.id),
                     canAttach: viewModel.canUploadFiles(in: channel),
+                    replyAuthor: draftState.replyContext?.authorDisplayName,
+                    replyPreview: draftState.replyContext?.contentPreview,
                     focusRequestID: viewModel.composerFocusRequestID,
+                    onCancelReply: {
+                        viewModel.cancelReply(for: channel.id)
+                    },
                     onSend: {
                         Task { await viewModel.sendDraft(for: channel.id) }
                     }
@@ -2784,6 +2958,7 @@ public struct ChatPlaceholderView: View {
 
 public struct MessageTimelineView: View {
     private let viewModel: MainShellViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(viewModel: MainShellViewModel) {
         self.viewModel = viewModel
@@ -2803,12 +2978,46 @@ public struct MessageTimelineView: View {
                 .padding(StoatSpacing.xLarge)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .onChange(of: viewModel.scrollTargetMessageID) { _, messageID in
-                guard let messageID else { return }
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    proxy.scrollTo(messageID, anchor: .center)
-                }
+            .onChange(of: viewModel.timelineViewport.pendingScrollIntent) { _, intent in
+                guard let intent else { return }
+                performScroll(intent, proxy: proxy)
+                viewModel.consumeScrollIntent()
             }
+        }
+    }
+
+    private func performScroll(_ intent: TimelineScrollIntent, proxy: ScrollViewProxy) {
+        let target: MessageID?
+        let anchor: UnitPoint?
+        switch intent {
+        case let .message(id, scrollAnchor, _):
+            target = id
+            anchor = unitPoint(for: scrollAnchor)
+        case .newest:
+            target = viewModel.selectedTimelineMessages.last?.message.id
+            anchor = .bottom
+        case let .firstUnread(id):
+            target = id
+            anchor = .center
+        case let .preservePositionAfterPrepend(previousOldestID):
+            target = previousOldestID
+            anchor = .top
+        }
+        guard let target else { return }
+        let scroll = { proxy.scrollTo(target, anchor: anchor) }
+        if reduceMotion {
+            scroll()
+        } else {
+            withAnimation(.easeInOut(duration: 0.18), scroll)
+        }
+    }
+
+    private func unitPoint(for anchor: TimelineScrollAnchor) -> UnitPoint? {
+        switch anchor {
+        case .top: .top
+        case .center: .center
+        case .bottom: .bottom
+        case .nearest: nil
         }
     }
 
@@ -2889,7 +3098,22 @@ public struct MessageTimelineView: View {
         ForEach(viewModel.selectedTimelineMessageGroups) { group in
             TimelineMessageGroupView(group: group, author: viewModel.snapshot.usersByID[group.authorID], viewModel: viewModel)
         }
+        newestIndicator
         typingIndicator
+    }
+
+    @ViewBuilder private var newestIndicator: some View {
+        if viewModel.timelineViewport.hasNewerMessagesIndicator {
+            Button {
+                viewModel.jumpToNewestMessage()
+            } label: {
+                Label("Jump to Newest", systemImage: "arrow.down.to.line")
+            }
+            .buttonStyle(GlassButtonStyle())
+            .frame(maxWidth: .infinity)
+            .accessibilityLabel(StoatAccessibility.jumpNewestLabel(hasNewMessages: true))
+            .accessibilityHint("Scrolls to the newest loaded message and marks this channel read locally")
+        }
     }
 
     private var retryButton: some View {
@@ -2977,9 +3201,21 @@ public struct TimelineMessageGroupView: View {
                             author: author,
                             showsHeader: index == 0,
                             statusText: accessibilityStatus(for: timelineMessage),
-                            isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id
+                            isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id,
+                            isFocused: viewModel.timelineSelection.focus.messageID == timelineMessage.message.id && viewModel.timelineSelection.focus.mode != .none,
+                            replyPreview: replyPreview(for: timelineMessage.message)
                         )
                         .id(timelineMessage.message.id)
+                        .onAppear {
+                            if timelineMessage.message.id == viewModel.selectedTimelineMessages.last?.message.id {
+                                viewModel.updateTimelineAtNewest(true)
+                            }
+                        }
+                        .onDisappear {
+                            if timelineMessage.message.id == viewModel.selectedTimelineMessages.last?.message.id {
+                                viewModel.updateTimelineAtNewest(false)
+                            }
+                        }
                         .onTapGesture {
                             select(timelineMessage)
                         }
@@ -2998,6 +3234,12 @@ public struct TimelineMessageGroupView: View {
                                     Button("Edit Message") {
                                         select(timelineMessage)
                                         viewModel.perform(.editSelectedMessage)
+                                    }
+                                }
+                                if viewModel.canReply(to: timelineMessage) {
+                                    Button("Reply") {
+                                        select(timelineMessage, source: .contextMenu)
+                                        viewModel.perform(.replyToSelectedMessage)
                                     }
                                 }
                                 if viewModel.canDelete(timelineMessage) {
@@ -3040,9 +3282,19 @@ public struct TimelineMessageGroupView: View {
         .id(group.id)
     }
 
-    private func select(_ timelineMessage: TimelineMessage) {
-        viewModel.timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id)
+    private func select(_ timelineMessage: TimelineMessage, source: MessageFocusSource = .mouse) {
+        viewModel.timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: source)
         viewModel.requestFocus(.timeline)
+    }
+
+    private func replyPreview(for message: Message) -> String? {
+        guard let replyID = message.replies?.first else { return nil }
+        guard let referenced = viewModel.selectedTimelineMessages.first(where: { $0.message.id == replyID })?.message else {
+            return "Original message unavailable"
+        }
+        let author = viewModel.snapshot.usersByID[referenced.authorID]
+        let authorName = referenced.masquerade?.name ?? author?.displayName ?? author?.username ?? referenced.authorID.rawValue
+        return "\(authorName): \(MainShellViewModel.replyPreviewText(for: referenced))"
     }
 
     @ViewBuilder private func statusView(for timelineMessage: TimelineMessage) -> some View {

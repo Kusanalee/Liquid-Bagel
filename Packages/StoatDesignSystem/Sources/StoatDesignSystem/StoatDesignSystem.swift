@@ -125,13 +125,15 @@ public enum StoatAccessibility {
         return parts.joined(separator: ", ")
     }
 
-    public static func messageLabel(author: String, timestamp: String, content: String, isEdited: Bool = false, isPinned: Bool = false, reactionCount: Int = 0, status: String? = nil, isSelected: Bool = false) -> String {
+    public static func messageLabel(author: String, timestamp: String, content: String, isEdited: Bool = false, isPinned: Bool = false, reactionCount: Int = 0, status: String? = nil, isSelected: Bool = false, isFocused: Bool = false, replyPreview: String? = nil) -> String {
         var parts = [author, timestamp, content.isEmpty ? "message" : content]
+        if let replyPreview, !replyPreview.isEmpty { parts.append("reply to \(replyPreview)") }
         if isEdited { parts.append("edited") }
         if isPinned { parts.append("pinned") }
         if reactionCount > 0 { parts.append(reactionCount == 1 ? "1 reaction" : "\(reactionCount) reactions") }
         if let status, !status.isEmpty { parts.append(status) }
         if isSelected { parts.append("selected") }
+        if isFocused { parts.append("focused") }
         return parts.joined(separator: ", ")
     }
 
@@ -149,9 +151,25 @@ public enum StoatAccessibility {
         return parts.joined(separator: ", ")
     }
 
-    public static func composerLabel(isEnabled: Bool, disabledReason: String?) -> String {
-        if isEnabled { return "Message composer" }
-        return ["Message composer disabled", disabledReason].compactMap { $0 }.joined(separator: ", ")
+    public static func composerLabel(isEnabled: Bool, disabledReason: String?, replyAuthor: String? = nil) -> String {
+        let base = isEnabled ? "Message composer" : "Message composer disabled"
+        return [base, replyAuthor.map { "replying to \($0)" }, isEnabled ? nil : disabledReason].compactMap { $0 }.joined(separator: ", ")
+    }
+
+    public static func replyContextLabel(author: String, preview: String, mentionsAuthor: Bool) -> String {
+        ["Replying to \(author)", preview, mentionsAuthor ? "will mention author" : "will not mention author"].joined(separator: ", ")
+    }
+
+    public static func replyPreviewLabel(_ preview: String) -> String {
+        "Reply preview, \(preview)"
+    }
+
+    public static func jumpNewestLabel(hasNewMessages: Bool) -> String {
+        hasNewMessages ? "Jump to newest messages" : "Jump to newest message"
+    }
+
+    public static func localReadStateLabel() -> String {
+        "Marked read locally"
     }
 
     public static func runtimeLabel(mode: String, connection: String, health: String? = nil) -> String {

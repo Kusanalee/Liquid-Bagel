@@ -207,6 +207,9 @@ public actor MockStoatAPIClient: StoatAPIClient {
         messagesByChannel[channelID]?.removeAll { $0.id == messageID }
     }
 
+    public func ackChannel(channelID: ChannelID, messageID: MessageID) async throws {
+    }
+
     public func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
         guard var messages = messagesByChannel[channelID],
               let index = messages.firstIndex(where: { $0.id == messageID })
@@ -253,4 +256,3 @@ public actor MockStoatAPIClient: StoatAPIClient {
         messagesByChannel[channelID] = messages
     }
 }
-

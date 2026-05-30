@@ -82,6 +82,12 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("u", modifiers: [.command, .shift])
             .disabled(commandHandler?.canPerform(.jumpToFirstUnreadMessage) == false)
+
+            Button("Focus Timeline") {
+                commandHandler?.perform(.focusTimeline)
+            }
+            .keyboardShortcut("t", modifiers: [.command, .option])
+            .disabled(commandHandler?.canPerform(.focusTimeline) == false)
         }
 
         CommandMenu("Message") {
@@ -102,6 +108,18 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("e", modifiers: [.command])
             .disabled(commandHandler?.canPerform(.editSelectedMessage) == false)
+
+            Button("Reply to Message") {
+                commandHandler?.perform(.replyToSelectedMessage)
+            }
+            .keyboardShortcut("r", modifiers: [.command, .option])
+            .disabled(commandHandler?.canPerform(.replyToSelectedMessage) == false)
+
+            Button("Cancel Reply") {
+                commandHandler?.perform(.cancelReply)
+            }
+            .keyboardShortcut(.escape, modifiers: [.command])
+            .disabled(commandHandler?.canPerform(.cancelReply) == false)
 
             Button("Delete Message") {
                 commandHandler?.perform(.deleteSelectedMessage)

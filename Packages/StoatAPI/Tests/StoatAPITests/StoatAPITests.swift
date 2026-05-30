@@ -173,6 +173,23 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(request.url?.path, "/auth/session/logout")
     }
 
+    func testChannelAckEndpointRequestHasNoBody() async throws {
+        let transport = RecordingHTTPTransport(statusCode: 204)
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        try await client.ackChannel(channelID: "channel-1", messageID: "message-1")
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+
+        XCTAssertEqual(request.httpMethod, "PUT")
+        XCTAssertEqual(request.url?.path, "/channels/channel-1/ack/message-1")
+        XCTAssertNil(request.httpBody)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
+    }
+
     func testSessionValidationErrorMapping() {
         XCTAssertEqual(LiveSessionValidator.map(.unauthorized), .invalidOrExpired)
         XCTAssertEqual(LiveSessionValidator.map(.forbidden), .forbidden)
