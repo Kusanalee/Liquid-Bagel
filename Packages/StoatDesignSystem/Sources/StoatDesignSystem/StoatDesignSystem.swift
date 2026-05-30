@@ -125,11 +125,27 @@ public enum StoatAccessibility {
         return parts.joined(separator: ", ")
     }
 
-    public static func messageLabel(author: String, timestamp: String, content: String, isEdited: Bool = false, status: String? = nil, isSelected: Bool = false) -> String {
+    public static func messageLabel(author: String, timestamp: String, content: String, isEdited: Bool = false, isPinned: Bool = false, reactionCount: Int = 0, status: String? = nil, isSelected: Bool = false) -> String {
         var parts = [author, timestamp, content.isEmpty ? "message" : content]
         if isEdited { parts.append("edited") }
+        if isPinned { parts.append("pinned") }
+        if reactionCount > 0 { parts.append(reactionCount == 1 ? "1 reaction" : "\(reactionCount) reactions") }
         if let status, !status.isEmpty { parts.append(status) }
         if isSelected { parts.append("selected") }
+        return parts.joined(separator: ", ")
+    }
+
+    public static func inlineEditLabel(isSaving: Bool, errorMessage: String? = nil) -> String {
+        ["Inline message editor", isSaving ? "saving" : nil, errorMessage].compactMap { $0 }.joined(separator: ", ")
+    }
+
+    public static func failedMessageActionLabel(action: String, error: String? = nil) -> String {
+        [action, "failed message", error].compactMap { $0 }.joined(separator: ", ")
+    }
+
+    public static func reactionLabel(emoji: String, count: Int, hasReacted: Bool) -> String {
+        var parts = ["Reaction \(emoji)", count == 1 ? "1 reaction" : "\(count) reactions"]
+        if hasReacted { parts.append("selected") }
         return parts.joined(separator: ", ")
     }
 

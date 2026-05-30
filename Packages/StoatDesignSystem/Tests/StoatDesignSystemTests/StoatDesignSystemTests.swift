@@ -44,4 +44,15 @@ final class StoatDesignSystemTests: XCTestCase {
         let reducedGlass = StoatMaterialStyle.resolved(reduceTransparency: false, increaseContrast: false, reduceGlassIntensity: true)
         XCTAssertFalse(reducedGlass.usesMaterial)
     }
+
+    func testPhase9AccessibilityHelperText() {
+        let message = StoatAccessibility.messageLabel(author: "A", timestamp: "now", content: "body", isPinned: true, reactionCount: 3, status: "failed", isSelected: true)
+        XCTAssertTrue(message.contains("pinned"))
+        XCTAssertTrue(message.contains("3 reactions"))
+        XCTAssertTrue(message.contains("failed"))
+        XCTAssertTrue(message.contains("selected"))
+
+        XCTAssertEqual(StoatAccessibility.reactionLabel(emoji: "👍", count: 2, hasReacted: false), "Reaction 👍, 2 reactions")
+        XCTAssertTrue(StoatAccessibility.inlineEditLabel(isSaving: false, errorMessage: "Edit failed").contains("Edit failed"))
+    }
 }

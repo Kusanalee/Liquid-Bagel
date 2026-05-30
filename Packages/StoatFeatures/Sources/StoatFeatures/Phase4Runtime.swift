@@ -93,6 +93,7 @@ public enum TimelineMessageStatus: Hashable, Sendable {
     case confirmed
     case pending
     case failed(String)
+    case deleting
 }
 
 public struct TimelineMessage: Hashable, Sendable, Identifiable {
@@ -126,6 +127,304 @@ public enum ChannelMessageState: Equatable, Sendable {
 
     public var hasMessages: Bool {
         !timelineMessages.isEmpty
+    }
+}
+
+public struct ChannelMessageHistory: Hashable, Sendable {
+    public var channelID: ChannelID
+    public var messages: [TimelineMessage]
+    public var hasMoreBefore: Bool
+    public var isLoadingInitial: Bool
+    public var isLoadingOlder: Bool
+    public var lastLoadedAt: Date?
+    public var firstUnreadMessageID: MessageID?
+    public var newestMessageID: MessageID?
+    public var errorMessage: String?
+
+    public init(
+        channelID: ChannelID,
+        messages: [TimelineMessage] = [],
+        hasMoreBefore: Bool = false,
+        isLoadingInitial: Bool = false,
+        isLoadingOlder: Bool = false,
+        lastLoadedAt: Date? = nil,
+        firstUnreadMessageID: MessageID? = nil,
+        newestMessageID: MessageID? = nil,
+        errorMessage: String? = nil
+    ) {
+        self.channelID = channelID
+        self.messages = messages
+        self.hasMoreBefore = hasMoreBefore
+        self.isLoadingInitial = isLoadingInitial
+        self.isLoadingOlder = isLoadingOlder
+        self.lastLoadedAt = lastLoadedAt
+        self.firstUnreadMessageID = firstUnreadMessageID
+        self.newestMessageID = newestMessageID
+        self.errorMessage = errorMessage
+    }
+
+    public var state: ChannelMessageState {
+        if isLoadingOlder {
+            return .loadingOlder(messages: messages)
+        }
+        if isLoadingInitial && messages.isEmpty {
+            return .loading
+        }
+        if let errorMessage {
+            return .failed(errorMessage, cachedMessages: messages)
+        }
+        if messages.isEmpty {
+            return isLoadingInitial ? .loading : .empty
+        }
+        return .loaded(messages: messages, hasMoreBefore: hasMoreBefore)
+    }
+}
+
+public struct LocalReadState: Hashable, Sendable {
+    public var channelID: ChannelID
+    public var firstUnreadMessageID: MessageID?
+    public var lastReadMessageID: MessageID?
+    public var unreadCount: Int
+    public var mentionCount: Int
+
+    public init(
+        channelID: ChannelID,
+        firstUnreadMessageID: MessageID? = nil,
+        lastReadMessageID: MessageID? = nil,
+        unreadCount: Int = 0,
+        mentionCount: Int = 0
+    ) {
+        self.channelID = channelID
+        self.firstUnreadMessageID = firstUnreadMessageID
+        self.lastReadMessageID = lastReadMessageID
+        self.unreadCount = unreadCount
+        self.mentionCount = mentionCount
+    }
+}
+
+public struct InlineEditState: Hashable, Sendable {
+    public var channelID: ChannelID
+    public var messageID: MessageID
+    public var originalContent: String
+    public var draftContent: String
+    public var isSaving: Bool
+    public var errorMessage: String?
+
+    public init(
+        channelID: ChannelID,
+        messageID: MessageID,
+        originalContent: String,
+        draftContent: String,
+        isSaving: Bool = false,
+        errorMessage: String? = nil
+    ) {
+        self.channelID = channelID
+        self.messageID = messageID
+        self.originalContent = originalContent
+        self.draftContent = draftContent
+        self.isSaving = isSaving
+        self.errorMessage = errorMessage
+    }
+
+    public var trimmedDraft: String {
+        draftContent.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public var canSave: Bool {
+        !trimmedDraft.isEmpty && trimmedDraft != originalContent.trimmingCharacters(in: .whitespacesAndNewlines) && !isSaving
+    }
+}
+
+public enum ChannelMessageHistoryEvent: Hashable, Sendable {
+    case initialLoadStarted
+    case initialLoadSucceeded(messages: [Message], hasMoreBefore: Bool, loadedAt: Date)
+    case initialLoadFailed(String)
+    case olderLoadStarted
+    case olderLoadSucceeded(messages: [Message], hasMoreBefore: Bool, loadedAt: Date)
+    case olderLoadFailed(String)
+    case snapshotMerged([Message])
+    case optimisticSendCreated(TimelineMessage)
+    case sendConfirmed(message: Message, nonce: String?)
+    case sendFailed(nonce: String, error: String)
+    case retryStarted(messageID: MessageID)
+    case discardLocalMessage(MessageID)
+    case realtimeMessageReceived(Message)
+    case messageUpdated(Message)
+    case messageDeleted(MessageID)
+    case reactionChanged(messageID: MessageID, emoji: String, userID: UserID, isAdding: Bool)
+    case messagePinned(MessageID)
+    case messageUnpinned(MessageID)
+    case unreadMarkerMoved(MessageID?)
+    case channelMarkedRead(lastReadMessageID: MessageID?)
+}
+
+public struct ChannelMessageHistoryReducer: Sendable {
+    public var messageCapPerChannel: Int
+
+    public init(messageCapPerChannel: Int = 250) {
+        self.messageCapPerChannel = messageCapPerChannel
+    }
+
+    public func reduce(_ history: ChannelMessageHistory, event: ChannelMessageHistoryEvent) -> ChannelMessageHistory {
+        var history = history
+        switch event {
+        case .initialLoadStarted:
+            history.isLoadingInitial = true
+            history.errorMessage = nil
+        case let .initialLoadSucceeded(messages, hasMoreBefore, loadedAt):
+            history.messages = merge(current: history.messages, incoming: messages)
+            history.hasMoreBefore = hasMoreBefore
+            history.isLoadingInitial = false
+            history.errorMessage = nil
+            history.lastLoadedAt = loadedAt
+        case let .initialLoadFailed(message):
+            history.isLoadingInitial = false
+            history.errorMessage = message
+        case .olderLoadStarted:
+            history.isLoadingOlder = true
+            history.errorMessage = nil
+        case let .olderLoadSucceeded(messages, hasMoreBefore, loadedAt):
+            history.messages = merge(current: history.messages, incoming: messages)
+            history.hasMoreBefore = hasMoreBefore
+            history.isLoadingOlder = false
+            history.errorMessage = nil
+            history.lastLoadedAt = loadedAt
+        case let .olderLoadFailed(message):
+            history.isLoadingOlder = false
+            history.errorMessage = message
+        case let .snapshotMerged(messages):
+            history.messages = merge(current: history.messages, incoming: messages)
+        case let .optimisticSendCreated(timelineMessage):
+            history.messages = replacingOrAppending(timelineMessage, in: history.messages)
+        case let .sendConfirmed(message, nonce):
+            var messages = history.messages
+            messages.removeAll { timelineMessage in
+                timelineMessage.message.id == message.id || (nonce != nil && timelineMessage.message.nonce == nonce)
+            }
+            messages.append(TimelineMessage(message: message, status: .confirmed))
+            history.messages = sortedCapped(messages)
+        case let .sendFailed(nonce, error):
+            if let index = history.messages.firstIndex(where: { $0.message.nonce == nonce }) {
+                history.messages[index].status = .failed(error)
+            }
+        case let .retryStarted(messageID):
+            if let index = history.messages.firstIndex(where: { $0.message.id == messageID }) {
+                history.messages[index].status = .pending
+            }
+        case let .discardLocalMessage(messageID):
+            history.messages.removeAll { $0.message.id == messageID && $0.status.isLocalOnly }
+        case let .realtimeMessageReceived(message):
+            history.messages = merge(current: history.messages, incoming: [message])
+        case let .messageUpdated(message):
+            history.messages = replacingOrAppending(TimelineMessage(message: message, status: .confirmed), in: history.messages)
+        case let .messageDeleted(messageID):
+            history.messages.removeAll { $0.message.id == messageID }
+            if history.firstUnreadMessageID == messageID {
+                history.firstUnreadMessageID = history.messages.first?.message.id
+            }
+        case let .reactionChanged(messageID, emoji, userID, isAdding):
+            guard let index = history.messages.firstIndex(where: { $0.message.id == messageID }) else { break }
+            if isAdding {
+                history.messages[index].message.reactions[emoji, default: []].insert(userID)
+            } else {
+                history.messages[index].message.reactions[emoji]?.remove(userID)
+                if history.messages[index].message.reactions[emoji]?.isEmpty == true {
+                    history.messages[index].message.reactions.removeValue(forKey: emoji)
+                }
+            }
+        case let .messagePinned(messageID):
+            if let index = history.messages.firstIndex(where: { $0.message.id == messageID }) {
+                history.messages[index].message.pinned = true
+            }
+        case let .messageUnpinned(messageID):
+            if let index = history.messages.firstIndex(where: { $0.message.id == messageID }) {
+                history.messages[index].message.pinned = false
+            }
+        case let .unreadMarkerMoved(messageID):
+            history.firstUnreadMessageID = messageID
+        case let .channelMarkedRead(lastReadMessageID):
+            history.firstUnreadMessageID = nil
+            if let lastReadMessageID {
+                history.newestMessageID = lastReadMessageID
+            }
+        }
+        history.messages = sortedCapped(history.messages)
+        history.newestMessageID = history.messages.last?.message.id
+        if let firstUnreadMessageID = history.firstUnreadMessageID,
+           !history.messages.contains(where: { $0.message.id == firstUnreadMessageID }) {
+            history.firstUnreadMessageID = nil
+        }
+        return history
+    }
+
+    private func merge(current: [TimelineMessage], incoming messages: [Message]) -> [TimelineMessage] {
+        var byID: [MessageID: TimelineMessage] = [:]
+        let incomingNonces = Set(messages.compactMap(\.nonce))
+
+        for timelineMessage in current {
+            switch timelineMessage.status {
+            case .pending, .failed:
+                if let nonce = timelineMessage.message.nonce, incomingNonces.contains(nonce) {
+                    continue
+                }
+                byID[timelineMessage.message.id] = timelineMessage
+            case .confirmed, .deleting:
+                byID[timelineMessage.message.id] = timelineMessage
+            }
+        }
+
+        for message in messages {
+            byID[message.id] = TimelineMessage(message: message, status: .confirmed)
+        }
+
+        return sortedCapped(Array(byID.values))
+    }
+
+    private func replacingOrAppending(_ timelineMessage: TimelineMessage, in messages: [TimelineMessage]) -> [TimelineMessage] {
+        var messages = messages
+        if let index = messages.firstIndex(where: { $0.message.id == timelineMessage.message.id }) {
+            messages[index] = timelineMessage
+        } else if let nonce = timelineMessage.message.nonce,
+                  let index = messages.firstIndex(where: { $0.message.nonce == nonce }) {
+            messages[index] = timelineMessage
+        } else {
+            messages.append(timelineMessage)
+        }
+        return sortedCapped(messages)
+    }
+
+    private func sortedCapped(_ messages: [TimelineMessage]) -> [TimelineMessage] {
+        let sorted = messages.sorted { lhs, rhs in
+            if lhs.message.id == rhs.message.id { return false }
+            return Self.messageIDChronologicalSort(lhs.message.id, rhs.message.id)
+        }
+        guard sorted.count > messageCapPerChannel else { return sorted }
+        let local = sorted.filter(\.status.isLocalOnly)
+        let confirmed = sorted.filter { !$0.status.isLocalOnly }
+        let keptConfirmedCount = max(0, messageCapPerChannel - local.count)
+        return (Array(confirmed.suffix(keptConfirmedCount)) + local).sorted {
+            Self.messageIDChronologicalSort($0.message.id, $1.message.id)
+        }
+    }
+
+    public static func messageIDChronologicalSort(_ lhs: MessageID, _ rhs: MessageID) -> Bool {
+        let lhsDate = Message.dateFromULID(lhs.rawValue) ?? (lhs.rawValue.hasPrefix("pending-") ? .distantFuture : .distantPast)
+        let rhsDate = Message.dateFromULID(rhs.rawValue) ?? (rhs.rawValue.hasPrefix("pending-") ? .distantFuture : .distantPast)
+        if lhsDate == rhsDate {
+            return lhs.rawValue < rhs.rawValue
+        }
+        return lhsDate < rhsDate
+    }
+}
+
+public extension TimelineMessageStatus {
+    var isLocalOnly: Bool {
+        switch self {
+        case .pending, .failed:
+            return true
+        case .confirmed, .deleting:
+            return false
+        }
     }
 }
 
@@ -189,6 +488,8 @@ public protocol MessageActionHandling: Sendable {
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws
     func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws
     func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws
+    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws
+    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws
     func beginTyping(channelID: ChannelID) async throws
     func endTyping(channelID: ChannelID) async throws
 }
@@ -199,6 +500,8 @@ public actor MockMessageActionHandler: MessageActionHandling {
     public private(set) var deletedMessages: [(ChannelID, MessageID)] = []
     public private(set) var addedReactions: [(ChannelID, MessageID, String)] = []
     public private(set) var removedReactions: [(ChannelID, MessageID, String)] = []
+    public private(set) var pinnedMessages: [(ChannelID, MessageID)] = []
+    public private(set) var unpinnedMessages: [(ChannelID, MessageID)] = []
     public private(set) var typingEvents: [ClientGatewayEvent] = []
 
     private let currentUserID: UserID
@@ -245,6 +548,14 @@ public actor MockMessageActionHandler: MessageActionHandling {
 
     public func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
         removedReactions.append((channelID, messageID, emoji))
+    }
+
+    public func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        pinnedMessages.append((channelID, messageID))
+    }
+
+    public func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        unpinnedMessages.append((channelID, messageID))
     }
 
     public func beginTyping(channelID: ChannelID) async throws {
@@ -297,6 +608,14 @@ public actor LiveMessageActionHandler: MessageActionHandling {
         try await apiClient.removeReaction(channelID: channelID, messageID: messageID, emoji: emoji, removeAll: false)
     }
 
+    public func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        try await apiClient.pinMessage(channelID: channelID, messageID: messageID)
+    }
+
+    public func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        try await apiClient.unpinMessage(channelID: channelID, messageID: messageID)
+    }
+
     public func beginTyping(channelID: ChannelID) async throws {
         try await realtimeClient.send(.beginTyping(channel: channelID))
     }
@@ -333,6 +652,14 @@ public actor UnavailableMessageActionHandler: MessageActionHandling {
         throw MessageActionError.unavailable(message)
     }
 
+    public func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        throw MessageActionError.unavailable(message)
+    }
+
+    public func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        throw MessageActionError.unavailable(message)
+    }
+
     public func beginTyping(channelID: ChannelID) async throws {
         throw MessageActionError.unavailable(message)
     }
@@ -346,6 +673,7 @@ public actor UnavailableMessageActionHandler: MessageActionHandling {
 @Observable
 public final class ChannelMessageController {
     public private(set) var statesByChannelID: [ChannelID: ChannelMessageState]
+    public private(set) var historiesByChannelID: [ChannelID: ChannelMessageHistory]
     public private(set) var sendingChannelIDs: Set<ChannelID>
     public private(set) var lastErrorByChannelID: [ChannelID: String]
 
@@ -354,6 +682,7 @@ public final class ChannelMessageController {
     @ObservationIgnored private var currentUserID: UserID?
     @ObservationIgnored private let pageSize: Int
     @ObservationIgnored private let messageCapPerChannel: Int
+    @ObservationIgnored private var reducer: ChannelMessageHistoryReducer
     @ObservationIgnored private var loadTokens: [ChannelID: UUID] = [:]
 
     public init(
@@ -368,7 +697,9 @@ public final class ChannelMessageController {
         self.currentUserID = currentUserID
         self.pageSize = pageSize
         self.messageCapPerChannel = messageCapPerChannel
+        self.reducer = ChannelMessageHistoryReducer(messageCapPerChannel: messageCapPerChannel)
         self.statesByChannelID = [:]
+        self.historiesByChannelID = [:]
         self.sendingChannelIDs = []
         self.lastErrorByChannelID = [:]
     }
@@ -381,6 +712,7 @@ public final class ChannelMessageController {
 
     public func reset() {
         statesByChannelID.removeAll()
+        historiesByChannelID.removeAll()
         sendingChannelIDs.removeAll()
         lastErrorByChannelID.removeAll()
         loadTokens.removeAll()
@@ -388,7 +720,7 @@ public final class ChannelMessageController {
 
     public func state(for channelID: ChannelID?) -> ChannelMessageState {
         guard let channelID else { return .idle }
-        return statesByChannelID[channelID] ?? .idle
+        return historiesByChannelID[channelID]?.state ?? statesByChannelID[channelID] ?? .idle
     }
 
     public func hydrate(from snapshot: RealtimeSnapshot) {
@@ -398,7 +730,7 @@ public final class ChannelMessageController {
     }
 
     public func loadInitialIfNeeded(channelID: ChannelID, snapshotMessages: [Message]) async {
-        if case .loaded = statesByChannelID[channelID], !snapshotMessages.isEmpty {
+        if case .loaded = state(for: channelID), !snapshotMessages.isEmpty {
             mergeSnapshotMessages(snapshotMessages, channelID: channelID)
             return
         }
@@ -410,24 +742,25 @@ public final class ChannelMessageController {
         loadTokens[channelID] = token
 
         if shouldUseLiveAPI, let apiClient {
-            let cached = merge(current: state(for: channelID).timelineMessages, incoming: snapshotMessages)
-            statesByChannelID[channelID] = cached.isEmpty ? .loading : .loaded(messages: cached, hasMoreBefore: true)
+            mergeSnapshotMessages(snapshotMessages, channelID: channelID)
+            apply(.initialLoadStarted, channelID: channelID)
+            var cachedHistory = history(for: channelID)
+            cachedHistory.hasMoreBefore = true
+            setHistory(cachedHistory)
             do {
                 let fetched = try await apiClient.fetchMessages(channelID: channelID, before: nil, after: nil, limit: pageSize)
                 guard loadTokens[channelID] == token else { return }
-                let merged = merge(current: cached, incoming: fetched)
-                statesByChannelID[channelID] = merged.isEmpty ? .empty : .loaded(messages: merged, hasMoreBefore: fetched.count >= pageSize)
+                apply(.initialLoadSucceeded(messages: fetched, hasMoreBefore: fetched.count >= pageSize, loadedAt: Date()), channelID: channelID)
                 lastErrorByChannelID[channelID] = nil
             } catch {
                 guard loadTokens[channelID] == token else { return }
-                statesByChannelID[channelID] = .failed(error.userFacingMessage, cachedMessages: cached)
+                apply(.initialLoadFailed(error.userFacingMessage), channelID: channelID)
                 lastErrorByChannelID[channelID] = error.userFacingMessage
             }
             return
         }
 
-        let merged = merge(current: state(for: channelID).timelineMessages, incoming: snapshotMessages)
-        statesByChannelID[channelID] = merged.isEmpty ? .empty : .loaded(messages: merged, hasMoreBefore: false)
+        apply(.initialLoadSucceeded(messages: snapshotMessages, hasMoreBefore: false, loadedAt: Date()), channelID: channelID)
     }
 
     public func loadOlderMessages(channelID: ChannelID) async {
@@ -437,29 +770,28 @@ public final class ChannelMessageController {
 
         let token = UUID()
         loadTokens[channelID] = token
-        statesByChannelID[channelID] = .loadingOlder(messages: current)
+        apply(.olderLoadStarted, channelID: channelID)
 
         do {
             let fetched = try await apiClient.fetchMessages(channelID: channelID, before: before, after: nil, limit: pageSize)
             guard loadTokens[channelID] == token else { return }
-            let merged = merge(current: current, incoming: fetched)
-            statesByChannelID[channelID] = merged.isEmpty ? .empty : .loaded(messages: merged, hasMoreBefore: fetched.count >= pageSize)
+            apply(.olderLoadSucceeded(messages: fetched, hasMoreBefore: fetched.count >= pageSize, loadedAt: Date()), channelID: channelID)
             lastErrorByChannelID[channelID] = nil
         } catch {
             guard loadTokens[channelID] == token else { return }
-            statesByChannelID[channelID] = .failed(error.userFacingMessage, cachedMessages: current)
+            apply(.olderLoadFailed(error.userFacingMessage), channelID: channelID)
             lastErrorByChannelID[channelID] = error.userFacingMessage
         }
     }
 
     public func refreshMessages(channelID: ChannelID, snapshotMessages: [Message]) async {
-        statesByChannelID[channelID] = .loading
+        apply(.initialLoadStarted, channelID: channelID)
         await loadInitialMessages(channelID: channelID, snapshotMessages: snapshotMessages)
     }
 
     public func sendMessage(channelID: ChannelID, content: String, handler: any MessageActionHandling) async -> Bool {
         guard let currentUserID else {
-            statesByChannelID[channelID] = .failed(MessageActionError.missingCurrentUser.userFacingMessage, cachedMessages: state(for: channelID).timelineMessages)
+            apply(.initialLoadFailed(MessageActionError.missingCurrentUser.userFacingMessage), channelID: channelID)
             return false
         }
 
@@ -474,18 +806,18 @@ public final class ChannelMessageController {
             ),
             status: .pending
         )
-        replaceOrAppend(pending, channelID: channelID)
+        apply(.optimisticSendCreated(pending), channelID: channelID)
         sendingChannelIDs.insert(channelID)
 
         do {
             let confirmed = try await handler.sendMessage(channelID: channelID, content: content, nonce: nonce)
             sendingChannelIDs.remove(channelID)
-            reconcileConfirmedMessage(confirmed, nonce: nonce, channelID: channelID)
+            apply(.sendConfirmed(message: confirmed, nonce: nonce), channelID: channelID)
             lastErrorByChannelID[channelID] = nil
             return true
         } catch {
             sendingChannelIDs.remove(channelID)
-            markPendingFailed(nonce: nonce, channelID: channelID, error: error.userFacingMessage)
+            apply(.sendFailed(nonce: nonce, error: error.userFacingMessage), channelID: channelID)
             lastErrorByChannelID[channelID] = error.userFacingMessage
             return false
         }
@@ -493,48 +825,70 @@ public final class ChannelMessageController {
 
     public func retrySend(_ timelineMessage: TimelineMessage, handler: any MessageActionHandling) async -> Bool {
         guard let content = timelineMessage.message.content else { return false }
-        removeMessage(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id)
+        apply(.discardLocalMessage(timelineMessage.message.id), channelID: timelineMessage.message.channelID)
         return await sendMessage(channelID: timelineMessage.message.channelID, content: content, handler: handler)
     }
 
+    public func markRetryStarted(_ timelineMessage: TimelineMessage) {
+        apply(.retryStarted(messageID: timelineMessage.message.id), channelID: timelineMessage.message.channelID)
+    }
+
+    public func discardLocalMessage(_ timelineMessage: TimelineMessage) {
+        apply(.discardLocalMessage(timelineMessage.message.id), channelID: timelineMessage.message.channelID)
+    }
+
     public func applyEditedMessage(_ message: Message) {
-        replaceOrAppend(TimelineMessage(message: message, status: .confirmed), channelID: message.channelID)
+        apply(.messageUpdated(message), channelID: message.channelID)
     }
 
     public func removeMessage(channelID: ChannelID, messageID: MessageID) {
-        var messages = state(for: channelID).timelineMessages
-        messages.removeAll { $0.message.id == messageID }
-        statesByChannelID[channelID] = messages.isEmpty ? .empty : .loaded(messages: messages, hasMoreBefore: false)
+        apply(.messageDeleted(messageID), channelID: channelID)
     }
 
     public func applyReaction(channelID: ChannelID, messageID: MessageID, emoji: String, userID: UserID, isAdding: Bool) {
-        var messages = state(for: channelID).timelineMessages
-        guard let index = messages.firstIndex(where: { $0.message.id == messageID }) else { return }
-        if isAdding {
-            messages[index].message.reactions[emoji, default: []].insert(userID)
-        } else {
-            messages[index].message.reactions[emoji]?.remove(userID)
-            if messages[index].message.reactions[emoji]?.isEmpty == true {
-                messages[index].message.reactions.removeValue(forKey: emoji)
-            }
-        }
-        statesByChannelID[channelID] = .loaded(messages: sortedCapped(messages), hasMoreBefore: false)
+        apply(.reactionChanged(messageID: messageID, emoji: emoji, userID: userID, isAdding: isAdding), channelID: channelID)
+    }
+
+    public func applyPinState(channelID: ChannelID, messageID: MessageID, isPinned: Bool) {
+        apply(isPinned ? .messagePinned(messageID) : .messageUnpinned(messageID), channelID: channelID)
+    }
+
+    public func moveUnreadMarker(channelID: ChannelID, messageID: MessageID?) {
+        apply(.unreadMarkerMoved(messageID), channelID: channelID)
+    }
+
+    public func markRead(channelID: ChannelID, lastReadMessageID: MessageID?) {
+        apply(.channelMarkedRead(lastReadMessageID: lastReadMessageID), channelID: channelID)
     }
 
     private var shouldUseLiveAPI: Bool {
         runtimeMode == .liveManual && apiClient != nil
     }
 
-    private func mergeSnapshotMessages(_ messages: [Message], channelID: ChannelID) {
-        let merged = merge(current: state(for: channelID).timelineMessages, incoming: messages)
-        guard !merged.isEmpty else { return }
-        let hasMore: Bool
-        if case let .loaded(_, existingHasMore) = statesByChannelID[channelID] {
-            hasMore = existingHasMore
-        } else {
-            hasMore = shouldUseLiveAPI
+    private func history(for channelID: ChannelID) -> ChannelMessageHistory {
+        if let history = historiesByChannelID[channelID] {
+            return history
         }
-        statesByChannelID[channelID] = .loaded(messages: merged, hasMoreBefore: hasMore)
+        return ChannelMessageHistory(channelID: channelID)
+    }
+
+    private func setHistory(_ history: ChannelMessageHistory) {
+        historiesByChannelID[history.channelID] = history
+        statesByChannelID[history.channelID] = history.state
+    }
+
+    private func apply(_ event: ChannelMessageHistoryEvent, channelID: ChannelID) {
+        setHistory(reducer.reduce(history(for: channelID), event: event))
+    }
+
+    private func mergeSnapshotMessages(_ messages: [Message], channelID: ChannelID) {
+        let hadMessages = !state(for: channelID).timelineMessages.isEmpty
+        apply(.snapshotMerged(messages), channelID: channelID)
+        if !hadMessages {
+            var history = history(for: channelID)
+            history.hasMoreBefore = shouldUseLiveAPI
+            setHistory(history)
+        }
     }
 
     private func merge(current: [TimelineMessage], incoming messages: [Message]) -> [TimelineMessage] {
@@ -543,7 +897,7 @@ public final class ChannelMessageController {
 
         for timelineMessage in current {
             switch timelineMessage.status {
-            case .confirmed:
+            case .confirmed, .deleting:
                 byID[timelineMessage.message.id] = timelineMessage
             case .pending, .failed:
                 if let nonce = timelineMessage.message.nonce, incomingNonces.contains(nonce) {

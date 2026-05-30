@@ -28,11 +28,16 @@ public enum AppCommand: Hashable, Sendable {
     case selectNextMessage
     case selectPreviousMessage
     case jumpToNewestMessage
+    case jumpToFirstUnreadMessage
     case copySelectedMessage
+    case copySelectedMessageID
     case editSelectedMessage
     case deleteSelectedMessage
     case reactToSelectedMessage(String)
     case retrySelectedMessage
+    case discardSelectedFailedMessage
+    case editAndRetrySelectedFailedMessage
+    case pinOrUnpinSelectedMessage
     case closeTransientUI
 }
 
@@ -58,6 +63,7 @@ public enum ShellFocusTarget: Hashable, Sendable {
     case serverRail
     case channelList
     case timeline
+    case inlineEdit
     case composer
     case quickSwitcher
     case memberPanel

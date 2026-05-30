@@ -500,6 +500,13 @@ public struct MessageRow: View {
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                         }
+                        if message.isPinned {
+                            Label("Pinned", systemImage: "pin.fill")
+                                .labelStyle(.iconOnly)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .accessibilityLabel("pinned")
+                        }
                     }
                 }
                 if let system = message.system {
@@ -531,6 +538,7 @@ public struct MessageRow: View {
                                 .padding(.horizontal, StoatSpacing.small)
                                 .padding(.vertical, StoatSpacing.xSmall)
                                 .background(Color.primary.opacity(0.07), in: Capsule())
+                                .accessibilityLabel(StoatAccessibility.reactionLabel(emoji: key, count: message.reactions[key]?.count ?? 0, hasReacted: false))
                         }
                     }
                     .padding(.top, StoatSpacing.xSmall)
@@ -540,7 +548,7 @@ public struct MessageRow: View {
         .padding(.vertical, showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall)
         .background(isSelected ? Color.accentColor.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, status: statusText, isSelected: isSelected))
+        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: message.reactions.values.reduce(0) { $0 + $1.count }, status: statusText, isSelected: isSelected))
     }
 
     private var authorName: String {

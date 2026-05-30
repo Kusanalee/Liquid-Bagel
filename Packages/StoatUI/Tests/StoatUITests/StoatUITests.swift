@@ -30,4 +30,15 @@ final class StoatUITests: XCTestCase {
         let channel = StoatAccessibility.channelLabel(name: "voice", isDisabled: true)
         XCTAssertTrue(channel.contains("unavailable"))
     }
+
+    func testPhase9MessageActionAccessibilityHelpers() {
+        let message = StoatAccessibility.messageLabel(author: "Liquid", timestamp: "now", content: "hello", isEdited: true, isPinned: true, reactionCount: 2, status: "selected")
+        XCTAssertTrue(message.contains("edited"))
+        XCTAssertTrue(message.contains("pinned"))
+        XCTAssertTrue(message.contains("2 reactions"))
+
+        XCTAssertTrue(StoatAccessibility.inlineEditLabel(isSaving: true).contains("saving"))
+        XCTAssertTrue(StoatAccessibility.failedMessageActionLabel(action: "Retry", error: "send failed").contains("failed message"))
+        XCTAssertTrue(StoatAccessibility.reactionLabel(emoji: "✅", count: 1, hasReacted: true).contains("selected"))
+    }
 }

@@ -1033,6 +1033,151 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertNil(model.timelineSelection.messageID)
     }
 
+    func testPhase9HistoryReducerReconcilesOptimisticEchoFailureDiscardPinReactionAndCap() {
+        let channelID: ChannelID = "channel"
+        let userID: UserID = "user"
+        let reducer = ChannelMessageHistoryReducer(messageCapPerChannel: 3)
+        var history = ChannelMessageHistory(channelID: channelID)
+        let first = message(id: ulid(milliseconds: 1_000), author: userID, channel: channelID)
+        let second = message(id: ulid(milliseconds: 2_000), author: userID, channel: channelID)
+
+        history = reducer.reduce(history, event: .initialLoadSucceeded(messages: [second, first], hasMoreBefore: true, loadedAt: Date()))
+        XCTAssertEqual(history.messages.map(\.message.id), [first.id, second.id])
+        XCTAssertTrue(history.hasMoreBefore)
+
+        let pending = TimelineMessage(message: Message(id: "pending-nonce", channelID: channelID, authorID: userID, content: "local", nonce: "nonce"), status: .pending)
+        history = reducer.reduce(history, event: .optimisticSendCreated(pending))
+        XCTAssertEqual(history.messages.filter { $0.message.nonce == "nonce" }.count, 1)
+
+        let confirmed = Message(id: MessageID(rawValue: ulid(milliseconds: 3_000)), channelID: channelID, authorID: userID, content: "local", nonce: "nonce")
+        history = reducer.reduce(history, event: .sendConfirmed(message: confirmed, nonce: "nonce"))
+        XCTAssertFalse(history.messages.contains { $0.message.id.rawValue.hasPrefix("pending-") })
+        XCTAssertEqual(history.messages.filter { $0.message.nonce == "nonce" }.count, 1)
+
+        history = reducer.reduce(history, event: .reactionChanged(messageID: confirmed.id, emoji: "👍", userID: userID, isAdding: true))
+        XCTAssertEqual(history.messages.first { $0.message.id == confirmed.id }?.message.reactions["👍"], [userID])
+
+        history = reducer.reduce(history, event: .messagePinned(confirmed.id))
+        XCTAssertEqual(history.messages.first { $0.message.id == confirmed.id }?.message.pinned, true)
+        history = reducer.reduce(history, event: .messageUnpinned(confirmed.id))
+        XCTAssertEqual(history.messages.first { $0.message.id == confirmed.id }?.message.pinned, false)
+
+        history = reducer.reduce(history, event: .sendFailed(nonce: "missing", error: "failed"))
+        let failed = TimelineMessage(message: Message(id: "pending-failed", channelID: channelID, authorID: userID, content: "oops", nonce: "failed"), status: .pending)
+        history = reducer.reduce(history, event: .optimisticSendCreated(failed))
+        history = reducer.reduce(history, event: .sendFailed(nonce: "failed", error: "failed"))
+        XCTAssertTrue(history.messages.contains { if case .failed = $0.status { true } else { false } })
+        history = reducer.reduce(history, event: .discardLocalMessage(failed.message.id))
+        XCTAssertFalse(history.messages.contains { $0.message.id == failed.message.id })
+
+        let fourth = message(id: ulid(milliseconds: 4_000), author: userID, channel: channelID)
+        history = reducer.reduce(history, event: .realtimeMessageReceived(fourth))
+        XCTAssertLessThanOrEqual(history.messages.count, 3)
+        XCTAssertTrue(history.messages.contains { $0.message.id == fourth.id })
+    }
+
+    @MainActor
+    func testPhase9InlineEditStateSavesAndPreservesComposerDraft() async {
+        let handler = MockMessageActionHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        model.selectServer(model.servers[0].id)
+        let channelID = model.selection.channelID!
+        let ownMessage = model.selectedTimelineMessages.first { $0.message.authorID == MockShellData.currentUserID }!
+
+        model.updateDraft("composer survives", for: channelID)
+        model.beginEditing(ownMessage)
+        XCTAssertEqual(model.inlineEditState?.draftContent, ownMessage.message.content)
+        XCTAssertFalse(model.inlineEditState?.canSave ?? true)
+
+        model.updateInlineEditDraft("edited inline")
+        XCTAssertTrue(model.inlineEditState?.canSave == true)
+        await model.saveEditingDraft()
+
+        let edited = await handler.editedMessages
+        XCTAssertEqual(edited.count, 1)
+        XCTAssertNil(model.inlineEditState)
+        XCTAssertEqual(model.draft(for: channelID), "composer survives")
+    }
+
+    @MainActor
+    func testPhase9DeleteDiscardAndSelectionFallback() async {
+        let handler = MockMessageActionHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        model.selectServer(model.servers[0].id)
+        let ownMessage = model.selectedTimelineMessages.first { $0.message.authorID == MockShellData.currentUserID }!
+        model.timelineSelection = TimelineSelection(channelID: ownMessage.message.channelID, messageID: ownMessage.message.id)
+
+        model.requestDelete(ownMessage)
+        XCTAssertNotNil(model.pendingDeletion)
+        await model.confirmPendingDelete()
+        XCTAssertFalse(model.selectedTimelineMessages.contains { $0.message.id == ownMessage.message.id })
+        XCTAssertNotEqual(model.timelineSelection.messageID, ownMessage.message.id)
+        let deletedCount = await handler.deletedMessages.count
+        XCTAssertEqual(deletedCount, 1)
+    }
+
+    @MainActor
+    func testPhase9FailedMessageDiscardDoesNotCallAPIAndCommandsPauseWhileEditing() async {
+        let handler = MockMessageActionHandler(sendError: MessageActionError.unavailable("send failed"))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        model.selectServer(model.servers[0].id)
+        let channelID = model.selection.channelID!
+        model.updateDraft("hello", for: channelID)
+
+        await model.sendDraft(for: channelID)
+        let failed = model.selectedTimelineMessages.first { if case .failed = $0.status { true } else { false } }!
+        model.timelineSelection = TimelineSelection(channelID: channelID, messageID: failed.message.id)
+
+        model.perform(.discardSelectedFailedMessage)
+        XCTAssertFalse(model.selectedTimelineMessages.contains { $0.message.id == failed.message.id })
+        let deletedCount = await handler.deletedMessages.count
+        XCTAssertEqual(deletedCount, 0)
+
+        model.beginEditing(model.selectedTimelineMessages.first { $0.message.authorID == MockShellData.currentUserID }!)
+        XCTAssertFalse(model.canPerform(.copySelectedMessage))
+    }
+
+    @MainActor
+    func testPhase9PinReactionAndJumpCommandsRouteThroughSelection() async throws {
+        let handler = MockMessageActionHandler()
+        var snapshot = MockShellData.snapshot
+        let channelID = try XCTUnwrap(snapshot.channelsByID.values.first { $0.displayName == "general" }?.id)
+        snapshot.channelsByID[channelID]?.permissions = [.viewChannel, .readMessageHistory, .sendMessage, .react, .manageMessages]
+        let model = MainShellViewModel(snapshot: snapshot, messageActionHandler: handler)
+        model.selectChannel(channelID)
+        let message = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
+        model.timelineSelection = TimelineSelection(channelID: channelID, messageID: message.message.id)
+
+        model.perform(.pinOrUnpinSelectedMessage)
+        try await Task.sleep(for: .milliseconds(30))
+        let pinnedCount = await handler.pinnedMessages.count
+        XCTAssertEqual(pinnedCount, 1)
+        XCTAssertEqual(model.selectedTimelineMessage?.message.pinned, true)
+
+        model.perform(.reactToSelectedMessage("✅"))
+        try await Task.sleep(for: .milliseconds(30))
+        let reactionCount = await handler.addedReactions.count
+        XCTAssertEqual(reactionCount, 1)
+        XCTAssertEqual(model.selectedTimelineMessage?.message.reactions["✅"], [MockShellData.currentUserID])
+
+        model.jumpToNewestMessage()
+        XCTAssertEqual(model.timelineSelection.messageID, model.selectedTimelineMessages.last?.message.id)
+    }
+
+    @MainActor
+    func testPhase9LocalUnreadStatePreservesMentionAndJumpsFirstUnread() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channel = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "macos-native" })
+
+        model.selectChannel(channel.id)
+
+        XCTAssertEqual(model.localReadStates[channel.id]?.unreadCount, 0)
+        XCTAssertEqual(model.localReadStates[channel.id]?.mentionCount, 1)
+        XCTAssertNotNil(model.firstUnreadMessageID(for: channel.id))
+        model.perform(.jumpToFirstUnreadMessage)
+        XCTAssertEqual(model.timelineSelection.messageID, model.firstUnreadMessageID(for: channel.id))
+    }
+
     private func message(
         id: String,
         author: UserID,

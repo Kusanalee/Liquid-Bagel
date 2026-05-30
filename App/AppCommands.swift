@@ -62,14 +62,68 @@ struct AppCommands: Commands {
             Button("Previous Channel") {
                 commandHandler?.perform(.selectPreviousChannel)
             }
-            .keyboardShortcut(.upArrow, modifiers: [.command])
+            .keyboardShortcut(.upArrow, modifiers: [.command, .control])
             .disabled(commandHandler?.canPerform(.selectPreviousChannel) == false)
 
             Button("Next Channel") {
                 commandHandler?.perform(.selectNextChannel)
             }
-            .keyboardShortcut(.downArrow, modifiers: [.command])
+            .keyboardShortcut(.downArrow, modifiers: [.command, .control])
             .disabled(commandHandler?.canPerform(.selectNextChannel) == false)
+
+            Button("Jump to Newest Message") {
+                commandHandler?.perform(.jumpToNewestMessage)
+            }
+            .keyboardShortcut(.downArrow, modifiers: [.command])
+            .disabled(commandHandler?.canPerform(.jumpToNewestMessage) == false)
+
+            Button("Jump to First Unread") {
+                commandHandler?.perform(.jumpToFirstUnreadMessage)
+            }
+            .keyboardShortcut("u", modifiers: [.command, .shift])
+            .disabled(commandHandler?.canPerform(.jumpToFirstUnreadMessage) == false)
+        }
+
+        CommandMenu("Message") {
+            Button("Copy Message") {
+                commandHandler?.perform(.copySelectedMessage)
+            }
+            .keyboardShortcut("c", modifiers: [.command])
+            .disabled(commandHandler?.canPerform(.copySelectedMessage) == false)
+
+            Button("Copy Message ID") {
+                commandHandler?.perform(.copySelectedMessageID)
+            }
+            .keyboardShortcut("c", modifiers: [.command, .option])
+            .disabled(commandHandler?.canPerform(.copySelectedMessageID) == false)
+
+            Button("Edit Message") {
+                commandHandler?.perform(.editSelectedMessage)
+            }
+            .keyboardShortcut("e", modifiers: [.command])
+            .disabled(commandHandler?.canPerform(.editSelectedMessage) == false)
+
+            Button("Delete Message") {
+                commandHandler?.perform(.deleteSelectedMessage)
+            }
+            .keyboardShortcut(.delete, modifiers: [])
+            .disabled(commandHandler?.canPerform(.deleteSelectedMessage) == false)
+
+            Button("Pin or Unpin Message") {
+                commandHandler?.perform(.pinOrUnpinSelectedMessage)
+            }
+            .keyboardShortcut("p", modifiers: [.command, .shift])
+            .disabled(commandHandler?.canPerform(.pinOrUnpinSelectedMessage) == false)
+
+            Button("Retry Failed Message") {
+                commandHandler?.perform(.retrySelectedMessage)
+            }
+            .disabled(commandHandler?.canPerform(.retrySelectedMessage) == false)
+
+            Button("Discard Failed Message") {
+                commandHandler?.perform(.discardSelectedFailedMessage)
+            }
+            .disabled(commandHandler?.canPerform(.discardSelectedFailedMessage) == false)
         }
 
         CommandGroup(after: .appSettings) {
