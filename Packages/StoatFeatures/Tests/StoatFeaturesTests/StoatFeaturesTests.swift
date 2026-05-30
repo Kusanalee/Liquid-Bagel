@@ -1274,6 +1274,143 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.placeholderStatus, "Unread message is not loaded.")
     }
 
+    func testPhase11VisibleRangeDrivesAtNewestDeterministically() {
+        let channelID: ChannelID = "channel"
+        let messages = [
+            TimelineMessage(message: message(id: ulid(milliseconds: 1_000), author: "a", channel: channelID)),
+            TimelineMessage(message: message(id: ulid(milliseconds: 2_000), author: "a", channel: channelID)),
+            TimelineMessage(message: message(id: ulid(milliseconds: 3_000), author: "a", channel: channelID)),
+            TimelineMessage(message: message(id: ulid(milliseconds: 4_000), author: "a", channel: channelID)),
+            TimelineMessage(message: message(id: ulid(milliseconds: 5_000), author: "a", channel: channelID))
+        ]
+        let reducer = TimelineViewportReducer()
+        var state = reducer.channelSelected(channelID: channelID, messages: messages, firstUnreadMessageID: nil)
+
+        state = reducer.visibleRangeChanged(
+            state,
+            channelID: channelID,
+            visibleMessageIDs: [messages[0].message.id, messages[1].message.id],
+            loadedMessageIDs: messages.map(\.message.id)
+        )
+        XCTAssertEqual(state.visibleRange?.firstVisibleMessageID, messages[0].message.id)
+        XCTAssertEqual(state.visibleRange?.lastVisibleMessageID, messages[1].message.id)
+        XCTAssertFalse(state.isAtNewest)
+
+        let unchanged = reducer.visibleRangeChanged(
+            state,
+            channelID: channelID,
+            visibleMessageIDs: [messages[1].message.id, messages[0].message.id],
+            loadedMessageIDs: messages.map(\.message.id)
+        )
+        XCTAssertEqual(unchanged.visibleRange, state.visibleRange)
+
+        state = reducer.visibleRangeChanged(
+            state,
+            channelID: channelID,
+            visibleMessageIDs: [messages[2].message.id],
+            loadedMessageIDs: messages.map(\.message.id)
+        )
+        XCTAssertTrue(state.isAtNewest)
+    }
+
+    func testPhase11HistoryTracksBoundariesAndUnreadRecovery() {
+        let channelID: ChannelID = "channel"
+        let reducer = ChannelMessageHistoryReducer(messageCapPerChannel: 10)
+        let messages = [
+            message(id: ulid(milliseconds: 1_000), author: "a", channel: channelID),
+            message(id: ulid(milliseconds: 2_000), author: "a", channel: channelID)
+        ]
+
+        var history = reducer.reduce(
+            ChannelMessageHistory(channelID: channelID),
+            event: .initialLoadSucceeded(messages: messages, hasMoreBefore: true, loadedAt: Date())
+        )
+
+        XCTAssertEqual(history.loadedRange.oldestLoadedMessageID, messages.first?.id)
+        XCTAssertEqual(history.loadedRange.newestLoadedMessageID, messages.last?.id)
+        XCTAssertTrue(history.loadedRange.hasMoreBefore)
+
+        history = reducer.reduce(history, event: .unreadMarkerMoved("missing"))
+        XCTAssertEqual(history.firstUnreadMessageID, "missing")
+        XCTAssertEqual(history.unreadRecoveryState, .targetUnloaded("missing"))
+
+        history = reducer.reduce(history, event: .olderLoadFailed("Could not load older messages"))
+        XCTAssertEqual(history.loadedRange.lastPaginationError, "Could not load older messages")
+    }
+
+    @MainActor
+    func testPhase11FailedSendPreservesRetryMetadataAndPreventsDoubleRetry() async throws {
+        let handler = MockMessageActionHandler(sendError: MessageActionError.unavailable("offline"))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        model.selectServer(model.servers[0].id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        let target = try XCTUnwrap(model.selectedTimelineMessages.first)
+
+        model.beginReply(to: target)
+        model.updateReplyMentionPreference(false, for: channelID)
+        model.updateDraft("retry me", for: channelID)
+        await model.sendDraft(for: channelID)
+
+        let failed = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status.failedMetadata != nil })
+        let metadata = try XCTUnwrap(failed.status.failedMetadata)
+        XCTAssertEqual(metadata.originalContent, "retry me")
+        XCTAssertEqual(metadata.replyContext?.messageID, target.message.id)
+        XCTAssertFalse(metadata.mentionReply)
+        XCTAssertEqual(metadata.attemptCount, 1)
+
+        async let first: Bool = model.messageController.retrySend(failed, handler: handler)
+        async let second: Bool = model.messageController.retrySend(failed, handler: handler)
+        let results = await [first, second]
+        XCTAssertEqual(results.filter { $0 }.count, 0)
+        let retried = try XCTUnwrap(model.selectedTimelineMessages.first { $0.message.id == failed.message.id })
+        XCTAssertEqual(retried.status.failedMetadata?.attemptCount, 2)
+    }
+
+    @MainActor
+    func testPhase11ReferenceResolverCachesVisibleReplyFallbacks() async throws {
+        let channelID: ChannelID = "channel"
+        let original = message(id: ulid(milliseconds: 1_000), author: "a", channel: channelID)
+        let reply = message(id: ulid(milliseconds: 2_000), author: "b", channel: channelID, replies: [original.id])
+        let channel = Channel(id: channelID, kind: .textChannel, name: "general")
+        let snapshot = RealtimeSnapshot(
+            usersByID: [:],
+            channelsByID: [channelID: channel],
+            messagesByChannelID: [channelID: [reply]]
+        )
+        let resolver = InMemoryMessageReferenceResolver(messagesByChannelID: [channelID: [original]])
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server("server"), serverID: "server", channelID: channelID),
+            snapshot: snapshot,
+            messageReferenceResolver: resolver
+        )
+
+        XCTAssertEqual(model.resolvedReplyPreview(for: reply), "Loading original message...")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(model.resolvedReplyPreview(for: reply), "a: hello")
+
+        let diagnostics = model.timelineDiagnostics()
+        XCTAssertEqual(diagnostics.pendingReferenceFetchCount, 0)
+    }
+
+    @MainActor
+    func testPhase11TimelineDiagnosticsStayTokenFree() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        let first = try XCTUnwrap(model.selectedTimelineMessages.first?.message.id)
+        let last = try XCTUnwrap(model.selectedTimelineMessages.last?.message.id)
+
+        model.updateTimelineVisibility(messageID: first, channelID: channelID, isVisible: true)
+        model.updateTimelineVisibility(messageID: last, channelID: channelID, isVisible: true)
+
+        let diagnostics = model.timelineDiagnostics()
+        XCTAssertEqual(diagnostics.channelID, channelID)
+        XCTAssertEqual(diagnostics.loadedMessageCount, model.selectedTimelineMessages.count)
+        XCTAssertEqual(diagnostics.firstVisibleMessageID, first)
+        XCTAssertEqual(diagnostics.lastVisibleMessageID, last)
+        XCTAssertFalse(String(describing: diagnostics).localizedCaseInsensitiveContains("token="))
+    }
+
     private func message(
         id: String,
         author: UserID,

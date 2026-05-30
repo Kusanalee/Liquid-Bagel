@@ -6,6 +6,7 @@ public struct TimelineViewportState: Hashable, Sendable {
     public var channelID: ChannelID?
     public var anchorMessageID: MessageID?
     public var selectedMessageID: MessageID?
+    public var visibleRange: TimelineVisibleRange?
     public var newestVisibleMessageID: MessageID?
     public var oldestVisibleMessageID: MessageID?
     public var isAtNewest: Bool
@@ -16,6 +17,7 @@ public struct TimelineViewportState: Hashable, Sendable {
         channelID: ChannelID? = nil,
         anchorMessageID: MessageID? = nil,
         selectedMessageID: MessageID? = nil,
+        visibleRange: TimelineVisibleRange? = nil,
         newestVisibleMessageID: MessageID? = nil,
         oldestVisibleMessageID: MessageID? = nil,
         isAtNewest: Bool = true,
@@ -25,6 +27,7 @@ public struct TimelineViewportState: Hashable, Sendable {
         self.channelID = channelID
         self.anchorMessageID = anchorMessageID
         self.selectedMessageID = selectedMessageID
+        self.visibleRange = visibleRange
         self.newestVisibleMessageID = newestVisibleMessageID
         self.oldestVisibleMessageID = oldestVisibleMessageID
         self.isAtNewest = isAtNewest
@@ -33,11 +36,34 @@ public struct TimelineViewportState: Hashable, Sendable {
     }
 }
 
+public struct TimelineVisibleRange: Hashable, Sendable {
+    public var channelID: ChannelID
+    public var firstVisibleMessageID: MessageID?
+    public var lastVisibleMessageID: MessageID?
+    public var visibleMessageIDs: [MessageID]
+    public var updatedAt: Date
+
+    public init(
+        channelID: ChannelID,
+        firstVisibleMessageID: MessageID? = nil,
+        lastVisibleMessageID: MessageID? = nil,
+        visibleMessageIDs: [MessageID] = [],
+        updatedAt: Date = Date()
+    ) {
+        self.channelID = channelID
+        self.firstVisibleMessageID = firstVisibleMessageID
+        self.lastVisibleMessageID = lastVisibleMessageID
+        self.visibleMessageIDs = visibleMessageIDs
+        self.updatedAt = updatedAt
+    }
+}
+
 public enum TimelineScrollIntent: Hashable, Sendable {
     case message(MessageID, anchor: TimelineScrollAnchor, reason: TimelineScrollReason)
     case newest(reason: TimelineScrollReason)
     case firstUnread(MessageID)
     case preservePositionAfterPrepend(previousOldestID: MessageID)
+    case preserveVisibleAnchor(MessageID)
 }
 
 public enum TimelineScrollAnchor: Hashable, Sendable {
@@ -153,6 +179,164 @@ public struct ComposerDraftState: Hashable, Sendable {
     }
 }
 
+public enum UnreadRecoveryState: Hashable, Sendable {
+    case none
+    case targetLoaded(MessageID)
+    case targetUnloaded(MessageID)
+    case loadingToTarget(MessageID, attempts: Int)
+    case targetMissing(MessageID)
+    case failed(MessageID, String)
+}
+
+public struct ChannelLoadedMessageRange: Hashable, Sendable {
+    public var oldestLoadedMessageID: MessageID?
+    public var newestLoadedMessageID: MessageID?
+    public var hasMoreBefore: Bool
+    public var hasMoreAfter: Bool
+    public var loadedAroundMessageID: MessageID?
+    public var lastPaginationError: String?
+
+    public init(
+        oldestLoadedMessageID: MessageID? = nil,
+        newestLoadedMessageID: MessageID? = nil,
+        hasMoreBefore: Bool = false,
+        hasMoreAfter: Bool = false,
+        loadedAroundMessageID: MessageID? = nil,
+        lastPaginationError: String? = nil
+    ) {
+        self.oldestLoadedMessageID = oldestLoadedMessageID
+        self.newestLoadedMessageID = newestLoadedMessageID
+        self.hasMoreBefore = hasMoreBefore
+        self.hasMoreAfter = hasMoreAfter
+        self.loadedAroundMessageID = loadedAroundMessageID
+        self.lastPaginationError = lastPaginationError
+    }
+}
+
+public struct FailedMessageRecoveryMetadata: Hashable, Sendable {
+    public var originalContent: String
+    public var originalNonce: String?
+    public var replyContext: ReplyContext?
+    public var mentionReply: Bool
+    public var createdAt: Date
+    public var lastAttemptAt: Date?
+    public var attemptCount: Int
+    public var lastError: String
+
+    public init(
+        originalContent: String,
+        originalNonce: String? = nil,
+        replyContext: ReplyContext? = nil,
+        mentionReply: Bool = true,
+        createdAt: Date = Date(),
+        lastAttemptAt: Date? = nil,
+        attemptCount: Int = 1,
+        lastError: String
+    ) {
+        self.originalContent = originalContent
+        self.originalNonce = originalNonce
+        self.replyContext = replyContext
+        self.mentionReply = mentionReply
+        self.createdAt = createdAt
+        self.lastAttemptAt = lastAttemptAt
+        self.attemptCount = attemptCount
+        self.lastError = lastError
+    }
+
+    public func retrying(at date: Date = Date()) -> Self {
+        var copy = self
+        copy.lastAttemptAt = date
+        copy.attemptCount += 1
+        return copy
+    }
+
+    public func edited(content: String) -> Self {
+        var copy = self
+        copy.originalContent = content
+        return copy
+    }
+}
+
+public enum MessageReferenceResolution: Hashable, Sendable {
+    case loaded(Message)
+    case deleted
+    case unavailable(String)
+    case notSupported
+}
+
+public protocol MessageReferenceResolving: Sendable {
+    func resolveReference(channelID: ChannelID, messageID: MessageID) async throws -> MessageReferenceResolution
+}
+
+public struct DisabledMessageReferenceResolver: MessageReferenceResolving {
+    public init() {}
+    public func resolveReference(channelID: ChannelID, messageID: MessageID) async throws -> MessageReferenceResolution {
+        .notSupported
+    }
+}
+
+public actor InMemoryMessageReferenceResolver: MessageReferenceResolving {
+    private var messagesByChannelID: [ChannelID: [MessageID: Message]]
+    private var deletedMessageIDs: Set<MessageID>
+
+    public init(messagesByChannelID: [ChannelID: [Message]] = [:], deletedMessageIDs: Set<MessageID> = []) {
+        self.messagesByChannelID = messagesByChannelID.mapValues { messages in
+            Dictionary(uniqueKeysWithValues: messages.map { ($0.id, $0) })
+        }
+        self.deletedMessageIDs = deletedMessageIDs
+    }
+
+    public func resolveReference(channelID: ChannelID, messageID: MessageID) async throws -> MessageReferenceResolution {
+        if let message = messagesByChannelID[channelID]?[messageID] {
+            return .loaded(message)
+        }
+        if deletedMessageIDs.contains(messageID) {
+            return .deleted
+        }
+        return .unavailable("Original message unavailable")
+    }
+}
+
+public struct TimelineDiagnostics: Hashable, Sendable {
+    public var channelID: ChannelID?
+    public var loadedMessageCount: Int
+    public var oldestLoadedMessageID: MessageID?
+    public var newestLoadedMessageID: MessageID?
+    public var firstVisibleMessageID: MessageID?
+    public var lastVisibleMessageID: MessageID?
+    public var firstUnreadMessageID: MessageID?
+    public var atNewest: Bool
+    public var hasMoreBefore: Bool
+    public var pendingReferenceFetchCount: Int
+    public var pendingRetryCount: Int
+
+    public init(
+        channelID: ChannelID? = nil,
+        loadedMessageCount: Int = 0,
+        oldestLoadedMessageID: MessageID? = nil,
+        newestLoadedMessageID: MessageID? = nil,
+        firstVisibleMessageID: MessageID? = nil,
+        lastVisibleMessageID: MessageID? = nil,
+        firstUnreadMessageID: MessageID? = nil,
+        atNewest: Bool = true,
+        hasMoreBefore: Bool = false,
+        pendingReferenceFetchCount: Int = 0,
+        pendingRetryCount: Int = 0
+    ) {
+        self.channelID = channelID
+        self.loadedMessageCount = loadedMessageCount
+        self.oldestLoadedMessageID = oldestLoadedMessageID
+        self.newestLoadedMessageID = newestLoadedMessageID
+        self.firstVisibleMessageID = firstVisibleMessageID
+        self.lastVisibleMessageID = lastVisibleMessageID
+        self.firstUnreadMessageID = firstUnreadMessageID
+        self.atNewest = atNewest
+        self.hasMoreBefore = hasMoreBefore
+        self.pendingReferenceFetchCount = pendingReferenceFetchCount
+        self.pendingRetryCount = pendingRetryCount
+    }
+}
+
 public struct TimelineViewportReducer: Sendable {
     public init() {}
 
@@ -163,6 +347,14 @@ public struct TimelineViewportReducer: Sendable {
             channelID: channelID,
             anchorMessageID: target,
             selectedMessageID: target,
+            visibleRange: channelID.map {
+                TimelineVisibleRange(
+                    channelID: $0,
+                    firstVisibleMessageID: messages.first?.message.id,
+                    lastVisibleMessageID: newest,
+                    visibleMessageIDs: messages.map(\.message.id)
+                )
+            },
             newestVisibleMessageID: newest,
             oldestVisibleMessageID: messages.first?.message.id,
             isAtNewest: true,
@@ -197,6 +389,35 @@ public struct TimelineViewportReducer: Sendable {
         return state
     }
 
+    public func visibleRangeChanged(
+        _ state: TimelineViewportState,
+        channelID: ChannelID,
+        visibleMessageIDs: [MessageID],
+        loadedMessageIDs: [MessageID],
+        updatedAt: Date = Date()
+    ) -> TimelineViewportState {
+        var state = state
+        let orderedVisible = loadedMessageIDs.filter { visibleMessageIDs.contains($0) }
+        guard state.visibleRange?.channelID != channelID || state.visibleRange?.visibleMessageIDs != orderedVisible else {
+            return state
+        }
+        state.channelID = channelID
+        state.visibleRange = TimelineVisibleRange(
+            channelID: channelID,
+            firstVisibleMessageID: orderedVisible.first,
+            lastVisibleMessageID: orderedVisible.last,
+            visibleMessageIDs: orderedVisible,
+            updatedAt: updatedAt
+        )
+        state.oldestVisibleMessageID = orderedVisible.first
+        state.newestVisibleMessageID = orderedVisible.last
+        state.isAtNewest = Self.isNewestVisibleOrNearVisible(visibleMessageIDs: orderedVisible, loadedMessageIDs: loadedMessageIDs)
+        if state.isAtNewest {
+            state.hasNewerMessagesIndicator = false
+        }
+        return state
+    }
+
     public func newMessage(_ state: TimelineViewportState, newestMessageID: MessageID, isActiveChannel: Bool) -> TimelineViewportState {
         var state = state
         state.newestVisibleMessageID = newestMessageID
@@ -217,6 +438,18 @@ public struct TimelineViewportReducer: Sendable {
         state.anchorMessageID = messageID
         state.pendingScrollIntent = .message(messageID, anchor: .nearest, reason: reason)
         return state
+    }
+
+    public static func isNewestVisibleOrNearVisible(visibleMessageIDs: [MessageID], loadedMessageIDs: [MessageID], trailingThreshold: Int = 2) -> Bool {
+        guard let newest = loadedMessageIDs.last else { return true }
+        guard !visibleMessageIDs.contains(newest) else { return true }
+        guard let lastVisible = visibleMessageIDs.last,
+              let visibleIndex = loadedMessageIDs.firstIndex(of: lastVisible)
+        else {
+            return false
+        }
+        let newestIndex = loadedMessageIDs.index(before: loadedMessageIDs.endIndex)
+        return loadedMessageIDs.distance(from: visibleIndex, to: newestIndex) <= trailingThreshold
     }
 }
 

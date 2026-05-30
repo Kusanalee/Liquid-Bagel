@@ -423,13 +423,17 @@ public final class MainShellViewModel {
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var channelAckSender: any ChannelAckSending
+    @ObservationIgnored public var messageReferenceResolver: any MessageReferenceResolving
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
     @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
     @ObservationIgnored private var ackTask: Task<Void, Never>?
+    @ObservationIgnored private var referenceFetchTasks: [MessageID: Task<Void, Never>] = [:]
     @ObservationIgnored private var activeTypingChannelID: ChannelID?
     @ObservationIgnored private var lastTypingBeginAt: [ChannelID: Date] = [:]
     @ObservationIgnored private var lastAckedMessageByChannelID: [ChannelID: MessageID] = [:]
+    @ObservationIgnored private var visibleMessageIDsByChannelID: [ChannelID: Set<MessageID>] = [:]
+    @ObservationIgnored private var resolvedReferencesByChannelID: [ChannelID: [MessageID: MessageReferenceResolution]] = [:]
     @ObservationIgnored private var locallyClearedUnreadChannelIDs: Set<ChannelID> = []
     @ObservationIgnored private var restoredLiveConnectionGeneration: Int?
     @ObservationIgnored private var previousSnapshot = RealtimeSnapshot()
@@ -449,7 +453,8 @@ public final class MainShellViewModel {
         snapshotSource: (any ShellSnapshotSource)? = nil,
         messageController: ChannelMessageController? = nil,
         messageActionHandler: (any MessageActionHandling)? = nil,
-        channelAckSender: (any ChannelAckSending)? = nil
+        channelAckSender: (any ChannelAckSending)? = nil,
+        messageReferenceResolver: (any MessageReferenceResolving)? = nil
     ) {
         self.selection = selection
         self.snapshot = snapshot
@@ -462,6 +467,7 @@ public final class MainShellViewModel {
         self.messageController = messageController ?? ChannelMessageController(runtimeMode: runtimeMode, currentUserID: currentUser?.id ?? MockShellData.currentUserID)
         self.messageActionHandler = messageActionHandler ?? MockMessageActionHandler(currentUserID: currentUser?.id ?? MockShellData.currentUserID)
         self.channelAckSender = channelAckSender ?? NoopChannelAckSender()
+        self.messageReferenceResolver = messageReferenceResolver ?? DisabledMessageReferenceResolver()
         self.previousSnapshot = snapshot
         self.quickSwitcherViewModel = QuickSwitcherViewModel(snapshot: snapshot, selection: selection)
         self.quickSwitcherViewModel = QuickSwitcherViewModel(
@@ -482,6 +488,7 @@ public final class MainShellViewModel {
         selectedChannelLoadTask?.cancel()
         typingEndTask?.cancel()
         ackTask?.cancel()
+        referenceFetchTasks.values.forEach { $0.cancel() }
     }
 
     public var servers: [Server] {
@@ -854,6 +861,9 @@ public final class MainShellViewModel {
         messageActionHandler = sessionCoordinator.messageActionHandler
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
         channelAckSender = liveAPIClient.map { LiveChannelAckSender(apiClient: $0) } ?? NoopChannelAckSender()
+        messageReferenceResolver = sessionCoordinator.mode == .mock
+            ? InMemoryMessageReferenceResolver(messagesByChannelID: snapshot.messagesByChannelID)
+            : DisabledMessageReferenceResolver()
         messageController.configure(
             runtimeMode: sessionCoordinator.mode,
             apiClient: liveAPIClient,
@@ -999,7 +1009,7 @@ public final class MainShellViewModel {
         switch timelineMessage.status {
         case .failed:
             return true
-        case .pending, .deleting:
+        case .pending, .retrying, .deleting:
             return false
         case .confirmed:
             return canDelete(timelineMessage.message)
@@ -1069,9 +1079,13 @@ public final class MainShellViewModel {
 
     public func loadOlderSelectedMessages() async {
         guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
-        let previousOldest = selectedTimelineMessages.first?.message.id
-        await messageController.loadOlderMessages(channelID: channelID)
-        timelineViewport = viewportReducer.preserveAfterPrepend(timelineViewport, previousOldestID: previousOldest)
+        let anchor = timelineViewport.visibleRange?.firstVisibleMessageID ?? selectedTimelineMessages.first?.message.id
+        let loaded = await messageController.loadOlderMessages(channelID: channelID)
+        if loaded {
+            let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
+            let target = anchor.flatMap { loadedIDs.contains($0) ? $0 : nil } ?? selectedTimelineMessages.first?.message.id
+            timelineViewport = viewportReducer.preserveAfterPrepend(timelineViewport, previousOldestID: target)
+        }
     }
 
     public func beginEditing(_ timelineMessage: TimelineMessage) {
@@ -1102,13 +1116,12 @@ public final class MainShellViewModel {
         guard editState.canSave else { return }
         if let localFailed = selectedTimelineMessages.first(where: { $0.message.id == editState.messageID }),
            case .failed = localFailed.status {
-            messageController.discardLocalMessage(localFailed)
             inlineEditState = nil
             editingDraft = nil
-            var draftState = composerDraftState(for: editState.channelID)
-            draftState.text = editState.draftContent
-            composerDrafts[editState.channelID] = draftState
-            await sendDraft(for: editState.channelID)
+            messageController.updateFailedRecoveryContent(messageID: localFailed.message.id, channelID: editState.channelID, content: editState.draftContent)
+            if let updated = messageController.state(for: editState.channelID).timelineMessages.first(where: { $0.message.id == localFailed.message.id }) {
+                _ = await messageController.retrySend(updated, handler: messageActionHandler)
+            }
             requestFocus(.timeline)
             return
         }
@@ -1389,9 +1402,15 @@ public final class MainShellViewModel {
         guard let unreadID = firstUnreadMessageID(for: activeChannelID),
               selectedTimelineMessages.contains(where: { $0.message.id == unreadID })
         else {
-            placeholderStatus = firstUnreadMessageID(for: activeChannelID) == nil ? "No unread marker in this channel." : "Unread message is not loaded."
+            if let unreadID = firstUnreadMessageID(for: activeChannelID) {
+                messageController.updateUnreadRecovery(channelID: activeChannelID, state: .targetUnloaded(unreadID))
+                placeholderStatus = "Unread message is not loaded."
+            } else {
+                placeholderStatus = "No unread marker in this channel."
+            }
             return
         }
+        messageController.updateUnreadRecovery(channelID: activeChannelID, state: .targetLoaded(unreadID))
         timelineSelection = TimelineSelection(channelID: activeChannelID, messageID: unreadID, source: .scrollJump)
         timelineViewport = viewportReducer.jumpFirstUnread(timelineViewport, unreadMessageID: unreadID, loadedMessageIDs: Set(selectedTimelineMessages.map(\.message.id)))
         requestFocus(.timeline)
@@ -1428,6 +1447,96 @@ public final class MainShellViewModel {
                 scheduleLiveAckIfNeeded(channelID: channelID)
             }
         }
+    }
+
+    public func updateTimelineVisibility(messageID: MessageID, channelID: ChannelID, isVisible: Bool) {
+        guard channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        var visible = visibleMessageIDsByChannelID[channelID] ?? []
+        if isVisible {
+            visible.insert(messageID)
+        } else {
+            visible.remove(messageID)
+        }
+        visibleMessageIDsByChannelID[channelID] = visible
+        let loadedIDs = selectedTimelineMessages.map(\.message.id)
+        timelineViewport = viewportReducer.visibleRangeChanged(
+            timelineViewport,
+            channelID: channelID,
+            visibleMessageIDs: Array(visible),
+            loadedMessageIDs: loadedIDs
+        )
+        if timelineViewport.isAtNewest {
+            acknowledgeSelectedChannel()
+            scheduleLiveAckIfNeeded(channelID: channelID)
+        }
+    }
+
+    public func loadToFirstUnreadMessage() async {
+        guard let channelID = selection.channelID ?? selection.dmChannelID,
+              let unreadID = firstUnreadMessageID(for: channelID)
+        else {
+            placeholderStatus = "No unread marker in this channel."
+            return
+        }
+        if selectedTimelineMessages.contains(where: { $0.message.id == unreadID }) {
+            jumpToFirstUnreadMessage()
+            return
+        }
+        let state = await messageController.loadOlderMessagesToTarget(channelID: channelID, targetMessageID: unreadID, maxAttempts: 4)
+        switch state {
+        case .targetLoaded:
+            jumpToFirstUnreadMessage()
+        case .targetMissing:
+            placeholderStatus = "Unread message could not be found."
+        case let .failed(_, message):
+            placeholderStatus = message
+        default:
+            placeholderStatus = "Unread message is outside the loaded range."
+        }
+    }
+
+    public func resolvedReplyPreview(for message: Message) -> String? {
+        guard let replyID = message.replies?.first else { return nil }
+        if let referenced = selectedTimelineMessages.first(where: { $0.message.id == replyID })?.message {
+            let author = snapshot.usersByID[referenced.authorID]
+            let authorName = referenced.masquerade?.name ?? author?.displayName ?? author?.username ?? referenced.authorID.rawValue
+            return "\(authorName): \(Self.replyPreviewText(for: referenced))"
+        }
+        if let resolution = resolvedReferencesByChannelID[message.channelID]?[replyID] {
+            switch resolution {
+            case let .loaded(referenced):
+                let author = snapshot.usersByID[referenced.authorID]
+                let authorName = referenced.masquerade?.name ?? author?.displayName ?? author?.username ?? referenced.authorID.rawValue
+                return "\(authorName): \(Self.replyPreviewText(for: referenced))"
+            case .deleted:
+                return "Original message was deleted"
+            case let .unavailable(message):
+                return message
+            case .notSupported:
+                return "Original message unavailable"
+            }
+        }
+        resolveReferenceIfNeeded(channelID: message.channelID, messageID: replyID)
+        return "Loading original message..."
+    }
+
+    public func timelineDiagnostics() -> TimelineDiagnostics {
+        let channelID = selection.channelID ?? selection.dmChannelID
+        let history = channelID.flatMap { messageController.historiesByChannelID[$0] }
+        let messages = selectedTimelineMessages
+        return TimelineDiagnostics(
+            channelID: channelID,
+            loadedMessageCount: messages.count,
+            oldestLoadedMessageID: history?.loadedRange.oldestLoadedMessageID ?? messages.first?.message.id,
+            newestLoadedMessageID: history?.loadedRange.newestLoadedMessageID ?? messages.last?.message.id,
+            firstVisibleMessageID: timelineViewport.visibleRange?.firstVisibleMessageID,
+            lastVisibleMessageID: timelineViewport.visibleRange?.lastVisibleMessageID,
+            firstUnreadMessageID: channelID.flatMap { firstUnreadMessageID(for: $0) },
+            atNewest: timelineViewport.isAtNewest,
+            hasMoreBefore: history?.loadedRange.hasMoreBefore ?? false,
+            pendingReferenceFetchCount: history?.pendingReferenceFetchMessageIDs.count ?? 0,
+            pendingRetryCount: messageController.retryingMessageIDs.count
+        )
     }
 
     public func reconcileTimelineSelection(deletedHint: MessageID? = nil, replacementHint: MessageID? = nil) {
@@ -1685,7 +1794,9 @@ public final class MainShellViewModel {
         let unread = snapshot.unreadsByChannelID[channelID]
         let currentMessages = messageController.state(for: channelID).timelineMessages
         let firstUnread = localReadStates[channelID]?.firstUnreadMessageID ?? unread?.lastMessageID
-        let newest = currentMessages.last?.message.id ?? unread?.lastMessageID
+        let newest = timelineViewport.isAtNewest
+            ? (timelineViewport.visibleRange?.lastVisibleMessageID ?? currentMessages.last?.message.id ?? unread?.lastMessageID)
+            : (timelineViewport.visibleRange?.lastVisibleMessageID ?? localReadStates[channelID]?.lastReadMessageID)
         localReadStates[channelID] = LocalReadState(
             channelID: channelID,
             firstUnreadMessageID: firstUnread,
@@ -1703,7 +1814,7 @@ public final class MainShellViewModel {
         guard effectiveRuntimeMode == .liveManual,
               effectiveSessionState == .connected,
               timelineViewport.isAtNewest,
-              let messageID = messageController.state(for: channelID).timelineMessages.last?.message.id ?? snapshot.unreadsByChannelID[channelID]?.lastMessageID,
+              let messageID = timelineViewport.visibleRange?.lastVisibleMessageID ?? messageController.state(for: channelID).timelineMessages.last?.message.id ?? snapshot.unreadsByChannelID[channelID]?.lastMessageID,
               lastAckedMessageByChannelID[channelID] != messageID
         else {
             return
@@ -1724,6 +1835,31 @@ public final class MainShellViewModel {
                 await MainActor.run {
                     self?.messageActionStatus = "Read acknowledgement failed: \(error.userFacingMessage)"
                 }
+            }
+        }
+    }
+
+    private func resolveReferenceIfNeeded(channelID: ChannelID, messageID: MessageID) {
+        guard resolvedReferencesByChannelID[channelID]?[messageID] == nil,
+              referenceFetchTasks[messageID] == nil
+        else {
+            return
+        }
+        messageController.markReferenceFetchStarted(channelID: channelID, messageID: messageID)
+        referenceFetchTasks[messageID] = Task { [weak self, resolver = messageReferenceResolver] in
+            let resolution: MessageReferenceResolution
+            do {
+                resolution = try await resolver.resolveReference(channelID: channelID, messageID: messageID)
+            } catch {
+                resolution = .unavailable(error.userFacingMessage)
+            }
+            await MainActor.run {
+                guard let self else { return }
+                var channelReferences = self.resolvedReferencesByChannelID[channelID] ?? [:]
+                channelReferences[messageID] = resolution
+                self.resolvedReferencesByChannelID[channelID] = channelReferences
+                self.referenceFetchTasks[messageID] = nil
+                self.messageController.markReferenceFetchFinished(channelID: channelID, messageID: messageID)
             }
         }
     }
@@ -3002,6 +3138,9 @@ public struct MessageTimelineView: View {
         case let .preservePositionAfterPrepend(previousOldestID):
             target = previousOldestID
             anchor = .top
+        case let .preserveVisibleAnchor(messageID):
+            target = messageID
+            anchor = .top
         }
         guard let target else { return }
         let scroll = { proxy.scrollTo(target, anchor: anchor) }
@@ -3081,6 +3220,7 @@ public struct MessageTimelineView: View {
     }
 
     @ViewBuilder private func timelineMessages(showLoadOlder: Bool, isLoadingOlder: Bool) -> some View {
+        unreadRecoveryBanner
         if isLoadingOlder {
             ProgressView("Loading older messages")
                 .controlSize(.small)
@@ -3093,6 +3233,11 @@ public struct MessageTimelineView: View {
             }
             .buttonStyle(GlassButtonStyle())
             .frame(maxWidth: .infinity)
+        } else if viewModel.selectedChannelMessageState.timelineMessages.isEmpty == false {
+            Text("Beginning of loaded history")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
         }
         unreadSeparator
         ForEach(viewModel.selectedTimelineMessageGroups) { group in
@@ -3100,6 +3245,61 @@ public struct MessageTimelineView: View {
         }
         newestIndicator
         typingIndicator
+        timelineDiagnosticsView
+    }
+
+    @ViewBuilder private var unreadRecoveryBanner: some View {
+        if let channelID = viewModel.selection.channelID ?? viewModel.selection.dmChannelID,
+           let history = viewModel.messageController.historiesByChannelID[channelID] {
+            switch history.unreadRecoveryState {
+            case .none, .targetLoaded:
+                EmptyView()
+            case let .targetUnloaded(messageID):
+                HStack(spacing: StoatSpacing.small) {
+                    Image(systemName: "text.line.first.and.arrowtriangle.forward")
+                    Text("Unread message is outside the loaded range.")
+                    Spacer()
+                    Button("Load Older") {
+                        Task { await viewModel.loadToFirstUnreadMessage() }
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                }
+                .font(.caption)
+                .padding(StoatSpacing.medium)
+                .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                .accessibilityLabel("Unread message is outside the loaded range. Load older messages to reach it. Target \(messageID.rawValue).")
+            case let .loadingToTarget(_, attempts):
+                HStack(spacing: StoatSpacing.small) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading to unread, attempt \(attempts)")
+                    Spacer()
+                }
+                .font(.caption)
+                .padding(StoatSpacing.medium)
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+            case .targetMissing:
+                inlineError("Unread message could not be found.")
+            case let .failed(_, message):
+                inlineError(message)
+            }
+        }
+    }
+
+    @ViewBuilder private var timelineDiagnosticsView: some View {
+        if viewModel.isDeveloperControlsEnabled {
+            let diagnostics = viewModel.timelineDiagnostics()
+            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                Text("Timeline Diagnostics")
+                    .font(.caption.weight(.semibold))
+                Text("Loaded \(diagnostics.loadedMessageCount) · visible \(diagnostics.firstVisibleMessageID?.rawValue ?? "-") to \(diagnostics.lastVisibleMessageID?.rawValue ?? "-") · at newest \(diagnostics.atNewest ? "yes" : "no") · pending refs \(diagnostics.pendingReferenceFetchCount) · retries \(diagnostics.pendingRetryCount)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            .padding(StoatSpacing.small)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        }
     }
 
     @ViewBuilder private var newestIndicator: some View {
@@ -3203,18 +3403,14 @@ public struct TimelineMessageGroupView: View {
                             statusText: accessibilityStatus(for: timelineMessage),
                             isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id,
                             isFocused: viewModel.timelineSelection.focus.messageID == timelineMessage.message.id && viewModel.timelineSelection.focus.mode != .none,
-                            replyPreview: replyPreview(for: timelineMessage.message)
+                            replyPreview: viewModel.resolvedReplyPreview(for: timelineMessage.message)
                         )
                         .id(timelineMessage.message.id)
                         .onAppear {
-                            if timelineMessage.message.id == viewModel.selectedTimelineMessages.last?.message.id {
-                                viewModel.updateTimelineAtNewest(true)
-                            }
+                            viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
                         }
                         .onDisappear {
-                            if timelineMessage.message.id == viewModel.selectedTimelineMessages.last?.message.id {
-                                viewModel.updateTimelineAtNewest(false)
-                            }
+                            viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
                         }
                         .onTapGesture {
                             select(timelineMessage)
@@ -3287,16 +3483,6 @@ public struct TimelineMessageGroupView: View {
         viewModel.requestFocus(.timeline)
     }
 
-    private func replyPreview(for message: Message) -> String? {
-        guard let replyID = message.replies?.first else { return nil }
-        guard let referenced = viewModel.selectedTimelineMessages.first(where: { $0.message.id == replyID })?.message else {
-            return "Original message unavailable"
-        }
-        let author = viewModel.snapshot.usersByID[referenced.authorID]
-        let authorName = referenced.masquerade?.name ?? author?.displayName ?? author?.username ?? referenced.authorID.rawValue
-        return "\(authorName): \(MainShellViewModel.replyPreviewText(for: referenced))"
-    }
-
     @ViewBuilder private func statusView(for timelineMessage: TimelineMessage) -> some View {
         switch timelineMessage.status {
         case .confirmed:
@@ -3320,15 +3506,27 @@ public struct TimelineMessageGroupView: View {
             }
             .padding(.leading, StoatSize.avatar + StoatSpacing.medium)
             .accessibilityLabel("Message sending")
-        case let .failed(message):
+        case let .retrying(metadata):
             HStack(spacing: StoatSpacing.small) {
-                Text("Failed: \(message)")
+                ProgressView()
+                    .controlSize(.small)
+                Text("Retrying... attempt \(metadata.attemptCount)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.leading, StoatSize.avatar + StoatSpacing.medium)
+            .accessibilityLabel("Retrying failed message, attempt \(metadata.attemptCount)")
+        case let .failed(metadata):
+            let message = metadata.lastError
+            HStack(spacing: StoatSpacing.small) {
+                Text("Failed after \(metadata.attemptCount) attempt\(metadata.attemptCount == 1 ? "" : "s"): \(message)")
                     .font(.caption2)
                     .foregroundStyle(.red)
                 Button("Retry") {
                     Task { await viewModel.retry(timelineMessage) }
                 }
                 .buttonStyle(.borderless)
+                .disabled(viewModel.messageController.retryingMessageIDs.contains(timelineMessage.message.id))
                 .accessibilityLabel(StoatAccessibility.failedMessageActionLabel(action: "Retry", error: message))
                 Button("Edit & Retry") {
                     viewModel.editAndRetry(timelineMessage)
@@ -3353,8 +3551,10 @@ public struct TimelineMessageGroupView: View {
             return "deleting"
         case .pending:
             return "sending"
-        case .failed:
-            return "failed to send"
+        case .retrying:
+            return "retrying failed send"
+        case let .failed(metadata):
+            return "failed to send after \(metadata.attemptCount) attempt\(metadata.attemptCount == 1 ? "" : "s")"
         }
     }
 }
@@ -3854,6 +4054,31 @@ public typealias PhaseFourStatus = PhaseOneStatus
     let model = MainShellViewModel(snapshot: MockShellData.snapshot)
     model.selectServer(model.servers[0].id)
     model.jumpToNewestMessage()
+    return MessageTimelineView(viewModel: model)
+        .frame(width: 760, height: 520)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 11 Unloaded Unread") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    if let channel = model.snapshot.channelsByID.values.first(where: { $0.displayName == "macos-native" }) {
+        model.selectChannel(channel.id)
+        model.localReadStates[channel.id] = LocalReadState(channelID: channel.id, firstUnreadMessageID: "missing-unread", unreadCount: 1, mentionCount: 0)
+        model.jumpToFirstUnreadMessage()
+    }
+    return MessageTimelineView(viewModel: model)
+        .frame(width: 760, height: 520)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 11 Timeline Diagnostics") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selectServer(model.servers[0].id)
+    if let channelID = model.selection.channelID {
+        for message in model.selectedTimelineMessages.suffix(2) {
+            model.updateTimelineVisibility(messageID: message.message.id, channelID: channelID, isVisible: true)
+        }
+    }
     return MessageTimelineView(viewModel: model)
         .frame(width: 760, height: 520)
 }
