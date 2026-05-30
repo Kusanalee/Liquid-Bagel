@@ -575,7 +575,173 @@ private struct DeveloperVerificationTab: View {
     @Bindable var viewModel: MainShellViewModel
 
     var body: some View {
-        CredentialSetupView(viewModel: viewModel)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        ScrollView {
+            VStack(alignment: .leading, spacing: StoatSpacing.large) {
+                CredentialSetupView(viewModel: viewModel)
+                    .frame(minHeight: 220)
+                TimelineValidationHarnessView(viewModel: viewModel)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct TimelineValidationHarnessView: View {
+    @Bindable var viewModel: MainShellViewModel
+
+    var body: some View {
+        let diagnostics = viewModel.timelineDiagnostics()
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            Text("Timeline Validation")
+                .font(.headline)
+            diagnosticsGrid(diagnostics)
+            warningList(diagnostics.validationWarnings)
+            actionGrid
+            tuningControls
+            findControls
+            checklist(diagnostics)
+        }
+        .padding(StoatSpacing.medium)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
+    }
+
+    private func diagnosticsGrid(_ diagnostics: TimelineDiagnostics) -> some View {
+        Grid(alignment: .leading, horizontalSpacing: StoatSpacing.large, verticalSpacing: StoatSpacing.xSmall) {
+            diagnosticRow("Environment", viewModel.sessionCoordinator.map { Phase6UIHelpers.environmentDisplayName($0.environment, preferences: $0.preferences) } ?? "Mock")
+            diagnosticRow("Current User", viewModel.currentUser?.displayName ?? viewModel.currentUser?.username ?? "-")
+            diagnosticRow("Connection", "\(viewModel.effectiveRuntimeMode == .liveManual ? "Live Manual" : "Mock") · \(viewModel.effectiveSessionState)")
+            diagnosticRow("Ready", viewModel.sessionCoordinator?.verificationState.readyReceived == true ? "yes" : "no")
+            diagnosticRow("Channel", TimelineCopyFormatter.shortID(diagnostics.channelID?.rawValue))
+            diagnosticRow("Loaded", "\(diagnostics.loadedMessageCount)")
+            diagnosticRow("Range", "\(TimelineCopyFormatter.shortID(diagnostics.oldestLoadedMessageID?.rawValue)) to \(TimelineCopyFormatter.shortID(diagnostics.newestLoadedMessageID?.rawValue))")
+            diagnosticRow("Visible", "\(TimelineCopyFormatter.shortID(diagnostics.firstVisibleMessageID?.rawValue)) to \(TimelineCopyFormatter.shortID(diagnostics.lastVisibleMessageID?.rawValue))")
+            diagnosticRow("At Newest", diagnostics.atNewest ? "yes" : "no")
+            diagnosticRow("Unread", TimelineCopyFormatter.shortID(diagnostics.firstUnreadMessageID?.rawValue))
+            diagnosticRow("Pagination", "before \(diagnostics.hasMoreBefore ? "yes" : "no"), after \(diagnostics.hasMoreAfter ? "yes" : "no")")
+            diagnosticRow("References", "pending \(diagnostics.pendingReferenceFetchCount), failed \(diagnostics.failedReferenceFetchCount)")
+            diagnosticRow("Retries", "\(diagnostics.pendingRetryCount)")
+            diagnosticRow("Ack", "\(TimelineCopyFormatter.shortID(diagnostics.lastAckTargetMessageID?.rawValue)) · \(diagnostics.lastAckResult ?? "-")")
+            diagnosticRow("Action", diagnostics.lastTimelineActionResult ?? "-")
+            diagnosticRow("Routes", diagnostics.lastRouteVerificationResult ?? "-")
+        }
+        .font(.caption)
+    }
+
+    private func diagnosticRow(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label).foregroundStyle(.secondary)
+            Text(value).textSelection(.enabled)
+        }
+    }
+
+    @ViewBuilder private func warningList(_ warnings: [TimelineValidationWarning]) -> some View {
+        if !warnings.isEmpty {
+            VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                ForEach(warnings, id: \.self) { warning in
+                    let imageName = warning.severity == .error ? "exclamationmark.triangle.fill" : "exclamationmark.triangle"
+                    let style: Color = warning.severity == .info ? .secondary : .orange
+                    Label(warning.message, systemImage: imageName)
+                        .font(.caption)
+                        .foregroundStyle(style)
+                }
+            }
+        }
+    }
+
+    private var actionGrid: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: StoatSpacing.small)], alignment: .leading, spacing: StoatSpacing.small) {
+            Button("Validate Timeline") { _ = viewModel.validateTimelineState() }
+            Button("Refresh Channel") { viewModel.refreshCurrentContext() }
+            Button("Load Older") { Task { await viewModel.loadOlderSelectedMessages() } }
+            Button("Load To Unread") { Task { await viewModel.loadToFirstUnreadMessage() } }
+            Button("Jump Newest") { viewModel.jumpToNewestMessage() }
+            Button("Jump First Unread") { viewModel.jumpToFirstUnreadMessage() }
+            Button("Verify Routes") { viewModel.verifyTimelineRoutes() }
+            Button("Reset Diagnostics") { viewModel.resetTimelineDiagnostics() }
+            Button("Copy Diagnostics") { viewModel.copyRedactedTimelineDiagnostics() }
+        }
+        .buttonStyle(GlassButtonStyle())
+    }
+
+    private var tuningControls: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            Text("Timeline Tuning").font(.subheadline.weight(.semibold))
+            Stepper("Near newest threshold: \(viewModel.timelineTuning.nearNewestMessageThreshold)", value: binding(\.nearNewestMessageThreshold), in: 0...25)
+            Stepper("Visible debounce: \(viewModel.timelineTuning.visibleRangeUpdateDebounceMilliseconds) ms", value: binding(\.visibleRangeUpdateDebounceMilliseconds), in: 0...2000, step: 20)
+            Stepper("Load-to-unread attempts: \(viewModel.timelineTuning.loadToUnreadMaxAttempts)", value: binding(\.loadToUnreadMaxAttempts), in: 1...20)
+            Stepper("Reference cooldown: \(viewModel.timelineTuning.referenceFetchCooldownSeconds) sec", value: binding(\.referenceFetchCooldownSeconds), in: 0...3600, step: 10)
+            Stepper("Ack debounce: \(viewModel.timelineTuning.ackDebounceMilliseconds) ms", value: binding(\.ackDebounceMilliseconds), in: 0...10000, step: 100)
+        }
+        .font(.caption)
+    }
+
+    private func binding(_ keyPath: WritableKeyPath<TimelineTuningConfiguration, Int>) -> Binding<Int> {
+        Binding {
+            viewModel.timelineTuning[keyPath: keyPath]
+        } set: { value in
+            var tuning = viewModel.timelineTuning
+            tuning[keyPath: keyPath] = value
+            viewModel.updateTimelineTuning(tuning)
+        }
+    }
+
+    private var findControls: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            Text("Find in Loaded Messages").font(.subheadline.weight(.semibold))
+            HStack {
+                TextField("Find loaded messages", text: $viewModel.loadedMessageFindQuery)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { viewModel.refreshLoadedMessageFind() }
+                Button("Find") { viewModel.refreshLoadedMessageFind() }
+            }
+            ForEach(viewModel.loadedMessageFindResults) { result in
+                Button {
+                    viewModel.jumpToLoadedFindResult(result)
+                } label: {
+                    HStack {
+                        Text(TimelineCopyFormatter.shortID(result.messageID.rawValue))
+                        Text(result.snippet).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            Text("Selected Channel Search").font(.subheadline.weight(.semibold))
+            HStack {
+                TextField("Search selected channel", text: $viewModel.remoteSearchQuery)
+                    .textFieldStyle(.roundedBorder)
+                Toggle("Pinned only", isOn: $viewModel.remoteSearchPinnedOnly)
+                Button("Search") { Task { await viewModel.runSelectedChannelSearch() } }
+            }
+            if let status = viewModel.remoteSearchStatus {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(viewModel.remoteSearchResults) { result in
+                HStack {
+                    Text(TimelineCopyFormatter.shortID(result.messageID.rawValue))
+                    Text(result.snippet).foregroundStyle(.secondary).lineLimit(1)
+                }
+                .font(.caption)
+            }
+        }
+    }
+
+    private func checklist(_ diagnostics: TimelineDiagnostics) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            Text("Live Manual Checklist").font(.subheadline.weight(.semibold))
+            checklistRow("Connected Live Manual", viewModel.effectiveRuntimeMode == .liveManual && viewModel.effectiveSessionState == .connected)
+            checklistRow("Ready received", viewModel.sessionCoordinator?.verificationState.readyReceived == true)
+            checklistRow("Selected channel exists", diagnostics.channelID != nil)
+            checklistRow("Initial messages loaded", diagnostics.loadedMessageCount > 0)
+            checklistRow("Visible range active", diagnostics.firstVisibleMessageID != nil || diagnostics.lastVisibleMessageID != nil)
+            checklistRow("At-newest detected", diagnostics.atNewest)
+            checklistRow("Reference resolver status known", diagnostics.lastRouteVerificationResult != nil || diagnostics.pendingReferenceFetchCount + diagnostics.failedReferenceFetchCount >= 0)
+            checklistRow("Diagnostics are redacted", true)
+        }
+    }
+
+    private func checklistRow(_ title: String, _ passed: Bool) -> some View {
+        Label(title, systemImage: passed ? "checkmark.circle.fill" : "circle")
+            .font(.caption)
+            .foregroundStyle(passed ? .green : .secondary)
     }
 }

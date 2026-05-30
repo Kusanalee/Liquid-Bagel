@@ -1465,3 +1465,80 @@ public enum BulkMessageResponse: Codable, Hashable, Sendable {
     }
 }
 
+public enum MessageSort: String, Codable, Hashable, Sendable, CaseIterable {
+    case relevance = "Relevance"
+    case latest = "Latest"
+    case oldest = "Oldest"
+}
+
+public struct MessageFetchOptions: Codable, Hashable, Sendable {
+    public var before: MessageID?
+    public var after: MessageID?
+    public var nearby: MessageID?
+    public var sort: MessageSort?
+    public var limit: Int?
+    public var includeUsers: Bool?
+
+    public init(
+        before: MessageID? = nil,
+        after: MessageID? = nil,
+        nearby: MessageID? = nil,
+        sort: MessageSort? = nil,
+        limit: Int? = nil,
+        includeUsers: Bool? = nil
+    ) {
+        self.before = before
+        self.after = after
+        self.nearby = nearby
+        self.sort = sort
+        self.limit = limit
+        self.includeUsers = includeUsers
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case before
+        case after
+        case nearby
+        case sort
+        case limit
+        case includeUsers = "include_users"
+    }
+}
+
+public struct ChannelMessageSearchRequest: Codable, Hashable, Sendable {
+    public var query: String?
+    public var pinned: Bool?
+    public var before: MessageID?
+    public var after: MessageID?
+    public var limit: Int?
+    public var sort: MessageSort?
+    public var includeUsers: Bool?
+
+    public init(
+        query: String? = nil,
+        pinned: Bool? = nil,
+        before: MessageID? = nil,
+        after: MessageID? = nil,
+        limit: Int? = nil,
+        sort: MessageSort? = nil,
+        includeUsers: Bool? = nil
+    ) {
+        self.query = query
+        self.pinned = pinned
+        self.before = before
+        self.after = after
+        self.limit = limit
+        self.sort = sort
+        self.includeUsers = includeUsers
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case query
+        case pinned
+        case before
+        case after
+        case limit
+        case sort
+        case includeUsers = "include_users"
+    }
+}

@@ -894,6 +894,34 @@ public final class ChannelMessageController {
     }
 
     @discardableResult
+    public func loadMessagesAround(channelID: ChannelID, targetMessageID: MessageID, limit: Int? = nil) async -> Bool {
+        guard shouldUseLiveAPI, let apiClient else { return false }
+        let token = UUID()
+        loadTokens[channelID] = token
+        apply(.olderLoadStarted, channelID: channelID)
+
+        do {
+            let fetched = try await apiClient.fetchMessages(
+                channelID: channelID,
+                options: MessageFetchOptions(nearby: targetMessageID, limit: limit ?? pageSize)
+            )
+            guard loadTokens[channelID] == token else { return false }
+            let hasMoreBefore = history(for: channelID).hasMoreBefore
+            apply(.olderLoadSucceeded(messages: fetched, hasMoreBefore: hasMoreBefore, loadedAt: Date()), channelID: channelID)
+            var updated = history(for: channelID)
+            updated.loadedRange.loadedAroundMessageID = targetMessageID
+            setHistory(updated)
+            lastErrorByChannelID[channelID] = nil
+            return true
+        } catch {
+            guard loadTokens[channelID] == token else { return false }
+            apply(.olderLoadFailed(error.userFacingMessage), channelID: channelID)
+            lastErrorByChannelID[channelID] = error.userFacingMessage
+            return false
+        }
+    }
+
+    @discardableResult
     public func loadOlderMessagesToTarget(channelID: ChannelID, targetMessageID: MessageID, maxAttempts: Int = 4) async -> UnreadRecoveryState {
         guard maxAttempts > 0 else {
             let state: UnreadRecoveryState = .failed(targetMessageID, "Could not load older messages.")

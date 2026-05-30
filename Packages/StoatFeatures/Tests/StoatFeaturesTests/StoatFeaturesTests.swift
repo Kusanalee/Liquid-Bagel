@@ -1411,6 +1411,87 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertFalse(String(describing: diagnostics).localizedCaseInsensitiveContains("token="))
     }
 
+    @MainActor
+    func testPhase12TuningValidationAndAtNewestThreshold() throws {
+        let tuning = TimelineTuningConfiguration(
+            nearNewestMessageThreshold: -3,
+            visibleRangeUpdateDebounceMilliseconds: -1,
+            loadToUnreadMaxAttempts: 99,
+            referenceFetchMaxAttempts: 12,
+            referenceFetchCooldownSeconds: -1,
+            ackDebounceMilliseconds: 99_999
+        ).validated()
+
+        XCTAssertEqual(tuning.nearNewestMessageThreshold, 0)
+        XCTAssertEqual(tuning.visibleRangeUpdateDebounceMilliseconds, 0)
+        XCTAssertEqual(tuning.loadToUnreadMaxAttempts, 20)
+        XCTAssertEqual(tuning.referenceFetchMaxAttempts, 5)
+        XCTAssertEqual(tuning.referenceFetchCooldownSeconds, 0)
+        XCTAssertEqual(tuning.ackDebounceMilliseconds, 10_000)
+
+        let ids: [MessageID] = ["1", "2", "3", "4"]
+        XCTAssertFalse(TimelineViewportReducer.isNewestVisibleOrNearVisible(visibleMessageIDs: ["2"], loadedMessageIDs: ids, trailingThreshold: 0))
+        XCTAssertTrue(TimelineViewportReducer.isNewestVisibleOrNearVisible(visibleMessageIDs: ["2"], loadedMessageIDs: ids, trailingThreshold: 2))
+    }
+
+    @MainActor
+    func testPhase12VisibleRangeValidationWarnings() throws {
+        let channelID: ChannelID = "channel"
+        let loaded: [MessageID] = ["1", "2", "3"]
+        let validator = TimelineVisibleRangeValidator()
+
+        let valid = validator.warnings(
+            channelID: channelID,
+            loadedMessageIDs: loaded,
+            visibleRange: TimelineVisibleRange(channelID: channelID, firstVisibleMessageID: "2", lastVisibleMessageID: "3", visibleMessageIDs: ["2", "3"]),
+            atNewest: true,
+            nearNewestMessageThreshold: 0
+        )
+        XCTAssertTrue(valid.isEmpty)
+
+        let warnings = validator.warnings(
+            channelID: channelID,
+            loadedMessageIDs: loaded,
+            visibleRange: TimelineVisibleRange(channelID: "other", firstVisibleMessageID: "2", lastVisibleMessageID: "1", visibleMessageIDs: ["2", "missing", "1"]),
+            atNewest: true,
+            nearNewestMessageThreshold: 0
+        )
+        XCTAssertTrue(warnings.contains { $0.message.contains("channel") })
+        XCTAssertTrue(warnings.contains { $0.message.contains("not loaded") })
+        XCTAssertTrue(warnings.contains { $0.message.contains("First visible") })
+        XCTAssertTrue(warnings.contains { $0.message.contains("at newest") })
+    }
+
+    @MainActor
+    func testPhase12FindInLoadedMessagesIsLocalAndCreatesJumpIntent() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        let message = message(id: "01J00000000000000000000001", author: "a", channel: channelID)
+        let finder = LoadedMessageFinder()
+        var searchable = message
+        searchable.content = "Phase 12 find in loaded messages"
+        let found = finder.find(query: "Phase 12", messages: [TimelineMessage(message: searchable)])
+        let result = try XCTUnwrap(found.first)
+        model.jumpToLoadedFindResult(result)
+
+        XCTAssertEqual(model.timelineViewport.selectedMessageID, result.messageID)
+        XCTAssertNotNil(model.timelineViewport.pendingScrollIntent)
+    }
+
+    @MainActor
+    func testPhase12DiagnosticsCopyRedactsTokenLikeStrings() throws {
+        let diagnostics = TimelineDiagnostics(
+            lastAckResult: "token=secret-token-value",
+            lastTimelineActionResult: "X-Session-Token: abcdefghijklmnopqrstuvwxyz"
+        )
+
+        let copied = TimelineCopyFormatter.diagnostics(diagnostics)
+        XCTAssertFalse(copied.contains("secret-token-value"))
+        XCTAssertFalse(copied.contains("abcdefghijklmnopqrstuvwxyz"))
+        XCTAssertTrue(copied.contains("<redacted>"))
+    }
+
     private func message(
         id: String,
         author: UserID,

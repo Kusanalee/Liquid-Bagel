@@ -255,3 +255,27 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Liquid Bagel implements only the narrow channel ack route, scoped to the active selected channel in Live Manual.
 - Server-wide ack remains deferred.
 - Mention clearing is allowed after a successful live ack or equivalent verified ack state, but local-only mock behavior continues to avoid claiming server acknowledgement.
+
+## Phase 12 Notes
+
+### Sources inspected
+
+- Current generated API routes: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/routes.ts
+- Current generated API schema: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/schema.ts
+- Backend single-message fetch route: https://raw.githubusercontent.com/stoatchat/stoatchat/main/crates/delta/src/routes/channels/message_fetch.rs
+- Backend message query route: https://raw.githubusercontent.com/stoatchat/stoatchat/main/crates/delta/src/routes/channels/message_query.rs
+- Backend message search route: https://raw.githubusercontent.com/stoatchat/stoatchat/main/crates/delta/src/routes/channels/message_search.rs
+
+### Verified route findings
+
+- Single message fetch is verified as `GET /channels/{target}/messages/{msg}`. Backend checks `ViewChannel`, fetches the referenced message, and returns `NotFound` if the message does not belong to the target channel.
+- Around-message fetch is verified on `GET /channels/{target}/messages` with query parameter `nearby`. The generated schema says `nearby` ignores `before`, `after`, and `sort`, uses the limit on both sides, and includes the target message.
+- Standard channel message fetch also supports `before`, `after`, `sort`, `limit`, and `include_users`.
+- Selected-channel message search is verified as `POST /channels/{target}/search`, with `query`, `pinned`, `before`, `after`, `limit`, `sort`, and `include_users`.
+- Pinned-message listing is available through the selected-channel search route with `pinned: true`; no separate pinned-message list endpoint was found or needed for Phase 12.
+
+### Phase 12 safety decisions
+
+- Live reference fetching may use the verified single-message route only after explicit Live Manual connection and visible/explicit timeline need.
+- Around-message fetch may use verified `nearby` only for explicit recovery actions such as load-to-unread or load-around-target.
+- Remote search remains selected-channel only, explicit, non-persistent, and Live Manual only. Local “Find in loaded messages” remains available in mock and live loaded data without network calls.

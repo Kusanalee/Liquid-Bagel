@@ -48,6 +48,50 @@ public enum MessageDensityPreference: String, Codable, Hashable, Sendable, CaseI
     case compact
 }
 
+public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
+    public var nearNewestMessageThreshold: Int
+    public var visibleRangeUpdateDebounceMilliseconds: Int
+    public var loadToUnreadMaxAttempts: Int
+    public var referenceFetchMaxAttempts: Int
+    public var referenceFetchCooldownSeconds: Int
+    public var ackDebounceMilliseconds: Int
+
+    public init(
+        nearNewestMessageThreshold: Int = 2,
+        visibleRangeUpdateDebounceMilliseconds: Int = 120,
+        loadToUnreadMaxAttempts: Int = 4,
+        referenceFetchMaxAttempts: Int = 1,
+        referenceFetchCooldownSeconds: Int = 60,
+        ackDebounceMilliseconds: Int = 1500
+    ) {
+        self.nearNewestMessageThreshold = nearNewestMessageThreshold
+        self.visibleRangeUpdateDebounceMilliseconds = visibleRangeUpdateDebounceMilliseconds
+        self.loadToUnreadMaxAttempts = loadToUnreadMaxAttempts
+        self.referenceFetchMaxAttempts = referenceFetchMaxAttempts
+        self.referenceFetchCooldownSeconds = referenceFetchCooldownSeconds
+        self.ackDebounceMilliseconds = ackDebounceMilliseconds
+    }
+
+    public static var defaults: TimelineTuningConfiguration {
+        TimelineTuningConfiguration()
+    }
+
+    public func validated() -> TimelineTuningConfiguration {
+        TimelineTuningConfiguration(
+            nearNewestMessageThreshold: Self.clamp(nearNewestMessageThreshold, 0...25),
+            visibleRangeUpdateDebounceMilliseconds: Self.clamp(visibleRangeUpdateDebounceMilliseconds, 0...2_000),
+            loadToUnreadMaxAttempts: Self.clamp(loadToUnreadMaxAttempts, 1...20),
+            referenceFetchMaxAttempts: Self.clamp(referenceFetchMaxAttempts, 0...5),
+            referenceFetchCooldownSeconds: Self.clamp(referenceFetchCooldownSeconds, 0...3_600),
+            ackDebounceMilliseconds: Self.clamp(ackDebounceMilliseconds, 0...10_000)
+        )
+    }
+
+    private static func clamp(_ value: Int, _ range: ClosedRange<Int>) -> Int {
+        min(max(value, range.lowerBound), range.upperBound)
+    }
+}
+
 public struct EnvironmentProfile: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var name: String
@@ -135,6 +179,20 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public var memberPanelVisible: Bool
     public var messageDensity: MessageDensityPreference
     public var reduceGlassIntensity: Bool
+    public var timelineTuning: TimelineTuningConfiguration
+
+    private enum CodingKeys: String, CodingKey {
+        case lastSelectedEnvironmentID
+        case environmentProfiles
+        case preferredLaunchMode
+        case showDeveloperRuntimeControls
+        case lastSelectedServerID
+        case lastSelectedChannelID
+        case memberPanelVisible
+        case messageDensity
+        case reduceGlassIntensity
+        case timelineTuning
+    }
 
     public init(
         lastSelectedEnvironmentID: String? = nil,
@@ -145,7 +203,8 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         lastSelectedChannelID: ChannelID? = nil,
         memberPanelVisible: Bool = true,
         messageDensity: MessageDensityPreference = .comfortable,
-        reduceGlassIntensity: Bool = false
+        reduceGlassIntensity: Bool = false,
+        timelineTuning: TimelineTuningConfiguration = .defaults
     ) {
         self.lastSelectedEnvironmentID = lastSelectedEnvironmentID
         self.environmentProfiles = Self.normalizedProfiles(environmentProfiles)
@@ -156,6 +215,37 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.memberPanelVisible = memberPanelVisible
         self.messageDensity = messageDensity
         self.reduceGlassIntensity = reduceGlassIntensity
+        self.timelineTuning = timelineTuning.validated()
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            lastSelectedEnvironmentID: try container.decodeIfPresent(String.self, forKey: .lastSelectedEnvironmentID),
+            environmentProfiles: try container.decodeIfPresent([EnvironmentProfile].self, forKey: .environmentProfiles) ?? [EnvironmentProfile.production()],
+            preferredLaunchMode: try container.decodeIfPresent(PreferredLaunchMode.self, forKey: .preferredLaunchMode) ?? .mock,
+            showDeveloperRuntimeControls: try container.decodeIfPresent(Bool.self, forKey: .showDeveloperRuntimeControls) ?? true,
+            lastSelectedServerID: try container.decodeIfPresent(ServerID.self, forKey: .lastSelectedServerID),
+            lastSelectedChannelID: try container.decodeIfPresent(ChannelID.self, forKey: .lastSelectedChannelID),
+            memberPanelVisible: try container.decodeIfPresent(Bool.self, forKey: .memberPanelVisible) ?? true,
+            messageDensity: try container.decodeIfPresent(MessageDensityPreference.self, forKey: .messageDensity) ?? .comfortable,
+            reduceGlassIntensity: try container.decodeIfPresent(Bool.self, forKey: .reduceGlassIntensity) ?? false,
+            timelineTuning: try container.decodeIfPresent(TimelineTuningConfiguration.self, forKey: .timelineTuning) ?? .defaults
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(lastSelectedEnvironmentID, forKey: .lastSelectedEnvironmentID)
+        try container.encode(environmentProfiles, forKey: .environmentProfiles)
+        try container.encode(preferredLaunchMode, forKey: .preferredLaunchMode)
+        try container.encode(showDeveloperRuntimeControls, forKey: .showDeveloperRuntimeControls)
+        try container.encodeIfPresent(lastSelectedServerID, forKey: .lastSelectedServerID)
+        try container.encodeIfPresent(lastSelectedChannelID, forKey: .lastSelectedChannelID)
+        try container.encode(memberPanelVisible, forKey: .memberPanelVisible)
+        try container.encode(messageDensity, forKey: .messageDensity)
+        try container.encode(reduceGlassIntensity, forKey: .reduceGlassIntensity)
+        try container.encode(timelineTuning.validated(), forKey: .timelineTuning)
     }
 
     public static var defaults: AppPreferences {
@@ -187,7 +277,9 @@ public struct AppPreferences: Codable, Hashable, Sendable {
                 try profile.environment.validate()
             }
         }
-        return self
+        var copy = self
+        copy.timelineTuning = timelineTuning.validated()
+        return copy
     }
 
     public func withSelectedEnvironmentID(_ id: String?) -> AppPreferences {

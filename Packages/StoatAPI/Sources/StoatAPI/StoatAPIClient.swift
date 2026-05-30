@@ -7,7 +7,10 @@ public protocol StoatAPIClient: Sendable {
     func fetchServers() async throws -> [Server]
     func fetchChannels() async throws -> [Channel]
     func fetchChannel(id: ChannelID) async throws -> Channel
+    func fetchMessage(channelID: ChannelID, messageID: MessageID) async throws -> Message
+    func fetchMessages(channelID: ChannelID, options: MessageFetchOptions) async throws -> [Message]
     func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message]
+    func searchMessages(channelID: ChannelID, request: ChannelMessageSearchRequest) async throws -> [Message]
     func sendMessage(channelID: ChannelID, draft: MessageDraft) async throws -> Message
     func editMessage(channelID: ChannelID, messageID: MessageID, draft: MessageEditDraft) async throws -> Message
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws
@@ -27,6 +30,18 @@ public protocol StoatAPIClient: Sendable {
 }
 
 public extension StoatAPIClient {
+    func fetchMessage(channelID: ChannelID, messageID: MessageID) async throws -> Message {
+        throw StoatAPIError.unimplementedEndpoint("Single message fetch is not implemented by this API client.")
+    }
+
+    func fetchMessages(channelID: ChannelID, options: MessageFetchOptions) async throws -> [Message] {
+        try await fetchMessages(channelID: channelID, before: options.before, after: options.after, limit: options.limit)
+    }
+
+    func searchMessages(channelID: ChannelID, request: ChannelMessageSearchRequest) async throws -> [Message] {
+        throw StoatAPIError.unimplementedEndpoint("Channel message search is not implemented by this API client.")
+    }
+
     func ackChannel(channelID: ChannelID, messageID: MessageID) async throws {
         throw StoatAPIError.unimplementedEndpoint("Channel read acknowledgement is not implemented by this API client.")
     }
@@ -103,22 +118,55 @@ public actor LiveStoatAPIClient: StoatAPIClient {
         try await perform(StoatRequest<Channel>(method: .get, path: "/channels/\(id.rawValue.stoatPathComponentEscaped)"))
     }
 
-    public func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message] {
+    public func fetchMessage(channelID: ChannelID, messageID: MessageID) async throws -> Message {
+        try await perform(
+            StoatRequest<Message>(
+                method: .get,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages/\(messageID.rawValue.stoatPathComponentEscaped)"
+            )
+        )
+    }
+
+    public func fetchMessages(channelID: ChannelID, options: MessageFetchOptions) async throws -> [Message] {
         var queryItems: [URLQueryItem] = []
-        if let before {
+        if let before = options.before {
             queryItems.append(URLQueryItem(name: "before", value: before.rawValue))
         }
-        if let after {
+        if let after = options.after {
             queryItems.append(URLQueryItem(name: "after", value: after.rawValue))
         }
-        if let limit {
+        if let nearby = options.nearby {
+            queryItems.append(URLQueryItem(name: "nearby", value: nearby.rawValue))
+        }
+        if let sort = options.sort {
+            queryItems.append(URLQueryItem(name: "sort", value: sort.rawValue))
+        }
+        if let limit = options.limit {
             queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        if let includeUsers = options.includeUsers {
+            queryItems.append(URLQueryItem(name: "include_users", value: includeUsers ? "true" : "false"))
         }
         let response = try await perform(
             StoatRequest<BulkMessageResponse>(
                 method: .get,
                 path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages",
                 queryItems: queryItems
+            )
+        )
+        return response.messages
+    }
+
+    public func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message] {
+        try await fetchMessages(channelID: channelID, options: MessageFetchOptions(before: before, after: after, limit: limit))
+    }
+
+    public func searchMessages(channelID: ChannelID, request: ChannelMessageSearchRequest) async throws -> [Message] {
+        let response = try await perform(
+            StoatRequest<BulkMessageResponse>(
+                method: .post,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/search",
+                body: .json(try encoder.encode(request))
             )
         )
         return response.messages

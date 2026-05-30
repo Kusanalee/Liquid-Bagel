@@ -190,6 +190,60 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
     }
 
+    func testSingleMessageFetchEndpointRequest() async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"{"_id":"message-1","channel":"channel-1","author":"user-1","content":"hello"}"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        let message = try await client.fetchMessage(channelID: "channel-1", messageID: "message-1")
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+
+        XCTAssertEqual(message.id, "message-1")
+        XCTAssertEqual(request.httpMethod, "GET")
+        XCTAssertEqual(request.url?.path, "/channels/channel-1/messages/message-1")
+    }
+
+    func testNearbyMessageFetchEndpointRequest() async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"[{"_id":"message-1","channel":"channel-1","author":"user-1","content":"hello"}]"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        _ = try await client.fetchMessages(channelID: "channel-1", options: MessageFetchOptions(nearby: "message-1", sort: .latest, limit: 9, includeUsers: false))
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let query = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.queryItems ?? []
+
+        XCTAssertEqual(request.httpMethod, "GET")
+        XCTAssertEqual(request.url?.path, "/channels/channel-1/messages")
+        XCTAssertEqual(query.first { $0.name == "nearby" }?.value, "message-1")
+        XCTAssertEqual(query.first { $0.name == "sort" }?.value, "Latest")
+        XCTAssertEqual(query.first { $0.name == "limit" }?.value, "9")
+        XCTAssertEqual(query.first { $0.name == "include_users" }?.value, "false")
+    }
+
+    func testChannelSearchEndpointRequest() async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"[{"_id":"message-1","channel":"channel-1","author":"user-1","content":"needle"}]"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        _ = try await client.searchMessages(channelID: "channel-1", request: ChannelMessageSearchRequest(query: "needle", limit: 25, sort: .relevance))
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let body = String(data: try XCTUnwrap(request.httpBody), encoding: .utf8)
+
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/channels/channel-1/search")
+        XCTAssertTrue(body?.contains(#""query":"needle""#) == true)
+        XCTAssertTrue(body?.contains(#""sort":"Relevance""#) == true)
+    }
+
     func testSessionValidationErrorMapping() {
         XCTAssertEqual(LiveSessionValidator.map(.unauthorized), .invalidOrExpired)
         XCTAssertEqual(LiveSessionValidator.map(.forbidden), .forbidden)

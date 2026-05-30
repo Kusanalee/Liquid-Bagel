@@ -161,15 +161,66 @@ public actor MockStoatAPIClient: StoatAPIClient {
         return channel
     }
 
-    public func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message] {
+    public func fetchMessage(channelID: ChannelID, messageID: MessageID) async throws -> Message {
+        guard let message = messagesByChannel[channelID]?.first(where: { $0.id == messageID }) else {
+            throw StoatAPIError.notFound
+        }
+        return message
+    }
+
+    public func fetchMessages(channelID: ChannelID, options: MessageFetchOptions) async throws -> [Message] {
         var messages = messagesByChannel[channelID] ?? []
-        if let before, let index = messages.firstIndex(where: { $0.id == before }) {
+        if let nearby = options.nearby,
+           let index = messages.firstIndex(where: { $0.id == nearby }) {
+            let limit = max(1, options.limit ?? messages.count)
+            let side = max(0, limit / 2)
+            let lower = max(messages.startIndex, index - side)
+            let upper = min(messages.endIndex, index + side + 1)
+            messages = Array(messages[lower..<upper])
+        } else {
+            if let before = options.before, let index = messages.firstIndex(where: { $0.id == before }) {
+                messages = Array(messages[..<index])
+            }
+            if let after = options.after, let index = messages.firstIndex(where: { $0.id == after }) {
+                messages = Array(messages[messages.index(after: index)...])
+            }
+            if options.sort == .oldest {
+                messages.sort { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
+            } else if options.sort == .latest {
+                messages.sort { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+            }
+        }
+        if let limit = options.limit, limit < messages.count {
+            messages = Array(messages.prefix(limit))
+        }
+        return messages
+    }
+
+    public func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message] {
+        try await fetchMessages(channelID: channelID, options: MessageFetchOptions(before: before, after: after, limit: limit))
+    }
+
+    public func searchMessages(channelID: ChannelID, request: ChannelMessageSearchRequest) async throws -> [Message] {
+        var messages = messagesByChannel[channelID] ?? []
+        if request.pinned == true {
+            messages = messages.filter { $0.pinned == true }
+        } else if let query = request.query?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty {
+            messages = messages.filter { ($0.content ?? "").localizedCaseInsensitiveContains(query) }
+        } else {
+            messages = []
+        }
+        if let before = request.before, let index = messages.firstIndex(where: { $0.id == before }) {
             messages = Array(messages[..<index])
         }
-        if let after, let index = messages.firstIndex(where: { $0.id == after }) {
+        if let after = request.after, let index = messages.firstIndex(where: { $0.id == after }) {
             messages = Array(messages[messages.index(after: index)...])
         }
-        if let limit, limit < messages.count {
+        if request.sort == .oldest {
+            messages.sort { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
+        } else {
+            messages.sort { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+        }
+        if let limit = request.limit, limit < messages.count {
             messages = Array(messages.prefix(limit))
         }
         return messages

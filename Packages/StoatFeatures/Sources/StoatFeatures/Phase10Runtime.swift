@@ -1,6 +1,7 @@
 import Foundation
 import StoatAPI
 import StoatModels
+import StoatPersistence
 
 public struct TimelineViewportState: Hashable, Sendable {
     public var channelID: ChannelID?
@@ -260,6 +261,9 @@ public struct FailedMessageRecoveryMetadata: Hashable, Sendable {
 public enum MessageReferenceResolution: Hashable, Sendable {
     case loaded(Message)
     case deleted
+    case forbidden
+    case notFound
+    case rateLimited
     case unavailable(String)
     case notSupported
 }
@@ -307,8 +311,17 @@ public struct TimelineDiagnostics: Hashable, Sendable {
     public var firstUnreadMessageID: MessageID?
     public var atNewest: Bool
     public var hasMoreBefore: Bool
+    public var hasMoreAfter: Bool
+    public var unreadRecoveryState: UnreadRecoveryState
     public var pendingReferenceFetchCount: Int
+    public var failedReferenceFetchCount: Int
     public var pendingRetryCount: Int
+    public var lastAckTargetMessageID: MessageID?
+    public var lastAckResult: String?
+    public var lastTimelineActionResult: String?
+    public var lastRouteVerificationResult: String?
+    public var tuningConfiguration: TimelineTuningConfiguration
+    public var validationWarnings: [TimelineValidationWarning]
 
     public init(
         channelID: ChannelID? = nil,
@@ -320,8 +333,17 @@ public struct TimelineDiagnostics: Hashable, Sendable {
         firstUnreadMessageID: MessageID? = nil,
         atNewest: Bool = true,
         hasMoreBefore: Bool = false,
+        hasMoreAfter: Bool = false,
+        unreadRecoveryState: UnreadRecoveryState = .none,
         pendingReferenceFetchCount: Int = 0,
-        pendingRetryCount: Int = 0
+        failedReferenceFetchCount: Int = 0,
+        pendingRetryCount: Int = 0,
+        lastAckTargetMessageID: MessageID? = nil,
+        lastAckResult: String? = nil,
+        lastTimelineActionResult: String? = nil,
+        lastRouteVerificationResult: String? = nil,
+        tuningConfiguration: TimelineTuningConfiguration = .defaults,
+        validationWarnings: [TimelineValidationWarning] = []
     ) {
         self.channelID = channelID
         self.loadedMessageCount = loadedMessageCount
@@ -332,8 +354,17 @@ public struct TimelineDiagnostics: Hashable, Sendable {
         self.firstUnreadMessageID = firstUnreadMessageID
         self.atNewest = atNewest
         self.hasMoreBefore = hasMoreBefore
+        self.hasMoreAfter = hasMoreAfter
+        self.unreadRecoveryState = unreadRecoveryState
         self.pendingReferenceFetchCount = pendingReferenceFetchCount
+        self.failedReferenceFetchCount = failedReferenceFetchCount
         self.pendingRetryCount = pendingRetryCount
+        self.lastAckTargetMessageID = lastAckTargetMessageID
+        self.lastAckResult = lastAckResult
+        self.lastTimelineActionResult = lastTimelineActionResult
+        self.lastRouteVerificationResult = lastRouteVerificationResult
+        self.tuningConfiguration = tuningConfiguration
+        self.validationWarnings = validationWarnings
     }
 }
 
@@ -394,6 +425,7 @@ public struct TimelineViewportReducer: Sendable {
         channelID: ChannelID,
         visibleMessageIDs: [MessageID],
         loadedMessageIDs: [MessageID],
+        nearNewestMessageThreshold: Int = 2,
         updatedAt: Date = Date()
     ) -> TimelineViewportState {
         var state = state
@@ -411,7 +443,11 @@ public struct TimelineViewportReducer: Sendable {
         )
         state.oldestVisibleMessageID = orderedVisible.first
         state.newestVisibleMessageID = orderedVisible.last
-        state.isAtNewest = Self.isNewestVisibleOrNearVisible(visibleMessageIDs: orderedVisible, loadedMessageIDs: loadedMessageIDs)
+        state.isAtNewest = Self.isNewestVisibleOrNearVisible(
+            visibleMessageIDs: orderedVisible,
+            loadedMessageIDs: loadedMessageIDs,
+            trailingThreshold: nearNewestMessageThreshold
+        )
         if state.isAtNewest {
             state.hasNewerMessagesIndicator = false
         }

@@ -420,6 +420,19 @@ public final class MainShellViewModel {
     public var selectedSettingsTab: SettingsSectionTab = .account
     public var messageDensity: MessageDensityPreference = .comfortable
     public var reduceGlassIntensity = false
+    public var timelineTuning: TimelineTuningConfiguration = .defaults
+    public var timelineValidationWarnings: [TimelineValidationWarning] = []
+    public var routeVerificationResult = TimelineRouteVerificationResult()
+    public var lastRouteVerificationResult: String?
+    public var lastTimelineActionResult: String?
+    public var lastAckTargetMessageID: MessageID?
+    public var lastAckResult: String?
+    public var loadedMessageFindQuery = ""
+    public var loadedMessageFindResults: [LoadedMessageFindResult] = []
+    public var remoteSearchQuery = ""
+    public var remoteSearchPinnedOnly = false
+    public var remoteSearchResults: [LoadedMessageFindResult] = []
+    public var remoteSearchStatus: String?
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var channelAckSender: any ChannelAckSending
@@ -440,6 +453,10 @@ public final class MainShellViewModel {
     @ObservationIgnored private let selectionRestorer = ShellSelectionRestorer()
     @ObservationIgnored private let navigationHelper = ShellNavigationHelper()
     @ObservationIgnored private let viewportReducer = TimelineViewportReducer()
+    @ObservationIgnored private let visibleRangeValidator = TimelineVisibleRangeValidator()
+    @ObservationIgnored private let loadedMessageFinder = LoadedMessageFinder()
+    @ObservationIgnored private var visibleRangeUpdateTasks: [ChannelID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
 
     public init(
         selection: ShellSelection = ShellSelection(),
@@ -857,13 +874,19 @@ public final class MainShellViewModel {
         selection.isMemberPanelVisible = sessionCoordinator.preferences.memberPanelVisible
         messageDensity = sessionCoordinator.preferences.messageDensity
         reduceGlassIntensity = sessionCoordinator.preferences.reduceGlassIntensity
+        timelineTuning = sessionCoordinator.preferences.timelineTuning.validated()
         snapshot = sessionCoordinator.snapshot
         messageActionHandler = sessionCoordinator.messageActionHandler
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
         channelAckSender = liveAPIClient.map { LiveChannelAckSender(apiClient: $0) } ?? NoopChannelAckSender()
-        messageReferenceResolver = sessionCoordinator.mode == .mock
-            ? InMemoryMessageReferenceResolver(messagesByChannelID: snapshot.messagesByChannelID)
-            : DisabledMessageReferenceResolver()
+        if sessionCoordinator.mode == .mock {
+            messageReferenceResolver = InMemoryMessageReferenceResolver(messagesByChannelID: snapshot.messagesByChannelID)
+        } else if let liveAPIClient {
+            let currentTuning = timelineTuning
+            messageReferenceResolver = LiveMessageReferenceResolver(apiClient: liveAPIClient, tuning: { currentTuning })
+        } else {
+            messageReferenceResolver = DisabledMessageReferenceResolver()
+        }
         messageController.configure(
             runtimeMode: sessionCoordinator.mode,
             apiClient: liveAPIClient,
@@ -1085,6 +1108,9 @@ public final class MainShellViewModel {
             let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
             let target = anchor.flatMap { loadedIDs.contains($0) ? $0 : nil } ?? selectedTimelineMessages.first?.message.id
             timelineViewport = viewportReducer.preserveAfterPrepend(timelineViewport, previousOldestID: target)
+            lastTimelineActionResult = "Loaded older messages"
+        } else {
+            lastTimelineActionResult = "Load older unavailable or failed"
         }
     }
 
@@ -1463,8 +1489,10 @@ public final class MainShellViewModel {
             timelineViewport,
             channelID: channelID,
             visibleMessageIDs: Array(visible),
-            loadedMessageIDs: loadedIDs
+            loadedMessageIDs: loadedIDs,
+            nearNewestMessageThreshold: timelineTuning.nearNewestMessageThreshold
         )
+        validateTimelineState()
         if timelineViewport.isAtNewest {
             acknowledgeSelectedChannel()
             scheduleLiveAckIfNeeded(channelID: channelID)
@@ -1482,7 +1510,11 @@ public final class MainShellViewModel {
             jumpToFirstUnreadMessage()
             return
         }
-        let state = await messageController.loadOlderMessagesToTarget(channelID: channelID, targetMessageID: unreadID, maxAttempts: 4)
+        let state = await messageController.loadOlderMessagesToTarget(
+            channelID: channelID,
+            targetMessageID: unreadID,
+            maxAttempts: timelineTuning.loadToUnreadMaxAttempts
+        )
         switch state {
         case .targetLoaded:
             jumpToFirstUnreadMessage()
@@ -1510,10 +1542,16 @@ public final class MainShellViewModel {
                 return "\(authorName): \(Self.replyPreviewText(for: referenced))"
             case .deleted:
                 return "Original message was deleted"
+            case .forbidden:
+                return "Original message is not accessible"
+            case .notFound:
+                return "Original message was not found"
+            case .rateLimited:
+                return "Original message is rate limited"
             case let .unavailable(message):
                 return message
             case .notSupported:
-                return "Original message unavailable"
+                return "Live reference fetching is unavailable"
             }
         }
         resolveReferenceIfNeeded(channelID: message.channelID, messageID: replyID)
@@ -1534,9 +1572,141 @@ public final class MainShellViewModel {
             firstUnreadMessageID: channelID.flatMap { firstUnreadMessageID(for: $0) },
             atNewest: timelineViewport.isAtNewest,
             hasMoreBefore: history?.loadedRange.hasMoreBefore ?? false,
+            hasMoreAfter: history?.loadedRange.hasMoreAfter ?? false,
+            unreadRecoveryState: history?.unreadRecoveryState ?? .none,
             pendingReferenceFetchCount: history?.pendingReferenceFetchMessageIDs.count ?? 0,
-            pendingRetryCount: messageController.retryingMessageIDs.count
+            failedReferenceFetchCount: failedReferenceFetchMessageIDs.count,
+            pendingRetryCount: messageController.retryingMessageIDs.count,
+            lastAckTargetMessageID: lastAckTargetMessageID,
+            lastAckResult: lastAckResult,
+            lastTimelineActionResult: lastTimelineActionResult ?? messageActionStatus ?? placeholderStatus,
+            lastRouteVerificationResult: lastRouteVerificationResult,
+            tuningConfiguration: timelineTuning,
+            validationWarnings: timelineValidationWarnings
         )
+    }
+
+    @discardableResult
+    public func validateTimelineState() -> [TimelineValidationWarning] {
+        let channelID = selection.channelID ?? selection.dmChannelID
+        timelineValidationWarnings = visibleRangeValidator.warnings(
+            channelID: channelID,
+            loadedMessageIDs: selectedTimelineMessages.map(\.message.id),
+            visibleRange: timelineViewport.visibleRange,
+            atNewest: timelineViewport.isAtNewest,
+            nearNewestMessageThreshold: timelineTuning.nearNewestMessageThreshold
+        )
+        lastTimelineActionResult = timelineValidationWarnings.isEmpty ? "Timeline validation passed" : "Timeline validation found \(timelineValidationWarnings.count) warning(s)"
+        return timelineValidationWarnings
+    }
+
+    public func copyRedactedTimelineDiagnostics() {
+        let text = TimelineCopyFormatter.diagnostics(timelineDiagnostics())
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+        placeholderStatus = "Timeline diagnostics copied"
+        lastTimelineActionResult = "Copied redacted diagnostics"
+    }
+
+    public func resetTimelineDiagnostics() {
+        timelineValidationWarnings = []
+        failedReferenceFetchMessageIDs = []
+        lastAckTargetMessageID = nil
+        lastAckResult = nil
+        lastTimelineActionResult = nil
+        placeholderStatus = "Timeline diagnostics reset"
+    }
+
+    public func verifyTimelineRoutes() {
+        routeVerificationResult = .sourceVerified
+        lastRouteVerificationResult = routeVerificationResult.summary
+        placeholderStatus = "Timeline routes verified from source"
+    }
+
+    public func updateTimelineTuning(_ tuning: TimelineTuningConfiguration) {
+        let validated = tuning.validated()
+        timelineTuning = validated
+        Task { [weak sessionCoordinator] in
+            await sessionCoordinator?.updatePreferences { preferences in
+                preferences.timelineTuning = validated
+            }
+        }
+        validateTimelineState()
+    }
+
+    public func refreshLoadedMessageFind() {
+        loadedMessageFindResults = loadedMessageFinder.find(
+            query: loadedMessageFindQuery,
+            messages: selectedTimelineMessages
+        )
+    }
+
+    public func jumpToLoadedFindResult(_ result: LoadedMessageFindResult) {
+        guard result.channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
+        timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
+        lastTimelineActionResult = "Jumped to loaded find result"
+    }
+
+    public func loadAroundMessage(_ messageID: MessageID) async {
+        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        let anchor = timelineViewport.visibleRange?.firstVisibleMessageID ?? selectedTimelineMessages.first?.message.id
+        let loaded = await messageController.loadMessagesAround(channelID: channelID, targetMessageID: messageID)
+        if loaded {
+            if let anchor {
+                timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: anchor, reason: .loadOlder)
+            }
+            lastTimelineActionResult = "Loaded messages around target"
+        } else {
+            lastTimelineActionResult = "Around-message fetch unavailable or failed"
+        }
+    }
+
+    public func runSelectedChannelSearch() async {
+        guard effectiveRuntimeMode == .liveManual,
+              effectiveSessionState == .connected,
+              let channelID = selection.channelID ?? selection.dmChannelID,
+              let apiClient = sessionCoordinator?.apiClient
+        else {
+            remoteSearchStatus = "Connect Live Manual before searching the selected channel."
+            remoteSearchResults = []
+            return
+        }
+        let query = remoteSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard remoteSearchPinnedOnly || !query.isEmpty else {
+            remoteSearchStatus = "Enter search text or choose pinned only."
+            remoteSearchResults = []
+            return
+        }
+        do {
+            let messages = try await apiClient.searchMessages(
+                channelID: channelID,
+                request: ChannelMessageSearchRequest(
+                    query: remoteSearchPinnedOnly ? nil : query,
+                    pinned: remoteSearchPinnedOnly ? true : nil,
+                    limit: 25,
+                    sort: remoteSearchPinnedOnly ? .latest : .relevance
+                )
+            )
+            let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
+            remoteSearchResults = messages.map {
+                LoadedMessageFindResult(
+                    messageID: $0.id,
+                    channelID: $0.channelID,
+                    authorID: $0.authorID,
+                    createdAt: $0.createdAt,
+                    snippet: loadedIDs.contains($0.id) ? LoadedMessageFinder.snippet($0.content ?? "Message", matching: query.isEmpty ? ($0.content ?? "") : query) : "Result outside loaded range"
+                )
+            }
+            remoteSearchStatus = messages.isEmpty ? "No selected-channel results." : "\(messages.count) selected-channel result(s)."
+            lastTimelineActionResult = "Selected-channel search completed"
+        } catch {
+            remoteSearchResults = []
+            remoteSearchStatus = "Selected-channel search failed: \(error.userFacingMessage)"
+            lastTimelineActionResult = "Selected-channel search failed"
+        }
     }
 
     public func reconcileTimelineSelection(deletedHint: MessageID? = nil, replacementHint: MessageID? = nil) {
@@ -1819,13 +1989,17 @@ public final class MainShellViewModel {
         else {
             return
         }
+        lastAckTargetMessageID = messageID
+        lastAckResult = "Scheduled"
         ackTask?.cancel()
         ackTask = Task { [weak self, sender = channelAckSender] in
-            try? await Task.sleep(for: .milliseconds(1500))
+            let delay = await MainActor.run { self?.timelineTuning.ackDebounceMilliseconds ?? TimelineTuningConfiguration.defaults.ackDebounceMilliseconds }
+            try? await Task.sleep(for: .milliseconds(delay))
             do {
                 try await sender.ackChannel(channelID: channelID, messageID: messageID)
                 await MainActor.run {
                     self?.lastAckedMessageByChannelID[channelID] = messageID
+                    self?.lastAckResult = "Sent"
                     if var state = self?.localReadStates[channelID] {
                         state.mentionCount = 0
                         self?.localReadStates[channelID] = state
@@ -1833,6 +2007,7 @@ public final class MainShellViewModel {
                 }
             } catch {
                 await MainActor.run {
+                    self?.lastAckResult = "Failed"
                     self?.messageActionStatus = "Read acknowledgement failed: \(error.userFacingMessage)"
                 }
             }
@@ -1858,6 +2033,12 @@ public final class MainShellViewModel {
                 var channelReferences = self.resolvedReferencesByChannelID[channelID] ?? [:]
                 channelReferences[messageID] = resolution
                 self.resolvedReferencesByChannelID[channelID] = channelReferences
+                switch resolution {
+                case .loaded:
+                    self.failedReferenceFetchMessageIDs.remove(messageID)
+                default:
+                    self.failedReferenceFetchMessageIDs.insert(messageID)
+                }
                 self.referenceFetchTasks[messageID] = nil
                 self.messageController.markReferenceFetchFinished(channelID: channelID, messageID: messageID)
             }
