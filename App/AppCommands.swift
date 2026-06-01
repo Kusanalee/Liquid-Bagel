@@ -218,6 +218,11 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut(",", modifiers: [.command])
             .disabled(commandHandler?.canPerform(.openAccountSettings) == false)
+
+            Button("Notification Settings…") {
+                commandHandler?.perform(.openNotificationSettings)
+            }
+            .disabled(commandHandler?.canPerform(.openNotificationSettings) == false)
         }
 
         CommandMenu("Servers") {

@@ -121,4 +121,57 @@ final class StoatPersistenceTests: XCTestCase {
         XCTAssertEqual(TimelineTuningPreset.conservative.configuration, .defaults)
         XCTAssertEqual(TimelineTuningPreset.debugStrict.configuration.nearNewestMessageThreshold, 0)
     }
+
+    func testPhase18NotificationPreferencesDefaultConservative() throws {
+        let preferences = try AppPreferences.defaults.validated().notificationPreferences
+
+        XCTAssertFalse(preferences.nativeNotificationsEnabled)
+        XCTAssertTrue(preferences.inAppBannersEnabled)
+        XCTAssertEqual(preferences.contentVisibility, .privateMode)
+        XCTAssertTrue(preferences.suppressActiveChannel)
+        XCTAssertEqual(preferences.deliveryScope, .mentionsAndDirectMessages)
+        XCTAssertEqual(preferences.dockBadge, .unreadChannelsAndMentions)
+    }
+
+    func testPhase18NotificationPreferencesDecodeOlderPayload() throws {
+        let json = """
+        {
+          "environmentProfiles": [
+            {
+              "id": "production",
+              "name": "Stoat Production",
+              "environment": {
+                "apiBaseURL": "https://api.stoat.chat",
+                "eventsURL": "wss://events.stoat.chat"
+              },
+              "isProduction": true,
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "updatedAt": "2026-01-01T00:00:00.000Z"
+            }
+          ],
+          "preferredLaunchMode": "mock",
+          "showDeveloperRuntimeControls": true,
+          "memberPanelVisible": true,
+          "messageDensity": "comfortable",
+          "reduceGlassIntensity": false
+        }
+        """
+
+        let decoded = try JSONDecoder.stoat.decode(AppPreferences.self, from: Data(json.utf8))
+
+        XCTAssertEqual(decoded.notificationPreferences, .defaults)
+    }
+
+    func testPhase18ChannelNotificationOverridesValidateAndRoundTrip() async throws {
+        let store = UserDefaultsAppPreferencesStore(suiteName: "LiquidBagelTests.\(UUID().uuidString)")
+        var preferences = AppPreferences.defaults
+        preferences.notificationPreferences.channelPreferences["muted"] = ChannelNotificationPreference(isMuted: true)
+        preferences.notificationPreferences.channelPreferences["empty"] = ChannelNotificationPreference()
+
+        try await store.savePreferences(preferences)
+        let loaded = try await store.loadPreferences()
+
+        XCTAssertEqual(loaded.notificationPreferences.channelPreferences["muted"]?.isMuted, true)
+        XCTAssertNil(loaded.notificationPreferences.channelPreferences["empty"])
+    }
 }

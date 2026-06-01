@@ -2010,6 +2010,135 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertFalse(text.contains("server payload"))
     }
 
+    func testPhase18ClassifierDeliversMentionsAndDirectMessages() {
+        let currentUserID: UserID = "user-me"
+        let otherUserID: UserID = "user-other"
+        let textChannelID: ChannelID = "channel-text"
+        let dmChannelID: ChannelID = "channel-dm"
+        let snapshot = phase18Snapshot(currentUserID: currentUserID, otherUserID: otherUserID, textChannelID: textChannelID, dmChannelID: dmChannelID)
+        let context = NotificationClassificationContext(runtimeMode: .liveManual, currentUserID: currentUserID, activeChannelID: nil, preferences: .defaults, snapshot: snapshot)
+
+        let mention = Message(id: "01J00000000000000000018001", channelID: textChannelID, authorID: otherUserID, content: "hello @you", mentions: [currentUserID])
+        let dm = Message(id: "01J00000000000000000018002", channelID: dmChannelID, authorID: otherUserID, content: "dm")
+
+        guard case let .deliver(mentionEvent) = NotificationClassifier.classify(message: mention, context: context) else {
+            return XCTFail("Expected mention delivery")
+        }
+        guard case let .deliver(dmEvent) = NotificationClassifier.classify(message: dm, context: context) else {
+            return XCTFail("Expected DM delivery")
+        }
+        XCTAssertEqual(mentionEvent.kind, .mention)
+        XCTAssertEqual(dmEvent.kind, .directMessage)
+    }
+
+    func testPhase18ClassifierSuppressesSelfActiveMutedAndSuppressedMessages() {
+        let currentUserID: UserID = "user-me"
+        let otherUserID: UserID = "user-other"
+        let channelID: ChannelID = "channel-text"
+        let snapshot = phase18Snapshot(currentUserID: currentUserID, otherUserID: otherUserID, textChannelID: channelID, dmChannelID: "channel-dm")
+        let mention = Message(id: "01J00000000000000000018003", channelID: channelID, authorID: otherUserID, content: "hello", mentions: [currentUserID])
+
+        let activeContext = NotificationClassificationContext(runtimeMode: .liveManual, currentUserID: currentUserID, activeChannelID: channelID, preferences: .defaults, snapshot: snapshot)
+        XCTAssertEqual(NotificationClassifier.classify(message: mention, context: activeContext), .suppress(.activeChannel))
+
+        var mutedPreferences = NotificationPreferences.defaults
+        mutedPreferences.channelPreferences[channelID] = ChannelNotificationPreference(isMuted: true)
+        let mutedContext = NotificationClassificationContext(runtimeMode: .liveManual, currentUserID: currentUserID, activeChannelID: nil, preferences: mutedPreferences, snapshot: snapshot)
+        XCTAssertEqual(NotificationClassifier.classify(message: mention, context: mutedContext), .suppress(.channelMuted))
+
+        let selfMessage = Message(id: "01J00000000000000000018004", channelID: channelID, authorID: currentUserID, content: "mine", mentions: [currentUserID])
+        let context = NotificationClassificationContext(runtimeMode: .liveManual, currentUserID: currentUserID, activeChannelID: nil, preferences: .defaults, snapshot: snapshot)
+        XCTAssertEqual(NotificationClassifier.classify(message: selfMessage, context: context), .suppress(.selfMessage))
+
+        let suppressed = Message(id: "01J00000000000000000018005", channelID: channelID, authorID: otherUserID, content: "quiet", mentions: [currentUserID], flags: .suppressNotifications)
+        XCTAssertEqual(NotificationClassifier.classify(message: suppressed, context: context), .suppress(.messageSuppressed))
+    }
+
+    func testPhase18ContentFormattingPrivacyAttachmentSummaryAndRedaction() {
+        let file = File(id: "phase18-file", tag: "attachments", filename: "secret.png", contentType: "image/png", size: 12)
+        let message = Message(id: "01J00000000000000000018006", channelID: "channel", authorID: "other", content: "see https://example.com/raw token: abc /tmp/private/file.md **bold**", attachments: [file])
+
+        let privateBody = NotificationContentFormatter.body(message: message, privacy: .privateMode)
+        let visibleBody = NotificationContentFormatter.body(message: message, privacy: .showSenderAndContent)
+
+        XCTAssertEqual(privateBody, "Open Liquid Bagel to view this message.")
+        XCTAssertTrue(visibleBody.contains("[redacted-url]"))
+        XCTAssertTrue(visibleBody.contains("[redacted-path]"))
+        XCTAssertTrue(visibleBody.contains("token=[redacted]"))
+        XCTAssertTrue(visibleBody.contains("1 attachment"))
+        XCTAssertFalse(visibleBody.contains("https://example.com"))
+        XCTAssertFalse(visibleBody.contains("/tmp/private"))
+    }
+
+    func testPhase18BadgeCountsRespectModeAndMutedChannels() {
+        var snapshot = RealtimeSnapshot()
+        snapshot.unreadsByChannelID = [
+            "a": ChannelUnread(id: ChannelCompositeKey(channelID: "a", userID: "me"), lastMessageID: "m1", mentions: ["m2"]),
+            "b": ChannelUnread(id: ChannelCompositeKey(channelID: "b", userID: "me"), lastMessageID: "m3", mentions: [])
+        ]
+        var preferences = NotificationPreferences.defaults
+        preferences.channelPreferences["b"] = ChannelNotificationPreference(isMuted: true)
+
+        let counts = NotificationBadgeCalculator.counts(snapshot: snapshot, preferences: preferences)
+
+        XCTAssertEqual(counts.unreadChannelCount, 1)
+        XCTAssertEqual(counts.mentionCount, 1)
+        XCTAssertEqual(counts.badgeValue(mode: .off), 0)
+        XCTAssertEqual(counts.badgeValue(mode: .mentionsOnly), 1)
+        XCTAssertEqual(counts.badgeValue(mode: .unreadChannelsAndMentions), 2)
+    }
+
+    @MainActor
+    func testPhase18NotificationRouteOpensLoadedMessage() async {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, notificationDeliverer: MockNotificationService(), notificationPermissionManager: MockNotificationPermissionManager(), dockBadgeManager: MockDockBadgeManager())
+        let channel = model.snapshot.channelsByID.values.first { ($0.serverID != nil) && $0.kind == .textChannel }!
+        let message = model.snapshot.messagesByChannelID[channel.id]!.first!
+
+        await model.openNotificationRoute(NotificationRoute(serverID: channel.serverID, channelID: channel.id, messageID: message.id))
+
+        XCTAssertEqual(model.selection.channelID, channel.id)
+        XCTAssertEqual(model.timelineSelection.messageID, message.id)
+    }
+
+    @MainActor
+    func testPhase18NotificationRouteDoesNotFetchUnloadedMessageInMockMode() async {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, notificationDeliverer: MockNotificationService(), notificationPermissionManager: MockNotificationPermissionManager(), dockBadgeManager: MockDockBadgeManager())
+        let channel = model.snapshot.channelsByID.values.first { ($0.serverID != nil) && $0.kind == .textChannel }!
+
+        await model.openNotificationRoute(NotificationRoute(serverID: channel.serverID, channelID: channel.id, messageID: "missing-message"))
+
+        XCTAssertEqual(model.selection.channelID, channel.id)
+        XCTAssertEqual(model.placeholderStatus, "Notification message is not loaded.")
+    }
+
+    @MainActor
+    func testPhase18MockDeliveryIsExplicitOnly() async throws {
+        let service = MockNotificationService()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, notificationDeliverer: service, notificationPermissionManager: MockNotificationPermissionManager(), dockBadgeManager: MockDockBadgeManager())
+
+        let before = await service.events()
+        XCTAssertTrue(before.isEmpty)
+        model.deliverMockNotificationDemo()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let delivered = await service.events()
+        XCTAssertEqual(delivered.count, 1)
+        XCTAssertEqual(delivered.first?.title, "Liquid Bagel notification demo")
+    }
+
+    private func phase18Snapshot(currentUserID: UserID, otherUserID: UserID, textChannelID: ChannelID, dmChannelID: ChannelID) -> RealtimeSnapshot {
+        let currentUser = User(id: currentUserID, username: "me", displayName: "Me")
+        let otherUser = User(id: otherUserID, username: "other", displayName: "Other")
+        let server = Server(id: "server-phase18", ownerID: currentUserID, name: "Phase 18", channelIDs: [textChannelID])
+        let text = Channel(id: textChannelID, kind: .textChannel, serverID: server.id, name: "general")
+        let dm = Channel(id: dmChannelID, kind: .directMessage, recipients: [currentUserID, otherUserID])
+        return RealtimeSnapshot(
+            usersByID: [currentUserID: currentUser, otherUserID: otherUser],
+            serversByID: [server.id: server],
+            channelsByID: [text.id: text, dm.id: dm]
+        )
+    }
+
     private func message(
         id: String,
         author: UserID,

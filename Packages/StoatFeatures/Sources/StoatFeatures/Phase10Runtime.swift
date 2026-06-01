@@ -90,6 +90,7 @@ public enum MessageFocusSource: Hashable, Sendable {
     case mouse
     case contextMenu
     case quickSwitcher
+    case notification
     case scrollJump
     case realtimeFallback
 }

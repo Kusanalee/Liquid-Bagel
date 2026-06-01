@@ -51,6 +51,10 @@ public struct AccountConnectionSettingsView: View {
             .tabItem { Label("Connection", systemImage: "network") }
             .tag(SettingsSectionTab.connection)
 
+            NotificationSettingsTab(viewModel: viewModel)
+                .tabItem { Label("Notifications", systemImage: "bell.badge") }
+                .tag(SettingsSectionTab.notifications)
+
             DeveloperVerificationTab(viewModel: viewModel)
                 .tabItem { Label("Developer", systemImage: "checklist") }
                 .tag(SettingsSectionTab.developer)
@@ -60,6 +64,7 @@ public struct AccountConnectionSettingsView: View {
         .task {
             await connectionViewModel.load()
             accountViewModel.syncFromCoordinator()
+            viewModel.refreshNotificationPermissionStatus()
             await refreshCredentialPresence()
             if viewModel.selectedSettingsTab == .sessions {
                 await accountViewModel.refreshSessions()
@@ -583,6 +588,107 @@ private struct DeveloperVerificationTab: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+}
+
+private struct NotificationSettingsTab: View {
+    @Bindable var viewModel: MainShellViewModel
+
+    private var preferences: NotificationPreferences {
+        viewModel.sessionCoordinator?.preferences.notificationPreferences ?? .defaults
+    }
+
+    private var selectedChannelID: ChannelID? {
+        viewModel.selection.channelID ?? viewModel.selection.dmChannelID
+    }
+
+    var body: some View {
+        Form {
+            Section("Permission") {
+                LabeledContent("System status", value: viewModel.notificationPermissionStatus.rawValue)
+                Button("Request Notification Permission") {
+                    viewModel.requestNotificationPermission()
+                }
+                Text("Permission is requested only from this settings surface.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Delivery") {
+                Toggle("Native notifications", isOn: binding(\.nativeNotificationsEnabled))
+                Toggle("In-app banners", isOn: binding(\.inAppBannersEnabled))
+                Toggle("Suppress current channel", isOn: binding(\.suppressActiveChannel))
+                Picker("Delivery scope", selection: binding(\.deliveryScope)) {
+                    Text("Mentions and DMs").tag(NotificationDeliveryScope.mentionsAndDirectMessages)
+                    Text("All messages").tag(NotificationDeliveryScope.allMessages)
+                }
+                Picker("Content", selection: binding(\.contentVisibility)) {
+                    Text("Private").tag(NotificationContentVisibility.privateMode)
+                    Text("Sender and content").tag(NotificationContentVisibility.showSenderAndContent)
+                }
+                Picker("Dock badge", selection: binding(\.dockBadge)) {
+                    Text("Off").tag(DockBadgePreference.off)
+                    Text("Mentions").tag(DockBadgePreference.mentionsOnly)
+                    Text("Unread channels and mentions").tag(DockBadgePreference.unreadChannelsAndMentions)
+                }
+            }
+
+            Section("Selected Channel") {
+                if let selectedChannelID,
+                   let channel = viewModel.snapshot.channelsByID[selectedChannelID] {
+                    LabeledContent("Channel", value: channel.displayName)
+                    Toggle("Mute notifications here", isOn: Binding(
+                        get: { preferences.preference(for: selectedChannelID).isMuted },
+                        set: { viewModel.setSelectedChannelMuted($0) }
+                    ))
+                    Toggle("Suppress native here", isOn: channelBinding(selectedChannelID, \.suppressNative))
+                    Toggle("Suppress in-app here", isOn: channelBinding(selectedChannelID, \.suppressInApp))
+                } else {
+                    ContentUnavailableView("No channel selected", systemImage: "bell.slash", description: Text("Select a channel to edit its local notification override."))
+                }
+            }
+
+            Section("Diagnostics") {
+                LabeledContent("Dock badge", value: "\(viewModel.notificationDiagnostics.dockBadgeValue)")
+                LabeledContent("Delivered", value: "\(viewModel.notificationDiagnostics.deliveredCount)")
+                LabeledContent("Suppressed", value: "\(viewModel.notificationDiagnostics.suppressedCount)")
+                LabeledContent("Last suppression", value: viewModel.notificationDiagnostics.lastSuppressionReason?.rawValue ?? "-")
+                LabeledContent("Last event", value: viewModel.notificationDiagnostics.lastEventKind?.rawValue ?? "-")
+                HStack {
+                    Button("Copy Diagnostics") { viewModel.copyRedactedNotificationDiagnostics() }
+                    Button("Demo Notification") { viewModel.deliverMockNotificationDemo() }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private func binding<Value>(_ keyPath: WritableKeyPath<NotificationPreferences, Value>) -> Binding<Value> {
+        Binding(
+            get: { preferences[keyPath: keyPath] },
+            set: { value in
+                viewModel.setNotificationPreference { notificationPreferences in
+                    notificationPreferences[keyPath: keyPath] = value
+                }
+            }
+        )
+    }
+
+    private func channelBinding(_ channelID: ChannelID, _ keyPath: WritableKeyPath<ChannelNotificationPreference, Bool>) -> Binding<Bool> {
+        Binding(
+            get: { preferences.preference(for: channelID)[keyPath: keyPath] },
+            set: { value in
+                viewModel.setNotificationPreference { notificationPreferences in
+                    var channel = notificationPreferences.preference(for: channelID)
+                    channel[keyPath: keyPath] = value
+                    if channel.isMuted || channel.suppressNative || channel.suppressInApp {
+                        notificationPreferences.channelPreferences[channelID] = channel
+                    } else {
+                        notificationPreferences.channelPreferences.removeValue(forKey: channelID)
+                    }
+                }
+            }
+        )
     }
 }
 

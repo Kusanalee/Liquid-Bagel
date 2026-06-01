@@ -21,6 +21,7 @@ public enum SettingsSectionTab: String, Codable, Hashable, Sendable, CaseIterabl
     case account
     case sessions
     case connection
+    case notifications
     case developer
 }
 
@@ -449,6 +450,9 @@ public final class MainShellViewModel {
     public var loadedAttachmentOriginalData: [String: RemoteAttachmentData] = [:]
     public var attachmentLocalFiles: [String: URL] = [:]
     public var lastAttachmentAction: String?
+    public var notificationPermissionStatus: NotificationPermissionStatus = .unknown
+    public var notificationBanners: [NotificationEvent] = []
+    public var notificationDiagnostics = NotificationDiagnostics()
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var messageCopier: any MessageCopying
@@ -458,6 +462,10 @@ public final class MainShellViewModel {
     @ObservationIgnored public var attachmentOpener: any AttachmentOpening
     @ObservationIgnored public var channelAckSender: any ChannelAckSending
     @ObservationIgnored public var messageReferenceResolver: any MessageReferenceResolving
+    @ObservationIgnored public var notificationDeliverer: any NotificationDelivering
+    @ObservationIgnored public var notificationPermissionManager: any NotificationPermissionManaging
+    @ObservationIgnored public var dockBadgeManager: any DockBadgeManaging
+    @ObservationIgnored public var notificationRouteCenter: NotificationRouteCenter
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
     @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
@@ -471,6 +479,9 @@ public final class MainShellViewModel {
     @ObservationIgnored private var resolvedReferencesByChannelID: [ChannelID: [MessageID: MessageReferenceResolution]] = [:]
     @ObservationIgnored private var locallyClearedUnreadChannelIDs: Set<ChannelID> = []
     @ObservationIgnored private var restoredLiveConnectionGeneration: Int?
+    @ObservationIgnored private var notificationLiveConnectionGeneration: Int?
+    @ObservationIgnored private var seenNotificationMessageIDsByChannelID: [ChannelID: Set<MessageID>] = [:]
+    @ObservationIgnored private var deliveredNotificationIDs: Set<String> = []
     @ObservationIgnored private var previousSnapshot = RealtimeSnapshot()
     @ObservationIgnored private let selectionRestorer = ShellSelectionRestorer()
     @ObservationIgnored private let navigationHelper = ShellNavigationHelper()
@@ -499,7 +510,11 @@ public final class MainShellViewModel {
         attachmentSaver: (any AttachmentSaving)? = nil,
         attachmentOpener: (any AttachmentOpening)? = nil,
         channelAckSender: (any ChannelAckSending)? = nil,
-        messageReferenceResolver: (any MessageReferenceResolving)? = nil
+        messageReferenceResolver: (any MessageReferenceResolving)? = nil,
+        notificationDeliverer: (any NotificationDelivering)? = nil,
+        notificationPermissionManager: (any NotificationPermissionManaging)? = nil,
+        dockBadgeManager: (any DockBadgeManaging)? = nil,
+        notificationRouteCenter: NotificationRouteCenter = .shared
     ) {
         self.selection = selection
         self.snapshot = snapshot
@@ -518,7 +533,12 @@ public final class MainShellViewModel {
         self.attachmentOpener = attachmentOpener ?? AppKitAttachmentOpener()
         self.channelAckSender = channelAckSender ?? NoopChannelAckSender()
         self.messageReferenceResolver = messageReferenceResolver ?? DisabledMessageReferenceResolver()
+        self.notificationDeliverer = notificationDeliverer ?? UserNotificationsNotificationService()
+        self.notificationPermissionManager = notificationPermissionManager ?? UserNotificationsPermissionManager()
+        self.dockBadgeManager = dockBadgeManager ?? AppKitDockBadgeManager()
+        self.notificationRouteCenter = notificationRouteCenter
         self.previousSnapshot = snapshot
+        self.seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
         self.quickSwitcherViewModel = QuickSwitcherViewModel(snapshot: snapshot, selection: selection)
         self.quickSwitcherViewModel = QuickSwitcherViewModel(
             snapshot: snapshot,
@@ -528,6 +548,7 @@ public final class MainShellViewModel {
         )
         validateSelection()
         self.messageController.hydrate(from: snapshot)
+        installNotificationRouteHandler()
         if let snapshotSource {
             observe(snapshotSource: snapshotSource)
         }
@@ -831,6 +852,12 @@ public final class MainShellViewModel {
         isCredentialSetupPresented = true
     }
 
+    public func showNotificationSettings() {
+        selectedSettingsTab = .notifications
+        isCredentialSetupPresented = true
+        refreshNotificationPermissionStatus()
+    }
+
     public func showAccountSessions() {
         selectedSettingsTab = .account
         isCredentialSetupPresented = true
@@ -905,6 +932,7 @@ public final class MainShellViewModel {
 
     public func syncFromSessionCoordinator() {
         guard let sessionCoordinator else { return }
+        let previousNotificationGeneration = notificationLiveConnectionGeneration
         runtimeMode = sessionCoordinator.mode
         sessionState = sessionCoordinator.sessionState
         connectionState = sessionCoordinator.connectionState
@@ -915,6 +943,17 @@ public final class MainShellViewModel {
         reduceGlassIntensity = sessionCoordinator.preferences.reduceGlassIntensity
         timelineTuning = sessionCoordinator.preferences.timelineTuning.validated()
         snapshot = sessionCoordinator.snapshot
+        if sessionCoordinator.mode == .liveManual,
+           previousNotificationGeneration != sessionCoordinator.liveConnectionGeneration {
+            seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
+            notificationLiveConnectionGeneration = sessionCoordinator.liveConnectionGeneration
+            deliveredNotificationIDs.removeAll()
+        } else if sessionCoordinator.mode != .liveManual {
+            notificationLiveConnectionGeneration = nil
+            seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
+            deliveredNotificationIDs.removeAll()
+            notificationBanners.removeAll()
+        }
         messageActionHandler = sessionCoordinator.messageActionHandler
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
         attachmentUploadHandler = liveAPIClient.map { LiveAttachmentUploadHandler(apiClient: $0) } ?? MockAttachmentUploadHandler()
@@ -942,6 +981,8 @@ public final class MainShellViewModel {
         messageController.hydrate(from: snapshot)
         quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
         scheduleSelectedChannelLoad()
+        updateDockBadge()
+        updateNotificationDiagnostics()
         if sessionCoordinator.mode != .liveManual {
             restoredLiveConnectionGeneration = nil
         }
@@ -2140,6 +2181,113 @@ public final class MainShellViewModel {
         placeholderStatus = "Timeline diagnostics reset"
     }
 
+    public func refreshNotificationPermissionStatus() {
+        Task { [weak self, manager = notificationPermissionManager] in
+            let status = await manager.status()
+            await MainActor.run {
+                self?.notificationPermissionStatus = status
+                self?.updateNotificationDiagnostics()
+            }
+        }
+    }
+
+    public func requestNotificationPermission() {
+        Task { [weak self, manager = notificationPermissionManager] in
+            let status = await manager.requestAuthorization()
+            await MainActor.run {
+                self?.notificationPermissionStatus = status
+                self?.placeholderStatus = "Notification permission: \(status.rawValue)"
+                self?.updateNotificationDiagnostics()
+            }
+        }
+    }
+
+    public func saveNotificationPreferences(_ preferences: NotificationPreferences) {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.sessionCoordinator?.updatePreferences { appPreferences in
+                appPreferences.notificationPreferences = preferences.validated()
+            }
+            self.syncFromSessionCoordinator()
+        }
+    }
+
+    public func setNotificationPreference(_ update: @escaping (inout NotificationPreferences) -> Void) {
+        var preferences = notificationPreferences
+        update(&preferences)
+        saveNotificationPreferences(preferences)
+    }
+
+    public func setSelectedChannelMuted(_ isMuted: Bool) {
+        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        setNotificationPreference { preferences in
+            var channel = preferences.preference(for: channelID)
+            channel.isMuted = isMuted
+            if channel.isMuted || channel.suppressNative || channel.suppressInApp {
+                preferences.channelPreferences[channelID] = channel
+            } else {
+                preferences.channelPreferences.removeValue(forKey: channelID)
+            }
+        }
+    }
+
+    public func dismissNotificationBanner(_ id: String) {
+        notificationBanners.removeAll { $0.id == id }
+    }
+
+    public func deliverMockNotificationDemo() {
+        guard let channel = selectedChannel ?? selection.dmChannelID.flatMap({ snapshot.channelsByID[$0] }) ?? snapshot.channelsByID.values.first(where: { $0.kind == .directMessage || $0.kind == .textChannel }) else {
+            placeholderStatus = "No channel available for notification demo."
+            return
+        }
+        let event = NotificationEvent(
+            id: "demo-\(UUID().uuidString)",
+            route: NotificationRoute(serverID: channel.serverID, channelID: channel.id, messageID: nil),
+            title: "Liquid Bagel notification demo",
+            body: "This is an explicit mock notification preview.",
+            kind: .mention
+        )
+        if notificationPreferences.inAppBannersEnabled {
+            notificationBanners.append(event)
+        }
+        Task { [deliverer = notificationDeliverer] in
+            try? await deliverer.deliver(event)
+        }
+        placeholderStatus = "Mock notification demo delivered"
+    }
+
+    public func copyRedactedNotificationDiagnostics() {
+        let text = Phase17MessageActions.redactedDiagnosticText(notificationDiagnostics.redactedText)
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+        placeholderStatus = "Notification diagnostics copied"
+    }
+
+    public func openNotificationRoute(_ route: NotificationRoute) async {
+        selectChannel(route.channelID)
+        guard let messageID = route.messageID else { return }
+        if selectedTimelineMessages.contains(where: { $0.message.id == messageID }) {
+            timelineSelection = TimelineSelection(channelID: route.channelID, messageID: messageID, source: .notification)
+            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: messageID, reason: .jumpCommand)
+            placeholderStatus = "Opened notification"
+            return
+        }
+        guard effectiveRuntimeMode == .liveManual else {
+            placeholderStatus = "Notification message is not loaded."
+            return
+        }
+        let loaded = await messageController.loadMessagesAround(channelID: route.channelID, targetMessageID: messageID)
+        if loaded, selectedTimelineMessages.contains(where: { $0.message.id == messageID }) {
+            timelineSelection = TimelineSelection(channelID: route.channelID, messageID: messageID, source: .notification)
+            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: messageID, reason: .jumpCommand)
+            placeholderStatus = "Opened notification"
+        } else {
+            placeholderStatus = loaded ? "Notification target was not returned." : "Notification target could not be loaded."
+        }
+    }
+
     public func verifyTimelineRoutes() {
         routeVerificationResult = .sourceVerified
         lastRouteVerificationResult = routeVerificationResult.summary
@@ -2766,12 +2914,15 @@ public final class MainShellViewModel {
         self.snapshot = snapshot
         messageController.hydrate(from: snapshot)
         applyRealtimeDeleteDiff(previous: oldSnapshot, current: snapshot)
+        processNotificationDiff(previous: oldSnapshot, current: snapshot)
         previousSnapshot = snapshot
         restoreOrValidateSelection()
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
         reconcileTimelineSelection()
         quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+        updateDockBadge()
+        updateNotificationDiagnostics()
     }
 
     private func applyRealtimeDeleteDiff(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
@@ -2781,6 +2932,93 @@ public final class MainShellViewModel {
                 messageController.removeMessage(channelID: channelID, messageID: message.id)
             }
         }
+    }
+
+    private static func messageIDMap(_ snapshot: RealtimeSnapshot) -> [ChannelID: Set<MessageID>] {
+        snapshot.messagesByChannelID.mapValues { Set($0.map(\.id)) }
+    }
+
+    private var notificationPreferences: NotificationPreferences {
+        sessionCoordinator?.preferences.notificationPreferences ?? .defaults
+    }
+
+    private func processNotificationDiff(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
+        guard effectiveRuntimeMode == .liveManual,
+              sessionCoordinator?.hydrationStatus.readyReceived == true
+        else {
+            seenNotificationMessageIDsByChannelID = Self.messageIDMap(current)
+            return
+        }
+
+        let context = NotificationClassificationContext(
+            runtimeMode: effectiveRuntimeMode,
+            currentUserID: currentUserID,
+            activeChannelID: selection.channelID ?? selection.dmChannelID,
+            isActiveChannelVisible: true,
+            preferences: notificationPreferences,
+            snapshot: current
+        )
+
+        for (channelID, messages) in current.messagesByChannelID {
+            let previouslySeen = seenNotificationMessageIDsByChannelID[channelID] ?? Set((previous.messagesByChannelID[channelID] ?? []).map(\.id))
+            for message in messages where !previouslySeen.contains(message.id) {
+                handleNotificationClassification(NotificationClassifier.classify(message: message, context: context))
+            }
+        }
+        seenNotificationMessageIDsByChannelID = Self.messageIDMap(current)
+    }
+
+    private func handleNotificationClassification(_ classification: NotificationClassification) {
+        var diagnostics = notificationDiagnostics
+        switch classification {
+        case let .suppress(reason):
+            diagnostics.suppressedCount += 1
+            diagnostics.lastSuppressionReason = reason
+            notificationDiagnostics = diagnostics
+        case let .deliver(event):
+            guard !deliveredNotificationIDs.contains(event.id) else { return }
+            deliveredNotificationIDs.insert(event.id)
+            diagnostics.deliveredCount += 1
+            diagnostics.lastEventKind = event.kind
+            notificationDiagnostics = diagnostics
+            let channelPreference = notificationPreferences.preference(for: event.route.channelID)
+            if notificationPreferences.inAppBannersEnabled && !channelPreference.suppressInApp {
+                notificationBanners.append(event)
+                if notificationBanners.count > 3 {
+                    notificationBanners.removeFirst(notificationBanners.count - 3)
+                }
+            }
+            if notificationPreferences.nativeNotificationsEnabled && !channelPreference.suppressNative && notificationPermissionStatus.allowsDelivery {
+                Task { [deliverer = notificationDeliverer] in
+                    try? await deliverer.deliver(event)
+                }
+            }
+        }
+    }
+
+    private func installNotificationRouteHandler() {
+        notificationRouteCenter.setHandler { [weak self] route in
+            Task { @MainActor [weak self] in
+                await self?.openNotificationRoute(route)
+            }
+        }
+        refreshNotificationPermissionStatus()
+    }
+
+    private func updateDockBadge() {
+        let counts = NotificationBadgeCalculator.counts(snapshot: snapshot, preferences: notificationPreferences, localReadStates: localReadStates)
+        let value = counts.badgeValue(mode: notificationPreferences.dockBadge)
+        Task { [dockBadgeManager] in
+            await dockBadgeManager.setBadgeCount(value)
+        }
+    }
+
+    private func updateNotificationDiagnostics() {
+        let counts = NotificationBadgeCalculator.counts(snapshot: snapshot, preferences: notificationPreferences, localReadStates: localReadStates)
+        notificationDiagnostics.permissionStatus = notificationPermissionStatus
+        notificationDiagnostics.nativeEnabled = notificationPreferences.nativeNotificationsEnabled
+        notificationDiagnostics.inAppEnabled = notificationPreferences.inAppBannersEnabled
+        notificationDiagnostics.dockBadgeValue = counts.badgeValue(mode: notificationPreferences.dockBadge)
     }
 
     private func restoreOrValidateSelection() {
@@ -2871,6 +3109,8 @@ public final class MainShellViewModel {
         messageController.markRead(channelID: channelID, lastReadMessageID: newest)
         locallyClearedUnreadChannelIDs.insert(channelID)
         scheduleLiveAckIfNeeded(channelID: channelID)
+        updateDockBadge()
+        updateNotificationDiagnostics()
     }
 
     private func scheduleLiveAckIfNeeded(channelID: ChannelID) {
@@ -2898,6 +3138,8 @@ public final class MainShellViewModel {
                         state.mentionCount = 0
                         self?.localReadStates[channelID] = state
                     }
+                    self?.updateDockBadge()
+                    self?.updateNotificationDiagnostics()
                 }
             } catch {
                 await MainActor.run {
@@ -2978,7 +3220,7 @@ public final class MainShellViewModel {
 extension MainShellViewModel: AppCommandHandling {
     public func canPerform(_ command: AppCommand) -> Bool {
         switch command {
-        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
+        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
             return true
         case .openChannelSearch, .openLoadedMessageFind:
             return selectedChannel != nil || selection.dmChannelID != nil
@@ -3125,6 +3367,8 @@ extension MainShellViewModel: AppCommandHandling {
             showAccountSessions()
         case .openConnectionSettings:
             showConnectionSettings()
+        case .openNotificationSettings:
+            showNotificationSettings()
         case .toggleMemberPanel:
             toggleMemberPanel()
         case .toggleDeveloperControls:
@@ -3442,6 +3686,39 @@ public struct MainShellView: View {
                     .padding(.bottom, StoatSpacing.medium)
                     .transition(.opacity)
             }
+        }
+        .overlay(alignment: .topTrailing) {
+            VStack(alignment: .trailing, spacing: StoatSpacing.small) {
+                ForEach(viewModel.notificationBanners) { event in
+                    Button {
+                        Task { await viewModel.openNotificationRoute(event.route) }
+                        viewModel.dismissNotificationBanner(event.id)
+                    } label: {
+                        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                            HStack {
+                                Label(event.title, systemImage: event.kind == .mention ? "at" : "bell")
+                                    .font(.caption.weight(.semibold))
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(event.body)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        .frame(width: 280, alignment: .leading)
+                        .padding(StoatSpacing.small)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button("Dismiss") { viewModel.dismissNotificationBanner(event.id) }
+                    }
+                }
+            }
+            .padding(StoatSpacing.medium)
         }
         .focusedSceneValue(\.appCommandHandler, viewModel)
         .onExitCommand {

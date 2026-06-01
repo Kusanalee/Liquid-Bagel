@@ -13,6 +13,7 @@ public enum AppCommand: Hashable, Sendable {
     case resetToMock
     case openAccountSettings
     case openConnectionSettings
+    case openNotificationSettings
     case toggleMemberPanel
     case toggleDeveloperControls
     case selectServer(index: Int)
@@ -321,7 +322,8 @@ public final class QuickSwitcherViewModel {
             commandResult(.copyTimelineDiagnostics, title: "Copy Timeline Diagnostics", subtitle: "Copy redacted timeline diagnostics"),
             commandResult(.toggleMemberPanel, title: "Toggle Member Panel", subtitle: "Show or hide the member panel"),
             commandResult(.openAccountSettings, title: "Account Settings", subtitle: "Open Account & Connection settings"),
-            commandResult(.openConnectionSettings, title: "Connection Settings", subtitle: "Open connection settings")
+            commandResult(.openConnectionSettings, title: "Connection Settings", subtitle: "Open connection settings"),
+            commandResult(.openNotificationSettings, title: "Notification Settings", subtitle: "Open notification settings")
         ]
     }
 

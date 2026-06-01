@@ -48,6 +48,82 @@ public enum MessageDensityPreference: String, Codable, Hashable, Sendable, CaseI
     case compact
 }
 
+public enum NotificationDeliveryScope: String, Codable, Hashable, Sendable, CaseIterable {
+    case mentionsAndDirectMessages
+    case allMessages
+}
+
+public enum NotificationContentVisibility: String, Codable, Hashable, Sendable, CaseIterable {
+    case privateMode
+    case showSenderAndContent
+}
+
+public enum DockBadgePreference: String, Codable, Hashable, Sendable, CaseIterable {
+    case off
+    case mentionsOnly
+    case unreadChannelsAndMentions
+}
+
+public struct ChannelNotificationPreference: Codable, Hashable, Sendable {
+    public var isMuted: Bool
+    public var suppressNative: Bool
+    public var suppressInApp: Bool
+
+    public init(isMuted: Bool = false, suppressNative: Bool = false, suppressInApp: Bool = false) {
+        self.isMuted = isMuted
+        self.suppressNative = suppressNative
+        self.suppressInApp = suppressInApp
+    }
+
+    public var suppressesAllDelivery: Bool {
+        isMuted || (suppressNative && suppressInApp)
+    }
+}
+
+public struct NotificationPreferences: Codable, Hashable, Sendable {
+    public var nativeNotificationsEnabled: Bool
+    public var inAppBannersEnabled: Bool
+    public var contentVisibility: NotificationContentVisibility
+    public var suppressActiveChannel: Bool
+    public var deliveryScope: NotificationDeliveryScope
+    public var dockBadge: DockBadgePreference
+    public var channelPreferences: [ChannelID: ChannelNotificationPreference]
+
+    public init(
+        nativeNotificationsEnabled: Bool = false,
+        inAppBannersEnabled: Bool = true,
+        contentVisibility: NotificationContentVisibility = .privateMode,
+        suppressActiveChannel: Bool = true,
+        deliveryScope: NotificationDeliveryScope = .mentionsAndDirectMessages,
+        dockBadge: DockBadgePreference = .unreadChannelsAndMentions,
+        channelPreferences: [ChannelID: ChannelNotificationPreference] = [:]
+    ) {
+        self.nativeNotificationsEnabled = nativeNotificationsEnabled
+        self.inAppBannersEnabled = inAppBannersEnabled
+        self.contentVisibility = contentVisibility
+        self.suppressActiveChannel = suppressActiveChannel
+        self.deliveryScope = deliveryScope
+        self.dockBadge = dockBadge
+        self.channelPreferences = channelPreferences.filter { $0.value.isMuted || $0.value.suppressNative || $0.value.suppressInApp }
+    }
+
+    public static var defaults: NotificationPreferences {
+        NotificationPreferences()
+    }
+
+    public func preference(for channelID: ChannelID) -> ChannelNotificationPreference {
+        channelPreferences[channelID] ?? ChannelNotificationPreference()
+    }
+
+    public func validated() -> NotificationPreferences {
+        var copy = self
+        copy.channelPreferences = channelPreferences.filter { preference in
+            preference.value.isMuted || preference.value.suppressNative || preference.value.suppressInApp
+        }
+        return copy
+    }
+}
+
 public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
     public var nearNewestMessageThreshold: Int
     public var visibleRangeUpdateDebounceMilliseconds: Int
@@ -232,6 +308,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public var messageDensity: MessageDensityPreference
     public var reduceGlassIntensity: Bool
     public var timelineTuning: TimelineTuningConfiguration
+    public var notificationPreferences: NotificationPreferences
 
     private enum CodingKeys: String, CodingKey {
         case lastSelectedEnvironmentID
@@ -244,6 +321,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         case messageDensity
         case reduceGlassIntensity
         case timelineTuning
+        case notificationPreferences
     }
 
     public init(
@@ -256,7 +334,8 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         memberPanelVisible: Bool = true,
         messageDensity: MessageDensityPreference = .comfortable,
         reduceGlassIntensity: Bool = false,
-        timelineTuning: TimelineTuningConfiguration = .defaults
+        timelineTuning: TimelineTuningConfiguration = .defaults,
+        notificationPreferences: NotificationPreferences = .defaults
     ) {
         self.lastSelectedEnvironmentID = lastSelectedEnvironmentID
         self.environmentProfiles = Self.normalizedProfiles(environmentProfiles)
@@ -268,6 +347,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.messageDensity = messageDensity
         self.reduceGlassIntensity = reduceGlassIntensity
         self.timelineTuning = timelineTuning.validated()
+        self.notificationPreferences = notificationPreferences.validated()
     }
 
     public init(from decoder: Decoder) throws {
@@ -282,7 +362,8 @@ public struct AppPreferences: Codable, Hashable, Sendable {
             memberPanelVisible: try container.decodeIfPresent(Bool.self, forKey: .memberPanelVisible) ?? true,
             messageDensity: try container.decodeIfPresent(MessageDensityPreference.self, forKey: .messageDensity) ?? .comfortable,
             reduceGlassIntensity: try container.decodeIfPresent(Bool.self, forKey: .reduceGlassIntensity) ?? false,
-            timelineTuning: try container.decodeIfPresent(TimelineTuningConfiguration.self, forKey: .timelineTuning) ?? .defaults
+            timelineTuning: try container.decodeIfPresent(TimelineTuningConfiguration.self, forKey: .timelineTuning) ?? .defaults,
+            notificationPreferences: try container.decodeIfPresent(NotificationPreferences.self, forKey: .notificationPreferences) ?? .defaults
         )
     }
 
@@ -298,6 +379,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         try container.encode(messageDensity, forKey: .messageDensity)
         try container.encode(reduceGlassIntensity, forKey: .reduceGlassIntensity)
         try container.encode(timelineTuning.validated(), forKey: .timelineTuning)
+        try container.encode(notificationPreferences.validated(), forKey: .notificationPreferences)
     }
 
     public static var defaults: AppPreferences {
@@ -331,6 +413,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         }
         var copy = self
         copy.timelineTuning = timelineTuning.validated()
+        copy.notificationPreferences = notificationPreferences.validated()
         return copy
     }
 
