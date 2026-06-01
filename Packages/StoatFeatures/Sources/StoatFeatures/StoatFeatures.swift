@@ -453,6 +453,8 @@ public final class MainShellViewModel {
     public var notificationPermissionStatus: NotificationPermissionStatus = .unknown
     public var notificationBanners: [NotificationEvent] = []
     public var notificationDiagnostics = NotificationDiagnostics()
+    public var appLifecyclePhase: AppLifecyclePhase = .active
+    public var queuedNotificationRoutes: [QueuedNotificationRoute] = []
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var messageCopier: any MessageCopying
@@ -466,6 +468,7 @@ public final class MainShellViewModel {
     @ObservationIgnored public var notificationPermissionManager: any NotificationPermissionManaging
     @ObservationIgnored public var dockBadgeManager: any DockBadgeManaging
     @ObservationIgnored public var notificationRouteCenter: NotificationRouteCenter
+    @ObservationIgnored public var appLifecycleCenter: AppLifecycleCenter
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
     @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
@@ -482,6 +485,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var notificationLiveConnectionGeneration: Int?
     @ObservationIgnored private var seenNotificationMessageIDsByChannelID: [ChannelID: Set<MessageID>] = [:]
     @ObservationIgnored private var deliveredNotificationIDs: Set<String> = []
+    @ObservationIgnored private var expiredNotificationRouteCount = 0
     @ObservationIgnored private var previousSnapshot = RealtimeSnapshot()
     @ObservationIgnored private let selectionRestorer = ShellSelectionRestorer()
     @ObservationIgnored private let navigationHelper = ShellNavigationHelper()
@@ -514,7 +518,8 @@ public final class MainShellViewModel {
         notificationDeliverer: (any NotificationDelivering)? = nil,
         notificationPermissionManager: (any NotificationPermissionManaging)? = nil,
         dockBadgeManager: (any DockBadgeManaging)? = nil,
-        notificationRouteCenter: NotificationRouteCenter = .shared
+        notificationRouteCenter: NotificationRouteCenter = .shared,
+        appLifecycleCenter: AppLifecycleCenter = .shared
     ) {
         self.selection = selection
         self.snapshot = snapshot
@@ -537,6 +542,8 @@ public final class MainShellViewModel {
         self.notificationPermissionManager = notificationPermissionManager ?? UserNotificationsPermissionManager()
         self.dockBadgeManager = dockBadgeManager ?? AppKitDockBadgeManager()
         self.notificationRouteCenter = notificationRouteCenter
+        self.appLifecycleCenter = appLifecycleCenter
+        self.appLifecyclePhase = appLifecycleCenter.phase
         self.previousSnapshot = snapshot
         self.seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
         self.quickSwitcherViewModel = QuickSwitcherViewModel(snapshot: snapshot, selection: selection)
@@ -549,6 +556,7 @@ public final class MainShellViewModel {
         validateSelection()
         self.messageController.hydrate(from: snapshot)
         installNotificationRouteHandler()
+        installAppLifecycleHandler()
         if let snapshotSource {
             observe(snapshotSource: snapshotSource)
         }
@@ -983,6 +991,7 @@ public final class MainShellViewModel {
         scheduleSelectedChannelLoad()
         updateDockBadge()
         updateNotificationDiagnostics()
+        replayQueuedNotificationRoutesIfReady()
         if sessionCoordinator.mode != .liveManual {
             restoredLiveConnectionGeneration = nil
         }
@@ -2181,6 +2190,18 @@ public final class MainShellViewModel {
         placeholderStatus = "Timeline diagnostics reset"
     }
 
+    public func updateAppLifecyclePhase(_ phase: AppLifecyclePhase) {
+        guard appLifecyclePhase != phase else {
+            reconcileNotificationLifecycle()
+            return
+        }
+        appLifecyclePhase = phase
+        if phase == .active {
+            refreshNotificationPermissionStatus()
+        }
+        reconcileNotificationLifecycle()
+    }
+
     public func refreshNotificationPermissionStatus() {
         Task { [weak self, manager = notificationPermissionManager] in
             let status = await manager.status()
@@ -2233,6 +2254,7 @@ public final class MainShellViewModel {
 
     public func dismissNotificationBanner(_ id: String) {
         notificationBanners.removeAll { $0.id == id }
+        updateNotificationDiagnostics()
     }
 
     public func deliverMockNotificationDemo() {
@@ -2266,16 +2288,27 @@ public final class MainShellViewModel {
     }
 
     public func openNotificationRoute(_ route: NotificationRoute) async {
+        expiredNotificationRouteCount += removeExpiredQueuedNotificationRoutes()
         selectChannel(route.channelID)
         guard let messageID = route.messageID else { return }
         if selectedTimelineMessages.contains(where: { $0.message.id == messageID }) {
             timelineSelection = TimelineSelection(channelID: route.channelID, messageID: messageID, source: .notification)
             timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: messageID, reason: .jumpCommand)
             placeholderStatus = "Opened notification"
+            recordNotificationRouteOutcome(.opened)
             return
         }
         guard effectiveRuntimeMode == .liveManual else {
             placeholderStatus = "Notification message is not loaded."
+            recordNotificationRouteOutcome(.failed)
+            return
+        }
+        guard effectiveSessionState == .connected,
+              sessionCoordinator?.hydrationStatus.readyReceived == true
+        else {
+            queueNotificationRoute(route)
+            placeholderStatus = "Connect manually to open this message."
+            recordNotificationRouteOutcome(.queuedAwaitingManualConnect)
             return
         }
         let loaded = await messageController.loadMessagesAround(channelID: route.channelID, targetMessageID: messageID)
@@ -2283,8 +2316,10 @@ public final class MainShellViewModel {
             timelineSelection = TimelineSelection(channelID: route.channelID, messageID: messageID, source: .notification)
             timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: messageID, reason: .jumpCommand)
             placeholderStatus = "Opened notification"
+            recordNotificationRouteOutcome(.opened)
         } else {
             placeholderStatus = loaded ? "Notification target was not returned." : "Notification target could not be loaded."
+            recordNotificationRouteOutcome(.failed)
         }
     }
 
@@ -2923,6 +2958,7 @@ public final class MainShellViewModel {
         quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
         updateDockBadge()
         updateNotificationDiagnostics()
+        replayQueuedNotificationRoutesIfReady()
     }
 
     private func applyRealtimeDeleteDiff(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
@@ -2942,6 +2978,10 @@ public final class MainShellViewModel {
         sessionCoordinator?.preferences.notificationPreferences ?? .defaults
     }
 
+    private var isActiveChannelVisibleForNotifications: Bool {
+        appLifecyclePhase.selectedChannelIsVisible && (selection.channelID != nil || selection.dmChannelID != nil)
+    }
+
     private func processNotificationDiff(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
         guard effectiveRuntimeMode == .liveManual,
               sessionCoordinator?.hydrationStatus.readyReceived == true
@@ -2954,7 +2994,7 @@ public final class MainShellViewModel {
             runtimeMode: effectiveRuntimeMode,
             currentUserID: currentUserID,
             activeChannelID: selection.channelID ?? selection.dmChannelID,
-            isActiveChannelVisible: true,
+            isActiveChannelVisible: isActiveChannelVisibleForNotifications,
             preferences: notificationPreferences,
             snapshot: current
         )
@@ -2988,7 +3028,10 @@ public final class MainShellViewModel {
                     notificationBanners.removeFirst(notificationBanners.count - 3)
                 }
             }
-            if notificationPreferences.nativeNotificationsEnabled && !channelPreference.suppressNative && notificationPermissionStatus.allowsDelivery {
+            if appLifecyclePhase != .active,
+               notificationPreferences.nativeNotificationsEnabled,
+               !channelPreference.suppressNative,
+               notificationPermissionStatus.allowsDelivery {
                 Task { [deliverer = notificationDeliverer] in
                     try? await deliverer.deliver(event)
                 }
@@ -3005,6 +3048,66 @@ public final class MainShellViewModel {
         refreshNotificationPermissionStatus()
     }
 
+    private func installAppLifecycleHandler() {
+        appLifecycleCenter.setHandler { [weak self] phase in
+            self?.updateAppLifecyclePhase(phase)
+        }
+    }
+
+    private func reconcileNotificationLifecycle() {
+        expiredNotificationRouteCount += removeExpiredQueuedNotificationRoutes()
+        pruneNotificationBanners()
+        updateDockBadge()
+        updateNotificationDiagnostics()
+    }
+
+    private func pruneNotificationBanners(now: Date = Date()) {
+        notificationBanners.removeAll { now.timeIntervalSince($0.createdAt) > 300 }
+        if notificationBanners.count > 3 {
+            notificationBanners.removeFirst(notificationBanners.count - 3)
+        }
+    }
+
+    private func queueNotificationRoute(_ route: NotificationRoute, queuedAt: Date = Date()) {
+        let queued = QueuedNotificationRoute(route: route, queuedAt: queuedAt)
+        queuedNotificationRoutes.removeAll { $0.id == queued.id }
+        queuedNotificationRoutes.append(queued)
+        queuedNotificationRoutes = Array(queuedNotificationRoutes.suffix(10))
+        updateNotificationDiagnostics()
+    }
+
+    @discardableResult
+    private func removeExpiredQueuedNotificationRoutes(now: Date = Date()) -> Int {
+        let before = queuedNotificationRoutes.count
+        queuedNotificationRoutes.removeAll { $0.isExpired(at: now) }
+        return before - queuedNotificationRoutes.count
+    }
+
+    private func replayQueuedNotificationRoutesIfReady() {
+        expiredNotificationRouteCount += removeExpiredQueuedNotificationRoutes()
+        guard effectiveRuntimeMode == .liveManual,
+              effectiveSessionState == .connected,
+              sessionCoordinator?.hydrationStatus.readyReceived == true,
+              !queuedNotificationRoutes.isEmpty
+        else {
+            updateNotificationDiagnostics()
+            return
+        }
+        let routes = queuedNotificationRoutes
+        queuedNotificationRoutes.removeAll()
+        updateNotificationDiagnostics()
+        for queued in routes {
+            Task { @MainActor [weak self] in
+                await self?.openNotificationRoute(queued.route)
+            }
+        }
+    }
+
+    private func recordNotificationRouteOutcome(_ outcome: NotificationRouteOutcome) {
+        notificationDiagnostics.lastRouteOutcome = outcome
+        updateNotificationDiagnostics()
+    }
+
     private func updateDockBadge() {
         let counts = NotificationBadgeCalculator.counts(snapshot: snapshot, preferences: notificationPreferences, localReadStates: localReadStates)
         let value = counts.badgeValue(mode: notificationPreferences.dockBadge)
@@ -3019,6 +3122,10 @@ public final class MainShellViewModel {
         notificationDiagnostics.nativeEnabled = notificationPreferences.nativeNotificationsEnabled
         notificationDiagnostics.inAppEnabled = notificationPreferences.inAppBannersEnabled
         notificationDiagnostics.dockBadgeValue = counts.badgeValue(mode: notificationPreferences.dockBadge)
+        notificationDiagnostics.lifecyclePhase = appLifecyclePhase
+        notificationDiagnostics.activeChannelVisible = isActiveChannelVisibleForNotifications
+        notificationDiagnostics.queuedRouteCount = queuedNotificationRoutes.count + notificationRouteCenter.queuedRouteCount()
+        notificationDiagnostics.expiredRouteCount = expiredNotificationRouteCount
     }
 
     private func restoreOrValidateSelection() {
@@ -3580,6 +3687,7 @@ public enum MockShellData {
 }
 
 public struct LiquidBagelRootView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var sessionCoordinator: AppSessionCoordinator
     @State private var viewModel: MainShellViewModel
 
@@ -3597,6 +3705,24 @@ public struct LiquidBagelRootView: View {
                 viewModel.attachSessionCoordinator(sessionCoordinator)
                 await viewModel.startMockSession()
             }
+            .onChange(of: scenePhase) { _, phase in
+                viewModel.updateAppLifecyclePhase(AppLifecyclePhase(phase))
+            }
+    }
+}
+
+private extension AppLifecyclePhase {
+    init(_ phase: ScenePhase) {
+        switch phase {
+        case .active:
+            self = .active
+        case .inactive:
+            self = .inactive
+        case .background:
+            self = .background
+        @unknown default:
+            self = .inactive
+        }
     }
 }
 

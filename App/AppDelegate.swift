@@ -7,6 +7,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         UNUserNotificationCenter.current().delegate = self
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        AppLifecycleCenter.shared.update(.active)
+    }
+
+    func applicationWillResignActive(_ notification: Notification) {
+        AppLifecycleCenter.shared.update(.inactive)
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
@@ -25,6 +33,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.banner, .sound, .badge]
+        []
     }
 }

@@ -55,6 +55,47 @@ public struct NotificationRoute: Codable, Hashable, Sendable {
     }
 }
 
+public enum AppLifecyclePhase: String, Codable, Hashable, Sendable {
+    case active
+    case inactive
+    case background
+
+    public var selectedChannelIsVisible: Bool {
+        self == .active
+    }
+}
+
+public struct QueuedNotificationRoute: Identifiable, Hashable, Sendable {
+    public var id: String
+    public var route: NotificationRoute
+    public var queuedAt: Date
+    public var expiresAt: Date
+
+    public init(route: NotificationRoute, queuedAt: Date = Date(), expiresAfter: TimeInterval = 600) {
+        self.route = route
+        self.queuedAt = queuedAt
+        self.expiresAt = queuedAt.addingTimeInterval(expiresAfter)
+        self.id = [
+            route.serverID?.rawValue ?? "-",
+            route.channelID.rawValue,
+            route.messageID?.rawValue ?? "-"
+        ].joined(separator: ":")
+    }
+
+    public func isExpired(at date: Date = Date()) -> Bool {
+        expiresAt <= date
+    }
+}
+
+public enum NotificationRouteOutcome: String, Hashable, Sendable {
+    case none
+    case opened
+    case queuedAwaitingShell
+    case queuedAwaitingManualConnect
+    case expired
+    case failed
+}
+
 public enum NotificationClassificationKind: String, Hashable, Sendable {
     case mention
     case directMessage
@@ -273,6 +314,11 @@ public struct NotificationDiagnostics: Hashable, Sendable {
     public var suppressedCount: Int
     public var lastSuppressionReason: NotificationSuppressionReason?
     public var lastEventKind: NotificationClassificationKind?
+    public var lifecyclePhase: AppLifecyclePhase
+    public var activeChannelVisible: Bool
+    public var queuedRouteCount: Int
+    public var expiredRouteCount: Int
+    public var lastRouteOutcome: NotificationRouteOutcome
 
     public init(
         permissionStatus: NotificationPermissionStatus = .unknown,
@@ -282,7 +328,12 @@ public struct NotificationDiagnostics: Hashable, Sendable {
         deliveredCount: Int = 0,
         suppressedCount: Int = 0,
         lastSuppressionReason: NotificationSuppressionReason? = nil,
-        lastEventKind: NotificationClassificationKind? = nil
+        lastEventKind: NotificationClassificationKind? = nil,
+        lifecyclePhase: AppLifecyclePhase = .active,
+        activeChannelVisible: Bool = true,
+        queuedRouteCount: Int = 0,
+        expiredRouteCount: Int = 0,
+        lastRouteOutcome: NotificationRouteOutcome = .none
     ) {
         self.permissionStatus = permissionStatus
         self.nativeEnabled = nativeEnabled
@@ -292,6 +343,11 @@ public struct NotificationDiagnostics: Hashable, Sendable {
         self.suppressedCount = suppressedCount
         self.lastSuppressionReason = lastSuppressionReason
         self.lastEventKind = lastEventKind
+        self.lifecyclePhase = lifecyclePhase
+        self.activeChannelVisible = activeChannelVisible
+        self.queuedRouteCount = queuedRouteCount
+        self.expiredRouteCount = expiredRouteCount
+        self.lastRouteOutcome = lastRouteOutcome
     }
 
     public var redactedText: String {
@@ -305,6 +361,11 @@ public struct NotificationDiagnostics: Hashable, Sendable {
         suppressed: \(suppressedCount)
         lastSuppression: \(lastSuppressionReason?.rawValue ?? "-")
         lastKind: \(lastEventKind?.rawValue ?? "-")
+        lifecycle: \(lifecyclePhase.rawValue)
+        activeChannelVisible: \(activeChannelVisible)
+        queuedRoutes: \(queuedRouteCount)
+        expiredRoutes: \(expiredRouteCount)
+        lastRouteOutcome: \(lastRouteOutcome.rawValue)
         """
         return NotificationContentFormatter.sanitize(text)
     }
@@ -437,15 +498,71 @@ public final class NotificationRouteCenter {
     public static let shared = NotificationRouteCenter()
 
     private var handler: ((NotificationRoute) -> Void)?
+    private var queuedRoutes: [QueuedNotificationRoute] = []
+    private let routeExpirySeconds: TimeInterval
 
-    public init() {}
+    public init(routeExpirySeconds: TimeInterval = 600) {
+        self.routeExpirySeconds = routeExpirySeconds
+    }
 
     public func setHandler(_ handler: @escaping (NotificationRoute) -> Void) {
         self.handler = handler
+        let routes = drainQueuedRoutes()
+        for queued in routes {
+            handler(queued.route)
+        }
     }
 
     public func open(_ route: NotificationRoute) {
-        handler?(route)
+        guard let handler else {
+            queue(route)
+            return
+        }
+        handler(route)
+    }
+
+    public func queue(_ route: NotificationRoute, queuedAt: Date = Date()) {
+        let queued = QueuedNotificationRoute(route: route, queuedAt: queuedAt, expiresAfter: routeExpirySeconds)
+        queuedRoutes.removeAll { $0.id == queued.id }
+        queuedRoutes.append(queued)
+        queuedRoutes = Array(queuedRoutes.suffix(10))
+    }
+
+    public func queuedRouteCount(at date: Date = Date()) -> Int {
+        queuedRoutes.filter { !$0.isExpired(at: date) }.count
+    }
+
+    public func drainQueuedRoutes(at date: Date = Date()) -> [QueuedNotificationRoute] {
+        let liveRoutes = queuedRoutes.filter { !$0.isExpired(at: date) }
+        queuedRoutes.removeAll()
+        return liveRoutes
+    }
+
+    public func clearExpiredRoutes(at date: Date = Date()) -> Int {
+        let before = queuedRoutes.count
+        queuedRoutes.removeAll { $0.isExpired(at: date) }
+        return before - queuedRoutes.count
+    }
+}
+
+@MainActor
+public final class AppLifecycleCenter {
+    public static let shared = AppLifecycleCenter()
+
+    private var handler: ((AppLifecyclePhase) -> Void)?
+    public private(set) var phase: AppLifecyclePhase = .active
+
+    public init() {}
+
+    public func setHandler(_ handler: @escaping (AppLifecyclePhase) -> Void) {
+        self.handler = handler
+        handler(phase)
+    }
+
+    public func update(_ phase: AppLifecyclePhase) {
+        guard self.phase != phase else { return }
+        self.phase = phase
+        handler?(phase)
     }
 }
 

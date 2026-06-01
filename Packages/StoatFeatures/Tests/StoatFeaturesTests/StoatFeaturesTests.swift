@@ -2126,6 +2126,127 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(delivered.first?.title, "Liquid Bagel notification demo")
     }
 
+    func testPhase19LifecycleControlsActiveChannelVisibility() {
+        let currentUserID: UserID = "user-me"
+        let otherUserID: UserID = "user-other"
+        let channelID: ChannelID = "channel-text"
+        let snapshot = phase18Snapshot(currentUserID: currentUserID, otherUserID: otherUserID, textChannelID: channelID, dmChannelID: "channel-dm")
+        let mention = Message(id: "01J00000000000000000019001", channelID: channelID, authorID: otherUserID, content: "hello", mentions: [currentUserID])
+
+        let activeContext = NotificationClassificationContext(runtimeMode: .liveManual, currentUserID: currentUserID, activeChannelID: channelID, isActiveChannelVisible: AppLifecyclePhase.active.selectedChannelIsVisible, preferences: .defaults, snapshot: snapshot)
+        let inactiveContext = NotificationClassificationContext(runtimeMode: .liveManual, currentUserID: currentUserID, activeChannelID: channelID, isActiveChannelVisible: AppLifecyclePhase.inactive.selectedChannelIsVisible, preferences: .defaults, snapshot: snapshot)
+
+        XCTAssertEqual(NotificationClassifier.classify(message: mention, context: activeContext), .suppress(.activeChannel))
+        guard case .deliver = NotificationClassifier.classify(message: mention, context: inactiveContext) else {
+            return XCTFail("Inactive selected channels should not suppress notification delivery.")
+        }
+    }
+
+    @MainActor
+    func testPhase19RouteCenterQueuesClicksUntilShellHandlerIsReady() {
+        let center = NotificationRouteCenter(routeExpirySeconds: 600)
+        let route = NotificationRoute(serverID: "server-phase19", channelID: "channel-phase19", messageID: "message-phase19")
+        var opened: [NotificationRoute] = []
+
+        center.open(route)
+        XCTAssertEqual(center.queuedRouteCount(), 1)
+
+        center.setHandler { opened.append($0) }
+
+        XCTAssertEqual(opened, [route])
+        XCTAssertEqual(center.queuedRouteCount(), 0)
+    }
+
+    @MainActor
+    func testPhase19RouteCenterDropsExpiredQueuedClicks() {
+        let center = NotificationRouteCenter(routeExpirySeconds: 120)
+        let route = NotificationRoute(serverID: "server-phase19", channelID: "channel-phase19", messageID: "message-expired")
+        let queuedAt = Date(timeIntervalSince1970: 1_000)
+        var opened: [NotificationRoute] = []
+
+        center.queue(route, queuedAt: queuedAt)
+        XCTAssertEqual(center.queuedRouteCount(at: queuedAt.addingTimeInterval(60)), 1)
+        XCTAssertEqual(center.queuedRouteCount(at: queuedAt.addingTimeInterval(121)), 0)
+
+        _ = center.clearExpiredRoutes(at: queuedAt.addingTimeInterval(121))
+        center.setHandler { opened.append($0) }
+
+        XCTAssertTrue(opened.isEmpty)
+        XCTAssertEqual(center.queuedRouteCount(), 0)
+    }
+
+    @MainActor
+    func testPhase19DisconnectedNotificationClickQueuesWithoutConnecting() async {
+        let model = MainShellViewModel(
+            snapshot: MockShellData.snapshot,
+            runtimeMode: .liveManual,
+            sessionState: .readyToConnect,
+            currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID],
+            notificationDeliverer: MockNotificationService(),
+            notificationPermissionManager: MockNotificationPermissionManager(),
+            dockBadgeManager: MockDockBadgeManager(),
+            notificationRouteCenter: NotificationRouteCenter()
+        )
+        let channel = model.snapshot.channelsByID.values.first { ($0.serverID != nil) && $0.kind == .textChannel }!
+
+        await model.openNotificationRoute(NotificationRoute(serverID: channel.serverID, channelID: channel.id, messageID: "missing-phase19"))
+
+        XCTAssertEqual(model.effectiveSessionState, .readyToConnect)
+        XCTAssertEqual(model.placeholderStatus, "Connect manually to open this message.")
+        XCTAssertEqual(model.queuedNotificationRoutes.count, 1)
+        XCTAssertEqual(model.notificationDiagnostics.lastRouteOutcome, .queuedAwaitingManualConnect)
+    }
+
+    @MainActor
+    func testPhase19LifecycleReconcilesDockBadgeAndDiagnostics() async throws {
+        let dock = MockDockBadgeManager()
+        let model = MainShellViewModel(
+            snapshot: MockShellData.snapshot,
+            notificationDeliverer: MockNotificationService(),
+            notificationPermissionManager: MockNotificationPermissionManager(),
+            dockBadgeManager: dock,
+            notificationRouteCenter: NotificationRouteCenter()
+        )
+        let channel = model.snapshot.channelsByID.values.first { ($0.serverID != nil) && $0.kind == .textChannel }!
+        model.localReadStates[channel.id] = LocalReadState(channelID: channel.id, unreadCount: 1, mentionCount: 1)
+        let expectedBadge = NotificationBadgeCalculator
+            .counts(snapshot: model.snapshot, preferences: .defaults, localReadStates: model.localReadStates)
+            .badgeValue(mode: .unreadChannelsAndMentions)
+
+        model.updateAppLifecyclePhase(.inactive)
+        try await Task.sleep(for: .milliseconds(30))
+
+        let counts = await dock.badgeCounts
+        XCTAssertEqual(counts.last, expectedBadge)
+        XCTAssertEqual(model.notificationDiagnostics.lifecyclePhase, .inactive)
+        XCTAssertFalse(model.notificationDiagnostics.activeChannelVisible)
+        XCTAssertEqual(model.notificationDiagnostics.dockBadgeValue, expectedBadge)
+    }
+
+    func testPhase19NotificationDiagnosticsRemainRedacted() {
+        let diagnostics = NotificationDiagnostics(
+            permissionStatus: .authorized,
+            nativeEnabled: true,
+            inAppEnabled: true,
+            dockBadgeValue: 2,
+            deliveredCount: 1,
+            suppressedCount: 0,
+            lifecyclePhase: .background,
+            activeChannelVisible: false,
+            queuedRouteCount: 1,
+            expiredRouteCount: 1,
+            lastRouteOutcome: .queuedAwaitingManualConnect
+        )
+
+        let text = diagnostics.redactedText + "\n token: abc https://example.com/raw /tmp/private/file"
+        let redacted = NotificationContentFormatter.sanitize(text)
+
+        XCTAssertFalse(redacted.contains("abc"))
+        XCTAssertFalse(redacted.contains("https://example.com"))
+        XCTAssertFalse(redacted.contains("/tmp/private"))
+        XCTAssertTrue(redacted.contains("queuedRoutes: 1"))
+    }
+
     private func phase18Snapshot(currentUserID: UserID, otherUserID: UserID, textChannelID: ChannelID, dmChannelID: ChannelID) -> RealtimeSnapshot {
         let currentUser = User(id: currentUserID, username: "me", displayName: "Me")
         let otherUser = User(id: otherUserID, username: "other", displayName: "Other")

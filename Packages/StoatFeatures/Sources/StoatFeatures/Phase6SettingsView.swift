@@ -609,7 +609,10 @@ private struct NotificationSettingsTab: View {
                 Button("Request Notification Permission") {
                     viewModel.requestNotificationPermission()
                 }
-                Text("Permission is requested only from this settings surface.")
+                Button("Refresh Status") {
+                    viewModel.refreshNotificationPermissionStatus()
+                }
+                Text("Permission prompts happen only here. Status refreshes here and when Liquid Bagel becomes active.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -631,6 +634,9 @@ private struct NotificationSettingsTab: View {
                     Text("Mentions").tag(DockBadgePreference.mentionsOnly)
                     Text("Unread channels and mentions").tag(DockBadgePreference.unreadChannelsAndMentions)
                 }
+                Text("When Liquid Bagel is active, notifications stay in-app. Native macOS notifications are used only while inactive or in the background, and notification clicks never reconnect Live Manual automatically.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Selected Channel") {
@@ -649,7 +655,12 @@ private struct NotificationSettingsTab: View {
             }
 
             Section("Diagnostics") {
+                LabeledContent("Lifecycle", value: viewModel.notificationDiagnostics.lifecyclePhase.rawValue)
+                LabeledContent("Active channel visible", value: viewModel.notificationDiagnostics.activeChannelVisible ? "Yes" : "No")
                 LabeledContent("Dock badge", value: "\(viewModel.notificationDiagnostics.dockBadgeValue)")
+                LabeledContent("Queued routes", value: "\(viewModel.notificationDiagnostics.queuedRouteCount)")
+                LabeledContent("Expired routes", value: "\(viewModel.notificationDiagnostics.expiredRouteCount)")
+                LabeledContent("Last route", value: viewModel.notificationDiagnostics.lastRouteOutcome.rawValue)
                 LabeledContent("Delivered", value: "\(viewModel.notificationDiagnostics.deliveredCount)")
                 LabeledContent("Suppressed", value: "\(viewModel.notificationDiagnostics.suppressedCount)")
                 LabeledContent("Last suppression", value: viewModel.notificationDiagnostics.lastSuppressionReason?.rawValue ?? "-")
