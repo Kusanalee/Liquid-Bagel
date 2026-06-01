@@ -62,4 +62,18 @@ final class StoatUITests: XCTestCase {
         XCTAssertTrue(label.contains("PDF"))
         XCTAssertTrue(StoatAccessibility.attachmentActionLabel(action: "Save As", filename: "brief.pdf").contains("brief.pdf"))
     }
+
+    func testPhase17MessageActionAndReactionDisplayHelpers() {
+        let action = MessageRowActionItem(id: "delete", title: "Delete Message", systemImage: "trash", role: .destructive, isEnabled: false)
+        XCTAssertEqual(action.id, "delete")
+
+        let actionLabel = StoatAccessibility.messageActionLabel(title: action.title, isDestructive: action.role == .destructive, isEnabled: action.isEnabled)
+        XCTAssertTrue(actionLabel.contains("destructive"))
+        XCTAssertTrue(actionLabel.contains("unavailable"))
+
+        let reaction = MessageReactionDisplayItem(emoji: "👍", count: 2, hasCurrentUserReacted: true)
+        let reactionLabel = StoatAccessibility.reactionLabel(emoji: reaction.emoji, count: reaction.count, hasReacted: reaction.hasCurrentUserReacted)
+        XCTAssertTrue(reactionLabel.contains("2 reactions"))
+        XCTAssertTrue(reactionLabel.contains("selected"))
+    }
 }

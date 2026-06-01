@@ -384,7 +384,7 @@ public struct EditingMessageDraft: Hashable, Sendable, Identifiable {
 }
 
 public enum MessageQuickActions {
-    public static let quickReactions = ["👍", "❤️", "😂", "👀", "✅"]
+    public static let quickReactions = Phase17MessageActions.quickReactions
 }
 
 @MainActor
@@ -451,6 +451,7 @@ public final class MainShellViewModel {
     public var lastAttachmentAction: String?
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
+    @ObservationIgnored public var messageCopier: any MessageCopying
     @ObservationIgnored public var attachmentUploadHandler: any AttachmentUploadHandling
     @ObservationIgnored public var remoteAttachmentLoader: any RemoteAttachmentLoading
     @ObservationIgnored public var attachmentSaver: any AttachmentSaving
@@ -492,6 +493,7 @@ public final class MainShellViewModel {
         snapshotSource: (any ShellSnapshotSource)? = nil,
         messageController: ChannelMessageController? = nil,
         messageActionHandler: (any MessageActionHandling)? = nil,
+        messageCopier: (any MessageCopying)? = nil,
         attachmentUploadHandler: (any AttachmentUploadHandling)? = nil,
         remoteAttachmentLoader: (any RemoteAttachmentLoading)? = nil,
         attachmentSaver: (any AttachmentSaving)? = nil,
@@ -509,6 +511,7 @@ public final class MainShellViewModel {
         self.sessionCoordinator = sessionCoordinator
         self.messageController = messageController ?? ChannelMessageController(runtimeMode: runtimeMode, currentUserID: currentUser?.id ?? MockShellData.currentUserID)
         self.messageActionHandler = messageActionHandler ?? MockMessageActionHandler(currentUserID: currentUser?.id ?? MockShellData.currentUserID)
+        self.messageCopier = messageCopier ?? AppKitMessageCopier()
         self.attachmentUploadHandler = attachmentUploadHandler ?? MockAttachmentUploadHandler()
         self.remoteAttachmentLoader = remoteAttachmentLoader ?? MockRemoteAttachmentLoader()
         self.attachmentSaver = attachmentSaver ?? AppKitAttachmentSaver()
@@ -1701,29 +1704,100 @@ public final class MainShellViewModel {
         }
     }
 
-    public func copyMessage(_ message: Message) {
-        #if canImport(AppKit)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(Self.copyableContent(for: message), forType: .string)
-        #endif
+    public func messageActionContext(for timelineMessage: TimelineMessage) -> MessageActionContext {
+        MessageActionContext(
+            timelineMessage: timelineMessage,
+            currentUserID: currentUserID,
+            canReply: canReply(to: timelineMessage),
+            canEdit: canEdit(timelineMessage),
+            canDelete: canDelete(timelineMessage),
+            canReact: timelineMessage.status == .confirmed && canReact(to: timelineMessage.message),
+            canPin: canPin(timelineMessage),
+            developerControlsEnabled: isDeveloperControlsEnabled
+        )
     }
 
-    public func copyMessageID(_ message: Message) {
-        guard isDeveloperControlsEnabled else {
-            placeholderStatus = "Developer message ID copy is disabled."
+    public func messageActionItems(for timelineMessage: TimelineMessage) -> [MessageActionItem] {
+        Phase17MessageActions.actionItems(for: messageActionContext(for: timelineMessage))
+    }
+
+    public func reactionSummaries(for message: Message) -> [ReactionSummary] {
+        Phase17MessageActions.reactionSummaries(for: message, currentUserID: currentUserID)
+    }
+
+    public func messageActionDiagnostics() -> MessageActionDiagnostics {
+        let messages = selectedTimelineMessages
+        let actions = messages.flatMap { messageActionItems(for: $0) }
+        let reactions = messages.flatMap { reactionSummaries(for: $0.message) }
+        return Phase17MessageActions.diagnostics(
+            actions: actions,
+            reactions: reactions,
+            hasPendingDeleteConfirmation: pendingDeletion != nil
+        )
+    }
+
+    public func isMessageActionAvailable(_ kind: MessageActionKind, for timelineMessage: TimelineMessage) -> Bool {
+        messageActionItems(for: timelineMessage).contains { $0.kind == kind && $0.availability.isAvailable }
+    }
+
+    public func performMessageAction(_ actionID: String, on timelineMessage: TimelineMessage) {
+        guard let item = messageActionItems(for: timelineMessage).first(where: { $0.id == actionID }),
+              item.availability.isAvailable
+        else {
+            placeholderStatus = "Message action is unavailable."
             return
         }
-        #if canImport(AppKit)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(message.id.rawValue, forType: .string)
-        #endif
+        timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: .mouse, mode: .actionMenu)
+        switch item.kind {
+        case .copyText:
+            Task { [weak self] in await self?.copyMessageText(timelineMessage.message) }
+        case .copyMessageID:
+            Task { [weak self] in await self?.copyMessageID(timelineMessage) }
+        case .reply:
+            beginReply(to: timelineMessage, source: .contextMenu)
+        case .edit:
+            beginEditing(timelineMessage)
+        case .delete, .discardFailed:
+            requestDelete(timelineMessage)
+        case .retry:
+            Task { [weak self] in await self?.retry(timelineMessage) }
+        case .editAndRetry:
+            editAndRetry(timelineMessage)
+        case .pin, .unpin:
+            Task { [weak self] in await self?.togglePin(timelineMessage) }
+        case let .addReaction(emoji), let .removeReaction(emoji):
+            Task { [weak self] in await self?.toggleReaction(emoji, on: timelineMessage) }
+        }
+    }
+
+    @discardableResult
+    public func copyMessageText(_ message: Message) async -> Bool {
+        guard let text = Phase17MessageActions.copyableText(for: message) else {
+            placeholderStatus = "Message has no copyable text."
+            return false
+        }
+        await messageCopier.copy(Phase17MessageActions.redactedDiagnosticText(text))
+        messageActionStatus = "Message text copied"
+        return true
+    }
+
+    @discardableResult
+    public func copyMessageID(_ timelineMessage: TimelineMessage) async -> Bool {
+        guard isDeveloperControlsEnabled else {
+            placeholderStatus = "Developer message ID copy is disabled."
+            return false
+        }
+        guard let id = Phase17MessageActions.stableMessageID(for: timelineMessage) else {
+            placeholderStatus = "Message ID is not available for local messages."
+            return false
+        }
+        await messageCopier.copy(id.rawValue)
         messageActionStatus = "Message ID copied"
+        return true
     }
 
     public static func copyableContent(for message: Message) -> String {
-        if let content = message.content, !content.isEmpty { return content }
-        if let system = message.system?.content, !system.isEmpty { return system }
-        return ""
+        Phase17MessageActions.copyableText(for: message) ?? ""
     }
 
     public static func replyPreviewText(for message: Message, maxLength: Int = 96) -> String {
@@ -2031,6 +2105,7 @@ public final class MainShellViewModel {
     public func copyRedactedTimelineDiagnostics() {
         let timeline = TimelineCopyFormatter.diagnostics(timelineDiagnostics())
         let attachments = attachmentDiagnostics()
+        let actions = messageActionDiagnostics()
         let attachmentText = """
         Attachment diagnostics
         queuedDrafts: \(attachments.queuedDraftCount)
@@ -2040,8 +2115,14 @@ public final class MainShellViewModel {
         loadedPreviews: \(attachments.loadedPreviewCount)
         failedPreviews: \(attachments.failedPreviewCount)
         lastAttachmentAction: \(attachments.lastAttachmentAction ?? "-")
+        Message action diagnostics
+        visibleActions: \(actions.visibleActionCount)
+        availableActions: \(actions.availableActionCount)
+        reactionGroups: \(actions.reactionGroupCount)
+        currentUserReactions: \(actions.currentUserReactionCount)
+        pendingDeleteConfirmation: \(actions.hasPendingDeleteConfirmation ? "yes" : "no")
         """
-        let text = Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText))
+        let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText)))
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -2545,20 +2626,23 @@ public final class MainShellViewModel {
     }
 
     public func copySelectedMessage() {
-        guard let message = selectedTimelineMessage?.message else {
+        guard let selectedTimelineMessage else {
             placeholderStatus = "No selected message to copy."
             return
         }
-        copyMessage(message)
-        messageActionStatus = "Message copied"
+        Task { [weak self] in
+            await self?.copyMessageText(selectedTimelineMessage.message)
+        }
     }
 
     public func copySelectedMessageID() {
-        guard let message = selectedTimelineMessage?.message else {
+        guard let selectedTimelineMessage else {
             placeholderStatus = "No selected message to copy."
             return
         }
-        copyMessageID(message)
+        Task { [weak self] in
+            await self?.copyMessageID(selectedTimelineMessage)
+        }
     }
 
     public func editSelectedMessage() {
@@ -2956,9 +3040,9 @@ extension MainShellViewModel: AppCommandHandling {
         case .cancelReply:
             return replyContext(for: selection.channelID ?? selection.dmChannelID) != nil
         case .copySelectedMessage:
-            return !isTextEntryFocused && selectedTimelineMessage != nil
+            return !isTextEntryFocused && selectedTimelineMessage.map { isMessageActionAvailable(.copyText, for: $0) } == true
         case .copySelectedMessageID:
-            return !isTextEntryFocused && isDeveloperControlsEnabled && selectedTimelineMessage != nil
+            return !isTextEntryFocused && selectedTimelineMessage.map { isMessageActionAvailable(.copyMessageID, for: $0) } == true
         case .editSelectedMessage:
             return !isTextEntryFocused && selectedTimelineMessage.map { canEdit($0) } == true
         case .deleteSelectedMessage:
@@ -4578,6 +4662,7 @@ public struct MessageTimelineView: View {
         if viewModel.isDeveloperControlsEnabled {
             let diagnostics = viewModel.timelineDiagnostics()
             let attachments = viewModel.attachmentDiagnostics()
+            let actions = viewModel.messageActionDiagnostics()
             VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                 Text("Timeline Diagnostics")
                     .font(.caption.weight(.semibold))
@@ -4586,6 +4671,10 @@ public struct MessageTimelineView: View {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                 Text("Attachments displayed \(attachments.displayedAttachmentCount) · loaded previews \(attachments.loadedPreviewCount) · failed previews \(attachments.failedPreviewCount) · drafts queued \(attachments.queuedDraftCount) · failed uploads \(attachments.failedUploadCount)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Text("Message actions visible \(actions.visibleActionCount) · available \(actions.availableActionCount) · reactions \(actions.reactionGroupCount) · mine \(actions.currentUserReactionCount) · delete confirm \(actions.hasPendingDeleteConfirmation ? "yes" : "no")")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
@@ -4702,6 +4791,16 @@ public struct TimelineMessageGroupView: View {
                             searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
                             replyPreview: viewModel.resolvedReplyPreview(for: timelineMessage.message),
                             attachmentItems: viewModel.attachmentDisplayItems(for: timelineMessage.message),
+                            actionItems: rowActionItems(for: timelineMessage),
+                            reactionItems: rowReactionItems(for: timelineMessage),
+                            onMessageAction: { actionID in
+                                select(timelineMessage, source: .contextMenu)
+                                viewModel.performMessageAction(actionID, on: timelineMessage)
+                            },
+                            onToggleReaction: { emoji in
+                                select(timelineMessage)
+                                Task { await viewModel.toggleReaction(emoji, on: timelineMessage) }
+                            },
                             onPreviewAttachment: { item in
                                 Task { await viewModel.previewAttachment(item) }
                             },
@@ -4725,61 +4824,17 @@ public struct TimelineMessageGroupView: View {
                         .onTapGesture {
                             select(timelineMessage)
                         }
-                            .contextMenu {
-                                Button("Copy Message") {
-                                    select(timelineMessage)
-                                    viewModel.perform(.copySelectedMessage)
+                        .contextMenu {
+                            ForEach(viewModel.messageActionItems(for: timelineMessage)) { item in
+                                Button(role: buttonRole(for: item)) {
+                                    select(timelineMessage, source: .contextMenu)
+                                    viewModel.performMessageAction(item.id, on: timelineMessage)
+                                } label: {
+                                    Label(item.title, systemImage: item.systemImage)
                                 }
-                                if viewModel.isDeveloperControlsEnabled {
-                                    Button("Copy Message ID") {
-                                        select(timelineMessage)
-                                        viewModel.perform(.copySelectedMessageID)
-                                    }
-                                }
-                                if viewModel.canEdit(timelineMessage) {
-                                    Button("Edit Message") {
-                                        select(timelineMessage)
-                                        viewModel.perform(.editSelectedMessage)
-                                    }
-                                }
-                                if viewModel.canReply(to: timelineMessage) {
-                                    Button("Reply") {
-                                        select(timelineMessage, source: .contextMenu)
-                                        viewModel.perform(.replyToSelectedMessage)
-                                    }
-                                }
-                                if viewModel.canDelete(timelineMessage) {
-                                    Button(timelineMessage.status == .confirmed ? "Delete Message" : "Discard Failed Message", role: .destructive) {
-                                        select(timelineMessage)
-                                        viewModel.perform(timelineMessage.status == .confirmed ? .deleteSelectedMessage : .discardSelectedFailedMessage)
-                                    }
-                                }
-                                if case .failed = timelineMessage.status {
-                                    Button("Retry Send") {
-                                        select(timelineMessage)
-                                        viewModel.perform(.retrySelectedMessage)
-                                    }
-                                    Button("Edit & Retry") {
-                                        select(timelineMessage)
-                                        viewModel.perform(.editAndRetrySelectedFailedMessage)
-                                    }
-                                }
-                                if viewModel.canPin(timelineMessage) {
-                                    Button(timelineMessage.message.isPinned ? "Unpin Message" : "Pin Message") {
-                                        select(timelineMessage)
-                                        viewModel.perform(.pinOrUnpinSelectedMessage)
-                                    }
-                                }
-                                if viewModel.canReact(to: timelineMessage.message) {
-                                    Divider()
-                                    ForEach(MessageQuickActions.quickReactions, id: \.self) { emoji in
-                                        Button("React \(emoji)") {
-                                            select(timelineMessage)
-                                            viewModel.perform(.reactToSelectedMessage(emoji))
-                                        }
-                                    }
-                                }
+                                .disabled(!item.availability.isAvailable)
                             }
+                        }
                     }
                     statusView(for: timelineMessage)
                 }
@@ -4791,6 +4846,29 @@ public struct TimelineMessageGroupView: View {
     private func select(_ timelineMessage: TimelineMessage, source: MessageFocusSource = .mouse) {
         viewModel.timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: source)
         viewModel.requestFocus(.timeline)
+    }
+
+    private func rowActionItems(for timelineMessage: TimelineMessage) -> [MessageRowActionItem] {
+        viewModel.messageActionItems(for: timelineMessage).map { item in
+            MessageRowActionItem(
+                id: item.id,
+                title: item.title,
+                systemImage: item.systemImage,
+                role: item.role == .destructive ? .destructive : .standard,
+                isEnabled: item.availability.isAvailable,
+                isPrimary: item.isPrimary
+            )
+        }
+    }
+
+    private func rowReactionItems(for timelineMessage: TimelineMessage) -> [MessageReactionDisplayItem] {
+        viewModel.reactionSummaries(for: timelineMessage.message).map {
+            MessageReactionDisplayItem(emoji: $0.emoji, count: $0.count, hasCurrentUserReacted: $0.hasCurrentUserReacted)
+        }
+    }
+
+    private func buttonRole(for item: MessageActionItem) -> ButtonRole? {
+        item.role == .destructive ? .destructive : nil
     }
 
     @ViewBuilder private func statusView(for timelineMessage: TimelineMessage) -> some View {

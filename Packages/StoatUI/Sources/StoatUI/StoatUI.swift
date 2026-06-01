@@ -265,6 +265,50 @@ public struct AttachmentDisplayItem: Identifiable, Hashable, Sendable, CustomStr
     }
 }
 
+public enum MessageRowActionRole: Hashable, Sendable {
+    case standard
+    case destructive
+}
+
+public struct MessageRowActionItem: Identifiable, Hashable, Sendable {
+    public var id: String
+    public var title: String
+    public var systemImage: String
+    public var role: MessageRowActionRole
+    public var isEnabled: Bool
+    public var isPrimary: Bool
+
+    public init(
+        id: String,
+        title: String,
+        systemImage: String,
+        role: MessageRowActionRole = .standard,
+        isEnabled: Bool = true,
+        isPrimary: Bool = false
+    ) {
+        self.id = id
+        self.title = title
+        self.systemImage = systemImage
+        self.role = role
+        self.isEnabled = isEnabled
+        self.isPrimary = isPrimary
+    }
+}
+
+public struct MessageReactionDisplayItem: Identifiable, Hashable, Sendable {
+    public var emoji: String
+    public var count: Int
+    public var hasCurrentUserReacted: Bool
+
+    public var id: String { emoji }
+
+    public init(emoji: String, count: Int, hasCurrentUserReacted: Bool) {
+        self.emoji = emoji
+        self.count = count
+        self.hasCurrentUserReacted = hasCurrentUserReacted
+    }
+}
+
 public enum AttachmentDisplayFormatting {
     public static func safeFilename(_ filename: String) -> String {
         let last = URL(fileURLWithPath: filename).lastPathComponent
@@ -954,6 +998,7 @@ public struct ErrorStateView: View {
 public struct MessageRow: View {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @State private var isHovering = false
     private let message: Message
     private let author: User?
     private let showsHeader: Bool
@@ -966,6 +1011,10 @@ public struct MessageRow: View {
     private let searchAccessibilityStatus: String?
     private let replyPreview: String?
     private let attachmentItems: [AttachmentDisplayItem]?
+    private let actionItems: [MessageRowActionItem]
+    private let reactionItems: [MessageReactionDisplayItem]
+    private let onMessageAction: (String) -> Void
+    private let onToggleReaction: (String) -> Void
     private let onPreviewAttachment: (AttachmentDisplayItem) -> Void
     private let onDownloadAttachment: (AttachmentDisplayItem) -> Void
     private let onOpenAttachment: (AttachmentDisplayItem) -> Void
@@ -984,6 +1033,10 @@ public struct MessageRow: View {
         searchAccessibilityStatus: String? = nil,
         replyPreview: String? = nil,
         attachmentItems: [AttachmentDisplayItem]? = nil,
+        actionItems: [MessageRowActionItem] = [],
+        reactionItems: [MessageReactionDisplayItem] = [],
+        onMessageAction: @escaping (String) -> Void = { _ in },
+        onToggleReaction: @escaping (String) -> Void = { _ in },
         onPreviewAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onDownloadAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onOpenAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
@@ -1001,6 +1054,10 @@ public struct MessageRow: View {
         self.searchAccessibilityStatus = searchAccessibilityStatus
         self.replyPreview = replyPreview
         self.attachmentItems = attachmentItems
+        self.actionItems = actionItems
+        self.reactionItems = reactionItems
+        self.onMessageAction = onMessageAction
+        self.onToggleReaction = onToggleReaction
         self.onPreviewAttachment = onPreviewAttachment
         self.onDownloadAttachment = onDownloadAttachment
         self.onOpenAttachment = onOpenAttachment
@@ -1092,21 +1149,32 @@ public struct MessageRow: View {
                         EmbedPreviewPlaceholder(title: embed.title ?? "Embed", subtitle: embed.description)
                     }
                 }
-                if !message.reactions.isEmpty {
+                let renderedReactions = reactionItems.isEmpty ? fallbackReactionItems : reactionItems
+                if !renderedReactions.isEmpty {
                     HStack(spacing: StoatSpacing.small) {
-                        ForEach(message.reactions.keys.sorted(), id: \.self) { key in
-                            Text("\(key) \(message.reactions[key]?.count ?? 0)")
-                                .font(.caption.weight(.medium))
-                                .padding(.horizontal, StoatSpacing.small)
-                                .padding(.vertical, StoatSpacing.xSmall)
-                                .background(Color.primary.opacity(0.07), in: Capsule())
-                                .accessibilityLabel(StoatAccessibility.reactionLabel(emoji: key, count: message.reactions[key]?.count ?? 0, hasReacted: false))
+                        ForEach(renderedReactions) { reaction in
+                            Button {
+                                onToggleReaction(reaction.emoji)
+                            } label: {
+                                Text("\(reaction.emoji) \(reaction.count)")
+                                    .font(.caption.weight(.medium))
+                                    .padding(.horizontal, StoatSpacing.small)
+                                    .padding(.vertical, StoatSpacing.xSmall)
+                                    .background(reaction.hasCurrentUserReacted ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.07), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(StoatAccessibility.reactionLabel(emoji: reaction.emoji, count: reaction.count, hasReacted: reaction.hasCurrentUserReacted))
                         }
                     }
                     .padding(.top, StoatSpacing.xSmall)
                 }
             }
+            Spacer(minLength: StoatSpacing.small)
+            if showsActionAffordance {
+                messageActionBar
+            }
         }
+        .onHover { isHovering = $0 }
         .padding(.vertical, (showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall) + searchStyle.verticalPaddingAdjustment)
         .background(searchBackground(searchStyle), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
         .overlay {
@@ -1120,7 +1188,79 @@ public struct MessageRow: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: message.reactions.values.reduce(0) { $0 + $1.count }, status: statusText, isSelected: isSelected, isFocused: isFocused, searchResultStatus: searchAccessibilityStatus, replyPreview: replyPreview))
+        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: reactionCount, status: statusText, isSelected: isSelected, isFocused: isFocused, searchResultStatus: searchAccessibilityStatus, replyPreview: replyPreview))
+    }
+
+    @ViewBuilder private var messageActionBar: some View {
+        HStack(spacing: StoatSpacing.xxSmall) {
+            ForEach(primaryActionItems.prefix(3)) { item in
+                actionButton(item)
+            }
+            if !actionItems.isEmpty {
+                Menu {
+                    ForEach(actionItems) { item in
+                        Button(role: buttonRole(for: item)) {
+                            onMessageAction(item.id)
+                        } label: {
+                            Label(item.title, systemImage: item.systemImage)
+                        }
+                        .disabled(!item.isEnabled)
+                        .accessibilityLabel(StoatAccessibility.messageActionLabel(title: item.title, isDestructive: item.role == .destructive, isEnabled: item.isEnabled))
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 26, height: 24)
+                }
+                .menuStyle(.button)
+                .buttonStyle(.borderless)
+                .accessibilityLabel("More message actions")
+            }
+        }
+        .padding(.horizontal, StoatSpacing.xxSmall)
+        .padding(.vertical, StoatSpacing.xxSmall)
+        .background(Color.primary.opacity(reduceTransparency ? 0.09 : 0.055), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+    }
+
+    private func actionButton(_ item: MessageRowActionItem) -> some View {
+        Button(role: buttonRole(for: item)) {
+            onMessageAction(item.id)
+        } label: {
+            Image(systemName: item.systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 26, height: 24)
+        }
+        .buttonStyle(.borderless)
+        .disabled(!item.isEnabled)
+        .help(item.title)
+        .accessibilityLabel(StoatAccessibility.messageActionLabel(title: item.title, isDestructive: item.role == .destructive, isEnabled: item.isEnabled))
+    }
+
+    private var primaryActionItems: [MessageRowActionItem] {
+        actionItems.filter { $0.isPrimary && $0.isEnabled }
+    }
+
+    private var showsActionAffordance: Bool {
+        !actionItems.isEmpty && (isHovering || isFocused || isSelected)
+    }
+
+    private var fallbackReactionItems: [MessageReactionDisplayItem] {
+        message.reactions
+            .filter { !$0.value.isEmpty }
+            .map { MessageReactionDisplayItem(emoji: $0.key, count: $0.value.count, hasCurrentUserReacted: false) }
+            .sorted { lhs, rhs in
+                if lhs.count == rhs.count { return lhs.emoji < rhs.emoji }
+                return lhs.count > rhs.count
+            }
+    }
+
+    private var reactionCount: Int {
+        let renderedReactions = reactionItems.isEmpty ? fallbackReactionItems : reactionItems
+        return renderedReactions.reduce(0) { $0 + $1.count }
+    }
+
+    private func buttonRole(for item: MessageRowActionItem) -> ButtonRole? {
+        item.role == .destructive ? .destructive : nil
     }
 
     private func searchBackground(_ searchStyle: SearchHighlightStyle) -> Color {

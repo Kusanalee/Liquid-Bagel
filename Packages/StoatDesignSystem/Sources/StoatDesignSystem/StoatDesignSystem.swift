@@ -190,6 +190,10 @@ public enum StoatAccessibility {
         return parts.joined(separator: ", ")
     }
 
+    public static func messageActionLabel(title: String, isDestructive: Bool = false, isEnabled: Bool = true) -> String {
+        [title, isDestructive ? "destructive" : nil, isEnabled ? nil : "unavailable"].compactMap { $0 }.joined(separator: ", ")
+    }
+
     public static func composerLabel(isEnabled: Bool, disabledReason: String?, replyAuthor: String? = nil) -> String {
         let base = isEnabled ? "Message composer" : "Message composer disabled"
         return [base, replyAuthor.map { "replying to \($0)" }, isEnabled ? nil : disabledReason].compactMap { $0 }.joined(separator: ", ")

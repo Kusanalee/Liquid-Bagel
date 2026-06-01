@@ -1903,6 +1903,113 @@ final class StoatFeaturesTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testPhase17ActionAvailabilityGatesOwnershipAndState() {
+        let currentUser = MockShellData.currentUserID
+        let channelID: ChannelID = "channel-phase17"
+        let own = TimelineMessage(message: Message(id: "01J00000000000000000017001", channelID: channelID, authorID: currentUser, content: "hello"))
+        let other = TimelineMessage(message: Message(id: "01J00000000000000000017002", channelID: channelID, authorID: "other", content: "hello"))
+        let failed = TimelineMessage(
+            message: Message(id: "pending-phase17", channelID: channelID, authorID: currentUser, content: "retry me"),
+            status: .failed(FailedMessageRecoveryMetadata(originalContent: "retry me", originalNonce: "nonce", lastError: "Network failed"))
+        )
+
+        let ownActions = Phase17MessageActions.actionItems(for: MessageActionContext(timelineMessage: own, currentUserID: currentUser, canReply: true, canEdit: true, canDelete: true, canReact: true, canPin: true, developerControlsEnabled: true))
+        XCTAssertTrue(ownActions.contains { $0.kind == .edit && $0.availability.isAvailable })
+        XCTAssertTrue(ownActions.contains { $0.kind == .delete && $0.availability.isAvailable })
+        XCTAssertTrue(ownActions.contains { $0.kind == .copyMessageID && $0.availability.isAvailable })
+
+        let otherActions = Phase17MessageActions.actionItems(for: MessageActionContext(timelineMessage: other, currentUserID: currentUser, canReply: true, canEdit: false, canDelete: false, canReact: true, canPin: false, developerControlsEnabled: true))
+        XCTAssertFalse(otherActions.contains { $0.kind == .edit })
+        XCTAssertFalse(otherActions.contains { $0.kind == .delete })
+        XCTAssertTrue(otherActions.contains { $0.kind == .reply && $0.availability.isAvailable })
+
+        let failedActions = Phase17MessageActions.actionItems(for: MessageActionContext(timelineMessage: failed, currentUserID: currentUser, canReply: false, canEdit: false, canDelete: true, canReact: false, canPin: false, developerControlsEnabled: true))
+        XCTAssertTrue(failedActions.contains { $0.kind == .retry && $0.availability.isAvailable })
+        XCTAssertTrue(failedActions.contains { $0.kind == .editAndRetry && $0.availability.isAvailable })
+        XCTAssertTrue(failedActions.contains { $0.kind == .discardFailed && $0.availability.isAvailable })
+        XCTAssertFalse(failedActions.contains { $0.kind == .copyMessageID })
+    }
+
+    @MainActor
+    func testPhase17DeleteConfirmationAndStableIDGating() {
+        let currentUser = MockShellData.currentUserID
+        let channelID: ChannelID = "channel-phase17"
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, currentUser: User(id: currentUser, username: "me"))
+        let confirmed = TimelineMessage(message: Message(id: "01J00000000000000000017003", channelID: channelID, authorID: currentUser, content: "delete me"))
+        let pending = TimelineMessage(message: Message(id: "pending-local", channelID: channelID, authorID: currentUser, content: "pending"), status: .pending)
+
+        XCTAssertEqual(Phase17MessageActions.stableMessageID(for: confirmed)?.rawValue, "01J00000000000000000017003")
+        XCTAssertNil(Phase17MessageActions.stableMessageID(for: pending))
+
+        model.requestDelete(confirmed)
+        XCTAssertEqual(model.pendingDeletion?.message.id, confirmed.message.id)
+    }
+
+    @MainActor
+    func testPhase17CopyUsesMockCopierAndRedactsUnsafeContent() async {
+        let copier = MockMessageCopier()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageCopier: copier)
+        let message = Message(
+            id: "01J00000000000000000017004",
+            channelID: "channel-phase17",
+            authorID: MockShellData.currentUserID,
+            content: #"see https://example.com/private token: "secret-value" /Users/enka/private/file.txt {"error":"raw server payload","token":"abc"}"#
+        )
+
+        let didCopy = await model.copyMessageText(message)
+        XCTAssertTrue(didCopy)
+        let copied = await copier.lastCopiedValue() ?? ""
+        XCTAssertFalse(copied.contains("https://example.com"))
+        XCTAssertFalse(copied.contains("secret-value"))
+        XCTAssertFalse(copied.contains("/Users/enka"))
+        XCTAssertFalse(copied.contains("raw server payload"))
+    }
+
+    @MainActor
+    func testPhase17ReactionGroupingAndToggleDirection() async {
+        let currentUser = MockShellData.currentUserID
+        let channelID = MockShellData.snapshot.channelsByID.values.first { $0.kind == .textChannel }!.id
+        let handler = MockMessageActionHandler(currentUserID: currentUser)
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, currentUser: User(id: currentUser, username: "me"), messageActionHandler: handler)
+        let reacted = TimelineMessage(message: Message(id: "01J00000000000000000017005", channelID: channelID, authorID: "other", content: "hello", reactions: ["👍": [currentUser, "other"], "✅": ["other"]]))
+
+        let summaries = model.reactionSummaries(for: reacted.message)
+        XCTAssertEqual(summaries.first?.emoji, "👍")
+        XCTAssertEqual(summaries.first?.count, 2)
+        XCTAssertEqual(summaries.first?.hasCurrentUserReacted, true)
+
+        await model.toggleReaction("👍", on: reacted)
+        let removed = await handler.removedReactions
+        XCTAssertEqual(removed.last?.2, "👍")
+
+        let unreacted = TimelineMessage(message: Message(id: "01J00000000000000000017006", channelID: channelID, authorID: "other", content: "hello"))
+        await model.toggleReaction("✅", on: unreacted)
+        let added = await handler.addedReactions
+        XCTAssertEqual(added.last?.2, "✅")
+    }
+
+    @MainActor
+    func testPhase17AttachmentDisplayDoesNotInvokeRemoteLoader() async {
+        let loader = MockRemoteAttachmentLoader()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, remoteAttachmentLoader: loader)
+        let file = File(id: "file-phase17", tag: "attachments", filename: "photo.png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
+        let message = Message(id: "01J00000000000000000017007", channelID: "channel-phase17", authorID: "other", content: "with file", attachments: [file])
+
+        let items = model.attachmentDisplayItems(for: message)
+        XCTAssertEqual(items.first?.previewState, .notLoaded)
+        let callCount = await loader.callCount()
+        XCTAssertEqual(callCount, 0)
+    }
+
+    func testPhase17DiagnosticsRedactionRemovesUnsafeValues() {
+        let text = Phase17MessageActions.redactedDiagnosticText(#"url https://example.com/raw token: "abc123" path /tmp/private/file.json {"error":"server payload","token":"abc"}"#)
+        XCTAssertFalse(text.contains("https://example.com"))
+        XCTAssertFalse(text.contains("abc123"))
+        XCTAssertFalse(text.contains("/tmp/private"))
+        XCTAssertFalse(text.contains("server payload"))
+    }
+
     private func message(
         id: String,
         author: UserID,
