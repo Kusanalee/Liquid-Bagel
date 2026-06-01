@@ -443,8 +443,10 @@ public final class MainShellViewModel {
     public var calibrationCheckpointNote = ""
     public var importedCalibrationNotes = ""
     public var selectedTimelineTuningPreset: TimelineTuningPreset = .conservative
+    public var attachmentPreview: ComposerAttachmentDraft?
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
+    @ObservationIgnored public var attachmentUploadHandler: any AttachmentUploadHandling
     @ObservationIgnored public var channelAckSender: any ChannelAckSending
     @ObservationIgnored public var messageReferenceResolver: any MessageReferenceResolving
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
@@ -465,6 +467,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private let viewportReducer = TimelineViewportReducer()
     @ObservationIgnored private let visibleRangeValidator = TimelineVisibleRangeValidator()
     @ObservationIgnored private let loadedMessageFinder = LoadedMessageFinder()
+    @ObservationIgnored private let attachmentValidationPolicy = AttachmentValidationPolicy()
     @ObservationIgnored private var visibleRangeUpdateTasks: [ChannelID: Task<Void, Never>] = [:]
     @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
 
@@ -480,6 +483,7 @@ public final class MainShellViewModel {
         snapshotSource: (any ShellSnapshotSource)? = nil,
         messageController: ChannelMessageController? = nil,
         messageActionHandler: (any MessageActionHandling)? = nil,
+        attachmentUploadHandler: (any AttachmentUploadHandling)? = nil,
         channelAckSender: (any ChannelAckSending)? = nil,
         messageReferenceResolver: (any MessageReferenceResolving)? = nil
     ) {
@@ -493,6 +497,7 @@ public final class MainShellViewModel {
         self.sessionCoordinator = sessionCoordinator
         self.messageController = messageController ?? ChannelMessageController(runtimeMode: runtimeMode, currentUserID: currentUser?.id ?? MockShellData.currentUserID)
         self.messageActionHandler = messageActionHandler ?? MockMessageActionHandler(currentUserID: currentUser?.id ?? MockShellData.currentUserID)
+        self.attachmentUploadHandler = attachmentUploadHandler ?? MockAttachmentUploadHandler()
         self.channelAckSender = channelAckSender ?? NoopChannelAckSender()
         self.messageReferenceResolver = messageReferenceResolver ?? DisabledMessageReferenceResolver()
         self.previousSnapshot = snapshot
@@ -893,6 +898,7 @@ public final class MainShellViewModel {
         snapshot = sessionCoordinator.snapshot
         messageActionHandler = sessionCoordinator.messageActionHandler
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
+        attachmentUploadHandler = liveAPIClient.map { LiveAttachmentUploadHandler(apiClient: $0) } ?? MockAttachmentUploadHandler()
         channelAckSender = liveAPIClient.map { LiveChannelAckSender(apiClient: $0) } ?? NoopChannelAckSender()
         if sessionCoordinator.mode == .mock {
             messageReferenceResolver = InMemoryMessageReferenceResolver(messagesByChannelID: snapshot.messagesByChannelID)
@@ -945,6 +951,70 @@ public final class MainShellViewModel {
         scheduleTyping(for: channelID, draft: draft)
     }
 
+    public func addAttachmentURLs(_ urls: [URL], to channelID: ChannelID?) {
+        guard let channelID else { return }
+        var state = composerDraftState(for: channelID)
+        for url in urls {
+            do {
+                let draft = try attachmentValidationPolicy.draft(for: url, existingCount: state.attachments.count)
+                state.attachments.append(draft)
+                composerError = nil
+            } catch {
+                composerError = error.userFacingMessage
+            }
+        }
+        composerDrafts[channelID] = state
+    }
+
+    public func addPastedImageData(_ data: Data, to channelID: ChannelID?) {
+        guard let channelID else { return }
+        var state = composerDraftState(for: channelID)
+        do {
+            let draft = try attachmentValidationPolicy.imageDraft(data: data, existingCount: state.attachments.count)
+            state.attachments.append(draft)
+            composerError = nil
+        } catch {
+            composerError = error.userFacingMessage
+        }
+        composerDrafts[channelID] = state
+    }
+
+    public func openAttachmentPicker(for channelID: ChannelID?) {
+        guard let channelID else { return }
+        #if canImport(AppKit)
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.resolvesAliases = true
+        panel.allowedContentTypes = attachmentValidationPolicy.allowedTypes
+        if panel.runModal() == .OK {
+            addAttachmentURLs(panel.urls, to: channelID)
+        }
+        #else
+        composerError = "File picker is unavailable on this platform."
+        #endif
+    }
+
+    public func removeAttachment(_ attachmentID: UUID, from channelID: ChannelID?) {
+        guard let channelID else { return }
+        var state = composerDraftState(for: channelID)
+        state.attachments.removeAll { $0.id == attachmentID }
+        composerDrafts[channelID] = state
+    }
+
+    public func retryAttachmentUpload(_ attachmentID: UUID, in channelID: ChannelID?) async {
+        await uploadAttachment(attachmentID, in: channelID)
+    }
+
+    public func uploadQueuedAttachments(for channelID: ChannelID?) async {
+        guard let channelID else { return }
+        let ids = composerDraftState(for: channelID).attachments.map(\.id)
+        for id in ids {
+            await uploadAttachment(id, in: channelID)
+        }
+    }
+
     public func composerDraftState(for channelID: ChannelID?) -> ComposerDraftState {
         guard let channelID else {
             return ComposerDraftState(channelID: "")
@@ -979,15 +1049,22 @@ public final class MainShellViewModel {
         guard let channelID, let channel = snapshot.channelsByID[channelID] else {
             return (false, "Select a channel to send a message.")
         }
+        let state = composerDraftState(for: channelID)
         let draft = draft(for: channelID).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !draft.isEmpty else {
-            return (false, "Write a message to send.")
+        guard !draft.isEmpty || !state.attachments.isEmpty else {
+            return (false, "Write a message or attach a file to send.")
         }
         guard isRuntimeSendCapable else {
             return (false, effectiveRuntimeMode == .mock ? "Mock runtime is unavailable." : "Connect Live Manual before sending.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
+        }
+        if !state.attachments.isEmpty, !canUploadFiles(in: channel) {
+            return (false, "You do not have permission to upload files here.")
+        }
+        if state.attachments.contains(where: { $0.status.isWorking }) {
+            return (false, "Attachment upload is still in progress.")
         }
         if messageController.sendingChannelIDs.contains(channelID) {
             return (false, "Sending the previous message.")
@@ -1015,6 +1092,47 @@ public final class MainShellViewModel {
         guard let channel else { return false }
         guard let permissions = resolvedPermissions(for: channel) else { return true }
         return permissions.contains(.uploadFiles)
+    }
+
+    public func composerAttachmentChips(for channelID: ChannelID?) -> [ComposerAttachmentChip] {
+        composerDraftState(for: channelID).attachments.map { attachment in
+            ComposerAttachmentChip(
+                id: attachment.id,
+                filename: attachment.filename,
+                subtitle: attachment.displaySize,
+                systemImage: systemImage(for: attachment.kind),
+                status: chipStatus(for: attachment.status),
+                previewData: attachment.previewData
+            )
+        }
+    }
+
+    private func systemImage(for kind: ComposerAttachmentKind) -> String {
+        switch kind {
+        case .image:
+            return "photo"
+        case .pdf:
+            return "doc.richtext"
+        case .text:
+            return "doc.text"
+        case .file:
+            return "doc"
+        }
+    }
+
+    private func chipStatus(for status: ComposerAttachmentUploadStatus) -> ComposerAttachmentChipStatus {
+        switch status {
+        case .queued:
+            return .queued
+        case .reading:
+            return .reading
+        case .uploading:
+            return .uploading
+        case .uploaded:
+            return .uploaded
+        case let .failed(message):
+            return .failed(message)
+        }
     }
 
     public func canReact(to message: Message) -> Bool {
@@ -1097,13 +1215,63 @@ public final class MainShellViewModel {
             composerError = readiness.reason
             return
         }
-        let content = draft(for: channelID).trimmingCharacters(in: .whitespacesAndNewlines)
-        let draftState = composerDraftState(for: channelID)
+        await uploadQueuedAttachments(for: channelID)
+        let uploadedState = composerDraftState(for: channelID)
+        guard !uploadedState.attachments.contains(where: {
+            if case .failed = $0.status { return true }
+            return $0.uploadedFileID == nil
+        }) else {
+            composerError = "One or more attachments could not be uploaded."
+            return
+        }
+        let content = uploadedState.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let draftState = uploadedState
         let replies = draftState.replyContext.map { [MessageReply(id: $0.messageID, mention: draftState.shouldMentionReplyAuthor)] }
+        let attachmentIDs = draftState.attachments.compactMap(\.uploadedFileID)
+        let attachmentFiles = draftState.attachments.compactMap { draft -> File? in
+            guard let id = draft.uploadedFileID else { return nil }
+            return File(attachmentDraft: draft, uploadedFileID: id)
+        }
         composerDrafts[channelID] = ComposerDraftState(channelID: channelID)
         composerError = nil
-        if await messageController.sendMessage(channelID: channelID, content: content, replies: replies, handler: messageActionHandler) {
+        if await messageController.sendMessage(channelID: channelID, content: content, replies: replies, attachments: attachmentIDs, attachmentFiles: attachmentFiles, handler: messageActionHandler) {
             acknowledgeSelectedChannel()
+        }
+    }
+
+    private func uploadAttachment(_ attachmentID: UUID, in channelID: ChannelID?) async {
+        guard let channelID else { return }
+        var state = composerDraftState(for: channelID)
+        guard let index = state.attachments.firstIndex(where: { $0.id == attachmentID }) else { return }
+        switch state.attachments[index].status {
+        case .uploaded, .reading, .uploading:
+            return
+        case .queued, .failed:
+            break
+        }
+
+        state.attachments[index].status = .reading
+        composerDrafts[channelID] = state
+
+        state = composerDraftState(for: channelID)
+        guard let readingIndex = state.attachments.firstIndex(where: { $0.id == attachmentID }) else { return }
+        let attachment = state.attachments[readingIndex]
+        state.attachments[readingIndex].status = .uploading
+        composerDrafts[channelID] = state
+
+        do {
+            let uploaded = try await attachmentUploadHandler.upload(attachment)
+            var updated = composerDraftState(for: channelID)
+            guard let updatedIndex = updated.attachments.firstIndex(where: { $0.id == attachmentID }) else { return }
+            updated.attachments[updatedIndex].status = .uploaded(uploaded.id)
+            composerDrafts[channelID] = updated
+            composerError = nil
+        } catch {
+            var updated = composerDraftState(for: channelID)
+            guard let updatedIndex = updated.attachments.firstIndex(where: { $0.id == attachmentID }) else { return }
+            updated.attachments[updatedIndex].status = .failed(error.userFacingMessage)
+            composerDrafts[channelID] = updated
+            composerError = "Attachment upload failed."
         }
     }
 
@@ -2769,7 +2937,7 @@ public enum MockShellData {
         let lab: ServerID = "01HX0000000000000000000201"
         let orchard: ServerID = "01HX0000000000000000000202"
 
-        let permissions: Permissions = [.viewChannel, .readMessageHistory, .sendMessage, .react]
+        let permissions: Permissions = [.viewChannel, .readMessageHistory, .sendMessage, .uploadFiles, .react]
         let role = Role(id: "01HX0000000000000000000301", name: "Core Crew", permissions: PermissionOverride(allow: permissions), colour: "#62D6E8", hoist: true, rank: 1)
 
         let servers = [
@@ -2881,6 +3049,9 @@ public struct MainShellView: View {
         }
         .sheet(isPresented: $viewModel.isCredentialSetupPresented) {
             AccountConnectionSettingsView(viewModel: viewModel)
+        }
+        .sheet(item: $viewModel.attachmentPreview) { attachment in
+            AttachmentPreviewSheet(attachment: attachment)
         }
         .confirmationDialog(
             "Send current composer text?",
@@ -3089,6 +3260,77 @@ public struct MainShellView: View {
             return true
         case .idle, .ready, .disconnected, .failed:
             return false
+        }
+    }
+}
+
+private struct AttachmentPreviewSheet: View {
+    let attachment: ComposerAttachmentDraft
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            HStack {
+                Label(attachment.filename, systemImage: systemImage)
+                    .font(.headline)
+                Spacer()
+                Text(attachment.displaySize)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            preview
+                .frame(minWidth: 420, minHeight: 280)
+            Text(attachment.mimeType)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(StoatSpacing.large)
+    }
+
+    @ViewBuilder private var preview: some View {
+        #if canImport(AppKit)
+        if let data = attachment.previewData, let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if case let .fileURL(url) = attachment.source,
+                  attachment.kind == .image,
+                  let image = NSImage(contentsOf: url) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            unavailablePreview
+        }
+        #else
+        unavailablePreview
+        #endif
+    }
+
+    private var unavailablePreview: some View {
+        VStack(spacing: StoatSpacing.small) {
+            Image(systemName: systemImage)
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text("Preview unavailable")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
+    }
+
+    private var systemImage: String {
+        switch attachment.kind {
+        case .image:
+            return "photo"
+        case .pdf:
+            return "doc.richtext"
+        case .text:
+            return "doc.text"
+        case .file:
+            return "doc"
         }
     }
 }
@@ -3721,11 +3963,33 @@ public struct ChatPlaceholderView: View {
                     disabledReason: sendReadiness.canSend ? nil : sendReadiness.reason,
                     isSending: viewModel.messageController.sendingChannelIDs.contains(channel.id),
                     canAttach: viewModel.canUploadFiles(in: channel),
+                    attachments: viewModel.composerAttachmentChips(for: channel.id),
                     replyAuthor: draftState.replyContext?.authorDisplayName,
                     replyPreview: draftState.replyContext?.contentPreview,
                     focusRequestID: viewModel.composerFocusRequestID,
                     onCancelReply: {
                         viewModel.cancelReply(for: channel.id)
+                    },
+                    onAttach: {
+                        viewModel.openAttachmentPicker(for: channel.id)
+                    },
+                    onUploadAttachment: { attachmentID in
+                        Task { await viewModel.retryAttachmentUpload(attachmentID, in: channel.id) }
+                    },
+                    onRemoveAttachment: { attachmentID in
+                        viewModel.removeAttachment(attachmentID, from: channel.id)
+                    },
+                    onPreviewAttachment: { attachmentID in
+                        viewModel.attachmentPreview = viewModel.composerDraftState(for: channel.id).attachments.first { $0.id == attachmentID }
+                    },
+                    onDropFileURLs: { urls in
+                        viewModel.addAttachmentURLs(urls, to: channel.id)
+                    },
+                    onPasteImageData: { data in
+                        viewModel.addPastedImageData(data, to: channel.id)
+                    },
+                    onPasteFileURLs: { urls in
+                        viewModel.addAttachmentURLs(urls, to: channel.id)
                     },
                     onSend: {
                         Task { await viewModel.sendDraft(for: channel.id) }

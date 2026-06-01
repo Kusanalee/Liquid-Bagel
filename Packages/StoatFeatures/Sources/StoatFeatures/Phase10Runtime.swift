@@ -171,12 +171,20 @@ public struct ComposerDraftState: Hashable, Sendable {
     public var text: String
     public var replyContext: ReplyContext?
     public var shouldMentionReplyAuthor: Bool
+    public var attachments: [ComposerAttachmentDraft]
 
-    public init(channelID: ChannelID, text: String = "", replyContext: ReplyContext? = nil, shouldMentionReplyAuthor: Bool = true) {
+    public init(
+        channelID: ChannelID,
+        text: String = "",
+        replyContext: ReplyContext? = nil,
+        shouldMentionReplyAuthor: Bool = true,
+        attachments: [ComposerAttachmentDraft] = []
+    ) {
         self.channelID = channelID
         self.text = text
         self.replyContext = replyContext
         self.shouldMentionReplyAuthor = shouldMentionReplyAuthor
+        self.attachments = attachments
     }
 }
 
@@ -217,6 +225,8 @@ public struct ChannelLoadedMessageRange: Hashable, Sendable {
 public struct FailedMessageRecoveryMetadata: Hashable, Sendable {
     public var originalContent: String
     public var originalNonce: String?
+    public var attachmentIDs: [FileID]
+    public var attachmentFiles: [File]
     public var replyContext: ReplyContext?
     public var mentionReply: Bool
     public var createdAt: Date
@@ -227,6 +237,8 @@ public struct FailedMessageRecoveryMetadata: Hashable, Sendable {
     public init(
         originalContent: String,
         originalNonce: String? = nil,
+        attachmentIDs: [FileID] = [],
+        attachmentFiles: [File] = [],
         replyContext: ReplyContext? = nil,
         mentionReply: Bool = true,
         createdAt: Date = Date(),
@@ -236,6 +248,8 @@ public struct FailedMessageRecoveryMetadata: Hashable, Sendable {
     ) {
         self.originalContent = originalContent
         self.originalNonce = originalNonce
+        self.attachmentIDs = attachmentIDs
+        self.attachmentFiles = attachmentFiles
         self.replyContext = replyContext
         self.mentionReply = mentionReply
         self.createdAt = createdAt

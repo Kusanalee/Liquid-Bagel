@@ -1,6 +1,7 @@
 import StoatDesignSystem
 import StoatModels
 import SwiftUI
+import UniformTypeIdentifiers
 
 #if canImport(AppKit)
 import AppKit
@@ -101,6 +102,32 @@ public struct GlassIconButton: View {
     }
 }
 
+public enum ComposerAttachmentChipStatus: Hashable, Sendable {
+    case queued
+    case reading
+    case uploading
+    case uploaded
+    case failed(String)
+}
+
+public struct ComposerAttachmentChip: Identifiable, Hashable, Sendable {
+    public var id: UUID
+    public var filename: String
+    public var subtitle: String
+    public var systemImage: String
+    public var status: ComposerAttachmentChipStatus
+    public var previewData: Data?
+
+    public init(id: UUID, filename: String, subtitle: String, systemImage: String, status: ComposerAttachmentChipStatus, previewData: Data? = nil) {
+        self.id = id
+        self.filename = filename
+        self.subtitle = subtitle
+        self.systemImage = systemImage
+        self.status = status
+        self.previewData = previewData
+    }
+}
+
 public struct GlassSearchField: View {
     private let title: String
     private let action: () -> Void
@@ -140,11 +167,19 @@ public struct GlassComposer: View {
     private let disabledReason: String?
     private let isSending: Bool
     private let canAttach: Bool
+    private let attachments: [ComposerAttachmentChip]
     private let replyAuthor: String?
     private let replyPreview: String?
     @Binding private var shouldMentionReplyAuthor: Bool
     private let focusRequestID: Int
     private let onCancelReply: () -> Void
+    private let onAttach: () -> Void
+    private let onUploadAttachment: (UUID) -> Void
+    private let onRemoveAttachment: (UUID) -> Void
+    private let onPreviewAttachment: (UUID) -> Void
+    private let onDropFileURLs: ([URL]) -> Void
+    private let onPasteImageData: (Data) -> Void
+    private let onPasteFileURLs: ([URL]) -> Void
     private let onSend: () -> Void
     private let onFocus: () -> Void
 
@@ -157,10 +192,18 @@ public struct GlassComposer: View {
         disabledReason: String? = nil,
         isSending: Bool = false,
         canAttach: Bool = false,
+        attachments: [ComposerAttachmentChip] = [],
         replyAuthor: String? = nil,
         replyPreview: String? = nil,
         focusRequestID: Int = 0,
         onCancelReply: @escaping () -> Void = {},
+        onAttach: @escaping () -> Void = {},
+        onUploadAttachment: @escaping (UUID) -> Void = { _ in },
+        onRemoveAttachment: @escaping (UUID) -> Void = { _ in },
+        onPreviewAttachment: @escaping (UUID) -> Void = { _ in },
+        onDropFileURLs: @escaping ([URL]) -> Void = { _ in },
+        onPasteImageData: @escaping (Data) -> Void = { _ in },
+        onPasteFileURLs: @escaping ([URL]) -> Void = { _ in },
         onSend: @escaping () -> Void = {},
         onFocus: @escaping () -> Void = {}
     ) {
@@ -172,10 +215,18 @@ public struct GlassComposer: View {
         self.disabledReason = disabledReason
         self.isSending = isSending
         self.canAttach = canAttach
+        self.attachments = attachments
         self.replyAuthor = replyAuthor
         self.replyPreview = replyPreview
         self.focusRequestID = focusRequestID
         self.onCancelReply = onCancelReply
+        self.onAttach = onAttach
+        self.onUploadAttachment = onUploadAttachment
+        self.onRemoveAttachment = onRemoveAttachment
+        self.onPreviewAttachment = onPreviewAttachment
+        self.onDropFileURLs = onDropFileURLs
+        self.onPasteImageData = onPasteImageData
+        self.onPasteFileURLs = onPasteFileURLs
         self.onSend = onSend
         self.onFocus = onFocus
     }
@@ -208,10 +259,28 @@ public struct GlassComposer: View {
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(StoatAccessibility.replyContextLabel(author: replyAuthor, preview: replyPreview, mentionsAuthor: shouldMentionReplyAuthor))
                 }
+                if !attachments.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: StoatSpacing.small) {
+                            ForEach(attachments) { attachment in
+                                ComposerAttachmentChipView(
+                                    attachment: attachment,
+                                    onUpload: { onUploadAttachment(attachment.id) },
+                                    onRemove: { onRemoveAttachment(attachment.id) },
+                                    onPreview: { onPreviewAttachment(attachment.id) }
+                                )
+                            }
+                        }
+                        .padding(.vertical, 1)
+                    }
+                    .accessibilityLabel("Queued attachments")
+                }
                 HStack(alignment: .bottom, spacing: StoatSpacing.medium) {
-                    GlassIconButton(canAttach ? "Attach file unavailable in Phase 4" : "Attach file unavailable", systemImage: "paperclip", isDisabled: true) {}
+                    GlassIconButton(canAttach ? "Attach File" : "Attach file unavailable", systemImage: "paperclip", isDisabled: !canAttach) {
+                        onAttach()
+                    }
                     ZStack(alignment: .topLeading) {
-                        ComposerTextInput(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSend, onFocus: onFocus)
+                        ComposerTextInput(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSend, onFocus: onFocus, onPasteImageData: onPasteImageData, onPasteFileURLs: onPasteFileURLs)
                             .frame(minHeight: 34, maxHeight: 92)
                         if text.isEmpty {
                             Text(placeholder)
@@ -238,6 +307,120 @@ public struct GlassComposer: View {
         .accessibilityLabel(StoatAccessibility.composerLabel(isEnabled: isEnabled, disabledReason: disabledReason, replyAuthor: replyAuthor))
         .accessibilityHint(isEnabled ? "Press Return to send, Shift Return for a new line" : (disabledReason ?? "Composer is unavailable"))
         .help(disabledReason ?? placeholder)
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
+            loadDroppedFileURLs(from: providers)
+            return true
+        }
+    }
+
+    private func loadDroppedFileURLs(from providers: [NSItemProvider]) {
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let url: URL?
+                if let data = item as? Data {
+                    url = URL(dataRepresentation: data, relativeTo: nil)
+                } else {
+                    url = item as? URL
+                }
+                if let url {
+                    DispatchQueue.main.async {
+                        onDropFileURLs([url])
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ComposerAttachmentChipView: View {
+    let attachment: ComposerAttachmentChip
+    let onUpload: () -> Void
+    let onRemove: () -> Void
+    let onPreview: () -> Void
+
+    var body: some View {
+        HStack(spacing: StoatSpacing.small) {
+            preview
+            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                Text(attachment.filename)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Text(statusText)
+                    .font(.caption2)
+                    .foregroundStyle(statusColor)
+                    .lineLimit(1)
+            }
+            if showsProgress {
+                ProgressView()
+                    .controlSize(.mini)
+            }
+            if case .failed = attachment.status {
+                GlassIconButton("Retry Upload", systemImage: "arrow.clockwise", action: onUpload)
+            }
+            GlassIconButton("Remove Attachment", systemImage: "xmark", action: onRemove)
+        }
+        .padding(.leading, StoatSpacing.xSmall)
+        .padding(.trailing, StoatSpacing.xxSmall)
+        .padding(.vertical, StoatSpacing.xSmall)
+        .frame(width: 260, alignment: .leading)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onPreview)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(attachment.filename), \(statusText)")
+    }
+
+    @ViewBuilder private var preview: some View {
+        #if canImport(AppKit)
+        if let data = attachment.previewData, let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 34, height: 34)
+                .clipShape(RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+                .accessibilityHidden(true)
+        } else {
+            Image(systemName: attachment.systemImage)
+                .frame(width: 34, height: 34)
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+                .accessibilityHidden(true)
+        }
+        #else
+        Image(systemName: attachment.systemImage)
+            .frame(width: 34, height: 34)
+            .accessibilityHidden(true)
+        #endif
+    }
+
+    private var statusText: String {
+        switch attachment.status {
+        case .queued:
+            return "\(attachment.subtitle) · queued"
+        case .reading:
+            return "Reading"
+        case .uploading:
+            return "Uploading"
+        case .uploaded:
+            return "\(attachment.subtitle) · uploaded"
+        case let .failed(message):
+            return message
+        }
+    }
+
+    private var statusColor: Color {
+        if case .failed = attachment.status {
+            return .red
+        }
+        return .secondary
+    }
+
+    private var showsProgress: Bool {
+        switch attachment.status {
+        case .reading, .uploading:
+            return true
+        case .queued, .uploaded, .failed:
+            return false
+        }
     }
 }
 
@@ -247,10 +430,12 @@ private struct ComposerTextInput: View {
     let focusRequestID: Int
     let onSubmit: () -> Void
     let onFocus: () -> Void
+    let onPasteImageData: (Data) -> Void
+    let onPasteFileURLs: ([URL]) -> Void
 
     var body: some View {
         #if canImport(AppKit)
-        ComposerTextView(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSubmit, onFocus: onFocus)
+        ComposerTextView(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSubmit, onFocus: onFocus, onPasteImageData: onPasteImageData, onPasteFileURLs: onPasteFileURLs)
             .font(.body)
         #else
         TextEditor(text: $text)
@@ -268,9 +453,11 @@ private struct ComposerTextView: NSViewRepresentable {
     let focusRequestID: Int
     let onSubmit: () -> Void
     let onFocus: () -> Void
+    let onPasteImageData: (Data) -> Void
+    let onPasteFileURLs: ([URL]) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, onSubmit: onSubmit, onFocus: onFocus)
+        Coordinator(text: $text, onSubmit: onSubmit, onFocus: onFocus, onPasteImageData: onPasteImageData, onPasteFileURLs: onPasteFileURLs)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -308,18 +495,30 @@ private struct ComposerTextView: NSViewRepresentable {
         context.coordinator.text = $text
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onFocus = onFocus
+        context.coordinator.onPasteImageData = onPasteImageData
+        context.coordinator.onPasteFileURLs = onPasteFileURLs
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var text: Binding<String>
         var onSubmit: () -> Void
         var onFocus: () -> Void
+        var onPasteImageData: (Data) -> Void
+        var onPasteFileURLs: ([URL]) -> Void
         var lastFocusRequestID = 0
 
-        init(text: Binding<String>, onSubmit: @escaping () -> Void, onFocus: @escaping () -> Void) {
+        init(
+            text: Binding<String>,
+            onSubmit: @escaping () -> Void,
+            onFocus: @escaping () -> Void,
+            onPasteImageData: @escaping (Data) -> Void,
+            onPasteFileURLs: @escaping ([URL]) -> Void
+        ) {
             self.text = text
             self.onSubmit = onSubmit
             self.onFocus = onFocus
+            self.onPasteImageData = onPasteImageData
+            self.onPasteFileURLs = onPasteFileURLs
         }
 
         func textDidBeginEditing(_ notification: Notification) {
@@ -332,6 +531,9 @@ private struct ComposerTextView: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSText.paste(_:)) {
+                return handlePaste()
+            }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else {
                 return false
             }
@@ -342,6 +544,20 @@ private struct ComposerTextView: NSViewRepresentable {
                 onSubmit()
             }
             return true
+        }
+
+        private func handlePaste() -> Bool {
+            let pasteboard = NSPasteboard.general
+            let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
+            if !urls.isEmpty {
+                onPasteFileURLs(urls)
+                return true
+            }
+            if let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
+                onPasteImageData(data)
+                return true
+            }
+            return false
         }
     }
 }
@@ -610,7 +826,7 @@ public struct MessageRow: View {
                 }
                 if let attachments = message.attachments, !attachments.isEmpty {
                     ForEach(attachments) { attachment in
-                        AttachmentPreviewPlaceholder(title: attachment.filename)
+                        AttachmentPreviewPlaceholder(attachment: attachment)
                     }
                 }
                 if let embeds = message.embeds, !embeds.isEmpty {
@@ -693,13 +909,68 @@ public struct MessageGroupView<GroupID: Hashable>: View {
 }
 
 public struct AttachmentPreviewPlaceholder: View {
-    private let title: String
-    public init(title: String) { self.title = title }
+    private let attachment: File
+    public init(title: String) {
+        self.attachment = File(id: FileID(rawValue: title), tag: "attachments", filename: title, contentType: "application/octet-stream", size: 0)
+    }
+    public init(attachment: File) {
+        self.attachment = attachment
+    }
     public var body: some View {
-        Label(title, systemImage: "doc")
-            .font(.caption)
-            .padding(StoatSpacing.medium)
-            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        HStack(spacing: StoatSpacing.small) {
+            Image(systemName: systemImage)
+                .font(.title3)
+                .frame(width: 38, height: 38)
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                Text(ComposerAttachmentDraftSafeName.sanitize(attachment.filename))
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(StoatSpacing.medium)
+        .frame(maxWidth: 340, alignment: .leading)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(ComposerAttachmentDraftSafeName.sanitize(attachment.filename)), \(subtitle)")
+    }
+
+    private var systemImage: String {
+        switch attachment.metadata {
+        case .image:
+            return "photo"
+        case .text:
+            return "doc.text"
+        case .video:
+            return "film"
+        case .audio:
+            return "waveform"
+        case .file, .unknown:
+            if attachment.contentType == "application/pdf" {
+                return "doc.richtext"
+            }
+            return "doc"
+        }
+    }
+
+    private var subtitle: String {
+        let size = attachment.size > 0 ? ByteCountFormatter.string(fromByteCount: Int64(attachment.size), countStyle: .file) : "Unknown size"
+        return "\(attachment.contentType) · \(size)"
+    }
+}
+
+private enum ComposerAttachmentDraftSafeName {
+    static func sanitize(_ filename: String) -> String {
+        let controlSet = CharacterSet.controlCharacters
+        let scalars = URL(fileURLWithPath: filename).lastPathComponent.unicodeScalars.filter { !controlSet.contains($0) }
+        let value = String(String.UnicodeScalarView(scalars)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? "attachment" : value
     }
 }
 

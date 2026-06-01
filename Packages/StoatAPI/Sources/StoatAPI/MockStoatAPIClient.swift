@@ -227,12 +227,16 @@ public actor MockStoatAPIClient: StoatAPIClient {
     }
 
     public func sendMessage(channelID: ChannelID, draft: MessageDraft) async throws -> Message {
+        let files = draft.attachments?.map {
+            File(id: $0, tag: "attachments", filename: "\($0.rawValue)", contentType: "application/octet-stream", size: 0)
+        }
         let message = Message(
             id: MessageID(rawValue: "01HX0000000000000000\(String(format: "%06d", Int.random(in: 5000...9999)))"),
             channelID: channelID,
             authorID: currentUser.id,
             content: draft.content,
             nonce: draft.nonce,
+            attachments: files,
             replies: draft.replies?.map(\.id),
             interactions: draft.interactions ?? MessageInteractions(),
             masquerade: draft.masquerade,

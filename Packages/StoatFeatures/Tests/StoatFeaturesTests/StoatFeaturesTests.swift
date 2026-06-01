@@ -5,6 +5,14 @@ import StoatRealtime
 import XCTest
 @testable import StoatFeatures
 
+private func makeTemporaryAttachment(name: String, contents: Data) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LiquidBagelPhase15Tests", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent(UUID().uuidString + "-" + name)
+    try contents.write(to: url)
+    return url
+}
+
 final class StoatFeaturesTests: XCTestCase {
     func testPhaseThreeStatusUsesOfficialEnvironment() {
         XCTAssertEqual(PhaseThreeStatus.current.environment.apiBaseURL.host(), "api.stoat.chat")
@@ -680,6 +688,98 @@ final class StoatFeaturesTests: XCTestCase {
 
         model.updateDraft("   ", for: channels[0].id)
         XCTAssertFalse(model.composerReadiness(for: channels[0].id).canSend)
+    }
+
+    @MainActor
+    func testPhase15AttachmentQueueDoesNotUploadUntilExplicitAction() async throws {
+        let uploader = MockAttachmentUploadHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, attachmentUploadHandler: uploader)
+        let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
+        let url = try makeTemporaryAttachment(name: "note.txt", contents: Data("hello".utf8))
+
+        model.addAttachmentURLs([url], to: channelID)
+
+        XCTAssertEqual(model.composerDraftState(for: channelID).attachments.count, 1)
+        let initialUploadCount = await uploader.uploadCount()
+        XCTAssertEqual(initialUploadCount, 0)
+        XCTAssertTrue(model.composerReadiness(for: channelID).canSend)
+
+        await model.uploadQueuedAttachments(for: channelID)
+
+        let finalUploadCount = await uploader.uploadCount()
+        XCTAssertEqual(finalUploadCount, 1)
+        XCTAssertNotNil(model.composerDraftState(for: channelID).attachments.first?.uploadedFileID)
+    }
+
+    @MainActor
+    func testPhase15AttachmentValidationAndPermissionGate() async throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
+        let oversized = try makeTemporaryAttachment(name: "large.txt", contents: Data(repeating: 1, count: 21 * 1024 * 1024))
+
+        model.addAttachmentURLs([oversized], to: channelID)
+
+        XCTAssertTrue(model.composerDraftState(for: channelID).attachments.isEmpty)
+        XCTAssertTrue(model.composerError?.contains("larger") == true)
+
+        var snapshot = MockShellData.snapshot
+        snapshot.channelsByID[channelID]?.permissions = [.viewChannel, .readMessageHistory, .sendMessage]
+        let permissionModel = MainShellViewModel(snapshot: snapshot)
+        XCTAssertFalse(permissionModel.canUploadFiles(in: permissionModel.snapshot.channelsByID[channelID]))
+    }
+
+    @MainActor
+    func testPhase15SendUploadsAttachmentsAndSendsFileIDs() async throws {
+        let uploader = MockAttachmentUploadHandler()
+        let handler = RecordingAttachmentMessageActionHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler, attachmentUploadHandler: uploader)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let channelID = model.selection.channelID!
+        let url = try makeTemporaryAttachment(name: "send.txt", contents: Data("payload".utf8))
+
+        model.addAttachmentURLs([url], to: channelID)
+        model.updateDraft("with file", for: channelID)
+        await model.sendDraft(for: channelID)
+
+        let sent = await handler.sentSnapshot()
+        let uploadCount = await uploader.uploadCount()
+        XCTAssertEqual(uploadCount, 1)
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?.content, "with file")
+        XCTAssertEqual(sent.first?.attachments?.count, 1)
+        XCTAssertEqual(model.composerDraftState(for: channelID).attachments.count, 0)
+    }
+
+    @MainActor
+    func testPhase15AttachmentOnlySendAndUploadFailureKeepsDraft() async throws {
+        let failingUploader = MockAttachmentUploadHandler(uploadError: MessageActionError.unavailable("upload failed"))
+        let handler = RecordingAttachmentMessageActionHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler, attachmentUploadHandler: failingUploader)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let channelID = model.selection.channelID!
+        let url = try makeTemporaryAttachment(name: "image.png", contents: Data([137, 80, 78, 71]))
+
+        model.addPastedImageData(Data([137, 80, 78, 71]), to: channelID)
+        await model.sendDraft(for: channelID)
+
+        let failedSent = await handler.sentSnapshot()
+        XCTAssertEqual(failedSent.count, 0)
+        XCTAssertEqual(model.composerDraftState(for: channelID).attachments.count, 1)
+        XCTAssertTrue(model.composerError?.contains("upload") == true)
+
+        let workingUploader = MockAttachmentUploadHandler()
+        let workingHandler = RecordingAttachmentMessageActionHandler()
+        let workingModel = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: workingHandler, attachmentUploadHandler: workingUploader)
+        workingModel.selectServer(server.id)
+        let workingChannelID = workingModel.selection.channelID!
+        workingModel.addAttachmentURLs([url], to: workingChannelID)
+        await workingModel.sendDraft(for: workingChannelID)
+
+        let sent = await workingHandler.sentSnapshot()
+        XCTAssertEqual(sent.first?.content, "")
+        XCTAssertEqual(sent.first?.attachments?.count, 1)
     }
 
     @MainActor
@@ -1925,6 +2025,46 @@ private actor RecordingAPIClient: StoatAPIClient {
     func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile {
         UploadedFile(id: "file")
     }
+}
+
+private struct RecordedAttachmentSend: Sendable {
+    var channelID: ChannelID
+    var content: String
+    var nonce: String?
+    var replies: [MessageReply]?
+    var attachments: [FileID]?
+}
+
+private actor RecordingAttachmentMessageActionHandler: MessageActionHandling {
+    private(set) var sent: [RecordedAttachmentSend] = []
+    var sendError: (any Error & Sendable)?
+
+    func sentSnapshot() -> [RecordedAttachmentSend] {
+        sent
+    }
+
+    func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?, attachments: [FileID]?) async throws -> Message {
+        if let sendError {
+            throw sendError
+        }
+        sent.append(RecordedAttachmentSend(channelID: channelID, content: content, nonce: nonce, replies: replies, attachments: attachments))
+        let files = attachments?.map {
+            File(id: $0, tag: "attachments", filename: "\($0.rawValue).txt", contentType: "text/plain", size: 1)
+        }
+        return Message(id: "01J00000100000000000009999", channelID: channelID, authorID: MockShellData.currentUserID, content: content, nonce: nonce, attachments: files, replies: replies?.map(\.id))
+    }
+
+    func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
+        Message(id: messageID, channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+    }
+
+    func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {}
+    func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {}
+    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func beginTyping(channelID: ChannelID) async throws {}
+    func endTyping(channelID: ChannelID) async throws {}
 }
 
 private struct StubSessionValidator: SessionValidating {

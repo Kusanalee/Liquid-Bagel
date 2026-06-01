@@ -335,6 +335,8 @@ public struct ChannelMessageHistoryReducer: Sendable {
                 history.messages[index].status = .failed(FailedMessageRecoveryMetadata(
                     originalContent: message.content ?? "",
                     originalNonce: nonce,
+                    attachmentIDs: message.attachments?.map(\.id) ?? [],
+                    attachmentFiles: message.attachments ?? [],
                     replyContext: replyContext,
                     mentionReply: true,
                     lastError: error
@@ -585,7 +587,7 @@ public enum MessageActionError: Error, Equatable, Sendable, LocalizedError {
 }
 
 public protocol MessageActionHandling: Sendable {
-    func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?) async throws -> Message
+    func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?, attachments: [FileID]?) async throws -> Message
     func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws
     func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws
@@ -619,17 +621,21 @@ public actor MockMessageActionHandler: MessageActionHandling {
         sendError = error
     }
 
-    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil) async throws -> Message {
+    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil, attachments: [FileID]? = nil) async throws -> Message {
         if let sendError {
             throw sendError
         }
         nextMessageCounter += 1
+        let files = attachments?.map {
+            File(id: $0, tag: "attachments", filename: "\($0.rawValue)", contentType: "application/octet-stream", size: 0)
+        }
         let message = Message(
             id: MessageID(rawValue: Self.mockMessageID(counter: nextMessageCounter)),
             channelID: channelID,
             authorID: currentUserID,
             content: content,
             nonce: nonce,
+            attachments: files,
             replies: replies?.map(\.id)
         )
         sentMessages.append(message)
@@ -691,8 +697,8 @@ public actor LiveMessageActionHandler: MessageActionHandling {
         self.realtimeClient = realtimeClient
     }
 
-    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil) async throws -> Message {
-        try await apiClient.sendMessage(channelID: channelID, draft: MessageDraft(content: content, nonce: nonce, replies: replies))
+    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil, attachments: [FileID]? = nil) async throws -> Message {
+        try await apiClient.sendMessage(channelID: channelID, draft: MessageDraft(content: content.isEmpty ? nil : content, nonce: nonce, attachments: attachments, replies: replies))
     }
 
     public func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
@@ -735,7 +741,7 @@ public actor UnavailableMessageActionHandler: MessageActionHandling {
         self.message = message
     }
 
-    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil) async throws -> Message {
+    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil, attachments: [FileID]? = nil) async throws -> Message {
         throw MessageActionError.unavailable(message)
     }
 
@@ -963,7 +969,14 @@ public final class ChannelMessageController {
         await loadInitialMessages(channelID: channelID, snapshotMessages: snapshotMessages)
     }
 
-    public func sendMessage(channelID: ChannelID, content: String, replies: [MessageReply]? = nil, handler: any MessageActionHandling) async -> Bool {
+    public func sendMessage(
+        channelID: ChannelID,
+        content: String,
+        replies: [MessageReply]? = nil,
+        attachments: [FileID] = [],
+        attachmentFiles: [File] = [],
+        handler: any MessageActionHandling
+    ) async -> Bool {
         guard let currentUserID else {
             apply(.initialLoadFailed(MessageActionError.missingCurrentUser.userFacingMessage), channelID: channelID)
             return false
@@ -977,6 +990,7 @@ public final class ChannelMessageController {
                 authorID: currentUserID,
                 content: content,
                 nonce: nonce,
+                attachments: attachmentFiles.isEmpty ? nil : attachmentFiles,
                 replies: replies?.map(\.id)
             ),
             status: .pending
@@ -985,7 +999,7 @@ public final class ChannelMessageController {
         sendingChannelIDs.insert(channelID)
 
         do {
-            let confirmed = try await handler.sendMessage(channelID: channelID, content: content, nonce: nonce, replies: replies)
+            let confirmed = try await handler.sendMessage(channelID: channelID, content: content, nonce: nonce, replies: replies, attachments: attachments.isEmpty ? nil : attachments)
             sendingChannelIDs.remove(channelID)
             apply(.sendConfirmed(message: confirmed, nonce: nonce), channelID: channelID)
             lastErrorByChannelID[channelID] = nil
@@ -998,10 +1012,18 @@ public final class ChannelMessageController {
                let failed = state(for: channelID).timelineMessages.first(where: { $0.message.id == failedID }),
                case let .failed(metadata) = failed.status {
                 var updated = metadata
+                updated.attachmentIDs = attachments
+                updated.attachmentFiles = attachmentFiles
                 updated.replyContext = ReplyContext(channelID: channelID, messageID: reply.id, authorDisplayName: "Original message", contentPreview: "Original message unavailable")
                 updated.mentionReply = reply.mention
                 apply(.failedRecoveryEdited(messageID: failedID, content: updated.originalContent), channelID: channelID)
                 setFailedMetadata(updated, messageID: failedID, channelID: channelID)
+            } else if let failedID = state(for: channelID).timelineMessages.first(where: { $0.message.nonce == nonce })?.message.id,
+                      let failed = state(for: channelID).timelineMessages.first(where: { $0.message.id == failedID }),
+                      case var .failed(metadata) = failed.status {
+                metadata.attachmentIDs = attachments
+                metadata.attachmentFiles = attachmentFiles
+                setFailedMetadata(metadata, messageID: failedID, channelID: channelID)
             }
             lastErrorByChannelID[channelID] = error.userFacingMessage
             return false
@@ -1020,7 +1042,7 @@ public final class ChannelMessageController {
         let nonce = UUID().uuidString
         let replies = metadata.replyContext.map { [MessageReply(id: $0.messageID, mention: metadata.mentionReply)] }
         do {
-            let confirmed = try await handler.sendMessage(channelID: channelID, content: metadata.originalContent, nonce: nonce, replies: replies)
+            let confirmed = try await handler.sendMessage(channelID: channelID, content: metadata.originalContent, nonce: nonce, replies: replies, attachments: metadata.attachmentIDs.isEmpty ? nil : metadata.attachmentIDs)
             retryingMessageIDs.remove(timelineMessage.message.id)
             apply(.discardLocalMessage(timelineMessage.message.id), channelID: channelID)
             apply(.sendConfirmed(message: confirmed, nonce: nonce), channelID: channelID)
@@ -1169,7 +1191,7 @@ public final class ChannelMessageController {
         var messages = state(for: channelID).timelineMessages
         guard let index = messages.firstIndex(where: { $0.message.nonce == nonce }) else { return }
         let message = messages[index].message
-        messages[index].status = .failed(FailedMessageRecoveryMetadata(originalContent: message.content ?? "", originalNonce: nonce, lastError: error))
+        messages[index].status = .failed(FailedMessageRecoveryMetadata(originalContent: message.content ?? "", originalNonce: nonce, attachmentIDs: message.attachments?.map(\.id) ?? [], attachmentFiles: message.attachments ?? [], lastError: error))
         statesByChannelID[channelID] = .loaded(messages: sortedCapped(messages), hasMoreBefore: false)
     }
 
