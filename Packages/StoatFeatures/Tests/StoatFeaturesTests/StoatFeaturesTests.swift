@@ -878,6 +878,83 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertNil(URLComponents(url: original, resolvingAgainstBaseURL: false)?.queryItems)
     }
 
+    func testPhase20AttachmentURLResolverUsesAutumnRoutes() throws {
+        let resolver = DefaultAttachmentURLResolver()
+        let environment = StoatAPIEnvironment.production
+        let file = File(id: "file id", tag: "attachments", filename: "photo.png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
+        let preview = try XCTUnwrap(resolver.remoteURL(for: file, environment: environment, purpose: .preview))
+        let original = try XCTUnwrap(resolver.remoteURL(for: file, environment: environment, purpose: .original))
+
+        XCTAssertEqual(preview.absoluteString, "https://cdn.stoatusercontent.com/attachments/file%20id")
+        XCTAssertEqual(original.absoluteString, "https://cdn.stoatusercontent.com/attachments/file%20id/original")
+        XCTAssertNil(URLComponents(url: preview, resolvingAgainstBaseURL: false)?.queryItems)
+    }
+
+    @MainActor
+    func testPhase20LiveConnectedSendAllowsUnknownPermissionsAndBlocksKnownDenial() async throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, runtimeMode: .liveManual, sessionState: .connected)
+        let channelID = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "general" }?.id)
+        model.selectChannel(channelID)
+        model.updateDraft("live hello", for: channelID)
+
+        XCTAssertTrue(model.composerReadiness(for: channelID).canSend)
+        XCTAssertTrue(model.composerInputReadiness(for: channelID).isEnabled)
+
+        var snapshot = MockShellData.snapshot
+        snapshot.channelsByID[channelID]?.permissions = [.viewChannel, .readMessageHistory]
+        let denied = MainShellViewModel(snapshot: snapshot, runtimeMode: .liveManual, sessionState: .connected)
+        denied.selectChannel(channelID)
+        denied.updateDraft("blocked", for: channelID)
+
+        let readiness = denied.composerReadiness(for: channelID)
+        XCTAssertFalse(readiness.canSend)
+        XCTAssertTrue(readiness.reason.contains("permission"))
+    }
+
+    @MainActor
+    func testPhase20SendDiagnosticsAndTimelineCopyStayRedacted() async throws {
+        let handler = MockMessageActionHandler(sendError: MessageActionError.unavailable(#"send failed token="secret" /Users/enka/private/file.png {"raw":"payload"}"#))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let channelID = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "general" }?.id)
+        model.selectChannel(channelID)
+        model.updateDraft("diagnostic message", for: channelID)
+
+        await model.sendDraft(for: channelID)
+
+        let diagnostics = model.currentMessageSendDiagnostics()
+        XCTAssertEqual(diagnostics.lastSendStage, .failed)
+        XCTAssertEqual(diagnostics.lastSendResult, .failed)
+        XCTAssertEqual(diagnostics.selectedChannelID, channelID)
+        XCTAssertFalse(diagnostics.lastError?.contains("secret") == true)
+        XCTAssertFalse(diagnostics.lastError?.contains("/Users/enka") == true)
+        XCTAssertFalse(diagnostics.lastError?.contains("payload") == true)
+
+        let copied = Phase17MessageActions.redactedDiagnosticText(MessageSendDiagnosticsFormatter.redactedText(model.currentMessageSendDiagnostics()))
+        XCTAssertTrue(copied.contains("stage: failed"))
+        XCTAssertFalse(copied.contains("secret"))
+        XCTAssertFalse(copied.contains("/Users/enka"))
+        XCTAssertFalse(copied.contains("payload"))
+    }
+
+    @MainActor
+    func testPhase20ImageSendPreservesLocalPreviewData() async throws {
+        let uploader = MockAttachmentUploadHandler()
+        let handler = ImageAttachmentMessageActionHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler, attachmentUploadHandler: uploader)
+        let channelID = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "general" }?.id)
+        let png = Data([137, 80, 78, 71, 13, 10, 26, 10])
+        model.selectChannel(channelID)
+        model.addPastedImageData(png, to: channelID)
+
+        await model.sendDraft(for: channelID)
+
+        let message = try XCTUnwrap(model.selectedTimelineMessages.first { $0.message.attachments?.isEmpty == false }?.message)
+        let item = try XCTUnwrap(model.attachmentDisplayItems(for: message).first)
+        XCTAssertEqual(item.kind, .image)
+        XCTAssertEqual(item.previewState, .readyRemote)
+        XCTAssertEqual(item.previewData, png)
+    }
+
     @MainActor
     func testEditDeleteAndReactionActionsCallHandler() async {
         let handler = MockMessageActionHandler()
@@ -2505,6 +2582,27 @@ private actor RecordingAttachmentMessageActionHandler: MessageActionHandling {
             File(id: $0, tag: "attachments", filename: "\($0.rawValue).txt", contentType: "text/plain", size: 1)
         }
         return Message(id: "01J00000100000000000009999", channelID: channelID, authorID: MockShellData.currentUserID, content: content, nonce: nonce, attachments: files, replies: replies?.map(\.id))
+    }
+
+    func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
+        Message(id: messageID, channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+    }
+
+    func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {}
+    func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {}
+    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func beginTyping(channelID: ChannelID) async throws {}
+    func endTyping(channelID: ChannelID) async throws {}
+}
+
+private actor ImageAttachmentMessageActionHandler: MessageActionHandling {
+    func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?, attachments: [FileID]?) async throws -> Message {
+        let files = attachments?.map {
+            File(id: $0, tag: "attachments", filename: "\($0.rawValue).png", metadata: .image(width: 1, height: 1, thumbhash: nil, animated: false), contentType: "image/png", size: 8)
+        }
+        return Message(id: "01J00000100000000000020000", channelID: channelID, authorID: MockShellData.currentUserID, content: content, nonce: nonce, attachments: files, replies: replies?.map(\.id))
     }
 
     func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {

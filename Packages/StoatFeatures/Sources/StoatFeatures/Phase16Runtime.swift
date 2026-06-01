@@ -52,6 +52,32 @@ public protocol RemoteAttachmentLoading: Sendable {
     func load(_ item: AttachmentDisplayItem, purpose: RemoteAttachmentLoadPurpose) async throws -> RemoteAttachmentData
 }
 
+public protocol AttachmentURLResolving: Sendable {
+    func remoteURL(for file: File, environment: StoatAPIEnvironment, purpose: RemoteAttachmentLoadPurpose) -> URL?
+    func remoteURL(for item: AttachmentDisplayItem, environment: StoatAPIEnvironment, purpose: RemoteAttachmentLoadPurpose) -> URL?
+}
+
+public struct DefaultAttachmentURLResolver: AttachmentURLResolving {
+    public init() {}
+
+    public func remoteURL(for file: File, environment: StoatAPIEnvironment, purpose: RemoteAttachmentLoadPurpose) -> URL? {
+        let tag = file.tag.isEmpty ? "attachments" : file.tag
+        let filename = purpose == .preview ? nil : "original"
+        guard let baseURL = environment.mediaBaseURL else { return nil }
+        return try? LiveRemoteAttachmentLoader.mediaURL(baseURL: baseURL, tag: tag, fileID: file.id, filename: filename)
+    }
+
+    public func remoteURL(for item: AttachmentDisplayItem, environment: StoatAPIEnvironment, purpose: RemoteAttachmentLoadPurpose) -> URL? {
+        guard case let .remote(fileID, tag, url) = item.source else { return nil }
+        if let url, purpose == .preview {
+            return url
+        }
+        let filename = purpose == .preview ? nil : "original"
+        guard let baseURL = environment.mediaBaseURL else { return nil }
+        return try? LiveRemoteAttachmentLoader.mediaURL(baseURL: baseURL, tag: tag, fileID: fileID, filename: filename)
+    }
+}
+
 public actor MockRemoteAttachmentLoader: RemoteAttachmentLoading {
     public private(set) var calls: [(String, RemoteAttachmentLoadPurpose)] = []
     private var result: Result<RemoteAttachmentData, any Error & Sendable>
@@ -82,26 +108,26 @@ public actor MockRemoteAttachmentLoader: RemoteAttachmentLoading {
 public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
     public var environment: StoatAPIEnvironment
     public var previewLimitBytes: Int
+    public var urlResolver: any AttachmentURLResolving
     private let session: URLSession
 
-    public init(environment: StoatAPIEnvironment, previewLimitBytes: Int = 8 * 1024 * 1024, session: URLSession = .shared) {
+    public init(environment: StoatAPIEnvironment, previewLimitBytes: Int = 8 * 1024 * 1024, urlResolver: any AttachmentURLResolving = DefaultAttachmentURLResolver(), session: URLSession = .shared) {
         self.environment = environment
         self.previewLimitBytes = previewLimitBytes
+        self.urlResolver = urlResolver
         self.session = session
     }
 
     public func load(_ item: AttachmentDisplayItem, purpose: RemoteAttachmentLoadPurpose) async throws -> RemoteAttachmentData {
-        guard case let .remote(fileID, tag, _) = item.source else {
+        guard case let .remote(fileID, _, _) = item.source else {
             throw AttachmentActionError.unavailable("Attachment is not remote.")
         }
         if purpose == .preview, let byteCount = item.byteCount, byteCount > previewLimitBytes {
             throw AttachmentActionError.tooLargeForPreview(maxBytes: previewLimitBytes)
         }
-        guard let baseURL = environment.mediaBaseURL else {
+        guard let url = urlResolver.remoteURL(for: item, environment: environment, purpose: purpose) else {
             throw AttachmentActionError.unavailable("Remote media is not configured.")
         }
-        let filename = purpose == .preview ? nil : "original"
-        let url = try Self.mediaURL(baseURL: baseURL, tag: tag, fileID: fileID, filename: filename)
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -119,6 +145,9 @@ public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
                 throw AttachmentActionError.tooLargeForPreview(maxBytes: previewLimitBytes)
             }
             let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? item.contentType
+            if purpose == .preview {
+                try Self.validatePreviewContentType(contentType, item: item)
+            }
             return RemoteAttachmentData(fileID: fileID, filename: item.displayName, contentType: contentType, byteCount: data.count, data: data)
         } catch let error as AttachmentActionError {
             throw error
@@ -163,6 +192,16 @@ public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
             "Attachment service is unavailable."
         default:
             "Attachment could not be loaded."
+        }
+    }
+
+    private static func validatePreviewContentType(_ contentType: String?, item: AttachmentDisplayItem) throws {
+        let lowered = (contentType ?? "").lowercased()
+        if lowered.contains("text/html") || lowered.contains("application/xhtml") {
+            throw AttachmentActionError.unavailable("Preview did not return an image.")
+        }
+        if item.kind == .image, !lowered.hasPrefix("image/") {
+            throw AttachmentActionError.unavailable("Preview did not return an image.")
         }
     }
 }
@@ -355,7 +394,8 @@ extension AttachmentDisplayItem {
             byteCount: draft.byteCount,
             kind: AttachmentDisplayFormatting.kind(contentType: draft.mimeType, filename: draft.filename),
             source: source,
-            previewState: draft.previewData == nil ? .notLoaded : .readyLocal
+            previewState: draft.previewData == nil ? .notLoaded : .readyLocal,
+            previewData: draft.previewData
         )
     }
 }

@@ -244,6 +244,57 @@ final class StoatAPITests: XCTestCase {
         XCTAssertTrue(body?.contains(#""sort":"Relevance""#) == true)
     }
 
+    func testSendMessageEndpointUsesIdempotencyHeaderAndVerifiedBodyShape() async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"{"_id":"message-1","channel":"channel-1","author":"user-1","content":"hello","nonce":"nonce-1","attachments":[{"_id":"file-1","tag":"attachments","filename":"photo.png","metadata":{"type":"Image","width":8,"height":8},"content_type":"image/png","size":100}],"replies":["message-reply"]}"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        let message = try await client.sendMessage(
+            channelID: "channel-1",
+            draft: MessageDraft(
+                content: "hello",
+                nonce: "nonce-1",
+                attachments: ["file-1"],
+                replies: [MessageReply(id: "message-reply", mention: false)]
+            )
+        )
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let bodyData = try XCTUnwrap(request.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
+
+        XCTAssertEqual(message.nonce, "nonce-1")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/channels/channel-1/messages")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), "nonce-1")
+        XCTAssertEqual(object["content"] as? String, "hello")
+        XCTAssertNil(object["nonce"])
+        XCTAssertEqual(object["attachments"] as? [String], ["file-1"])
+        let replies = try XCTUnwrap(object["replies"] as? [[String: Any]])
+        XCTAssertEqual(replies.first?["id"] as? String, "message-reply")
+        XCTAssertEqual(replies.first?["mention"] as? Bool, false)
+    }
+
+    func testSendMessageOmitsNilUnsupportedFields() async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"{"_id":"message-1","channel":"channel-1","author":"user-1","content":"hello","nonce":"nonce-2"}"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        _ = try await client.sendMessage(channelID: "channel-1", draft: MessageDraft(content: "hello", nonce: "nonce-2"))
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let bodyData = try XCTUnwrap(request.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
+
+        XCTAssertEqual(Set(object.keys), ["content"])
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Idempotency-Key"), "nonce-2")
+    }
+
     func testSessionValidationErrorMapping() {
         XCTAssertEqual(LiveSessionValidator.map(.unauthorized), .invalidOrExpired)
         XCTAssertEqual(LiveSessionValidator.map(.forbidden), .forbidden)

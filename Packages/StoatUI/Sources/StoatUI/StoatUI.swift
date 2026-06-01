@@ -216,6 +216,7 @@ public struct AttachmentDisplayItem: Identifiable, Hashable, Sendable, CustomStr
     public var kind: AttachmentDisplayKind
     public var source: AttachmentDisplaySource
     public var previewState: AttachmentPreviewState
+    public var previewData: Data?
 
     public init(
         id: String,
@@ -225,7 +226,8 @@ public struct AttachmentDisplayItem: Identifiable, Hashable, Sendable, CustomStr
         byteCount: Int? = nil,
         kind: AttachmentDisplayKind,
         source: AttachmentDisplaySource,
-        previewState: AttachmentPreviewState = .notLoaded
+        previewState: AttachmentPreviewState = .notLoaded,
+        previewData: Data? = nil
     ) {
         self.id = id
         self.fileID = fileID ?? source.fileID
@@ -235,6 +237,7 @@ public struct AttachmentDisplayItem: Identifiable, Hashable, Sendable, CustomStr
         self.kind = kind
         self.source = source
         self.previewState = previewState
+        self.previewData = previewData
     }
 
     public init(file: File, previewState: AttachmentPreviewState = .notLoaded) {
@@ -1378,9 +1381,7 @@ public struct AttachmentTimelineCard: View {
         ZStack {
             RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous)
                 .fill(Color.primary.opacity(reduceTransparency ? 0.10 : 0.06))
-            Image(systemName: item.kind.systemImage)
-                .font(.system(size: isCompact ? 16 : 20, weight: .semibold))
-                .foregroundStyle(iconColor)
+            thumbnailContent
             if case .loading = item.previewState {
                 ProgressView()
                     .controlSize(.mini)
@@ -1388,6 +1389,30 @@ public struct AttachmentTimelineCard: View {
         }
         .frame(width: isCompact ? 34 : 44, height: isCompact ? 34 : 44)
         .accessibilityHidden(true)
+    }
+
+    @ViewBuilder private var thumbnailContent: some View {
+        #if canImport(AppKit)
+        if item.kind == .image,
+           let data = item.previewData,
+           let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: isCompact ? 34 : 44, height: isCompact ? 34 : 44)
+                .clipShape(RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+        } else {
+            fallbackThumbnailIcon
+        }
+        #else
+        fallbackThumbnailIcon
+        #endif
+    }
+
+    private var fallbackThumbnailIcon: some View {
+        Image(systemName: item.kind.systemImage)
+            .font(.system(size: isCompact ? 16 : 20, weight: .semibold))
+            .foregroundStyle(iconColor)
     }
 
     @ViewBuilder private var stateLine: some View {
@@ -1470,7 +1495,8 @@ public struct AttachmentTimelineCard: View {
     }
 
     private var previewTitle: String {
-        item.previewState.isReady ? "Preview" : "Load Preview"
+        if item.previewState.isReady { return "Preview" }
+        return item.kind == .image ? "Load Image" : "Load Preview"
     }
 
     private var backgroundColor: Color {

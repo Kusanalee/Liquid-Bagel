@@ -32,6 +32,26 @@ public struct MessageDraft: Codable, Hashable, Sendable {
     }
 }
 
+struct MessageSendWireDraft: Codable, Hashable, Sendable {
+    var content: String?
+    var attachments: [FileID]?
+    var replies: [MessageReply]?
+    var embeds: [SendableEmbed]?
+    var masquerade: Masquerade?
+    var interactions: MessageInteractions?
+    var flags: MessageFlags?
+
+    init(_ draft: MessageDraft) {
+        self.content = draft.content
+        self.attachments = draft.attachments
+        self.replies = draft.replies
+        self.embeds = draft.embeds
+        self.masquerade = draft.masquerade
+        self.interactions = draft.interactions
+        self.flags = draft.flags
+    }
+}
+
 public struct MessageEditDraft: Codable, Hashable, Sendable {
     public var content: String?
     public var embeds: [SendableEmbed]?
@@ -41,4 +61,3 @@ public struct MessageEditDraft: Codable, Hashable, Sendable {
         self.embeds = embeds
     }
 }
-

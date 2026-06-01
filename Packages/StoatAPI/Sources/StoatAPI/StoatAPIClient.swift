@@ -177,11 +177,12 @@ public actor LiveStoatAPIClient: StoatAPIClient {
         if let nonce = draft.nonce {
             headers["Idempotency-Key"] = nonce
         }
+        let wireDraft = MessageSendWireDraft(draft)
         return try await perform(
             StoatRequest<Message>(
                 method: .post,
                 path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/messages",
-                body: .json(try encoder.encode(draft)),
+                body: .json(try encoder.encode(wireDraft)),
                 headers: headers
             )
         )

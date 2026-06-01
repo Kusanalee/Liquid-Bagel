@@ -106,6 +106,19 @@ Phase 0 captures enough current API and client research to keep the native macOS
   - Passing `original` as `{file_name}` redirects to the encoded stored filename.
 - Phase 16 uses these routes only after explicit user actions. It does not prefetch visible attachments, attach auth headers to media fetches, store persistent media, or add query parameters.
 
+### Phase 20 message send and media notes
+
+- Generated API package `stoatchat/javascript-client-api` package version `0.13.7` confirms `POST /channels/{target}/messages`.
+- The message send route accepts an `Idempotency-Key` header and a `DataMessageSend` JSON body.
+- Current body fields are `content`, `attachments`, `replies`, `embeds`, `masquerade`, `interactions`, and `flags`.
+- The legacy body `nonce` is deprecated and replaced by the `Idempotency-Key` header.
+- Backend source at `bd987bf72aedb8271846629e05f072247179a22d` consumes the idempotency header before creating the message, then populates returned `Message.nonce` from that header key.
+- Sending the same value in both `Idempotency-Key` and body `nonce` can be rejected as a duplicate nonce operation.
+- Official web/SDK behavior sends the header and omits body `nonce`; Liquid Bagel now mirrors that shape.
+- Live API root still reports media `https://cdn.stoatusercontent.com`, proxy `https://proxy.stoatusercontent.com`, and events `wss://events.stoat.chat`.
+- Attachment references in message send payloads are `string[]` file IDs, matching uploaded Autumn IDs.
+- Phase 20 keeps media loading explicit and uses Autumn preview/original routes without query parameters.
+
 ### Rate limits
 
 - Docs confirm fixed-window buckets and headers `X-RateLimit-Limit`, `X-RateLimit-Bucket`, `X-RateLimit-Remaining`, `X-RateLimit-Reset-After`.

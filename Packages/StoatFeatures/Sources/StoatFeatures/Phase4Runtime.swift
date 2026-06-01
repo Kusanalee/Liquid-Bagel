@@ -5,7 +5,7 @@ import StoatModels
 import StoatPersistence
 import StoatRealtime
 
-public enum AppSessionState: Equatable, Sendable {
+public enum AppSessionState: Hashable, Sendable {
     case mock
     case signedOut
     case loadingCredential

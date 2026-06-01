@@ -450,6 +450,7 @@ public final class MainShellViewModel {
     public var loadedAttachmentOriginalData: [String: RemoteAttachmentData] = [:]
     public var attachmentLocalFiles: [String: URL] = [:]
     public var lastAttachmentAction: String?
+    public var messageSendDiagnostics = MessageSendDiagnostics()
     public var notificationPermissionStatus: NotificationPermissionStatus = .unknown
     public var notificationBanners: [NotificationEvent] = []
     public var notificationDiagnostics = NotificationDiagnostics()
@@ -1099,6 +1100,41 @@ public final class MainShellViewModel {
         return composerDrafts[channelID] ?? ComposerDraftState(channelID: channelID)
     }
 
+    public func currentMessageSendDiagnostics() -> MessageSendDiagnostics {
+        let channelID = selection.channelID ?? selection.dmChannelID
+        let readiness = composerReadiness(for: channelID)
+        var diagnostics = messageSendDiagnostics
+        diagnostics.selectedChannelID = channelID
+        diagnostics.runtimeMode = effectiveRuntimeMode
+        diagnostics.sessionState = effectiveSessionState
+        diagnostics.connectionStateDescription = MessageSendDiagnosticsFormatter.redact(String(describing: effectiveConnectionState))
+        diagnostics.canSend = readiness.canSend
+        diagnostics.disabledReason = readiness.canSend ? nil : MessageSendDiagnosticsFormatter.redact(readiness.reason)
+        return diagnostics
+    }
+
+    private func recordMessageSendDiagnostics(
+        channelID: ChannelID?,
+        stage: MessageSendStage,
+        result: MessageSendResult? = nil,
+        error: String? = nil,
+        attemptedAt: Date? = nil
+    ) {
+        let readiness = composerReadiness(for: channelID)
+        messageSendDiagnostics = MessageSendDiagnostics(
+            selectedChannelID: channelID,
+            runtimeMode: effectiveRuntimeMode,
+            sessionState: effectiveSessionState,
+            connectionStateDescription: String(describing: effectiveConnectionState),
+            canSend: readiness.canSend,
+            disabledReason: readiness.canSend ? nil : readiness.reason,
+            lastSendAttemptAt: attemptedAt ?? messageSendDiagnostics.lastSendAttemptAt,
+            lastSendStage: stage,
+            lastSendResult: result ?? messageSendDiagnostics.lastSendResult,
+            lastError: error ?? messageSendDiagnostics.lastError
+        )
+    }
+
     public func replyContext(for channelID: ChannelID?) -> ReplyContext? {
         composerDraftState(for: channelID).replyContext
     }
@@ -1129,10 +1165,10 @@ public final class MainShellViewModel {
         let state = composerDraftState(for: channelID)
         let draft = draft(for: channelID).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !draft.isEmpty || !state.attachments.isEmpty else {
-            return (false, "Write a message or attach a file to send.")
+            return (false, "Type a message or attach a file.")
         }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Mock runtime is unavailable." : "Connect Live Manual before sending.")
+            return (false, effectiveRuntimeMode == .mock ? "Mock runtime is unavailable." : "Connect manually to send live messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -1141,13 +1177,13 @@ public final class MainShellViewModel {
             return (false, "You do not have permission to upload files here.")
         }
         if state.attachments.contains(where: { $0.status.isWorking }) {
-            return (false, "Attachment upload is still in progress.")
+            return (false, "Attachment upload is already in progress.")
         }
         if state.attachments.contains(where: {
             if case .failed = $0.status { return true }
             return false
         }) {
-            return (false, "Remove or retry failed attachments before sending.")
+            return (false, "Retry or remove failed attachments before sending.")
         }
         if messageController.sendingChannelIDs.contains(channelID) {
             return (false, "Sending the previous message.")
@@ -1160,7 +1196,7 @@ public final class MainShellViewModel {
             return (false, "Select a channel to send a message.")
         }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Mock runtime is unavailable." : "Connect Live Manual before sending.")
+            return (false, effectiveRuntimeMode == .mock ? "Mock runtime is unavailable." : "Connect manually to send live messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -1229,8 +1265,9 @@ public final class MainShellViewModel {
     public func attachmentDisplayItems(for message: Message) -> [AttachmentDisplayItem] {
         (message.attachments ?? []).map { file in
             var item = AttachmentDisplayItem(file: file, previewState: attachmentPreviewStates["file-\(file.id.rawValue)"] ?? .notLoaded)
-            if loadedAttachmentData[item.id] != nil {
+            if let loaded = loadedAttachmentData[item.id] {
                 item.previewState = .readyRemote
+                item.previewData = loaded.data
             }
             if attachmentLocalFiles[item.id] != nil {
                 item.previewState = .readyLocal
@@ -1501,12 +1538,21 @@ public final class MainShellViewModel {
     }
 
     public func sendDraft(for channelID: ChannelID?) async {
-        guard let channelID else { return }
+        recordMessageSendDiagnostics(channelID: channelID, stage: .validatingDraft, result: .pending, error: nil, attemptedAt: Date())
+        guard let channelID else {
+            recordMessageSendDiagnostics(channelID: nil, stage: .failed, result: .failed, error: "Select a channel to send a message.")
+            return
+        }
+        recordMessageSendDiagnostics(channelID: channelID, stage: .checkingRuntime, result: .pending, error: nil)
+        recordMessageSendDiagnostics(channelID: channelID, stage: .checkingPermissions, result: .pending, error: nil)
         let readiness = composerReadiness(for: channelID)
         guard readiness.canSend else {
             composerError = readiness.reason
+            placeholderStatus = readiness.reason
+            recordMessageSendDiagnostics(channelID: channelID, stage: .failed, result: .failed, error: readiness.reason)
             return
         }
+        recordMessageSendDiagnostics(channelID: channelID, stage: .uploadingAttachments, result: .pending, error: nil)
         await uploadQueuedAttachments(for: channelID)
         let uploadedState = composerDraftState(for: channelID)
         guard !uploadedState.attachments.contains(where: {
@@ -1514,21 +1560,51 @@ public final class MainShellViewModel {
             return $0.uploadedFileID == nil
         }) else {
             composerError = "One or more attachments could not be uploaded."
+            placeholderStatus = "One or more attachments could not be uploaded."
+            recordMessageSendDiagnostics(channelID: channelID, stage: .failed, result: .failed, error: "One or more attachments could not be uploaded.")
             return
         }
+        recordMessageSendDiagnostics(channelID: channelID, stage: .buildingPayload, result: .pending, error: nil)
         let content = uploadedState.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let draftState = uploadedState
         let replies = draftState.replyContext.map { [MessageReply(id: $0.messageID, mention: draftState.shouldMentionReplyAuthor)] }
         let attachmentIDs = draftState.attachments.compactMap(\.uploadedFileID)
         let attachmentFiles = draftState.attachments.compactMap { draft -> File? in
             guard let id = draft.uploadedFileID else { return nil }
+            let itemID = "file-\(id.rawValue)"
+            if draft.kind == .image,
+               let previewData = localImagePreviewData(for: draft) {
+                loadedAttachmentData[itemID] = RemoteAttachmentData(fileID: id, filename: draft.filename, contentType: draft.mimeType, byteCount: previewData.count, data: previewData)
+            }
             return File(attachmentDraft: draft, uploadedFileID: id)
         }
         composerDrafts[channelID] = ComposerDraftState(channelID: channelID)
         composerError = nil
-        if await messageController.sendMessage(channelID: channelID, content: content, replies: replies, attachments: attachmentIDs, attachmentFiles: attachmentFiles, handler: messageActionHandler) {
+        recordMessageSendDiagnostics(channelID: channelID, stage: .creatingOptimisticMessage, result: .pending, error: nil)
+        recordMessageSendDiagnostics(channelID: channelID, stage: .sendingRequest, result: .pending, error: nil)
+        let didSend = await messageController.sendMessage(channelID: channelID, content: content, replies: replies, attachments: attachmentIDs, attachmentFiles: attachmentFiles, handler: messageActionHandler)
+        if didSend {
+            recordMessageSendDiagnostics(channelID: channelID, stage: .decodingResponse, result: .pending, error: nil)
+            recordMessageSendDiagnostics(channelID: channelID, stage: .reconciled, result: .succeeded, error: nil)
+            messageActionStatus = "Message sent."
             acknowledgeSelectedChannel()
+        } else {
+            let error = messageController.lastErrorByChannelID[channelID] ?? "Message send failed."
+            recordMessageSendDiagnostics(channelID: channelID, stage: .failed, result: .failed, error: error)
+            messageActionStatus = error
         }
+    }
+
+    private func localImagePreviewData(for draft: ComposerAttachmentDraft) -> Data? {
+        guard draft.kind == .image else { return nil }
+        if let data = draft.previewData { return data }
+        guard draft.byteCount <= 8 * 1024 * 1024 else { return nil }
+        guard case let .fileURL(url) = draft.source else { return nil }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer {
+            if scoped { url.stopAccessingSecurityScopedResource() }
+        }
+        return try? Data(contentsOf: url, options: [.mappedIfSafe])
     }
 
     private func uploadAttachment(_ attachmentID: UUID, in channelID: ChannelID?) async {
@@ -2156,6 +2232,7 @@ public final class MainShellViewModel {
         let timeline = TimelineCopyFormatter.diagnostics(timelineDiagnostics())
         let attachments = attachmentDiagnostics()
         let actions = messageActionDiagnostics()
+        let send = MessageSendDiagnosticsFormatter.redactedText(currentMessageSendDiagnostics())
         let attachmentText = """
         Attachment diagnostics
         queuedDrafts: \(attachments.queuedDraftCount)
@@ -2172,7 +2249,7 @@ public final class MainShellViewModel {
         currentUserReactions: \(actions.currentUserReactionCount)
         pendingDeleteConfirmation: \(actions.hasPendingDeleteConfirmation ? "yes" : "no")
         """
-        let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText)))
+        let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText + "\n" + send)))
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -5066,6 +5143,7 @@ public struct MessageTimelineView: View {
             let diagnostics = viewModel.timelineDiagnostics()
             let attachments = viewModel.attachmentDiagnostics()
             let actions = viewModel.messageActionDiagnostics()
+            let send = viewModel.currentMessageSendDiagnostics()
             VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                 Text("Timeline Diagnostics")
                     .font(.caption.weight(.semibold))
@@ -5078,6 +5156,10 @@ public struct MessageTimelineView: View {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                 Text("Message actions visible \(actions.visibleActionCount) · available \(actions.availableActionCount) · reactions \(actions.reactionGroupCount) · mine \(actions.currentUserReactionCount) · delete confirm \(actions.hasPendingDeleteConfirmation ? "yes" : "no")")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Text("Send \(send.canSend ? "ready" : "blocked") · stage \(send.lastSendStage?.rawValue ?? "-") · result \(send.lastSendResult?.rawValue ?? "-") · reason \(send.disabledReason ?? "-") · error \(send.lastError ?? "-")")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
