@@ -232,8 +232,10 @@ private struct AccountSettingsTab: View {
                     }
                     .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true)
 
-                    Button("Reset to Mock") {
-                        Task { await viewModel.resetToMock() }
+                    if viewModel.isDeveloperControlsEnabled {
+                        Button("Open Preview Data") {
+                            Task { await viewModel.resetToMock() }
+                        }
                     }
                 }
             }
@@ -242,7 +244,7 @@ private struct AccountSettingsTab: View {
                 if let coordinator = viewModel.sessionCoordinator {
                     LabeledContent("Health", value: Phase6UIHelpers.connectionHealthText(state: coordinator.connectionState, diagnostics: coordinator.diagnostics, hydration: coordinator.hydrationStatus))
                     LabeledContent("Hydration", value: Phase6UIHelpers.hydrationLabel(coordinator.hydrationStatus))
-                    LabeledContent("Mode", value: viewModel.effectiveRuntimeMode == .liveManual ? "Live Manual" : "Mock")
+                    LabeledContent("Mode", value: viewModel.effectiveRuntimeMode == .liveManual ? "Live Manual" : "Preview Data")
                     LabeledContent("Ready", value: coordinator.hydrationStatus.readyReceived ? "Received" : "Waiting")
                     LabeledContent("Servers", value: "\(coordinator.hydrationStatus.serverCount)")
                     LabeledContent("Channels", value: "\(coordinator.hydrationStatus.channelCount)")
@@ -554,6 +556,17 @@ private struct ConnectionSettingsTab: View {
                         viewModel.reduceGlassIntensity = value
                     }
                 ))
+                Picker("Inline image previews", selection: Binding(
+                    get: { connectionViewModel.preferences.inlineImagePreviewPolicy },
+                    set: { value in
+                        connectionViewModel.preferences.inlineImagePreviewPolicy = value
+                        viewModel.inlineImagePreviewPolicy = value
+                    }
+                )) {
+                    Text("Automatic small images").tag(InlineImagePreviewPolicy.automaticSmallImages)
+                    Text("Explicit click only").tag(InlineImagePreviewPolicy.explicitClickOnly)
+                    Text("Disabled").tag(InlineImagePreviewPolicy.disabled)
+                }
                 Button("Save Preferences") {
                     Task {
                         await connectionViewModel.save()
@@ -727,9 +740,9 @@ private struct TimelineValidationHarnessView: View {
 
     private func diagnosticsGrid(_ diagnostics: TimelineDiagnostics) -> some View {
         Grid(alignment: .leading, horizontalSpacing: StoatSpacing.large, verticalSpacing: StoatSpacing.xSmall) {
-            diagnosticRow("Environment", viewModel.sessionCoordinator.map { Phase6UIHelpers.environmentDisplayName($0.environment, preferences: $0.preferences) } ?? "Mock")
+            diagnosticRow("Environment", viewModel.sessionCoordinator.map { Phase6UIHelpers.environmentDisplayName($0.environment, preferences: $0.preferences) } ?? "Preview Data")
             diagnosticRow("Current User", viewModel.currentUser?.displayName ?? viewModel.currentUser?.username ?? "-")
-            diagnosticRow("Connection", "\(viewModel.effectiveRuntimeMode == .liveManual ? "Live Manual" : "Mock") · \(viewModel.effectiveSessionState)")
+            diagnosticRow("Connection", "\(viewModel.effectiveRuntimeMode == .liveManual ? "Live Manual" : "Preview Data") · \(viewModel.effectiveSessionState)")
             diagnosticRow("Ready", viewModel.sessionCoordinator?.verificationState.readyReceived == true ? "yes" : "no")
             diagnosticRow("Channel", TimelineCopyFormatter.shortID(diagnostics.channelID?.rawValue))
             diagnosticRow("Loaded", "\(diagnostics.loadedMessageCount)")

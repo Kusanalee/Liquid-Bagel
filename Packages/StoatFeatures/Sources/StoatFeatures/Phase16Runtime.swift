@@ -12,6 +12,216 @@ public enum RemoteAttachmentLoadPurpose: Hashable, Sendable {
     case original
 }
 
+public enum ImageResourceKind: Hashable, Sendable {
+    case attachmentPreview
+    case attachmentOriginal
+    case userAvatar
+    case serverIcon
+    case serverBanner
+}
+
+public struct ImageCacheKey: Hashable, Sendable, CustomStringConvertible {
+    public var id: String
+    public var kind: ImageResourceKind
+
+    public init(id: String, kind: ImageResourceKind) {
+        self.id = id
+        self.kind = kind
+    }
+
+    public var description: String {
+        "\(kind)-\(AttachmentDisplayFormatting.shortID(id))"
+    }
+}
+
+public struct ImageResourceRequest: Hashable, Sendable {
+    public var id: String
+    public var url: URL
+    public var kind: ImageResourceKind
+    public var maxBytes: Int
+    public var filename: String?
+
+    public init(id: String, url: URL, kind: ImageResourceKind, maxBytes: Int, filename: String? = nil) {
+        self.id = id
+        self.url = url
+        self.kind = kind
+        self.maxBytes = maxBytes
+        self.filename = filename
+    }
+
+    public var cacheKey: ImageCacheKey {
+        ImageCacheKey(id: id, kind: kind)
+    }
+}
+
+public struct ImageResourceResult: Hashable, Sendable {
+    public var request: ImageResourceRequest
+    public var contentType: String?
+    public var data: Data
+    public var fromCache: Bool
+
+    public init(request: ImageResourceRequest, contentType: String? = nil, data: Data, fromCache: Bool = false) {
+        self.request = request
+        self.contentType = AttachmentDisplayFormatting.safeContentType(contentType)
+        self.data = data
+        self.fromCache = fromCache
+    }
+}
+
+public protocol ImageResourceLoading: Sendable {
+    func loadImage(_ request: ImageResourceRequest) async throws -> ImageResourceResult
+}
+
+public struct ImageMemoryCacheSnapshot: Hashable, Sendable {
+    public var count: Int
+    public var byteCount: Int
+}
+
+public actor ImageMemoryCache {
+    private struct Entry: Sendable {
+        var data: Data
+        var lastAccess: UInt64
+    }
+
+    private var entries: [ImageCacheKey: Entry] = [:]
+    private var currentBytes = 0
+    private var clock: UInt64 = 0
+    private let maxEntries: Int
+    private let maxBytes: Int
+
+    public init(maxEntries: Int = 128, maxBytes: Int = 32 * 1024 * 1024) {
+        self.maxEntries = max(1, maxEntries)
+        self.maxBytes = max(1, maxBytes)
+    }
+
+    public func imageData(for key: ImageCacheKey) -> Data? {
+        guard var entry = entries[key] else { return nil }
+        clock += 1
+        entry.lastAccess = clock
+        entries[key] = entry
+        return entry.data
+    }
+
+    public func store(_ data: Data, for key: ImageCacheKey) {
+        guard data.count <= maxBytes else { return }
+        if let existing = entries[key] {
+            currentBytes -= existing.data.count
+        }
+        clock += 1
+        entries[key] = Entry(data: data, lastAccess: clock)
+        currentBytes += data.count
+        evictIfNeeded()
+    }
+
+    public func removeAll() {
+        entries.removeAll()
+        currentBytes = 0
+    }
+
+    public func snapshot() -> ImageMemoryCacheSnapshot {
+        ImageMemoryCacheSnapshot(count: entries.count, byteCount: currentBytes)
+    }
+
+    private func evictIfNeeded() {
+        while entries.count > maxEntries || currentBytes > maxBytes {
+            guard let oldest = entries.min(by: { $0.value.lastAccess < $1.value.lastAccess }) else { return }
+            entries.removeValue(forKey: oldest.key)
+            currentBytes -= oldest.value.data.count
+        }
+    }
+}
+
+public actor MockImageResourceLoader: ImageResourceLoading {
+    public private(set) var calls: [ImageResourceRequest] = []
+    private var result: Result<Data, any Error & Sendable>
+
+    public init(result: Result<Data, any Error & Sendable> = .success(Data())) {
+        self.result = result
+    }
+
+    public func setResult(_ result: Result<Data, any Error & Sendable>) {
+        self.result = result
+    }
+
+    public func callCount() -> Int {
+        calls.count
+    }
+
+    public func loadImage(_ request: ImageResourceRequest) async throws -> ImageResourceResult {
+        calls.append(request)
+        switch result {
+        case let .success(data):
+            return ImageResourceResult(request: request, contentType: "image/png", data: data)
+        case let .failure(error):
+            throw error
+        }
+    }
+}
+
+public struct LiveImageResourceLoader: ImageResourceLoading {
+    public var cache: ImageMemoryCache
+    private let session: URLSession
+
+    public init(cache: ImageMemoryCache, session: URLSession = .shared) {
+        self.cache = cache
+        self.session = session
+    }
+
+    public func loadImage(_ request: ImageResourceRequest) async throws -> ImageResourceResult {
+        if let cached = await cache.imageData(for: request.cacheKey) {
+            return ImageResourceResult(request: request, contentType: nil, data: cached, fromCache: true)
+        }
+        var urlRequest = URLRequest(url: request.url)
+        urlRequest.httpMethod = "GET"
+        urlRequest.cachePolicy = .reloadIgnoringLocalCacheData
+        urlRequest.setValue("LiquidBagel/0.1 macOS", forHTTPHeaderField: "User-Agent")
+        do {
+            let (data, response) = try await session.data(for: urlRequest)
+            guard let http = response as? HTTPURLResponse else {
+                throw AttachmentActionError.unavailable("Image could not be loaded.")
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                throw AttachmentActionError.unavailable(Self.safeStatusMessage(http.statusCode))
+            }
+            guard data.count <= request.maxBytes else {
+                throw AttachmentActionError.tooLargeForPreview(maxBytes: request.maxBytes)
+            }
+            let contentType = http.value(forHTTPHeaderField: "Content-Type")
+            try Self.validateImageContentType(contentType)
+            await cache.store(data, for: request.cacheKey)
+            return ImageResourceResult(request: request, contentType: contentType, data: data)
+        } catch let error as AttachmentActionError {
+            throw error
+        } catch {
+            throw AttachmentActionError.unavailable("Image could not be loaded.")
+        }
+    }
+
+    private static func validateImageContentType(_ contentType: String?) throws {
+        let lowered = (contentType ?? "").lowercased()
+        if lowered.contains("text/html") || lowered.contains("application/xhtml") || !lowered.hasPrefix("image/") {
+            throw AttachmentActionError.unavailable("Image request did not return an image.")
+        }
+    }
+
+    private static func safeStatusMessage(_ code: Int) -> String {
+        switch code {
+        case 403:
+            "Image is not available."
+        case 404:
+            "Image was not found."
+        case 413:
+            "Image is too large."
+        case 429:
+            "Image service is rate limited."
+        case 500..<600:
+            "Image service is unavailable."
+        default:
+            "Image could not be loaded."
+        }
+    }
+}
+
 public struct RemoteAttachmentData: Hashable, Sendable {
     public var fileID: FileID?
     public var filename: String
@@ -364,6 +574,28 @@ public struct AttachmentDiagnostics: Hashable, Sendable {
         self.loadedPreviewCount = loadedPreviewCount
         self.failedPreviewCount = failedPreviewCount
         self.lastAttachmentAction = lastAttachmentAction.map(AttachmentDiagnosticsFormatter.redact)
+    }
+}
+
+public struct ImageResourceDiagnostics: Hashable, Sendable {
+    public var loadedCount: Int
+    public var failedCount: Int
+    public var cacheEntryCount: Int
+    public var cacheByteCount: Int
+    public var lastAction: String?
+
+    public init(
+        loadedCount: Int = 0,
+        failedCount: Int = 0,
+        cacheEntryCount: Int = 0,
+        cacheByteCount: Int = 0,
+        lastAction: String? = nil
+    ) {
+        self.loadedCount = loadedCount
+        self.failedCount = failedCount
+        self.cacheEntryCount = cacheEntryCount
+        self.cacheByteCount = cacheByteCount
+        self.lastAction = lastAction.map(AttachmentDiagnosticsFormatter.redact)
     }
 }
 

@@ -303,7 +303,7 @@ public final class QuickSwitcherViewModel {
             commandResult(.refresh, title: "Refresh", subtitle: "Refresh the current runtime context"),
             commandResult(.reconnect, title: "Reconnect", subtitle: "Explicitly reconnect Live Manual"),
             commandResult(.disconnect, title: "Disconnect", subtitle: "Disconnect the live realtime session"),
-            commandResult(.resetToMock, title: "Reset to Mock", subtitle: "Return to mock runtime"),
+            commandResult(.resetToMock, title: "Open Preview Data", subtitle: "Use local developer preview data"),
             commandResult(.openChannelSearch, title: "Search This Channel", subtitle: "Open selected-channel search"),
             commandResult(.openLoadedMessageFind, title: "Find in Loaded Messages", subtitle: "Search loaded messages only"),
             commandResult(.openLiveChannelSearch, title: "Live Search Selected Channel", subtitle: "Search this channel after Live Manual connection"),

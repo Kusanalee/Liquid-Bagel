@@ -1283,11 +1283,11 @@ public final class AppSessionCoordinator {
         self.apiClientFactory = apiClientFactory
         self.realtimeClientFactory = realtimeClientFactory
         self.realtimeStoreFactory = realtimeStoreFactory
-        self.mode = .mock
-        self.sessionState = .mock
+        self.mode = .liveManual
+        self.sessionState = .signedOut
         self.connectionState = .idle
-        self.snapshot = mockSnapshot
-        self.currentUser = mockSnapshot.usersByID[mockCurrentUserID]
+        self.snapshot = RealtimeSnapshot()
+        self.currentUser = nil
         self.validatedSession = nil
         self.pendingValidatedSession = nil
         self.mfaChallenge = nil
@@ -1300,8 +1300,8 @@ public final class AppSessionCoordinator {
         self.verificationState = LiveVerificationState()
         self.hydrationStatus = .empty
         self.liveConnectionGeneration = 0
-        self.snapshotSource = MockShellSnapshotSource(snapshot: mockSnapshot)
-        self.messageActionHandler = MockMessageActionHandler(currentUserID: mockCurrentUserID)
+        self.snapshotSource = MockShellSnapshotSource(snapshot: RealtimeSnapshot())
+        self.messageActionHandler = UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
     }
 
     deinit {
@@ -1312,6 +1312,28 @@ public final class AppSessionCoordinator {
 
     public func startMockSession() async {
         await startMockSession(loadStoredPreferences: true)
+    }
+
+    public func startLiveFirstSession() async {
+        await loadPreferences()
+        await disconnectActiveRealtime()
+        mode = .liveManual
+        connectionState = .idle
+        diagnostics = nil
+        lastErrorMessage = nil
+        validatedSession = nil
+        pendingValidatedSession = nil
+        mfaChallenge = nil
+        currentUser = nil
+        apiClient = nil
+        messageActionHandler = UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
+        verificationState = LiveVerificationState()
+        installLiveSafeSnapshot()
+        await refreshCredentialAvailability()
+        if case .keychainFailed = sessionState {
+            return
+        }
+        sessionState = hasSavedCredential ? .savedCredentialUnvalidated : .signedOut
     }
 
     private func startMockSession(loadStoredPreferences: Bool) async {

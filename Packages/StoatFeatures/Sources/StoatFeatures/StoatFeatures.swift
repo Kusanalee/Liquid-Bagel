@@ -450,6 +450,10 @@ public final class MainShellViewModel {
     public var loadedAttachmentOriginalData: [String: RemoteAttachmentData] = [:]
     public var attachmentLocalFiles: [String: URL] = [:]
     public var lastAttachmentAction: String?
+    public var inlineImagePreviewPolicy: InlineImagePreviewPolicy = .automaticSmallImages
+    public var loadedImageResources: [ImageCacheKey: Data] = [:]
+    public var imageResourceStates: [ImageCacheKey: AttachmentPreviewState] = [:]
+    public var lastImageResourceAction: String?
     public var messageSendDiagnostics = MessageSendDiagnostics()
     public var notificationPermissionStatus: NotificationPermissionStatus = .unknown
     public var notificationBanners: [NotificationEvent] = []
@@ -461,6 +465,8 @@ public final class MainShellViewModel {
     @ObservationIgnored public var messageCopier: any MessageCopying
     @ObservationIgnored public var attachmentUploadHandler: any AttachmentUploadHandling
     @ObservationIgnored public var remoteAttachmentLoader: any RemoteAttachmentLoading
+    @ObservationIgnored public var imageResourceLoader: any ImageResourceLoading
+    @ObservationIgnored public var imageMemoryCache: ImageMemoryCache
     @ObservationIgnored public var attachmentSaver: any AttachmentSaving
     @ObservationIgnored public var attachmentOpener: any AttachmentOpening
     @ObservationIgnored public var channelAckSender: any ChannelAckSending
@@ -476,6 +482,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var ackTask: Task<Void, Never>?
     @ObservationIgnored private var referenceFetchTasks: [MessageID: Task<Void, Never>] = [:]
     @ObservationIgnored private var attachmentLoadTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var imageResourceLoadTasks: [ImageCacheKey: Task<Void, Never>] = [:]
     @ObservationIgnored private var activeTypingChannelID: ChannelID?
     @ObservationIgnored private var lastTypingBeginAt: [ChannelID: Date] = [:]
     @ObservationIgnored private var lastAckedMessageByChannelID: [ChannelID: MessageID] = [:]
@@ -512,6 +519,8 @@ public final class MainShellViewModel {
         messageCopier: (any MessageCopying)? = nil,
         attachmentUploadHandler: (any AttachmentUploadHandling)? = nil,
         remoteAttachmentLoader: (any RemoteAttachmentLoading)? = nil,
+        imageMemoryCache: ImageMemoryCache = ImageMemoryCache(),
+        imageResourceLoader: (any ImageResourceLoading)? = nil,
         attachmentSaver: (any AttachmentSaving)? = nil,
         attachmentOpener: (any AttachmentOpening)? = nil,
         channelAckSender: (any ChannelAckSending)? = nil,
@@ -535,6 +544,8 @@ public final class MainShellViewModel {
         self.messageCopier = messageCopier ?? AppKitMessageCopier()
         self.attachmentUploadHandler = attachmentUploadHandler ?? MockAttachmentUploadHandler()
         self.remoteAttachmentLoader = remoteAttachmentLoader ?? MockRemoteAttachmentLoader()
+        self.imageMemoryCache = imageMemoryCache
+        self.imageResourceLoader = imageResourceLoader ?? MockImageResourceLoader()
         self.attachmentSaver = attachmentSaver ?? AppKitAttachmentSaver()
         self.attachmentOpener = attachmentOpener ?? AppKitAttachmentOpener()
         self.channelAckSender = channelAckSender ?? NoopChannelAckSender()
@@ -570,6 +581,7 @@ public final class MainShellViewModel {
         ackTask?.cancel()
         referenceFetchTasks.values.forEach { $0.cancel() }
         attachmentLoadTasks.values.forEach { $0.cancel() }
+        imageResourceLoadTasks.values.forEach { $0.cancel() }
     }
 
     public var servers: [Server] {
@@ -950,6 +962,7 @@ public final class MainShellViewModel {
         selection.isMemberPanelVisible = sessionCoordinator.preferences.memberPanelVisible
         messageDensity = sessionCoordinator.preferences.messageDensity
         reduceGlassIntensity = sessionCoordinator.preferences.reduceGlassIntensity
+        inlineImagePreviewPolicy = sessionCoordinator.preferences.inlineImagePreviewPolicy
         timelineTuning = sessionCoordinator.preferences.timelineTuning.validated()
         snapshot = sessionCoordinator.snapshot
         if sessionCoordinator.mode == .liveManual,
@@ -968,8 +981,10 @@ public final class MainShellViewModel {
         attachmentUploadHandler = liveAPIClient.map { LiveAttachmentUploadHandler(apiClient: $0) } ?? MockAttachmentUploadHandler()
         if sessionCoordinator.mode == .liveManual {
             remoteAttachmentLoader = LiveRemoteAttachmentLoader(environment: sessionCoordinator.environment)
+            imageResourceLoader = LiveImageResourceLoader(cache: imageMemoryCache)
         } else {
             remoteAttachmentLoader = MockRemoteAttachmentLoader()
+            imageResourceLoader = MockImageResourceLoader()
         }
         channelAckSender = liveAPIClient.map { LiveChannelAckSender(apiClient: $0) } ?? NoopChannelAckSender()
         if sessionCoordinator.mode == .mock {
@@ -995,6 +1010,9 @@ public final class MainShellViewModel {
         replayQueuedNotificationRoutesIfReady()
         if sessionCoordinator.mode != .liveManual {
             restoredLiveConnectionGeneration = nil
+        }
+        if sessionCoordinator.mode == .liveManual, sessionCoordinator.sessionState == .connected {
+            loadIdentityImagesForCurrentSnapshot()
         }
     }
 
@@ -1168,7 +1186,7 @@ public final class MainShellViewModel {
             return (false, "Type a message or attach a file.")
         }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Mock runtime is unavailable." : "Connect manually to send live messages.")
+            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Connect manually to send live messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -1196,7 +1214,7 @@ public final class MainShellViewModel {
             return (false, "Select a channel to send a message.")
         }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Mock runtime is unavailable." : "Connect manually to send live messages.")
+            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Connect manually to send live messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -1274,6 +1292,184 @@ public final class MainShellViewModel {
             }
             return item
         }
+    }
+
+    public func loadInlineImagePreviews(for message: Message) {
+        guard inlineImagePreviewPolicy == .automaticSmallImages else { return }
+        guard effectiveRuntimeMode == .liveManual || effectiveRuntimeMode == .mock else { return }
+        for item in attachmentDisplayItems(for: message) where shouldAutoLoadInlineImage(item) {
+            guard attachmentLoadTasks[item.id] == nil else { continue }
+            attachmentLoadTasks[item.id] = Task { [weak self] in
+                await self?.loadInlineImagePreview(item)
+            }
+        }
+    }
+
+    private func shouldAutoLoadInlineImage(_ item: AttachmentDisplayItem) -> Bool {
+        guard item.kind == .image, item.previewData == nil else { return false }
+        guard item.source.isRemoteLoadable else { return false }
+        guard item.byteCount.map({ $0 <= 8 * 1024 * 1024 }) ?? true else { return false }
+        switch item.previewState {
+        case .notLoaded:
+            return true
+        case .failed, .loading, .readyLocal, .readyRemote, .unsupported:
+            return false
+        }
+    }
+
+    private func loadInlineImagePreview(_ item: AttachmentDisplayItem) async {
+        await MainActor.run {
+            self.attachmentPreviewStates[item.id] = .loading
+            self.lastAttachmentAction = "Loading inline image preview"
+        }
+        defer {
+            Task { @MainActor [weak self] in
+                self?.attachmentLoadTasks[item.id] = nil
+            }
+        }
+        do {
+            let loaded = try await remoteAttachmentLoader.load(item, purpose: .preview)
+            await MainActor.run {
+                self.loadedAttachmentData[item.id] = loaded
+                self.attachmentPreviewStates[item.id] = .readyRemote
+                self.lastAttachmentAction = "Loaded inline image preview"
+            }
+        } catch {
+            let message = AttachmentSafety.safeErrorMessage(error)
+            await MainActor.run {
+                self.attachmentPreviewStates[item.id] = .failed(message)
+                self.lastAttachmentAction = "Inline image preview failed"
+            }
+        }
+    }
+
+    public func imageData(for file: File?, kind: ImageResourceKind) -> Data? {
+        guard let file else { return nil }
+        return loadedImageResources[ImageCacheKey(id: file.id.rawValue, kind: kind)]
+    }
+
+    public func loadImageResource(for file: File?, kind: ImageResourceKind) {
+        guard let request = imageResourceRequest(for: file, kind: kind) else { return }
+        let key = request.cacheKey
+        guard loadedImageResources[key] == nil, imageResourceLoadTasks[key] == nil else { return }
+        imageResourceStates[key] = .loading
+        imageResourceLoadTasks[key] = Task { [weak self] in
+            await self?.loadImageResource(request)
+        }
+    }
+
+    public func clearImageMemoryCache() async {
+        await imageMemoryCache.removeAll()
+        loadedImageResources.removeAll()
+        imageResourceStates.removeAll()
+        lastImageResourceAction = "Cleared image memory cache"
+    }
+
+    public func reloadVisibleImages() {
+        for message in selectedTimelineMessages.map(\.message) {
+            loadInlineImagePreviews(for: message)
+            loadImageResource(for: avatarFile(for: message), kind: .userAvatar)
+        }
+        loadIdentityImagesForCurrentSnapshot()
+        lastImageResourceAction = "Reloaded visible images"
+    }
+
+    public func imageResourceDiagnostics() async -> ImageResourceDiagnostics {
+        let snapshot = await imageMemoryCache.snapshot()
+        let failed = imageResourceStates.values.filter {
+            if case .failed = $0 { return true }
+            return false
+        }.count
+        return ImageResourceDiagnostics(
+            loadedCount: loadedImageResources.count,
+            failedCount: failed,
+            cacheEntryCount: snapshot.count,
+            cacheByteCount: snapshot.byteCount,
+            lastAction: lastImageResourceAction
+        )
+    }
+
+    private func loadImageResource(_ request: ImageResourceRequest) async {
+        defer {
+            Task { @MainActor [weak self] in
+                self?.imageResourceLoadTasks[request.cacheKey] = nil
+            }
+        }
+        do {
+            let loaded = try await imageResourceLoader.loadImage(request)
+            await MainActor.run {
+                self.loadedImageResources[request.cacheKey] = loaded.data
+                self.imageResourceStates[request.cacheKey] = .readyRemote
+                self.lastImageResourceAction = loaded.fromCache ? "Loaded image from memory cache" : "Loaded image"
+            }
+        } catch {
+            let message = AttachmentSafety.safeErrorMessage(error)
+            await MainActor.run {
+                self.imageResourceStates[request.cacheKey] = .failed(message)
+                self.lastImageResourceAction = "Image load failed"
+            }
+        }
+    }
+
+    private func loadIdentityImagesForCurrentSnapshot() {
+        for user in snapshot.usersByID.values {
+            loadImageResource(for: user.avatar, kind: .userAvatar)
+        }
+        for member in snapshot.membersByServerAndUserID.values {
+            loadImageResource(for: member.avatar, kind: .userAvatar)
+        }
+        for server in snapshot.serversByID.values {
+            loadImageResource(for: server.icon, kind: .serverIcon)
+            loadImageResource(for: server.banner, kind: .serverBanner)
+        }
+    }
+
+    private func imageResourceRequest(for file: File?, kind: ImageResourceKind) -> ImageResourceRequest? {
+        guard let file, file.deleted != true, file.reported != true else { return nil }
+        guard let baseURL = sessionCoordinator?.environment.mediaBaseURL ?? StoatAPIEnvironment.production.mediaBaseURL else { return nil }
+        let tag: String
+        switch kind {
+        case .attachmentPreview, .attachmentOriginal:
+            tag = file.tag.isEmpty ? "attachments" : file.tag
+        case .userAvatar:
+            tag = "avatars"
+        case .serverIcon:
+            tag = "icons"
+        case .serverBanner:
+            tag = "banners"
+        }
+        let filename = kind == .attachmentOriginal ? "original" : nil
+        guard let url = try? LiveRemoteAttachmentLoader.mediaURL(baseURL: baseURL, tag: tag, fileID: file.id, filename: filename) else {
+            return nil
+        }
+        let maxBytes: Int
+        switch kind {
+        case .serverBanner:
+            maxBytes = 4 * 1024 * 1024
+        case .attachmentPreview:
+            maxBytes = 8 * 1024 * 1024
+        case .attachmentOriginal:
+            maxBytes = 20 * 1024 * 1024
+        case .userAvatar, .serverIcon:
+            maxBytes = 2 * 1024 * 1024
+        }
+        return ImageResourceRequest(id: file.id.rawValue, url: url, kind: kind, maxBytes: maxBytes, filename: file.filename)
+    }
+
+    public func member(for userID: UserID, serverID: ServerID?) -> ServerMember? {
+        guard let serverID else { return nil }
+        return snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)]
+    }
+
+    public func displayName(for user: User?, member: ServerMember? = nil, fallbackID: UserID? = nil) -> String {
+        member?.nickname ?? user?.displayName ?? user?.username ?? fallbackID?.rawValue ?? "Unknown"
+    }
+
+    public func avatarFile(for message: Message) -> File? {
+        if let memberAvatar = message.member?.avatar { return memberAvatar }
+        if let userAvatar = message.user?.avatar { return userAvatar }
+        let member = member(for: message.authorID, serverID: snapshot.channelsByID[message.channelID]?.serverID)
+        return member?.avatar ?? snapshot.usersByID[message.authorID]?.avatar
     }
 
     public func previewComposerAttachment(_ attachmentID: UUID, in channelID: ChannelID?) {
@@ -3036,6 +3232,9 @@ public final class MainShellViewModel {
         updateDockBadge()
         updateNotificationDiagnostics()
         replayQueuedNotificationRoutesIfReady()
+        if effectiveRuntimeMode == .liveManual, effectiveSessionState == .connected {
+            loadIdentityImagesForCurrentSnapshot()
+        }
     }
 
     private func applyRealtimeDeleteDiff(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
@@ -3437,7 +3636,7 @@ extension MainShellViewModel: AppCommandHandling {
         case .disconnect:
             return isDisconnectable
         case .resetToMock:
-            return effectiveRuntimeMode != .mock || effectiveConnectionState != .idle
+            return isDeveloperControlsEnabled && (effectiveRuntimeMode != .mock || effectiveConnectionState != .idle)
         case .toggleDeveloperControls:
             return sessionCoordinator != nil
         case let .selectServer(index):
@@ -3498,7 +3697,7 @@ extension MainShellViewModel: AppCommandHandling {
         case .disconnect:
             return "No live realtime session is connected."
         case .resetToMock:
-            return "Already using mock runtime."
+            return isDeveloperControlsEnabled ? "Already using preview data." : "Developer controls are disabled."
         case .selectServer:
             return "That server shortcut has no visible server."
         case .selectChannel:
@@ -3769,7 +3968,7 @@ public struct LiquidBagelRootView: View {
     @State private var viewModel: MainShellViewModel
 
     public init(
-        viewModel: MainShellViewModel = MainShellViewModel(runtimeMode: .mock),
+        viewModel: MainShellViewModel = MainShellViewModel(snapshot: RealtimeSnapshot(), runtimeMode: .liveManual, sessionState: .signedOut, currentUser: nil),
         sessionCoordinator: AppSessionCoordinator = AppSessionCoordinator()
     ) {
         _sessionCoordinator = State(initialValue: sessionCoordinator)
@@ -3780,7 +3979,8 @@ public struct LiquidBagelRootView: View {
         MainShellView(viewModel: viewModel)
             .task {
                 viewModel.attachSessionCoordinator(sessionCoordinator)
-                await viewModel.startMockSession()
+                await sessionCoordinator.startLiveFirstSession()
+                viewModel.syncFromSessionCoordinator()
             }
             .onChange(of: scenePhase) { _, phase in
                 viewModel.updateAppLifecyclePhase(AppLifecyclePhase(phase))
@@ -4016,8 +4216,10 @@ public struct MainShellView: View {
                 Task { await viewModel.disconnectLive() }
             }
             .disabled(!isDisconnectable)
-            Button("Reset to Mock") {
-                Task { await viewModel.resetToMock() }
+            if viewModel.isDeveloperControlsEnabled {
+                Button("Open Preview Data") {
+                    Task { await viewModel.resetToMock() }
+                }
             }
         } label: {
             Text("\(runtimeModeText) · \(connectionText)")
@@ -4042,7 +4244,7 @@ public struct MainShellView: View {
 
     private var connectionText: String {
         switch viewModel.effectiveConnectionState {
-        case .idle: "Mock"
+        case .idle: viewModel.effectiveRuntimeMode == .mock ? "Preview" : "Idle"
         case .ready: "Ready"
         case .connecting, .authenticating, .authenticated, .connected: "Connecting"
         case .reconnecting: "Reconnecting"
@@ -4053,14 +4255,14 @@ public struct MainShellView: View {
 
     private var runtimeModeText: String {
         switch viewModel.effectiveRuntimeMode {
-        case .mock: "Mock"
+        case .mock: "Preview Data"
         case .liveManual: "Live Manual"
         }
     }
 
     private var sessionStateText: String {
         switch viewModel.effectiveSessionState {
-        case .mock: "Mock"
+        case .mock: "Preview Data"
         case .signedOut: "Signed Out"
         case .loadingCredential: "Loading Credential"
         case .savedCredentialUnvalidated: "Saved Credential"
@@ -4290,8 +4492,10 @@ public struct CredentialSetupView: View {
                     }
                     .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true)
 
-                    Button("Reset to Mock") {
-                        Task { await viewModel.resetToMock() }
+                    if viewModel.isDeveloperControlsEnabled {
+                        Button("Open Preview Data") {
+                            Task { await viewModel.resetToMock() }
+                        }
                     }
                 }
             }
@@ -4391,6 +4595,21 @@ public struct CredentialSetupView: View {
                         viewModel.isTestSendConfirmationPresented = true
                     }
                     .disabled(!viewModel.composerReadiness(for: viewModel.selection.channelID ?? viewModel.selection.dmChannelID).canSend)
+                }
+                HStack {
+                    Button("Reload Visible Images") {
+                        viewModel.reloadVisibleImages()
+                    }
+                    Button("Clear Image Memory Cache") {
+                        Task { await viewModel.clearImageMemoryCache() }
+                    }
+                }
+                LabeledContent("Inline images", value: "\(viewModel.inlineImagePreviewPolicy)")
+                LabeledContent("Loaded identity/media images", value: "\(viewModel.loadedImageResources.count)")
+                if let last = viewModel.lastImageResourceAction {
+                    Text(last)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -4505,14 +4724,14 @@ public struct CredentialSetupView: View {
 
     private var runtimeModeText: String {
         switch viewModel.effectiveRuntimeMode {
-        case .mock: "Mock"
+        case .mock: "Preview Data"
         case .liveManual: "Live Manual"
         }
     }
 
     private var sessionStateText: String {
         switch viewModel.effectiveSessionState {
-        case .mock: "Mock"
+        case .mock: "Preview Data"
         case .signedOut: "Signed Out"
         case .loadingCredential: "Loading Credential"
         case .savedCredentialUnvalidated: "Saved Credential"
@@ -4604,8 +4823,17 @@ public struct ServerRailView: View {
                     ForEach(viewModel.servers) { server in
                         let unread = unreadCount(for: server)
                         let mentions = mentionCount(for: server)
-                        ServerRailItem(title: server.name, isSelected: viewModel.selection.serverID == server.id, unreadCount: unread, mentionCount: mentions) {
+                        ServerRailItem(
+                            title: server.name,
+                            isSelected: viewModel.selection.serverID == server.id,
+                            unreadCount: unread,
+                            mentionCount: mentions,
+                            imageData: viewModel.imageData(for: server.icon, kind: .serverIcon)
+                        ) {
                             viewModel.selectServer(server.id)
+                        }
+                        .onAppear {
+                            viewModel.loadImageResource(for: server.icon, kind: .serverIcon)
                         }
                     }
                 }
@@ -4694,7 +4922,7 @@ public struct ChannelListView: View {
     private var runtimeSubtitle: String {
         switch viewModel.effectiveRuntimeMode {
         case .mock:
-            return "Mock runtime · no live connection"
+            return "Preview Data"
         case .liveManual:
             switch viewModel.effectiveSessionState {
             case .connected:
@@ -4712,7 +4940,7 @@ public struct ChannelListView: View {
             case .validationFailed, .connectionFailed, .keychainFailed, .failed:
                 return "Live Manual · failed"
             case .mock:
-                return "Mock runtime · no live connection"
+                return "Preview Data"
             }
         }
     }
@@ -4817,21 +5045,24 @@ public struct ChatPlaceholderView: View {
     public var body: some View {
         VStack(spacing: 0) {
             GlassToolbar {
-                HStack(spacing: StoatSpacing.medium) {
-                    Label(viewModel.selectedChannel?.displayName ?? "No channel", systemImage: "number")
-                        .font(.headline)
-                    if let topic = viewModel.selectedChannel?.description {
-                        Text(topic).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                ZStack {
+                    serverBanner
+                    HStack(spacing: StoatSpacing.medium) {
+                        Label(viewModel.selectedChannel?.displayName ?? "No channel", systemImage: "number")
+                            .font(.headline)
+                        if let topic = viewModel.selectedChannel?.description {
+                            Text(topic).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        GlassIconButton("Pinned in this channel", systemImage: "pin") {
+                            viewModel.openChannelSearch(mode: .pinned)
+                        }
+                        GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
+                            viewModel.openChannelSearch(mode: .loadedOnly)
+                        }
+                        GlassIconButton("Toggle member panel", systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
+                        GlassIconButton("Channel settings unavailable in Phase 3", systemImage: "gearshape", isDisabled: true) {}
                     }
-                    Spacer()
-                    GlassIconButton("Pinned in this channel", systemImage: "pin") {
-                        viewModel.openChannelSearch(mode: .pinned)
-                    }
-                    GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
-                        viewModel.openChannelSearch(mode: .loadedOnly)
-                    }
-                    GlassIconButton("Toggle member panel", systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
-                    GlassIconButton("Channel settings unavailable in Phase 3", systemImage: "gearshape", isDisabled: true) {}
                 }
             }
             MessageTimelineView(viewModel: viewModel)
@@ -4892,6 +5123,27 @@ public struct ChatPlaceholderView: View {
                 .padding([.horizontal, .bottom], StoatSpacing.large)
             }
         }
+        .onAppear {
+            viewModel.loadImageResource(for: viewModel.selectedServer?.banner, kind: .serverBanner)
+        }
+        .onChange(of: viewModel.selectedServer?.id) { _, _ in
+            viewModel.loadImageResource(for: viewModel.selectedServer?.banner, kind: .serverBanner)
+        }
+    }
+
+    @ViewBuilder private var serverBanner: some View {
+        #if canImport(AppKit)
+        if let data = viewModel.imageData(for: viewModel.selectedServer?.banner, kind: .serverBanner),
+           let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(maxWidth: .infinity, maxHeight: 52)
+                .clipped()
+                .overlay(Color.black.opacity(0.28))
+                .accessibilityHidden(true)
+        }
+        #endif
     }
 }
 
@@ -5266,6 +5518,14 @@ public struct TimelineMessageGroupView: View {
                         MessageRow(
                             message: timelineMessage.message,
                             author: author,
+                            authorDisplayNameOverride: viewModel.displayName(
+                                for: timelineMessage.message.user ?? author,
+                                member: timelineMessage.message.member ?? viewModel.member(
+                                    for: timelineMessage.message.authorID,
+                                    serverID: viewModel.snapshot.channelsByID[timelineMessage.message.channelID]?.serverID
+                                ),
+                                fallbackID: timelineMessage.message.authorID
+                            ),
                             showsHeader: index == 0,
                             statusText: accessibilityStatus(for: timelineMessage),
                             isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id,
@@ -5276,6 +5536,7 @@ public struct TimelineMessageGroupView: View {
                             searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
                             replyPreview: viewModel.resolvedReplyPreview(for: timelineMessage.message),
                             attachmentItems: viewModel.attachmentDisplayItems(for: timelineMessage.message),
+                            authorAvatarData: viewModel.imageData(for: viewModel.avatarFile(for: timelineMessage.message), kind: .userAvatar),
                             actionItems: rowActionItems(for: timelineMessage),
                             reactionItems: rowReactionItems(for: timelineMessage),
                             onMessageAction: { actionID in
@@ -5302,6 +5563,8 @@ public struct TimelineMessageGroupView: View {
                         .id(timelineMessage.message.id)
                         .onAppear {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
+                            viewModel.loadInlineImagePreviews(for: timelineMessage.message)
+                            viewModel.loadImageResource(for: viewModel.avatarFile(for: timelineMessage.message), kind: .userAvatar)
                         }
                         .onDisappear {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
@@ -5544,14 +5807,16 @@ public struct MemberPanelView: View {
                             .font(StoatTypography.section)
                             .foregroundStyle(.secondary)
                         ForEach(members.filter(\.online)) { user in
-                            MemberRow(user: user, subtitle: roleSubtitle(for: user))
+                            MemberRow(user: user, subtitle: roleSubtitle(for: user), displayName: displayName(for: user), imageData: avatarData(for: user))
+                                .onAppear { loadAvatar(for: user) }
                         }
                         Text("OFFLINE")
                             .font(StoatTypography.section)
                             .foregroundStyle(.secondary)
                             .padding(.top, StoatSpacing.medium)
                         ForEach(members.filter { !$0.online }) { user in
-                            MemberRow(user: user, subtitle: roleSubtitle(for: user))
+                            MemberRow(user: user, subtitle: roleSubtitle(for: user), displayName: displayName(for: user), imageData: avatarData(for: user))
+                                .onAppear { loadAvatar(for: user) }
                         }
                     }
                 }
@@ -5576,6 +5841,27 @@ public struct MemberPanelView: View {
         }
         return role.name
     }
+
+    private func member(for user: User) -> ServerMember? {
+        guard let serverID = viewModel.selection.serverID else { return nil }
+        return viewModel.snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: user.id)]
+    }
+
+    private func displayName(for user: User) -> String {
+        viewModel.displayName(for: user, member: member(for: user), fallbackID: user.id)
+    }
+
+    private func avatarFile(for user: User) -> File? {
+        member(for: user)?.avatar ?? user.avatar
+    }
+
+    private func avatarData(for user: User) -> Data? {
+        viewModel.imageData(for: avatarFile(for: user), kind: .userAvatar)
+    }
+
+    private func loadAvatar(for user: User) {
+        viewModel.loadImageResource(for: avatarFile(for: user), kind: .userAvatar)
+    }
 }
 
 public struct HomeView: View {
@@ -5586,34 +5872,163 @@ public struct HomeView: View {
     }
 
     public var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: StoatSpacing.xLarge) {
-                Text("Home")
-                    .font(.largeTitle.weight(.semibold))
-                HStack(alignment: .top, spacing: StoatSpacing.large) {
-                    GlassPanel {
-                        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                            Text("Current User").font(.headline)
-                            if let user = viewModel.currentUserID.flatMap({ viewModel.snapshot.usersByID[$0] }) ?? viewModel.currentUser {
-                                MemberRow(user: user, subtitle: user.status?.text)
+        if shouldShowLiveStartup {
+            LiveStartupView(viewModel: viewModel)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: StoatSpacing.xLarge) {
+                    Text("Home")
+                        .font(.largeTitle.weight(.semibold))
+                    HStack(alignment: .top, spacing: StoatSpacing.large) {
+                        GlassPanel {
+                            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                                Text("Current User").font(.headline)
+                                if let user = viewModel.currentUserID.flatMap({ viewModel.snapshot.usersByID[$0] }) ?? viewModel.currentUser {
+                                    MemberRow(user: user, subtitle: user.status?.text, imageData: viewModel.imageData(for: user.avatar, kind: .userAvatar))
+                                        .onAppear { viewModel.loadImageResource(for: user.avatar, kind: .userAvatar) }
+                                }
+                            }
+                        }
+                        GlassPanel {
+                            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                                Text("Recent DMs").font(.headline)
+                                ForEach(viewModel.snapshot.channelsByID.values.filter { $0.kind == .directMessage }) { channel in
+                                    Button(channel.displayName) { viewModel.selectChannel(channel.id) }
+                                        .buttonStyle(GlassButtonStyle())
+                                }
                             }
                         }
                     }
-                    GlassPanel {
-                        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                            Text("Recent DMs").font(.headline)
-                            ForEach(viewModel.snapshot.channelsByID.values.filter { $0.kind == .directMessage }) { channel in
-                                Button(channel.displayName) { viewModel.selectChannel(channel.id) }
-                                    .buttonStyle(GlassButtonStyle())
-                            }
-                        }
-                    }
+                    FriendsPlaceholderView(viewModel: viewModel)
                 }
-                FriendsPlaceholderView(viewModel: viewModel)
+                .padding(StoatSpacing.xxLarge)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(StoatSpacing.xxLarge)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var shouldShowLiveStartup: Bool {
+        viewModel.effectiveRuntimeMode == .liveManual &&
+            (viewModel.effectiveSessionState != .connected || viewModel.snapshot.serversByID.isEmpty)
+    }
+}
+
+public struct LiveStartupView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xLarge) {
+            VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                Text("Liquid Bagel")
+                    .font(.largeTitle.weight(.semibold))
+                Text(statusTitle)
+                    .font(.title3.weight(.medium))
+                Text(statusMessage)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: 520, alignment: .leading)
+            }
+
+            HStack(spacing: StoatSpacing.medium) {
+                Button(primaryActionTitle) {
+                    primaryAction()
+                }
+                .buttonStyle(GlassButtonStyle())
+
+                Button("Account & Connection") {
+                    viewModel.showAccountSessions()
+                }
+                .buttonStyle(GlassButtonStyle())
+
+                if viewModel.sessionCoordinator?.hasSavedCredential == true {
+                    Button("Validate Session") {
+                        Task {
+                            await viewModel.sessionCoordinator?.validateSavedSession()
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                }
+            }
+
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                    LabeledContent("Environment", value: environmentText)
+                    LabeledContent("Credential", value: viewModel.sessionCoordinator?.hasSavedCredential == true ? "Saved" : "Missing")
+                    LabeledContent("Connection", value: connectionText)
+                    LabeledContent("Ready", value: viewModel.sessionCoordinator?.hydrationStatus.readyReceived == true ? "Received" : "Waiting")
+                }
+            }
+            .frame(maxWidth: 460, alignment: .leading)
+
+            Spacer()
+        }
+        .padding(StoatSpacing.xxLarge)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var statusTitle: String {
+        switch viewModel.effectiveSessionState {
+        case .signedOut:
+            "Set up a live session"
+        case .savedCredentialUnvalidated, .readyToConnect, .validatedReady:
+            "Ready to connect manually"
+        case .connecting, .loadingCredential, .validatingCredential:
+            "Preparing live session"
+        case .connected:
+            viewModel.snapshot.serversByID.isEmpty ? "Connected with no servers" : "Connected"
+        case .invalidSession, .validationFailed, .connectionFailed, .keychainFailed, .failed:
+            "Live session needs attention"
+        case .mock:
+            "Preview data"
+        }
+    }
+
+    private var statusMessage: String {
+        switch viewModel.effectiveSessionState {
+        case .signedOut:
+            "No saved credential is available for this environment. Set up a session before connecting."
+        case .savedCredentialUnvalidated:
+            "A credential exists, but Liquid Bagel will not validate or connect until you ask."
+        case .readyToConnect, .validatedReady:
+            "Connect manually when you are ready to dogfood against live Stoat."
+        case .connected:
+            viewModel.snapshot.serversByID.isEmpty ? "Ready arrived, but no servers are available in the live snapshot." : "Live data is ready."
+        case .connecting, .loadingCredential, .validatingCredential:
+            "Live setup is running because you requested it."
+        case .invalidSession, .validationFailed, .connectionFailed, .keychainFailed, .failed:
+            viewModel.sessionCoordinator?.lastErrorMessage ?? "Open Account & Connection to repair the session."
+        case .mock:
+            "Preview data is available only for development."
+        }
+    }
+
+    private var primaryActionTitle: String {
+        viewModel.sessionCoordinator?.hasSavedCredential == true ? "Connect Manually" : "Set Up Session"
+    }
+
+    private func primaryAction() {
+        if viewModel.sessionCoordinator?.hasSavedCredential == true {
+            Task { await viewModel.connectLiveManually() }
+        } else {
+            viewModel.showAccountSessions()
+        }
+    }
+
+    private var environmentText: String {
+        guard let coordinator = viewModel.sessionCoordinator else { return "Stoat Production" }
+        return Phase6UIHelpers.environmentDisplayName(coordinator.environment, preferences: coordinator.preferences)
+    }
+
+    private var connectionText: String {
+        Phase6UIHelpers.connectionHealthText(
+            state: viewModel.effectiveConnectionState,
+            diagnostics: viewModel.effectiveDiagnostics,
+            hydration: viewModel.sessionCoordinator?.hydrationStatus ?? .empty
+        )
     }
 }
 
@@ -6016,7 +6431,7 @@ public struct LiquidBagelSettingsView: View {
             }
             Section("Status") {
                 LabeledContent("App phase", value: "Phase 5")
-                LabeledContent("Runtime", value: "Mock by default, Live Manual only")
+                LabeledContent("Runtime", value: "Live-first, manual connect only")
                 LabeledContent("Credentials", value: "Keychain scoped by environment")
                 LabeledContent("Custom environment", value: "Memory-only")
             }

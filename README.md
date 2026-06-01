@@ -1,6 +1,6 @@
 # Liquid Bagel
 
-Liquid Bagel is a native macOS SwiftUI client skeleton for Stoat. It now includes verified model/API/realtime foundations, an explicit mock-safe runtime, manual credential setup, safe non-token preference persistence, focused account/session management, and a repaired live-manual chat send path.
+Liquid Bagel is a native macOS SwiftUI client skeleton for Stoat. It now includes verified model/API/realtime foundations, a live-first manual runtime, retained preview/test mock data, manual credential setup, safe non-token preference persistence, focused account/session management, inline image previews, identity media, and a repaired live-manual chat send path.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ The check script runs every local Swift package test target, then builds the mac
 - `Packages/StoatUI`: placeholder native chat shell UI.
 - `Packages/StoatFeatures`: feature facade used by the app target.
 - `Docs/Research.md`: Stoat docs/source research notes.
-- `Docs/Phase1.md` ... `Docs/Phase20.md`: phase implementation summaries and handoff notes.
+- `Docs/Phase1.md` ... `Docs/Phase21.md`: phase implementation summaries and handoff notes.
 
 ## Phase Roadmap
 
@@ -43,8 +43,8 @@ The check script runs every local Swift package test target, then builds the mac
 5. Phase 4: controlled live manual runtime and message actions.
 6. Phase 5: manual credential import, login/MFA, Keychain scoping, and verification.
 7. Phase 6: safe preferences, environment profiles, account summary, and session management.
-8. Phases 7-20: timeline actions, replies, diagnostics, search, attachments/media, notifications/lifecycle, and the live send repair.
+8. Phases 7-21: timeline actions, replies, diagnostics, search, attachments/media, notifications/lifecycle, live send repair, live-first startup, inline images, avatars, server icons, and banners.
 
 ## Current Limits
 
-No real Stoat credentials are required to run the app. The app launches in mock mode, never auto-connects to live Stoat, and stores session tokens only in Keychain. Live chat send is available only after an explicit manual connection. Persistent message cache, friends/discover APIs, voice, broad server/channel settings, and automatic background media/network work remain deferred.
+No real Stoat credentials are required to run the app. Normal launch is live-first and starts signed out or ready for manual connection; it never auto-connects to live Stoat, never auto-validates credentials on launch, and stores session tokens only in Keychain. Preview/mock data remains available for tests, previews, and developer controls. Persistent message/media cache, friends/discover APIs, voice, broad server/channel settings, and automatic background networking remain deferred.

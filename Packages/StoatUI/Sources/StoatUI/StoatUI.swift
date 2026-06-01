@@ -850,23 +850,19 @@ public struct AvatarView: View {
     private let subtitle: String?
     private let size: CGFloat
     private let isOnline: Bool?
+    private let imageData: Data?
 
-    public init(title: String, subtitle: String? = nil, size: CGFloat = StoatSize.avatar, isOnline: Bool? = nil) {
+    public init(title: String, subtitle: String? = nil, size: CGFloat = StoatSize.avatar, isOnline: Bool? = nil, imageData: Data? = nil) {
         self.title = title
         self.subtitle = subtitle
         self.size = size
         self.isOnline = isOnline
+        self.imageData = imageData
     }
 
     public var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            RoundedRectangle(cornerRadius: min(StoatRadius.avatar, size / 4), style: .continuous)
-                .fill(LinearGradient(colors: [Color.accentColor.opacity(0.78), Color.pink.opacity(0.52)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                .overlay {
-                    Text(StoatInitials.make(title))
-                        .font(.system(size: max(11, size * 0.36), weight: .bold))
-                        .foregroundStyle(.white)
-                }
+            avatarContent
             if let isOnline {
                 PresenceDot(isOnline: isOnline)
                     .offset(x: 2, y: 2)
@@ -875,18 +871,66 @@ public struct AvatarView: View {
         .frame(width: size, height: size)
         .accessibilityLabel(subtitle.map { "\(title), \($0)" } ?? title)
     }
+
+    @ViewBuilder private var avatarContent: some View {
+        #if canImport(AppKit)
+        if let imageData, let image = NSImage(data: imageData) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: min(StoatRadius.avatar, size / 4), style: .continuous))
+        } else {
+            fallback
+        }
+        #else
+        fallback
+        #endif
+    }
+
+    private var fallback: some View {
+        RoundedRectangle(cornerRadius: min(StoatRadius.avatar, size / 4), style: .continuous)
+            .fill(LinearGradient(colors: [Color.accentColor.opacity(0.78), Color.pink.opacity(0.52)], startPoint: .topLeading, endPoint: .bottomTrailing))
+            .overlay {
+                Text(StoatInitials.make(title))
+                    .font(.system(size: max(11, size * 0.36), weight: .bold))
+                    .foregroundStyle(.white)
+            }
+    }
 }
 
 public struct ServerIconView: View {
     private let name: String
     private let isSelected: Bool
+    private let imageData: Data?
 
-    public init(name: String, isSelected: Bool = false) {
+    public init(name: String, isSelected: Bool = false, imageData: Data? = nil) {
         self.name = name
         self.isSelected = isSelected
+        self.imageData = imageData
     }
 
     public var body: some View {
+        content
+            .frame(width: StoatSize.serverIcon, height: StoatSize.serverIcon)
+    }
+
+    @ViewBuilder private var content: some View {
+        #if canImport(AppKit)
+        if let imageData, let image = NSImage(data: imageData) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .clipShape(RoundedRectangle(cornerRadius: isSelected ? 15 : StoatRadius.avatar, style: .continuous))
+        } else {
+            fallback
+        }
+        #else
+        fallback
+        #endif
+    }
+
+    private var fallback: some View {
         RoundedRectangle(cornerRadius: isSelected ? 15 : StoatRadius.avatar, style: .continuous)
             .fill(LinearGradient(colors: [Color.cyan.opacity(0.82), Color.indigo.opacity(0.72)], startPoint: .topLeading, endPoint: .bottomTrailing))
             .overlay {
@@ -894,7 +938,6 @@ public struct ServerIconView: View {
                     .font(.headline.weight(.bold))
                     .foregroundStyle(.white)
             }
-            .frame(width: StoatSize.serverIcon, height: StoatSize.serverIcon)
     }
 }
 
@@ -1004,6 +1047,7 @@ public struct MessageRow: View {
     @State private var isHovering = false
     private let message: Message
     private let author: User?
+    private let authorDisplayNameOverride: String?
     private let showsHeader: Bool
     private let statusText: String?
     private let isSelected: Bool
@@ -1014,6 +1058,7 @@ public struct MessageRow: View {
     private let searchAccessibilityStatus: String?
     private let replyPreview: String?
     private let attachmentItems: [AttachmentDisplayItem]?
+    private let authorAvatarData: Data?
     private let actionItems: [MessageRowActionItem]
     private let reactionItems: [MessageReactionDisplayItem]
     private let onMessageAction: (String) -> Void
@@ -1026,6 +1071,7 @@ public struct MessageRow: View {
     public init(
         message: Message,
         author: User?,
+        authorDisplayNameOverride: String? = nil,
         showsHeader: Bool = true,
         statusText: String? = nil,
         isSelected: Bool = false,
@@ -1036,6 +1082,7 @@ public struct MessageRow: View {
         searchAccessibilityStatus: String? = nil,
         replyPreview: String? = nil,
         attachmentItems: [AttachmentDisplayItem]? = nil,
+        authorAvatarData: Data? = nil,
         actionItems: [MessageRowActionItem] = [],
         reactionItems: [MessageReactionDisplayItem] = [],
         onMessageAction: @escaping (String) -> Void = { _ in },
@@ -1047,6 +1094,7 @@ public struct MessageRow: View {
     ) {
         self.message = message
         self.author = author
+        self.authorDisplayNameOverride = authorDisplayNameOverride
         self.showsHeader = showsHeader
         self.statusText = statusText
         self.isSelected = isSelected
@@ -1057,6 +1105,7 @@ public struct MessageRow: View {
         self.searchAccessibilityStatus = searchAccessibilityStatus
         self.replyPreview = replyPreview
         self.attachmentItems = attachmentItems
+        self.authorAvatarData = authorAvatarData
         self.actionItems = actionItems
         self.reactionItems = reactionItems
         self.onMessageAction = onMessageAction
@@ -1077,7 +1126,7 @@ public struct MessageRow: View {
         )
         HStack(alignment: .top, spacing: StoatSpacing.medium) {
             if showsHeader {
-                AvatarView(title: authorName, size: StoatSize.avatar, isOnline: author?.online)
+                AvatarView(title: authorName, size: StoatSize.avatar, isOnline: author?.online, imageData: authorAvatarData)
             } else {
                 Text(timestampText)
                     .font(.caption2)
@@ -1277,7 +1326,7 @@ public struct MessageRow: View {
     }
 
     private var authorName: String {
-        message.masquerade?.name ?? author?.displayName ?? author?.username ?? message.authorID.rawValue
+        message.masquerade?.name ?? authorDisplayNameOverride ?? author?.displayName ?? author?.username ?? message.authorID.rawValue
     }
 
     private var timestampText: String {
@@ -1350,6 +1399,7 @@ public struct AttachmentTimelineCard: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            inlineImagePreview
             HStack(spacing: StoatSpacing.small) {
                 thumbnail
                 VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
@@ -1375,6 +1425,29 @@ public struct AttachmentTimelineCard: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(StoatAccessibility.attachmentLabel(filename: item.displayName, kind: item.kind.label, size: AttachmentDisplayFormatting.formattedSize(item.byteCount), state: item.previewState.safeLabel))
+    }
+
+    @ViewBuilder private var inlineImagePreview: some View {
+        #if canImport(AppKit)
+        if item.kind == .image,
+           item.previewState.isReady,
+           let data = item.previewData,
+           let image = NSImage(data: data) {
+            Button(action: onPreview) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: isCompact ? 300 : 360, maxHeight: isCompact ? 180 : 240, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                    }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open image \(item.displayName)")
+        }
+        #endif
     }
 
     private var thumbnail: some View {
@@ -1632,15 +1705,17 @@ public struct ServerRailItem: View {
     private let unreadCount: Int
     private let mentionCount: Int
     private let isDisabled: Bool
+    private let imageData: Data?
     private let action: () -> Void
 
-    public init(title: String, systemImage: String? = nil, isSelected: Bool = false, unreadCount: Int = 0, mentionCount: Int = 0, isDisabled: Bool = false, action: @escaping () -> Void) {
+    public init(title: String, systemImage: String? = nil, isSelected: Bool = false, unreadCount: Int = 0, mentionCount: Int = 0, isDisabled: Bool = false, imageData: Data? = nil, action: @escaping () -> Void) {
         self.title = title
         self.systemImage = systemImage
         self.isSelected = isSelected
         self.unreadCount = unreadCount
         self.mentionCount = mentionCount
         self.isDisabled = isDisabled
+        self.imageData = imageData
         self.action = action
     }
 
@@ -1681,7 +1756,7 @@ public struct ServerRailItem: View {
                 .frame(width: StoatSize.serverIcon, height: StoatSize.serverIcon)
                 .background(isSelected ? Color.accentColor.opacity(0.26) : Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: isSelected ? 15 : StoatRadius.avatar, style: .continuous))
         } else {
-            ServerIconView(name: title, isSelected: isSelected)
+            ServerIconView(name: title, isSelected: isSelected, imageData: imageData)
         }
     }
 }
@@ -1689,17 +1764,22 @@ public struct ServerRailItem: View {
 public struct MemberRow: View {
     private let user: User
     private let subtitle: String?
+    private let displayName: String?
+    private let imageData: Data?
 
-    public init(user: User, subtitle: String? = nil) {
+    public init(user: User, subtitle: String? = nil, displayName: String? = nil, imageData: Data? = nil) {
         self.user = user
         self.subtitle = subtitle
+        self.displayName = displayName
+        self.imageData = imageData
     }
 
     public var body: some View {
+        let name = displayName ?? user.displayName ?? user.username
         HStack(spacing: StoatSpacing.medium) {
-            AvatarView(title: user.displayName ?? user.username, size: StoatSize.compactAvatar, isOnline: user.online)
+            AvatarView(title: name, size: StoatSize.compactAvatar, isOnline: user.online, imageData: imageData)
             VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
-                Text(user.displayName ?? user.username)
+                Text(name)
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
                 Text(subtitle ?? "@\(user.username)")

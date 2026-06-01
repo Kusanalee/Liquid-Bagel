@@ -43,6 +43,12 @@ public enum PreferredLaunchMode: String, Codable, Hashable, Sendable {
     case rememberLastButDoNotConnect
 }
 
+public enum InlineImagePreviewPolicy: String, Codable, Hashable, Sendable, CaseIterable {
+    case automaticSmallImages
+    case explicitClickOnly
+    case disabled
+}
+
 public enum MessageDensityPreference: String, Codable, Hashable, Sendable, CaseIterable {
     case comfortable
     case compact
@@ -307,6 +313,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public var memberPanelVisible: Bool
     public var messageDensity: MessageDensityPreference
     public var reduceGlassIntensity: Bool
+    public var inlineImagePreviewPolicy: InlineImagePreviewPolicy
     public var timelineTuning: TimelineTuningConfiguration
     public var notificationPreferences: NotificationPreferences
 
@@ -320,6 +327,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         case memberPanelVisible
         case messageDensity
         case reduceGlassIntensity
+        case inlineImagePreviewPolicy
         case timelineTuning
         case notificationPreferences
     }
@@ -334,6 +342,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         memberPanelVisible: Bool = true,
         messageDensity: MessageDensityPreference = .comfortable,
         reduceGlassIntensity: Bool = false,
+        inlineImagePreviewPolicy: InlineImagePreviewPolicy = .automaticSmallImages,
         timelineTuning: TimelineTuningConfiguration = .defaults,
         notificationPreferences: NotificationPreferences = .defaults
     ) {
@@ -346,6 +355,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.memberPanelVisible = memberPanelVisible
         self.messageDensity = messageDensity
         self.reduceGlassIntensity = reduceGlassIntensity
+        self.inlineImagePreviewPolicy = inlineImagePreviewPolicy
         self.timelineTuning = timelineTuning.validated()
         self.notificationPreferences = notificationPreferences.validated()
     }
@@ -362,6 +372,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
             memberPanelVisible: try container.decodeIfPresent(Bool.self, forKey: .memberPanelVisible) ?? true,
             messageDensity: try container.decodeIfPresent(MessageDensityPreference.self, forKey: .messageDensity) ?? .comfortable,
             reduceGlassIntensity: try container.decodeIfPresent(Bool.self, forKey: .reduceGlassIntensity) ?? false,
+            inlineImagePreviewPolicy: try container.decodeIfPresent(InlineImagePreviewPolicy.self, forKey: .inlineImagePreviewPolicy) ?? .automaticSmallImages,
             timelineTuning: try container.decodeIfPresent(TimelineTuningConfiguration.self, forKey: .timelineTuning) ?? .defaults,
             notificationPreferences: try container.decodeIfPresent(NotificationPreferences.self, forKey: .notificationPreferences) ?? .defaults
         )
@@ -378,6 +389,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         try container.encode(memberPanelVisible, forKey: .memberPanelVisible)
         try container.encode(messageDensity, forKey: .messageDensity)
         try container.encode(reduceGlassIntensity, forKey: .reduceGlassIntensity)
+        try container.encode(inlineImagePreviewPolicy, forKey: .inlineImagePreviewPolicy)
         try container.encode(timelineTuning.validated(), forKey: .timelineTuning)
         try container.encode(notificationPreferences.validated(), forKey: .notificationPreferences)
     }

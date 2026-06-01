@@ -165,7 +165,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testSessionStartsInMockModeAndDoesNotAutoConnect() async throws {
+    func testSessionStartsLiveFirstAndMockPreviewDoesNotAutoConnect() async throws {
         let realtime = RecordingRealtimeClient()
         let session = AppSessionCoordinator(
             tokenStore: InMemoryTokenStore(),
@@ -173,12 +173,14 @@ final class StoatFeaturesTests: XCTestCase {
             realtimeClientFactory: { realtime }
         )
 
-        XCTAssertEqual(session.mode, .mock)
-        XCTAssertEqual(session.sessionState, .mock)
+        XCTAssertEqual(session.mode, .liveManual)
+        XCTAssertEqual(session.sessionState, .signedOut)
+        XCTAssertTrue(session.snapshot.serversByID.isEmpty)
         await session.startMockSession()
 
         let connectCallCount = await realtime.connectCallCount
         XCTAssertEqual(connectCallCount, 0)
+        XCTAssertEqual(session.mode, .mock)
         XCTAssertEqual(session.snapshot, MockShellData.snapshot)
     }
 
@@ -2324,6 +2326,114 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(redacted.contains("queuedRoutes: 1"))
     }
 
+    @MainActor
+    func testPhase21LiveFirstStartupUsesEmptySnapshotWithoutConnectingOrValidating() async {
+        let realtime = RecordingRealtimeClient()
+        let api = RecordingAPIClient()
+        let session = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            apiClientFactory: { _, _ in api },
+            realtimeClientFactory: { realtime }
+        )
+
+        await session.startLiveFirstSession()
+
+        XCTAssertEqual(session.mode, .liveManual)
+        XCTAssertEqual(session.sessionState, .signedOut)
+        XCTAssertTrue(session.snapshot.serversByID.isEmpty)
+        XCTAssertNil(session.currentUser)
+        let connectCallCount = await realtime.connectCallCount
+        let fetchCurrentUserCallCount = await api.fetchCurrentUserCallCount
+        XCTAssertEqual(connectCallCount, 0)
+        XCTAssertEqual(fetchCurrentUserCallCount, 0)
+    }
+
+    @MainActor
+    func testPhase21SavedCredentialIsUnvalidatedAndDoesNotConnectOnStartup() async {
+        let realtime = RecordingRealtimeClient()
+        let api = RecordingAPIClient()
+        let session = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(credential: .sessionToken("token")),
+            apiClientFactory: { _, _ in api },
+            realtimeClientFactory: { realtime }
+        )
+
+        await session.startLiveFirstSession()
+
+        XCTAssertEqual(session.sessionState, .savedCredentialUnvalidated)
+        XCTAssertTrue(session.hasSavedCredential)
+        XCTAssertNil(session.currentUser)
+        let connectCallCount = await realtime.connectCallCount
+        let fetchCurrentUserCallCount = await api.fetchCurrentUserCallCount
+        XCTAssertEqual(connectCallCount, 0)
+        XCTAssertEqual(fetchCurrentUserCallCount, 0)
+    }
+
+    @MainActor
+    func testPhase21InlineImagePolicyAutoLoadsSmallVisibleImages() async {
+        let data = Data("png".utf8)
+        let loader = MockRemoteAttachmentLoader(result: .success(RemoteAttachmentData(filename: "photo.png", contentType: "image/png", byteCount: data.count, data: data)))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, remoteAttachmentLoader: loader)
+        let file = File(id: "phase21-image", tag: "attachments", filename: "photo.png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
+        let message = Message(id: "01J00000000000000000021001", channelID: "01HX0000000000000000000101", authorID: MockShellData.currentUserID, attachments: [file])
+
+        model.loadInlineImagePreviews(for: message)
+        try? await Task.sleep(for: .milliseconds(20))
+
+        let item = model.attachmentDisplayItems(for: message).first
+        let callCount = await loader.callCount()
+        XCTAssertEqual(item?.previewState, .readyRemote)
+        XCTAssertEqual(item?.previewData, data)
+        XCTAssertEqual(callCount, 1)
+    }
+
+    @MainActor
+    func testPhase21ExplicitInlinePolicyDoesNotAutoLoadImages() async {
+        let loader = MockRemoteAttachmentLoader()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, remoteAttachmentLoader: loader)
+        model.inlineImagePreviewPolicy = .explicitClickOnly
+        let file = File(id: "phase21-image-explicit", tag: "attachments", filename: "photo.png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
+        let message = Message(id: "01J00000000000000000021002", channelID: "01HX0000000000000000000101", authorID: MockShellData.currentUserID, attachments: [file])
+
+        model.loadInlineImagePreviews(for: message)
+        try? await Task.sleep(for: .milliseconds(20))
+        let callCount = await loader.callCount()
+        XCTAssertEqual(model.attachmentDisplayItems(for: message).first?.previewState, .notLoaded)
+        XCTAssertEqual(callCount, 0)
+    }
+
+    func testPhase21ImageMemoryCacheHitMissEvictionAndClear() async {
+        let cache = ImageMemoryCache(maxEntries: 1, maxBytes: 20)
+        let avatar = ImageCacheKey(id: "avatar", kind: .userAvatar)
+        let icon = ImageCacheKey(id: "icon", kind: .serverIcon)
+
+        let initial = await cache.imageData(for: avatar)
+        XCTAssertNil(initial)
+        await cache.store(Data("avatar".utf8), for: avatar)
+        let avatarData = await cache.imageData(for: avatar)
+        XCTAssertEqual(avatarData, Data("avatar".utf8))
+        await cache.store(Data("icon".utf8), for: icon)
+        let evictedAvatarData = await cache.imageData(for: avatar)
+        let iconData = await cache.imageData(for: icon)
+        XCTAssertNil(evictedAvatarData)
+        XCTAssertEqual(iconData, Data("icon".utf8))
+        await cache.removeAll()
+        let clearedIconData = await cache.imageData(for: icon)
+        XCTAssertNil(clearedIconData)
+    }
+
+    func testPhase21IdentityImagesUseExpectedAutumnTags() {
+        let base = StoatAPIEnvironment.production.mediaBaseURL!
+        let avatarURL = try? LiveRemoteAttachmentLoader.mediaURL(baseURL: base, tag: "avatars", fileID: "avatar id", filename: nil)
+        let iconURL = try? LiveRemoteAttachmentLoader.mediaURL(baseURL: base, tag: "icons", fileID: "icon id", filename: nil)
+        let bannerURL = try? LiveRemoteAttachmentLoader.mediaURL(baseURL: base, tag: "banners", fileID: "banner id", filename: nil)
+
+        XCTAssertEqual(avatarURL?.absoluteString, "https://cdn.stoatusercontent.com/avatars/avatar%20id")
+        XCTAssertEqual(iconURL?.absoluteString, "https://cdn.stoatusercontent.com/icons/icon%20id")
+        XCTAssertEqual(bannerURL?.absoluteString, "https://cdn.stoatusercontent.com/banners/banner%20id")
+        XCTAssertNil(URLComponents(url: bannerURL!, resolvingAgainstBaseURL: false)?.queryItems)
+    }
+
     private func phase18Snapshot(currentUserID: UserID, otherUserID: UserID, textChannelID: ChannelID, dmChannelID: ChannelID) -> RealtimeSnapshot {
         let currentUser = User(id: currentUserID, username: "me", displayName: "Me")
         let otherUser = User(id: otherUserID, username: "other", displayName: "Other")
@@ -2464,6 +2574,7 @@ private actor RecordingRealtimeClient: StoatRealtimeClient {
 }
 
 private actor RecordingAPIClient: StoatAPIClient {
+    private(set) var fetchCurrentUserCallCount = 0
     private(set) var fetchMessagesCallCount = 0
     private(set) var sentDrafts: [(ChannelID, MessageDraft)] = []
     private(set) var editedMessages: [(ChannelID, MessageID, MessageEditDraft)] = []
@@ -2490,7 +2601,8 @@ private actor RecordingAPIClient: StoatAPIClient {
     }
 
     func fetchCurrentUser() async throws -> User {
-        currentUser
+        fetchCurrentUserCallCount += 1
+        return currentUser
     }
 
     func fetchServers() async throws -> [Server] {
