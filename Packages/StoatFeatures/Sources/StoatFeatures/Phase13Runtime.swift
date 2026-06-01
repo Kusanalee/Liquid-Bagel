@@ -224,6 +224,156 @@ public enum ChannelSearchState: Hashable, Sendable {
         if case let .results(_, results) = self { return results }
         return []
     }
+
+    public var query: ChannelSearchQuery? {
+        switch self {
+        case .idle:
+            return nil
+        case let .searching(query), let .results(query, _), let .empty(query), let .failed(query, _):
+            return query
+        }
+    }
+}
+
+public struct TimelineSearchHighlightState: Hashable, Sendable {
+    public var channelID: ChannelID?
+    public var query: String
+    public var mode: ChannelSearchMode
+    public var resultIDs: [MessageID]
+    public var currentResultID: MessageID?
+    public var unloadedResultIDs: [MessageID]
+    public var updatedAt: Date?
+
+    public init(
+        channelID: ChannelID?,
+        query: String,
+        mode: ChannelSearchMode,
+        resultIDs: [MessageID],
+        currentResultID: MessageID?,
+        unloadedResultIDs: [MessageID] = [],
+        updatedAt: Date? = Date()
+    ) {
+        self.channelID = channelID
+        self.query = TimelineCopyFormatter.redactTokenLikeStrings(query)
+        self.mode = mode
+        self.resultIDs = resultIDs
+        self.currentResultID = currentResultID
+        self.unloadedResultIDs = unloadedResultIDs
+        self.updatedAt = updatedAt
+    }
+
+    public var loadedResultIDs: [MessageID] {
+        let unloaded = Set(unloadedResultIDs)
+        return resultIDs.filter { !unloaded.contains($0) }
+    }
+
+    public var isEmpty: Bool { resultIDs.isEmpty }
+
+    public func contains(_ messageID: MessageID) -> Bool {
+        resultIDs.contains(messageID) && !unloadedResultIDs.contains(messageID)
+    }
+
+    public func isCurrent(_ messageID: MessageID) -> Bool {
+        currentResultID == messageID
+    }
+
+    public func indexOfCurrent() -> Int? {
+        guard let currentResultID else { return nil }
+        return resultIDs.firstIndex(of: currentResultID).map { $0 + 1 }
+    }
+
+    public static func make(
+        channelID: ChannelID?,
+        query: ChannelSearchQuery,
+        results: [ChannelSearchResult],
+        currentResultID: MessageID?,
+        loadedMessageIDs: Set<MessageID>,
+        updatedAt: Date = Date()
+    ) -> TimelineSearchHighlightState? {
+        guard !results.isEmpty else { return nil }
+        let scoped = results.filter { result in
+            guard let channelID else { return true }
+            return result.channelID == channelID
+        }
+        guard !scoped.isEmpty else { return nil }
+        let resultIDs = scoped.map(\.messageID)
+        let unloaded = scoped.filter { !loadedMessageIDs.contains($0.messageID) }.map(\.messageID)
+        let preferredCurrent = currentResultID.flatMap { resultIDs.contains($0) ? $0 : nil }
+            ?? scoped.first(where: { loadedMessageIDs.contains($0.messageID) })?.messageID
+            ?? resultIDs.first
+        return TimelineSearchHighlightState(
+            channelID: channelID,
+            query: query.trimmedText,
+            mode: query.mode,
+            resultIDs: resultIDs,
+            currentResultID: preferredCurrent,
+            unloadedResultIDs: unloaded,
+            updatedAt: updatedAt
+        )
+    }
+}
+
+public enum TimelineDefaultTuningDecision: Hashable, Sendable {
+    case remainConservative(reason: String)
+    case recommendBalanced(reason: String)
+    case recommendCustom(TimelineTuningConfiguration, reason: String)
+
+    public var title: String {
+        switch self {
+        case .remainConservative: "Remain Conservative"
+        case .recommendBalanced: "Recommend Balanced"
+        case .recommendCustom: "Recommend Custom"
+        }
+    }
+
+    public var reason: String {
+        switch self {
+        case let .remainConservative(reason), let .recommendBalanced(reason), let .recommendCustom(_, reason):
+            return reason
+        }
+    }
+
+    public var recommendedConfiguration: TimelineTuningConfiguration {
+        switch self {
+        case .remainConservative:
+            return TimelineTuningPreset.conservative.configuration
+        case .recommendBalanced:
+            return TimelineTuningPreset.balanced.configuration
+        case let .recommendCustom(configuration, _):
+            return configuration.validated()
+        }
+    }
+}
+
+public enum TimelineDefaultTuningAdvisor {
+    public static func decision(notes: [String], recommendation: TimelineTuningRecommendation?) -> TimelineDefaultTuningDecision {
+        let redactedNotes = notes
+            .map(TimelineCopyFormatter.redactTokenLikeStrings)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !redactedNotes.isEmpty || recommendation != nil else {
+            return .remainConservative(reason: "No real Live Manual calibration notes are recorded, so Phase 14 keeps the conservative default.")
+        }
+
+        let joined = redactedNotes.joined(separator: "\n").lowercased()
+        let balancedSignals = ["balanced", "stable at balanced", "recommend balanced", "move to balanced"]
+            .filter { joined.contains($0) }
+            .count
+        let cautionSignals = ["noisy", "unstable", "failed", "warning", "conservative", "regression"]
+            .filter { joined.contains($0) }
+            .count
+
+        if let recommendation,
+           recommendation.recommendedTuning != TimelineTuningPreset.conservative.configuration,
+           recommendation.recommendedTuning != TimelineTuningPreset.balanced.configuration {
+            return .recommendCustom(recommendation.recommendedTuning, reason: TimelineCopyFormatter.redactTokenLikeStrings(recommendation.detail))
+        }
+
+        if balancedSignals > 0 && cautionSignals == 0 {
+            return .recommendBalanced(reason: "Imported calibration notes consistently mention Balanced without warning signals.")
+        }
+
+        return .remainConservative(reason: "Calibration notes are absent, mixed, or noisy; keep the safer conservative default and apply other presets manually.")
+    }
 }
 
 public enum Phase13Accessibility {
@@ -241,6 +391,20 @@ public enum Phase13Accessibility {
         parts.append(result.isLoaded ? "Loaded" : "Outside loaded range")
         if isSelected { parts.append("Selected") }
         return parts.joined(separator: ", ")
+    }
+
+    public static func searchHighlightLabel(isHighlighted: Bool, isCurrent: Bool) -> String? {
+        guard isHighlighted else { return nil }
+        return isCurrent ? "current search result" : "search result"
+    }
+
+    public static func searchResultCountLabel(mode: ChannelSearchMode, currentIndex: Int?, total: Int, loaded: Int, unloaded: Int) -> String {
+        let position = currentIndex.map { "result \($0) of \(total)" } ?? "\(total) results"
+        return "\(mode.displayName), \(position), \(loaded) loaded, \(unloaded) outside loaded range"
+    }
+
+    public static func loadAroundCurrentResultHint(canLoad: Bool) -> String {
+        canLoad ? "Loads messages around the current search result after explicit confirmation." : "Current search result is already loaded or the route is unavailable."
     }
 
     public static func routeCapabilityLabel(_ name: String, status: TimelineRouteVerificationStatus) -> String {

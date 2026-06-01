@@ -118,10 +118,22 @@ struct AppCommands: Commands {
             Button("Previous Search Result") {
                 commandHandler?.perform(.selectPreviousSearchResult)
             }
-            .keyboardShortcut(.upArrow, modifiers: [.command, .shift])
+            .keyboardShortcut("g", modifiers: [.command, .shift])
             .disabled(commandHandler?.canPerform(.selectPreviousSearchResult) == false)
 
             Button("Next Search Result") {
+                commandHandler?.perform(.selectNextSearchResult)
+            }
+            .keyboardShortcut("g", modifiers: [.command])
+            .disabled(commandHandler?.canPerform(.selectNextSearchResult) == false)
+
+            Button("Previous Search Result by Row") {
+                commandHandler?.perform(.selectPreviousSearchResult)
+            }
+            .keyboardShortcut(.upArrow, modifiers: [.command, .shift])
+            .disabled(commandHandler?.canPerform(.selectPreviousSearchResult) == false)
+
+            Button("Next Search Result by Row") {
                 commandHandler?.perform(.selectNextSearchResult)
             }
             .keyboardShortcut(.downArrow, modifiers: [.command, .shift])
@@ -138,6 +150,12 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut(.return, modifiers: [.command, .option])
             .disabled(commandHandler?.canPerform(.loadAroundSelectedSearchResult) == false)
+
+            Button("Clear Search Highlights") {
+                commandHandler?.perform(.clearSearchHighlights)
+            }
+            .keyboardShortcut(.escape, modifiers: [.command, .shift])
+            .disabled(commandHandler?.canPerform(.clearSearchHighlights) == false)
         }
 
         CommandMenu("Message") {

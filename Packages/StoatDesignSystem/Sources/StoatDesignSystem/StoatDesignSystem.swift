@@ -76,6 +76,44 @@ public enum StoatAnimation {
     }
 }
 
+public struct SearchHighlightStyle: Hashable, Sendable {
+    public var isHighlighted: Bool
+    public var isCurrent: Bool
+    public var highContrast: Bool
+    public var reduceTransparency: Bool
+    public var compactDensity: Bool
+
+    public init(isHighlighted: Bool = false, isCurrent: Bool = false, highContrast: Bool = false, reduceTransparency: Bool = false, compactDensity: Bool = false) {
+        self.isHighlighted = isHighlighted
+        self.isCurrent = isCurrent
+        self.highContrast = highContrast
+        self.reduceTransparency = reduceTransparency
+        self.compactDensity = compactDensity
+    }
+
+    public var fillOpacity: Double {
+        guard isHighlighted else { return 0 }
+        if reduceTransparency { return isCurrent ? 0.22 : 0.15 }
+        if highContrast { return isCurrent ? 0.24 : 0.16 }
+        return isCurrent ? 0.16 : 0.09
+    }
+
+    public var borderOpacity: Double {
+        guard isHighlighted else { return 0 }
+        if highContrast { return isCurrent ? 0.78 : 0.52 }
+        return isCurrent ? 0.58 : 0.28
+    }
+
+    public var borderWidth: CGFloat {
+        guard isHighlighted else { return 0 }
+        return highContrast || isCurrent ? 1.5 : 1
+    }
+
+    public var verticalPaddingAdjustment: CGFloat {
+        compactDensity ? 0 : 1
+    }
+}
+
 public enum StoatBadges {
     public static func displayCount(_ count: Int) -> String {
         if count <= 0 { return "" }
@@ -125,7 +163,7 @@ public enum StoatAccessibility {
         return parts.joined(separator: ", ")
     }
 
-    public static func messageLabel(author: String, timestamp: String, content: String, isEdited: Bool = false, isPinned: Bool = false, reactionCount: Int = 0, status: String? = nil, isSelected: Bool = false, isFocused: Bool = false, replyPreview: String? = nil) -> String {
+    public static func messageLabel(author: String, timestamp: String, content: String, isEdited: Bool = false, isPinned: Bool = false, reactionCount: Int = 0, status: String? = nil, isSelected: Bool = false, isFocused: Bool = false, searchResultStatus: String? = nil, replyPreview: String? = nil) -> String {
         var parts = [author, timestamp, content.isEmpty ? "message" : content]
         if let replyPreview, !replyPreview.isEmpty { parts.append("reply to \(replyPreview)") }
         if isEdited { parts.append("edited") }
@@ -134,6 +172,7 @@ public enum StoatAccessibility {
         if let status, !status.isEmpty { parts.append(status) }
         if isSelected { parts.append("selected") }
         if isFocused { parts.append("focused") }
+        if let searchResultStatus, !searchResultStatus.isEmpty { parts.append(searchResultStatus) }
         return parts.joined(separator: ", ")
     }
 

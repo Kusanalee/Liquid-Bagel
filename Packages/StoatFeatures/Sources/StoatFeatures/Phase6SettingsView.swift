@@ -599,6 +599,7 @@ private struct TimelineValidationHarnessView: View {
             warningList(diagnostics.validationWarnings)
             actionGrid
             tuningControls
+            defaultTuningDecisionControls
             calibrationControls
             findControls
             checklist(diagnostics)
@@ -723,19 +724,33 @@ private struct TimelineValidationHarnessView: View {
                     .disabled(run?.isRunning != true)
                 Button("Copy Calibration") { viewModel.copyRedactedTimelineCalibration() }
                     .disabled(run == nil)
-                Button("Apply Recommendation") { viewModel.applyTimelineCalibrationRecommendation() }
-                    .disabled(run?.recommendedAdjustments == nil)
             }
             TextField("Checkpoint note", text: $viewModel.calibrationCheckpointNote)
                 .textFieldStyle(.roundedBorder)
                 .disabled(run?.isRunning != true)
+            TextEditor(text: $viewModel.importedCalibrationNotes)
+                .frame(minHeight: 64)
+                .padding(StoatSpacing.xSmall)
+                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                .accessibilityLabel("Imported calibration notes")
+                .accessibilityHint("Paste calibration notes. Import redacts token-like text before using them.")
+            HStack {
+                Button("Import Notes") { viewModel.importCalibrationNotes() }
+                    .disabled(viewModel.importedCalibrationNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Apply Recommendation") { viewModel.applyTimelineCalibrationRecommendation() }
+                    .disabled(run?.recommendedAdjustments == nil)
+            }
             Text(Phase13Accessibility.calibrationLabel(isRunning: run?.isRunning == true, observationCount: run?.observations.count ?? 0))
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if let recommendation = run?.recommendedAdjustments {
-                Label("\(recommendation.title): \(recommendation.detail)", systemImage: "lightbulb")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                    Label("\(recommendation.title): \(recommendation.detail)", systemImage: "lightbulb")
+                    Text(tuningDiff(from: viewModel.timelineTuning, to: recommendation.recommendedTuning))
+                        .textSelection(.enabled)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             if let observations = run?.observations.suffix(4), !observations.isEmpty {
                 ForEach(Array(observations)) { observation in
@@ -746,6 +761,32 @@ private struct TimelineValidationHarnessView: View {
             }
         }
         .accessibilityLabel(Phase13Accessibility.calibrationLabel(isRunning: viewModel.activeCalibrationRun?.isRunning == true, observationCount: viewModel.activeCalibrationRun?.observations.count ?? 0))
+    }
+
+    private var defaultTuningDecisionControls: some View {
+        let decision = viewModel.defaultTuningDecision
+        return VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            Text("Default Tuning Decision").font(.subheadline.weight(.semibold))
+            LabeledContent("Current default", value: TimelineTuningPreset.conservative.displayName)
+            LabeledContent("Observed recommendation", value: decision.title)
+            Text(decision.reason)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            Text(tuningDiff(from: viewModel.timelineTuning, to: decision.recommendedConfiguration))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            HStack {
+                Button("Apply Decision") { viewModel.applyDefaultTuningDecision() }
+                Button("Reset Conservative") { viewModel.resetTimelineTuningToDefaults() }
+            }
+        }
+        .font(.caption)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Default tuning decision, \(decision.title), \(decision.reason)")
+    }
+
+    private func tuningDiff(from current: TimelineTuningConfiguration, to proposed: TimelineTuningConfiguration) -> String {
+        "Changes: near newest \(current.nearNewestMessageThreshold) to \(proposed.nearNewestMessageThreshold), visible debounce \(current.visibleRangeUpdateDebounceMilliseconds) to \(proposed.visibleRangeUpdateDebounceMilliseconds) ms, load attempts \(current.loadToUnreadMaxAttempts) to \(proposed.loadToUnreadMaxAttempts), ack debounce \(current.ackDebounceMilliseconds) to \(proposed.ackDebounceMilliseconds) ms"
     }
 
     private func binding(_ keyPath: WritableKeyPath<TimelineTuningConfiguration, Int>) -> Binding<Int> {

@@ -501,25 +501,54 @@ public struct ErrorStateView: View {
 }
 
 public struct MessageRow: View {
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     private let message: Message
     private let author: User?
     private let showsHeader: Bool
     private let statusText: String?
     private let isSelected: Bool
     private let isFocused: Bool
+    private let isSearchHighlighted: Bool
+    private let isCurrentSearchResult: Bool
+    private let isCompactDensity: Bool
+    private let searchAccessibilityStatus: String?
     private let replyPreview: String?
 
-    public init(message: Message, author: User?, showsHeader: Bool = true, statusText: String? = nil, isSelected: Bool = false, isFocused: Bool = false, replyPreview: String? = nil) {
+    public init(
+        message: Message,
+        author: User?,
+        showsHeader: Bool = true,
+        statusText: String? = nil,
+        isSelected: Bool = false,
+        isFocused: Bool = false,
+        isSearchHighlighted: Bool = false,
+        isCurrentSearchResult: Bool = false,
+        isCompactDensity: Bool = false,
+        searchAccessibilityStatus: String? = nil,
+        replyPreview: String? = nil
+    ) {
         self.message = message
         self.author = author
         self.showsHeader = showsHeader
         self.statusText = statusText
         self.isSelected = isSelected
         self.isFocused = isFocused
+        self.isSearchHighlighted = isSearchHighlighted
+        self.isCurrentSearchResult = isCurrentSearchResult
+        self.isCompactDensity = isCompactDensity
+        self.searchAccessibilityStatus = searchAccessibilityStatus
         self.replyPreview = replyPreview
     }
 
     public var body: some View {
+        let searchStyle = SearchHighlightStyle(
+            isHighlighted: isSearchHighlighted,
+            isCurrent: isCurrentSearchResult,
+            highContrast: colorSchemeContrast == .increased,
+            reduceTransparency: reduceTransparency,
+            compactDensity: isCompactDensity
+        )
         HStack(alignment: .top, spacing: StoatSpacing.medium) {
             if showsHeader {
                 AvatarView(title: authorName, size: StoatSize.avatar, isOnline: author?.online)
@@ -604,16 +633,30 @@ public struct MessageRow: View {
                 }
             }
         }
-        .padding(.vertical, showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall)
-        .background(isSelected || isFocused ? Color.accentColor.opacity(isFocused ? 0.16 : 0.10) : Color.clear, in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
+        .padding(.vertical, (showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall) + searchStyle.verticalPaddingAdjustment)
+        .background(searchBackground(searchStyle), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
         .overlay {
+            if searchStyle.isHighlighted {
+                RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous)
+                    .strokeBorder(Color.orange.opacity(searchStyle.borderOpacity), lineWidth: searchStyle.borderWidth)
+            }
             if isFocused {
                 RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous)
                     .strokeBorder(Color.accentColor.opacity(0.45), lineWidth: 1)
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: message.reactions.values.reduce(0) { $0 + $1.count }, status: statusText, isSelected: isSelected, isFocused: isFocused, replyPreview: replyPreview))
+        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: message.reactions.values.reduce(0) { $0 + $1.count }, status: statusText, isSelected: isSelected, isFocused: isFocused, searchResultStatus: searchAccessibilityStatus, replyPreview: replyPreview))
+    }
+
+    private func searchBackground(_ searchStyle: SearchHighlightStyle) -> Color {
+        if searchStyle.isHighlighted {
+            return Color.orange.opacity(searchStyle.fillOpacity)
+        }
+        if isSelected || isFocused {
+            return Color.accentColor.opacity(isFocused ? 0.16 : 0.10)
+        }
+        return Color.clear
     }
 
     private var authorName: String {

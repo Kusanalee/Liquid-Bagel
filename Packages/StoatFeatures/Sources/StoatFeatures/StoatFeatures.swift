@@ -437,9 +437,11 @@ public final class MainShellViewModel {
     public var channelSearchQuery = ChannelSearchQuery()
     public var channelSearchState: ChannelSearchState = .idle
     public var selectedSearchResultID: MessageID?
+    public var searchHighlightState: TimelineSearchHighlightState?
     public var searchNavigationStatus: String?
     public var activeCalibrationRun: TimelineCalibrationRun?
     public var calibrationCheckpointNote = ""
+    public var importedCalibrationNotes = ""
     public var selectedTimelineTuningPreset: TimelineTuningPreset = .conservative
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
@@ -626,6 +628,7 @@ public final class MainShellViewModel {
         selection.channelID = nil
         selection.dmChannelID = nil
         clearTimelineSelection()
+        reconcileSearchHighlightsForSelectedChannel()
         placeholderStatus = nil
         persistLiveSelectionIfNeeded()
     }
@@ -637,6 +640,7 @@ public final class MainShellViewModel {
         selection.channelID = nil
         selection.dmChannelID = nil
         clearTimelineSelection()
+        reconcileSearchHighlightsForSelectedChannel()
         placeholderStatus = nil
         persistLiveSelectionIfNeeded()
     }
@@ -648,6 +652,7 @@ public final class MainShellViewModel {
         selection.channelID = nil
         selection.dmChannelID = snapshot.channelsByID.values.first { $0.kind == .directMessage }?.id
         clearTimelineSelection()
+        reconcileSearchHighlightsForSelectedChannel()
         placeholderStatus = nil
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
@@ -666,6 +671,7 @@ public final class MainShellViewModel {
         selection.dmChannelID = nil
         clearTimelineSelection()
         updateViewportForSelectedChannel()
+        reconcileSearchHighlightsForSelectedChannel()
         placeholderStatus = nil
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
@@ -699,6 +705,7 @@ public final class MainShellViewModel {
         }
         clearTimelineSelection()
         updateViewportForSelectedChannel()
+        reconcileSearchHighlightsForSelectedChannel()
         placeholderStatus = nil
         requestFocus(.timeline)
         acknowledgeSelectedChannel()
@@ -1678,9 +1685,31 @@ public final class MainShellViewModel {
 
     public func addTimelineCalibrationCheckpoint(note: String? = nil) {
         let explicitNote = note ?? calibrationCheckpointNote
-        recordTimelineCalibrationObservation(kind: .manualCheckpoint, note: explicitNote.isEmpty ? nil : explicitNote)
+        let redacted = TimelineCopyFormatter.redactTokenLikeStrings(explicitNote)
+        recordTimelineCalibrationObservation(kind: .manualCheckpoint, note: redacted.isEmpty ? nil : redacted)
         calibrationCheckpointNote = ""
         placeholderStatus = "Calibration checkpoint recorded"
+    }
+
+    public var defaultTuningDecision: TimelineDefaultTuningDecision {
+        let notes = [importedCalibrationNotes] + (activeCalibrationRun?.observations.compactMap(\.note) ?? [])
+        return TimelineDefaultTuningAdvisor.decision(notes: notes, recommendation: activeCalibrationRun?.recommendedAdjustments)
+    }
+
+    public func importCalibrationNotes() {
+        let redacted = TimelineCopyFormatter.redactTokenLikeStrings(importedCalibrationNotes)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        importedCalibrationNotes = redacted
+        if activeCalibrationRun?.isRunning == true, !redacted.isEmpty {
+            recordTimelineCalibrationObservation(kind: .manualCheckpoint, note: redacted)
+        }
+        placeholderStatus = redacted.isEmpty ? "No calibration notes to import" : "Calibration notes imported"
+        lastTimelineActionResult = "Imported redacted calibration notes"
+    }
+
+    public func applyDefaultTuningDecision() {
+        updateTimelineTuning(defaultTuningDecision.recommendedConfiguration)
+        lastTimelineActionResult = "Applied default tuning decision"
     }
 
     public func applyTimelineCalibrationRecommendation() {
@@ -1725,6 +1754,8 @@ public final class MainShellViewModel {
         channelSearchQuery = ChannelSearchQuery(text: loadedMessageFindQuery, mode: .loadedOnly)
         let results = loadedMessageFindResults.map { channelSearchResult(from: $0, mode: .loadedOnly, isLoaded: true) }
         channelSearchState = results.isEmpty ? .empty(channelSearchQuery) : .results(channelSearchQuery, results)
+        selectedSearchResultID = results.first?.messageID
+        refreshSearchHighlightState()
     }
 
     public func jumpToLoadedFindResult(_ result: LoadedMessageFindResult) {
@@ -1740,6 +1771,7 @@ public final class MainShellViewModel {
         channelSearchQuery.pinnedOnly = mode == .pinned
         isChannelSearchPresented = true
         selectedSearchResultID = channelSearchState.results.first?.messageID
+        refreshSearchHighlightState()
         previousFocusTarget = focusTarget
         focusTarget = .quickSwitcher
     }
@@ -1753,6 +1785,7 @@ public final class MainShellViewModel {
         let query = channelSearchQuery
         let trimmed = query.trimmedText
         selectedSearchResultID = nil
+        searchHighlightState = nil
         searchNavigationStatus = nil
 
         switch query.mode {
@@ -1763,6 +1796,7 @@ public final class MainShellViewModel {
             let results = found.map { channelSearchResult(from: $0, mode: .loadedOnly, isLoaded: true) }
             channelSearchState = results.isEmpty ? .empty(query) : .results(query, results)
             selectedSearchResultID = results.first?.messageID
+            refreshSearchHighlightState()
         case .liveChannel, .pinned:
             guard effectiveRuntimeMode == .liveManual,
                   effectiveSessionState == .connected,
@@ -1797,6 +1831,7 @@ public final class MainShellViewModel {
                 }
                 channelSearchState = results.isEmpty ? .empty(query) : .results(query, results)
                 selectedSearchResultID = results.first?.messageID
+                refreshSearchHighlightState()
                 remoteSearchResults = results.map {
                     LoadedMessageFindResult(messageID: $0.messageID, channelID: $0.channelID, authorID: $0.authorID, createdAt: $0.createdAt, snippet: $0.snippet)
                 }
@@ -1818,26 +1853,103 @@ public final class MainShellViewModel {
         return results.first { $0.messageID == selectedSearchResultID } ?? results.first
     }
 
+    public var searchResultCountLabel: String? {
+        guard let state = searchHighlightState, !state.isEmpty else { return nil }
+        return Phase13Accessibility.searchResultCountLabel(
+            mode: state.mode,
+            currentIndex: state.indexOfCurrent(),
+            total: state.resultIDs.count,
+            loaded: state.loadedResultIDs.count,
+            unloaded: state.unloadedResultIDs.count
+        )
+    }
+
+    public func searchHighlightStatus(for messageID: MessageID) -> String? {
+        Phase13Accessibility.searchHighlightLabel(
+            isHighlighted: searchHighlightState?.contains(messageID) == true,
+            isCurrent: searchHighlightState?.isCurrent(messageID) == true
+        )
+    }
+
+    public func isSearchHighlighted(_ messageID: MessageID) -> Bool {
+        searchHighlightState?.contains(messageID) == true
+    }
+
+    public func isCurrentSearchResult(_ messageID: MessageID) -> Bool {
+        searchHighlightState?.contains(messageID) == true && searchHighlightState?.isCurrent(messageID) == true
+    }
+
+    public func clearSearchHighlights() {
+        channelSearchState = .idle
+        selectedSearchResultID = nil
+        searchHighlightState = nil
+        searchNavigationStatus = nil
+        loadedMessageFindResults = []
+        remoteSearchResults = []
+        remoteSearchStatus = nil
+        lastTimelineActionResult = "Cleared search highlights"
+    }
+
+    public func reconcileSearchHighlightsForSelectedChannel() {
+        let activeChannelID = selection.channelID ?? selection.dmChannelID
+        guard searchHighlightState?.channelID == activeChannelID else {
+            searchHighlightState = nil
+            selectedSearchResultID = nil
+            searchNavigationStatus = nil
+            return
+        }
+        refreshSearchHighlightState()
+    }
+
+    private func refreshSearchHighlightState() {
+        guard let query = channelSearchState.query else {
+            searchHighlightState = nil
+            return
+        }
+        let activeChannelID = selection.channelID ?? selection.dmChannelID
+        let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
+        searchHighlightState = TimelineSearchHighlightState.make(
+            channelID: activeChannelID,
+            query: query,
+            results: channelSearchState.results,
+            currentResultID: selectedSearchResultID,
+            loadedMessageIDs: loadedIDs
+        )
+        if selectedSearchResultID == nil {
+            selectedSearchResultID = searchHighlightState?.currentResultID
+        }
+    }
+
+    private func scrollToSearchResult(_ result: ChannelSearchResult) {
+        guard result.channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
+        timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
+    }
+
     public func selectSearchResult(_ result: ChannelSearchResult) {
         selectedSearchResultID = result.messageID
-        searchNavigationStatus = result.isLoaded ? nil : "Result outside loaded range."
+        refreshSearchHighlightState()
+        let isLoadedNow = selectedTimelineMessages.contains { $0.message.id == result.messageID }
+        searchNavigationStatus = isLoadedNow ? nil : "Result outside loaded range."
+        if isLoadedNow {
+            scrollToSearchResult(result)
+        }
     }
 
     public func selectAdjacentSearchResult(_ delta: Int) {
         let results = channelSearchState.results
         guard !results.isEmpty else { return }
         let current = selectedSearchResultID.flatMap { id in results.firstIndex { $0.messageID == id } } ?? 0
-        let next = min(max(current + delta, 0), results.count - 1)
-        selectedSearchResultID = results[next].messageID
+        let next = (current + delta + results.count) % results.count
+        selectSearchResult(results[next])
     }
 
     public func jumpToSelectedSearchResult() {
         guard let result = selectedSearchResult else { return }
         selectSearchResult(result)
         guard result.channelID == (selection.channelID ?? selection.dmChannelID) else { return }
-        if result.isLoaded || selectedTimelineMessages.contains(where: { $0.message.id == result.messageID }) {
-            timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
-            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
+        if selectedTimelineMessages.contains(where: { $0.message.id == result.messageID }) {
+            scrollToSearchResult(result)
             searchNavigationStatus = "Jumped to search result"
             lastTimelineActionResult = "Jumped to search result"
             recordTimelineCalibrationObservation(kind: .afterSearchJump)
@@ -1865,6 +1977,7 @@ public final class MainShellViewModel {
             searchNavigationStatus = "Loaded around result"
             lastTimelineActionResult = "Loaded around search result"
             markSearchResultLoaded(result.messageID)
+            refreshSearchHighlightState()
             recordTimelineCalibrationObservation(kind: .afterSearchJump)
         } else if loaded {
             searchNavigationStatus = "Loaded around result, but target was not returned."
@@ -1931,10 +2044,13 @@ public final class MainShellViewModel {
             channelSearchQuery = ChannelSearchQuery(text: remoteSearchQuery, mode: remoteSearchPinnedOnly ? .pinned : .liveChannel, pinnedOnly: remoteSearchPinnedOnly)
             let phase13Results = messages.map { channelSearchResult(from: $0, mode: remoteSearchPinnedOnly ? .pinned : .liveChannel, matching: query, loadedIDs: loadedIDs) }
             channelSearchState = phase13Results.isEmpty ? .empty(channelSearchQuery) : .results(channelSearchQuery, phase13Results)
+            selectedSearchResultID = phase13Results.first?.messageID
+            refreshSearchHighlightState()
         } catch {
             remoteSearchResults = []
             remoteSearchStatus = "Selected-channel search failed: \(error.userFacingMessage)"
             lastTimelineActionResult = "Selected-channel search failed"
+            searchHighlightState = nil
         }
     }
 
@@ -2356,7 +2472,7 @@ public final class MainShellViewModel {
 extension MainShellViewModel: AppCommandHandling {
     public func canPerform(_ command: AppCommand) -> Bool {
         switch command {
-        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover, .focusTimeline, .copyTimelineDiagnostics:
+        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
             return true
         case .openChannelSearch, .openLoadedMessageFind:
             return selectedChannel != nil || selection.dmChannelID != nil
@@ -2367,11 +2483,21 @@ extension MainShellViewModel: AppCommandHandling {
         case .selectNextSearchResult, .selectPreviousSearchResult, .jumpToSelectedSearchResult:
             return !channelSearchState.results.isEmpty
         case .loadAroundSelectedSearchResult:
-            return selectedSearchResult.map { !$0.isLoaded } == true && routeVerificationResult.aroundMessageFetch == .supported
+            return selectedSearchResult.map { result in
+                selectedTimelineMessages.contains { $0.message.id == result.messageID } == false
+            } == true && routeVerificationResult.aroundMessageFetch == .supported
+        case .clearSearchHighlights:
+            return searchHighlightState != nil || !channelSearchState.results.isEmpty
         case .startTimelineCalibration:
             return isDeveloperControlsEnabled
         case .addTimelineCalibrationCheckpoint:
             return isDeveloperControlsEnabled && activeCalibrationRun?.isRunning == true
+        case .applyTimelineCalibrationRecommendation:
+            return isDeveloperControlsEnabled && activeCalibrationRun?.recommendedAdjustments != nil
+        case .importCalibrationNotes:
+            return isDeveloperControlsEnabled && !importedCalibrationNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .copyTimelineCalibration:
+            return isDeveloperControlsEnabled && activeCalibrationRun != nil
         case .focusComposer:
             return selectedChannel != nil || selection.dmChannelID != nil
         case .reconnect:
@@ -2454,7 +2580,9 @@ extension MainShellViewModel: AppCommandHandling {
             return "No search result is selected."
         case .loadAroundSelectedSearchResult:
             return routeVerificationResult.aroundMessageFetch == .supported ? "Selected result is already loaded." : "Around-message route is not verified."
-        case .startTimelineCalibration, .addTimelineCalibrationCheckpoint:
+        case .clearSearchHighlights:
+            return "No search highlights are active."
+        case .startTimelineCalibration, .addTimelineCalibrationCheckpoint, .applyTimelineCalibrationRecommendation, .importCalibrationNotes, .copyTimelineCalibration:
             return isDeveloperControlsEnabled ? "Start a calibration run first." : "Developer controls are disabled."
         case .copySelectedMessage, .copySelectedMessageID, .editSelectedMessage, .deleteSelectedMessage, .reactToSelectedMessage, .retrySelectedMessage, .discardSelectedFailedMessage, .editAndRetrySelectedFailedMessage, .pinOrUnpinSelectedMessage, .replyToSelectedMessage:
             if isTextEntryFocused { return "Message actions are paused while typing." }
@@ -2545,10 +2673,20 @@ extension MainShellViewModel: AppCommandHandling {
             jumpToSelectedSearchResult()
         case .loadAroundSelectedSearchResult:
             Task { [weak self] in await self?.loadAroundSelectedSearchResult() }
+        case .clearSearchHighlights:
+            clearSearchHighlights()
         case .startTimelineCalibration:
             startTimelineCalibration()
         case .addTimelineCalibrationCheckpoint:
             addTimelineCalibrationCheckpoint()
+        case .applyTimelineCalibrationRecommendation:
+            applyTimelineCalibrationRecommendation()
+        case .resetTimelineTuningDefault:
+            resetTimelineTuningToDefaults()
+        case .importCalibrationNotes:
+            importCalibrationNotes()
+        case .copyTimelineCalibration:
+            copyRedactedTimelineCalibration()
         case .copyTimelineDiagnostics:
             copyRedactedTimelineDiagnostics()
         case .replyToSelectedMessage:
@@ -2582,6 +2720,8 @@ extension MainShellViewModel: AppCommandHandling {
                 closeChannelSearch()
             } else if inlineEditState != nil {
                 cancelInlineEdit()
+            } else if searchHighlightState != nil {
+                clearSearchHighlights()
             } else {
                 requestFocus(nil)
             }
@@ -3728,6 +3868,7 @@ public struct MessageTimelineView: View {
 
     @ViewBuilder private func timelineMessages(showLoadOlder: Bool, isLoadingOlder: Bool) -> some View {
         unreadRecoveryBanner
+        searchHighlightAffordance
         if isLoadingOlder {
             ProgressView("Loading older messages")
                 .controlSize(.small)
@@ -3753,6 +3894,54 @@ public struct MessageTimelineView: View {
         newestIndicator
         typingIndicator
         timelineDiagnosticsView
+    }
+
+    @ViewBuilder private var searchHighlightAffordance: some View {
+        if let label = viewModel.searchResultCountLabel {
+            HStack(spacing: StoatSpacing.small) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Text(label)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                Spacer()
+                Button {
+                    viewModel.selectAdjacentSearchResult(-1)
+                } label: {
+                    Image(systemName: "chevron.up")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Previous search result, \(label)")
+                Button {
+                    viewModel.selectAdjacentSearchResult(1)
+                } label: {
+                    Image(systemName: "chevron.down")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Next search result, \(label)")
+                if viewModel.canPerform(.loadAroundSelectedSearchResult) {
+                    Button("Load Around Result") {
+                        Task { await viewModel.loadAroundSelectedSearchResult() }
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityHint(Phase13Accessibility.loadAroundCurrentResultHint(canLoad: true))
+                }
+                Button {
+                    viewModel.clearSearchHighlights()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Clear search highlights")
+            }
+            .font(.caption)
+            .padding(.horizontal, StoatSpacing.medium)
+            .padding(.vertical, StoatSpacing.small)
+            .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(label)
+        }
     }
 
     @ViewBuilder private var unreadRecoveryBanner: some View {
@@ -3910,6 +4099,10 @@ public struct TimelineMessageGroupView: View {
                             statusText: accessibilityStatus(for: timelineMessage),
                             isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id,
                             isFocused: viewModel.timelineSelection.focus.messageID == timelineMessage.message.id && viewModel.timelineSelection.focus.mode != .none,
+                            isSearchHighlighted: viewModel.isSearchHighlighted(timelineMessage.message.id),
+                            isCurrentSearchResult: viewModel.isCurrentSearchResult(timelineMessage.message.id),
+                            isCompactDensity: viewModel.messageDensity == .compact,
+                            searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
                             replyPreview: viewModel.resolvedReplyPreview(for: timelineMessage.message)
                         )
                         .id(timelineMessage.message.id)
@@ -4464,16 +4657,21 @@ public struct ChannelSearchPanel: View {
         HStack {
             Button("Previous") { viewModel.selectAdjacentSearchResult(-1) }
                 .disabled(viewModel.channelSearchState.results.isEmpty)
+                .accessibilityLabel("Previous search result")
             Button("Next") { viewModel.selectAdjacentSearchResult(1) }
                 .disabled(viewModel.channelSearchState.results.isEmpty)
+                .accessibilityLabel("Next search result")
             Button("Jump") { viewModel.jumpToSelectedSearchResult() }
                 .disabled(viewModel.selectedSearchResult == nil)
             Button("Load around result") {
                 Task { await viewModel.loadAroundSelectedSearchResult() }
             }
             .disabled(viewModel.canPerform(.loadAroundSelectedSearchResult) == false)
+            .accessibilityHint(Phase13Accessibility.loadAroundCurrentResultHint(canLoad: viewModel.canPerform(.loadAroundSelectedSearchResult)))
+            Button("Clear") { viewModel.clearSearchHighlights() }
+                .disabled(viewModel.canPerform(.clearSearchHighlights) == false)
             Spacer()
-            if let status = viewModel.searchNavigationStatus {
+            if let status = viewModel.searchResultCountLabel ?? viewModel.searchNavigationStatus {
                 Text(status)
                     .font(.caption)
                     .foregroundStyle(.secondary)

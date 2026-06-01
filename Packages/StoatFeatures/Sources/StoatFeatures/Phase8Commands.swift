@@ -37,6 +37,11 @@ public enum AppCommand: Hashable, Sendable {
     case selectPreviousSearchResult
     case jumpToSelectedSearchResult
     case loadAroundSelectedSearchResult
+    case clearSearchHighlights
+    case applyTimelineCalibrationRecommendation
+    case resetTimelineTuningDefault
+    case importCalibrationNotes
+    case copyTimelineCalibration
     case startTimelineCalibration
     case addTimelineCalibrationCheckpoint
     case copyTimelineDiagnostics
@@ -304,10 +309,15 @@ public final class QuickSwitcherViewModel {
             commandResult(.openPinnedChannelSearch, title: "Pinned in This Channel", subtitle: "Search pinned messages in the selected channel"),
             commandResult(.jumpToSelectedSearchResult, title: "Jump to Search Result", subtitle: "Jump to the selected search result"),
             commandResult(.loadAroundSelectedSearchResult, title: "Load Around Search Result", subtitle: "Fetch messages around the selected result"),
+            commandResult(.clearSearchHighlights, title: "Clear Search Highlights", subtitle: "Clear selected-channel search highlights"),
             commandResult(.replyToSelectedMessage, title: "Reply to Message", subtitle: "Reply to the focused message"),
             commandResult(.cancelReply, title: "Cancel Reply", subtitle: "Clear the active reply context"),
             commandResult(.startTimelineCalibration, title: "Start Timeline Calibration", subtitle: "Begin a manual calibration run"),
             commandResult(.addTimelineCalibrationCheckpoint, title: "Add Calibration Checkpoint", subtitle: "Record current timeline diagnostics"),
+            commandResult(.importCalibrationNotes, title: "Import Calibration Notes", subtitle: "Redact and import pasted calibration notes"),
+            commandResult(.applyTimelineCalibrationRecommendation, title: "Apply Calibration Recommendation", subtitle: "Apply the visible timeline tuning recommendation"),
+            commandResult(.resetTimelineTuningDefault, title: "Reset Timeline Tuning", subtitle: "Restore conservative timeline tuning defaults"),
+            commandResult(.copyTimelineCalibration, title: "Copy Calibration Summary", subtitle: "Copy redacted timeline calibration output"),
             commandResult(.copyTimelineDiagnostics, title: "Copy Timeline Diagnostics", subtitle: "Copy redacted timeline diagnostics"),
             commandResult(.toggleMemberPanel, title: "Toggle Member Panel", subtitle: "Show or hide the member panel"),
             commandResult(.openAccountSettings, title: "Account Settings", subtitle: "Open Account & Connection settings"),

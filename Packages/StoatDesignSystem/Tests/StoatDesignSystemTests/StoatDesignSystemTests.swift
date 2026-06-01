@@ -55,4 +55,33 @@ final class StoatDesignSystemTests: XCTestCase {
         XCTAssertEqual(StoatAccessibility.reactionLabel(emoji: "👍", count: 2, hasReacted: false), "Reaction 👍, 2 reactions")
         XCTAssertTrue(StoatAccessibility.inlineEditLabel(isSaving: false, errorMessage: "Edit failed").contains("Edit failed"))
     }
+
+    func testPhase14SearchHighlightStyleStrengthensCurrentAndHighContrast() {
+        let normal = SearchHighlightStyle()
+        XCTAssertEqual(normal.fillOpacity, 0)
+        XCTAssertEqual(normal.borderOpacity, 0)
+
+        let highlighted = SearchHighlightStyle(isHighlighted: true)
+        let current = SearchHighlightStyle(isHighlighted: true, isCurrent: true)
+        XCTAssertGreaterThan(current.fillOpacity, highlighted.fillOpacity)
+        XCTAssertGreaterThan(current.borderOpacity, highlighted.borderOpacity)
+
+        let highContrast = SearchHighlightStyle(isHighlighted: true, isCurrent: true, highContrast: true)
+        XCTAssertGreaterThan(highContrast.borderOpacity, current.borderOpacity)
+
+        let reducedTransparency = SearchHighlightStyle(isHighlighted: true, isCurrent: true, reduceTransparency: true)
+        XCTAssertGreaterThan(reducedTransparency.fillOpacity, current.fillOpacity)
+    }
+
+    func testPhase14MessageAccessibilityCanIncludeSearchResultStatus() {
+        let label = StoatAccessibility.messageLabel(
+            author: "A",
+            timestamp: "now",
+            content: "body",
+            isSelected: true,
+            searchResultStatus: "current search result"
+        )
+        XCTAssertTrue(label.contains("selected"))
+        XCTAssertTrue(label.contains("current search result"))
+    }
 }

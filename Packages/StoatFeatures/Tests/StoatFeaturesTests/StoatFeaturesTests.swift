@@ -1579,6 +1579,134 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(model.canPerform(.loadAroundSelectedSearchResult))
     }
 
+    @MainActor
+    func testPhase14SearchHighlightClassifiesLoadedAndUnloadedResults() async throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        model.channelSearchQuery = ChannelSearchQuery(text: "Phase", mode: .loadedOnly)
+
+        await model.runChannelSearch()
+
+        let state = try XCTUnwrap(model.searchHighlightState)
+        XCTAssertEqual(state.mode, .loadedOnly)
+        XCTAssertFalse(state.resultIDs.isEmpty)
+        XCTAssertEqual(state.unloadedResultIDs, [])
+        XCTAssertEqual(state.currentResultID, model.selectedSearchResultID)
+        XCTAssertTrue(model.searchResultCountLabel?.contains("loaded") == true)
+    }
+
+    @MainActor
+    func testPhase14SearchNavigationCyclesAndScrollsLoadedResults() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        let messages = Array(model.selectedTimelineMessages.prefix(2))
+        XCTAssertEqual(messages.count, 2)
+        let results = messages.map {
+            ChannelSearchResult(
+                messageID: $0.message.id,
+                channelID: channelID,
+                authorID: $0.message.authorID,
+                snippet: $0.message.content ?? "Message",
+                mode: .loadedOnly,
+                isLoaded: true
+            )
+        }
+
+        model.channelSearchState = .results(ChannelSearchQuery(text: "needle", mode: .loadedOnly), results)
+        model.selectedSearchResultID = results.last?.messageID
+        model.selectAdjacentSearchResult(1)
+
+        XCTAssertEqual(model.selectedSearchResultID, results.first?.messageID)
+        XCTAssertEqual(model.timelineViewport.selectedMessageID, results.first?.messageID)
+        XCTAssertNotNil(model.timelineViewport.pendingScrollIntent)
+        XCTAssertTrue(model.isCurrentSearchResult(try XCTUnwrap(results.first?.messageID)))
+    }
+
+    @MainActor
+    func testPhase14UnloadedResultPreservesSelectionAndCanClearHighlights() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        let result = ChannelSearchResult(
+            messageID: "outside",
+            channelID: channelID,
+            authorID: "author",
+            snippet: "Result outside loaded range",
+            mode: .liveChannel,
+            isLoaded: false
+        )
+
+        model.channelSearchState = .results(ChannelSearchQuery(text: "needle", mode: .liveChannel), [result])
+        model.selectSearchResult(result)
+
+        XCTAssertEqual(model.selectedSearchResultID, result.messageID)
+        XCTAssertEqual(model.searchNavigationStatus, "Result outside loaded range.")
+        XCTAssertEqual(model.searchHighlightState?.unloadedResultIDs, [result.messageID])
+
+        model.clearSearchHighlights()
+        XCTAssertNil(model.searchHighlightState)
+        XCTAssertTrue(model.channelSearchState.results.isEmpty)
+        XCTAssertFalse(model.selectedTimelineMessages.isEmpty)
+    }
+
+    @MainActor
+    func testPhase14ChannelSwitchClearsScopedHighlights() async throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        model.channelSearchQuery = ChannelSearchQuery(text: "Phase", mode: .loadedOnly)
+        await model.runChannelSearch()
+        XCTAssertNotNil(model.searchHighlightState)
+
+        model.selectHome()
+
+        XCTAssertNil(model.searchHighlightState)
+        XCTAssertNil(model.selectedSearchResultID)
+    }
+
+    func testPhase14SearchAccessibilityAndRedactionHelpers() {
+        XCTAssertEqual(Phase13Accessibility.searchHighlightLabel(isHighlighted: true, isCurrent: true), "current search result")
+        XCTAssertEqual(Phase13Accessibility.searchHighlightLabel(isHighlighted: true, isCurrent: false), "search result")
+        let label = Phase13Accessibility.searchResultCountLabel(mode: .liveChannel, currentIndex: 2, total: 4, loaded: 3, unloaded: 1)
+        XCTAssertTrue(label.contains("2 of 4"))
+        XCTAssertTrue(label.contains("outside loaded range"))
+
+        let state = TimelineSearchHighlightState(
+            channelID: "c",
+            query: "token=super-secret-value",
+            mode: .loadedOnly,
+            resultIDs: ["m"],
+            currentResultID: "m"
+        )
+        XCTAssertFalse(state.query.contains("super-secret-value"))
+    }
+
+    @MainActor
+    func testPhase14CalibrationDecisionKeepsConservativeWithoutRealNotesAndRedactsImport() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        guard case .remainConservative = model.defaultTuningDecision else {
+            return XCTFail("Expected conservative default without notes")
+        }
+
+        model.importedCalibrationNotes = "Recommend Balanced token=super-secret-value"
+        model.importCalibrationNotes()
+
+        XCTAssertFalse(model.importedCalibrationNotes.contains("super-secret-value"))
+        guard case .recommendBalanced = model.defaultTuningDecision else {
+            return XCTFail("Expected balanced advisory from clean imported notes")
+        }
+    }
+
+    func testPhase14CalibrationDecisionTreatsNoisyNotesAsConservative() {
+        let decision = TimelineDefaultTuningAdvisor.decision(
+            notes: ["Balanced looked noisy with warning spikes"],
+            recommendation: nil
+        )
+        guard case .remainConservative = decision else {
+            return XCTFail("Expected noisy notes to remain conservative")
+        }
+    }
+
     private func message(
         id: String,
         author: UserID,
