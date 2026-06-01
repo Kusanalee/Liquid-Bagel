@@ -128,6 +128,215 @@ public struct ComposerAttachmentChip: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum AttachmentDisplayKind: Hashable, Sendable {
+    case image
+    case pdf
+    case text
+    case archive
+    case generic
+    case unsupported
+
+    public var label: String {
+        switch self {
+        case .image: "Image"
+        case .pdf: "PDF"
+        case .text: "Text"
+        case .archive: "Archive"
+        case .generic: "File"
+        case .unsupported: "Unsupported"
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .image: "photo"
+        case .pdf: "doc.richtext"
+        case .text: "doc.text"
+        case .archive: "archivebox"
+        case .generic: "doc"
+        case .unsupported: "questionmark.diamond"
+        }
+    }
+
+    public var isPreviewable: Bool {
+        switch self {
+        case .image, .pdf, .text:
+            true
+        case .archive, .generic, .unsupported:
+            false
+        }
+    }
+}
+
+public enum AttachmentDisplaySource: Hashable, Sendable {
+    case localDraft
+    case uploadedDraft(fileID: FileID)
+    case remote(fileID: FileID, tag: String, url: URL?)
+    case unavailable
+
+    public var fileID: FileID? {
+        switch self {
+        case let .uploadedDraft(fileID), let .remote(fileID, _, _):
+            fileID
+        case .localDraft, .unavailable:
+            nil
+        }
+    }
+
+    public var isRemoteLoadable: Bool {
+        if case .remote = self { return true }
+        return false
+    }
+}
+
+public enum AttachmentPreviewState: Hashable, Sendable {
+    case notLoaded
+    case loading
+    case readyLocal
+    case readyRemote
+    case failed(String)
+    case unsupported(String)
+
+    public var isReady: Bool {
+        switch self {
+        case .readyLocal, .readyRemote:
+            true
+        case .notLoaded, .loading, .failed, .unsupported:
+            false
+        }
+    }
+}
+
+public struct AttachmentDisplayItem: Identifiable, Hashable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    public var id: String
+    public var fileID: FileID?
+    public var displayName: String
+    public var contentType: String?
+    public var byteCount: Int?
+    public var kind: AttachmentDisplayKind
+    public var source: AttachmentDisplaySource
+    public var previewState: AttachmentPreviewState
+
+    public init(
+        id: String,
+        fileID: FileID? = nil,
+        displayName: String,
+        contentType: String? = nil,
+        byteCount: Int? = nil,
+        kind: AttachmentDisplayKind,
+        source: AttachmentDisplaySource,
+        previewState: AttachmentPreviewState = .notLoaded
+    ) {
+        self.id = id
+        self.fileID = fileID ?? source.fileID
+        self.displayName = AttachmentDisplayFormatting.safeFilename(displayName)
+        self.contentType = AttachmentDisplayFormatting.safeContentType(contentType)
+        self.byteCount = byteCount
+        self.kind = kind
+        self.source = source
+        self.previewState = previewState
+    }
+
+    public init(file: File, previewState: AttachmentPreviewState = .notLoaded) {
+        let source: AttachmentDisplaySource
+        if file.deleted == true || file.reported == true {
+            source = .unavailable
+        } else {
+            source = .remote(fileID: file.id, tag: file.tag.isEmpty ? "attachments" : file.tag, url: nil)
+        }
+        self.init(
+            id: "file-\(file.id.rawValue)",
+            fileID: file.id,
+            displayName: file.filename,
+            contentType: file.contentType,
+            byteCount: file.size > 0 ? file.size : nil,
+            kind: AttachmentDisplayFormatting.kind(contentType: file.contentType, filename: file.filename, metadata: file.metadata, unavailable: file.deleted == true || file.reported == true),
+            source: source,
+            previewState: file.deleted == true || file.reported == true ? .unsupported("Attachment unavailable") : previewState
+        )
+    }
+
+    public var description: String {
+        "\(displayName) · \(kind.label)"
+    }
+
+    public var debugDescription: String {
+        "AttachmentDisplayItem(id: \(id), fileID: \(AttachmentDisplayFormatting.shortID(fileID?.rawValue)), name: \(displayName), kind: \(kind.label), state: \(previewState.safeLabel))"
+    }
+}
+
+public enum AttachmentDisplayFormatting {
+    public static func safeFilename(_ filename: String) -> String {
+        let last = URL(fileURLWithPath: filename).lastPathComponent
+        let scalars = last.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+        let cleaned = String(String.UnicodeScalarView(scalars))
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: "\\", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "attachment" : cleaned
+    }
+
+    public static func safeContentType(_ contentType: String?) -> String? {
+        guard let contentType else { return nil }
+        let cleaned = contentType
+            .components(separatedBy: .whitespacesAndNewlines)
+            .joined()
+            .replacingOccurrences(of: "/", with: "/")
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
+    public static func formattedSize(_ byteCount: Int?) -> String {
+        guard let byteCount, byteCount > 0 else { return "Unknown size" }
+        return ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file)
+    }
+
+    public static func kind(contentType: String?, filename: String, metadata: FileMetadata? = nil, unavailable: Bool = false) -> AttachmentDisplayKind {
+        if unavailable { return .unsupported }
+        if let metadata {
+            switch metadata {
+            case .image:
+                return .image
+            case .text:
+                return .text
+            case .video, .audio:
+                return .unsupported
+            case .file, .unknown:
+                break
+            }
+        }
+        let loweredType = (contentType ?? "").lowercased()
+        let ext = URL(fileURLWithPath: filename).pathExtension.lowercased()
+        if loweredType.hasPrefix("image/") || ["png", "jpg", "jpeg", "gif", "heic", "webp"].contains(ext) { return .image }
+        if loweredType == "application/pdf" || ext == "pdf" { return .pdf }
+        if loweredType.hasPrefix("text/") || ["md", "markdown", "json", "csv", "rtf", "txt"].contains(ext) { return .text }
+        if ["zip", "gz", "tgz", "tar", "7z", "rar"].contains(ext) { return .archive }
+        return .generic
+    }
+
+    public static func shortID(_ value: String?) -> String {
+        guard let value, !value.isEmpty else { return "-" }
+        guard value.count > 12 else { return value }
+        return "\(value.prefix(6))...\(value.suffix(4))"
+    }
+}
+
+public extension AttachmentPreviewState {
+    var safeLabel: String {
+        switch self {
+        case .notLoaded:
+            "Not loaded"
+        case .loading:
+            "Loading"
+        case .readyLocal:
+            "Ready locally"
+        case .readyRemote:
+            "Ready"
+        case let .failed(message), let .unsupported(message):
+            AttachmentDisplayFormatting.safeFilename(message)
+        }
+    }
+}
+
 public struct GlassSearchField: View {
     private let title: String
     private let action: () -> Void
@@ -168,6 +377,7 @@ public struct GlassComposer: View {
     private let isSending: Bool
     private let canAttach: Bool
     private let attachments: [ComposerAttachmentChip]
+    private let attachmentSummary: String?
     private let replyAuthor: String?
     private let replyPreview: String?
     @Binding private var shouldMentionReplyAuthor: Bool
@@ -193,6 +403,7 @@ public struct GlassComposer: View {
         isSending: Bool = false,
         canAttach: Bool = false,
         attachments: [ComposerAttachmentChip] = [],
+        attachmentSummary: String? = nil,
         replyAuthor: String? = nil,
         replyPreview: String? = nil,
         focusRequestID: Int = 0,
@@ -216,6 +427,7 @@ public struct GlassComposer: View {
         self.isSending = isSending
         self.canAttach = canAttach
         self.attachments = attachments
+        self.attachmentSummary = attachmentSummary
         self.replyAuthor = replyAuthor
         self.replyPreview = replyPreview
         self.focusRequestID = focusRequestID
@@ -260,6 +472,12 @@ public struct GlassComposer: View {
                     .accessibilityLabel(StoatAccessibility.replyContextLabel(author: replyAuthor, preview: replyPreview, mentionsAuthor: shouldMentionReplyAuthor))
                 }
                 if !attachments.isEmpty {
+                    if let attachmentSummary {
+                        Text(attachmentSummary)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Attachment summary, \(attachmentSummary)")
+                    }
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: StoatSpacing.small) {
                             ForEach(attachments) { attachment in
@@ -276,7 +494,7 @@ public struct GlassComposer: View {
                     .accessibilityLabel("Queued attachments")
                 }
                 HStack(alignment: .bottom, spacing: StoatSpacing.medium) {
-                    GlassIconButton(canAttach ? "Attach File" : "Attach file unavailable", systemImage: "paperclip", isDisabled: !canAttach) {
+                    GlassIconButton(canAttach ? "Attach File" : "Attach file unavailable because file upload permission is missing", systemImage: "paperclip", isDisabled: !canAttach) {
                         onAttach()
                     }
                     ZStack(alignment: .topLeading) {
@@ -354,8 +572,8 @@ private struct ComposerAttachmentChipView: View {
                 ProgressView()
                     .controlSize(.mini)
             }
-            if case .failed = attachment.status {
-                GlassIconButton("Retry Upload", systemImage: "arrow.clockwise", action: onUpload)
+            if showsUploadButton {
+                GlassIconButton(uploadTitle, systemImage: "arrow.up.circle", action: onUpload)
             }
             GlassIconButton("Remove Attachment", systemImage: "xmark", action: onRemove)
         }
@@ -368,6 +586,7 @@ private struct ComposerAttachmentChipView: View {
         .onTapGesture(perform: onPreview)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(attachment.filename), \(statusText)")
+        .accessibilityHint("Press to preview. Use the buttons to upload or remove the attachment.")
     }
 
     @ViewBuilder private var preview: some View {
@@ -421,6 +640,22 @@ private struct ComposerAttachmentChipView: View {
         case .queued, .uploaded, .failed:
             return false
         }
+    }
+
+    private var showsUploadButton: Bool {
+        switch attachment.status {
+        case .queued, .failed:
+            true
+        case .reading, .uploading, .uploaded:
+            false
+        }
+    }
+
+    private var uploadTitle: String {
+        if case .failed = attachment.status {
+            return "Retry Upload"
+        }
+        return "Upload Attachment"
     }
 }
 
@@ -730,6 +965,11 @@ public struct MessageRow: View {
     private let isCompactDensity: Bool
     private let searchAccessibilityStatus: String?
     private let replyPreview: String?
+    private let attachmentItems: [AttachmentDisplayItem]?
+    private let onPreviewAttachment: (AttachmentDisplayItem) -> Void
+    private let onDownloadAttachment: (AttachmentDisplayItem) -> Void
+    private let onOpenAttachment: (AttachmentDisplayItem) -> Void
+    private let onRetryAttachment: (AttachmentDisplayItem) -> Void
 
     public init(
         message: Message,
@@ -742,7 +982,12 @@ public struct MessageRow: View {
         isCurrentSearchResult: Bool = false,
         isCompactDensity: Bool = false,
         searchAccessibilityStatus: String? = nil,
-        replyPreview: String? = nil
+        replyPreview: String? = nil,
+        attachmentItems: [AttachmentDisplayItem]? = nil,
+        onPreviewAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onDownloadAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onOpenAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onRetryAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in }
     ) {
         self.message = message
         self.author = author
@@ -755,6 +1000,11 @@ public struct MessageRow: View {
         self.isCompactDensity = isCompactDensity
         self.searchAccessibilityStatus = searchAccessibilityStatus
         self.replyPreview = replyPreview
+        self.attachmentItems = attachmentItems
+        self.onPreviewAttachment = onPreviewAttachment
+        self.onDownloadAttachment = onDownloadAttachment
+        self.onOpenAttachment = onOpenAttachment
+        self.onRetryAttachment = onRetryAttachment
     }
 
     public var body: some View {
@@ -824,9 +1074,17 @@ public struct MessageRow: View {
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if let attachments = message.attachments, !attachments.isEmpty {
-                    ForEach(attachments) { attachment in
-                        AttachmentPreviewPlaceholder(attachment: attachment)
+                let renderedAttachments = attachmentItems ?? message.attachments?.map { AttachmentDisplayItem(file: $0) } ?? []
+                if !renderedAttachments.isEmpty {
+                    ForEach(renderedAttachments) { attachment in
+                        AttachmentTimelineCard(
+                            item: attachment,
+                            isCompact: isCompactDensity,
+                            onPreview: { onPreviewAttachment(attachment) },
+                            onDownload: { onDownloadAttachment(attachment) },
+                            onOpenExternally: { onOpenAttachment(attachment) },
+                            onRetry: { onRetryAttachment(attachment) }
+                        )
                     }
                 }
                 if let embeds = message.embeds, !embeds.isEmpty {
@@ -917,51 +1175,193 @@ public struct AttachmentPreviewPlaceholder: View {
         self.attachment = attachment
     }
     public var body: some View {
-        HStack(spacing: StoatSpacing.small) {
-            Image(systemName: systemImage)
-                .font(.title3)
-                .frame(width: 38, height: 38)
-                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
-                Text(ComposerAttachmentDraftSafeName.sanitize(attachment.filename))
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                Text(subtitle)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(StoatSpacing.medium)
-        .frame(maxWidth: 340, alignment: .leading)
-        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(ComposerAttachmentDraftSafeName.sanitize(attachment.filename)), \(subtitle)")
+        AttachmentTimelineCard(item: AttachmentDisplayItem(file: attachment))
+    }
+}
+
+public struct AttachmentTimelineCard: View {
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    private let item: AttachmentDisplayItem
+    private let isCompact: Bool
+    private let onPreview: () -> Void
+    private let onDownload: () -> Void
+    private let onOpenExternally: () -> Void
+    private let onRetry: () -> Void
+
+    public init(
+        item: AttachmentDisplayItem,
+        isCompact: Bool = false,
+        onPreview: @escaping () -> Void = {},
+        onDownload: @escaping () -> Void = {},
+        onOpenExternally: @escaping () -> Void = {},
+        onRetry: @escaping () -> Void = {}
+    ) {
+        self.item = item
+        self.isCompact = isCompact
+        self.onPreview = onPreview
+        self.onDownload = onDownload
+        self.onOpenExternally = onOpenExternally
+        self.onRetry = onRetry
     }
 
-    private var systemImage: String {
-        switch attachment.metadata {
-        case .image:
-            return "photo"
-        case .text:
-            return "doc.text"
-        case .video:
-            return "film"
-        case .audio:
-            return "waveform"
-        case .file, .unknown:
-            if attachment.contentType == "application/pdf" {
-                return "doc.richtext"
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            HStack(spacing: StoatSpacing.small) {
+                thumbnail
+                VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                    Text(item.displayName)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    stateLine
+                }
+                Spacer(minLength: StoatSpacing.small)
             }
-            return "doc"
+            controls
         }
+        .padding(isCompact ? StoatSpacing.small : StoatSpacing.medium)
+        .frame(maxWidth: isCompact ? 320 : 380, alignment: .leading)
+        .background(backgroundColor, in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                .strokeBorder(borderColor, lineWidth: colorSchemeContrast == .increased ? 1.5 : 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(StoatAccessibility.attachmentLabel(filename: item.displayName, kind: item.kind.label, size: AttachmentDisplayFormatting.formattedSize(item.byteCount), state: item.previewState.safeLabel))
+    }
+
+    private var thumbnail: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous)
+                .fill(Color.primary.opacity(reduceTransparency ? 0.10 : 0.06))
+            Image(systemName: item.kind.systemImage)
+                .font(.system(size: isCompact ? 16 : 20, weight: .semibold))
+                .foregroundStyle(iconColor)
+            if case .loading = item.previewState {
+                ProgressView()
+                    .controlSize(.mini)
+            }
+        }
+        .frame(width: isCompact ? 34 : 44, height: isCompact ? 34 : 44)
+        .accessibilityHidden(true)
+    }
+
+    @ViewBuilder private var stateLine: some View {
+        switch item.previewState {
+        case .notLoaded, .readyLocal, .readyRemote:
+            EmptyView()
+        case .loading:
+            Text("Loading preview")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        case let .failed(message):
+            Text(message)
+                .font(.caption2)
+                .foregroundStyle(.red)
+                .lineLimit(1)
+        case let .unsupported(message):
+            Text(message)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder private var controls: some View {
+        HStack(spacing: StoatSpacing.xSmall) {
+            if showsPreview {
+                Button {
+                    onPreview()
+                } label: {
+                    Label(previewTitle, systemImage: "eye")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(StoatAccessibility.attachmentActionLabel(action: previewTitle, filename: item.displayName))
+            }
+            if item.source.isRemoteLoadable {
+                Button {
+                    onDownload()
+                } label: {
+                    Label("Save As", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(StoatAccessibility.attachmentActionLabel(action: "Save As", filename: item.displayName))
+            }
+            if item.previewState.isReady {
+                Button {
+                    onOpenExternally()
+                } label: {
+                    Label("Open", systemImage: "arrow.up.forward.app")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(StoatAccessibility.attachmentActionLabel(action: "Open Externally", filename: item.displayName))
+            }
+            if case .failed = item.previewState {
+                Button {
+                    onRetry()
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(StoatAccessibility.attachmentActionLabel(action: "Retry preview", filename: item.displayName))
+            }
+        }
+        .font(.caption)
     }
 
     private var subtitle: String {
-        let size = attachment.size > 0 ? ByteCountFormatter.string(fromByteCount: Int64(attachment.size), countStyle: .file) : "Unknown size"
-        return "\(attachment.contentType) · \(size)"
+        let type = item.contentType ?? item.kind.label
+        return "\(item.kind.label) · \(type) · \(AttachmentDisplayFormatting.formattedSize(item.byteCount))"
+    }
+
+    private var showsPreview: Bool {
+        switch item.previewState {
+        case .unsupported:
+            false
+        case .loading:
+            false
+        case .notLoaded, .readyLocal, .readyRemote, .failed:
+            item.kind.isPreviewable || item.previewState.isReady
+        }
+    }
+
+    private var previewTitle: String {
+        item.previewState.isReady ? "Preview" : "Load Preview"
+    }
+
+    private var backgroundColor: Color {
+        if colorSchemeContrast == .increased {
+            return Color.primary.opacity(0.10)
+        }
+        return Color.primary.opacity(reduceTransparency ? 0.09 : 0.055)
+    }
+
+    private var borderColor: Color {
+        if colorSchemeContrast == .increased {
+            return Color.primary.opacity(0.35)
+        }
+        return Color.primary.opacity(0.08)
+    }
+
+    private var iconColor: Color {
+        switch item.kind {
+        case .unsupported:
+            .secondary
+        case .image:
+            .accentColor
+        case .pdf:
+            .red
+        case .text:
+            .blue
+        case .archive:
+            .orange
+        case .generic:
+            .secondary
+        }
     }
 }
 

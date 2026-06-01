@@ -2,6 +2,7 @@ import StoatModels
 import StoatAPI
 import StoatPersistence
 import StoatRealtime
+import StoatUI
 import XCTest
 @testable import StoatFeatures
 
@@ -780,6 +781,101 @@ final class StoatFeaturesTests: XCTestCase {
         let sent = await workingHandler.sentSnapshot()
         XCTAssertEqual(sent.first?.content, "")
         XCTAssertEqual(sent.first?.attachments?.count, 1)
+    }
+
+    @MainActor
+    func testPhase16RemotePreviewOnlyLoadsAfterExplicitAction() async throws {
+        let loader = MockRemoteAttachmentLoader(result: .success(RemoteAttachmentData(fileID: "file-remote", filename: "note.txt", contentType: "text/plain", byteCount: 5, data: Data("hello".utf8))))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, remoteAttachmentLoader: loader)
+        let file = File(id: "file-remote", tag: "attachments", filename: "note.txt", metadata: .text, contentType: "text/plain", size: 5)
+        let item = AttachmentDisplayItem(file: file)
+
+        let initialCallCount = await loader.callCount()
+        XCTAssertEqual(initialCallCount, 0)
+        XCTAssertEqual(item.previewState, .notLoaded)
+
+        await model.previewAttachment(item)
+
+        let finalCallCount = await loader.callCount()
+        XCTAssertEqual(finalCallCount, 1)
+        XCTAssertEqual(model.attachmentPreviewStates[item.id], .readyRemote)
+        XCTAssertEqual(model.attachmentPreview?.data, Data("hello".utf8))
+    }
+
+    @MainActor
+    func testPhase16RemotePreviewFailureIsSafeAndRetryable() async throws {
+        let loader = MockRemoteAttachmentLoader(result: .failure(AttachmentActionError.unavailable("token=secret /Users/enka/private/file.png")))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, remoteAttachmentLoader: loader)
+        let file = File(id: "file-failed", tag: "attachments", filename: "safe.txt", metadata: .text, contentType: "text/plain", size: 5)
+        let item = AttachmentDisplayItem(file: file)
+
+        await model.previewAttachment(item)
+
+        guard case let .failed(message) = model.attachmentPreviewStates[item.id] else {
+            return XCTFail("Expected failed preview state")
+        }
+        XCTAssertFalse(message.contains("secret"))
+        XCTAssertFalse(message.contains("/Users/enka"))
+        let firstCallCount = await loader.callCount()
+        XCTAssertEqual(firstCallCount, 1)
+
+        await model.retryAttachmentPreview(item)
+        let retryCallCount = await loader.callCount()
+        XCTAssertEqual(retryCallCount, 2)
+    }
+
+    @MainActor
+    func testPhase16DownloadAndOpenUseMocksAndSanitizedFilename() async throws {
+        let data = Data("payload".utf8)
+        let loader = MockRemoteAttachmentLoader(result: .success(RemoteAttachmentData(fileID: "file-save", filename: "payload.txt", contentType: "text/plain", byteCount: data.count, data: data)))
+        let saver = MockAttachmentSaver()
+        let opener = MockAttachmentOpener()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, remoteAttachmentLoader: loader, attachmentSaver: saver, attachmentOpener: opener)
+        let file = File(id: "file-save", tag: "attachments", filename: "/private/payload.txt", metadata: .text, contentType: "text/plain", size: data.count)
+        let item = AttachmentDisplayItem(file: file)
+
+        await model.downloadAttachment(item)
+
+        let saveCount = await saver.saveCount()
+        XCTAssertEqual(saveCount, 1)
+        XCTAssertEqual(model.loadedAttachmentOriginalData[item.id]?.data, data)
+
+        await model.previewAttachment(item)
+        await model.openAttachmentExternally(item)
+
+        let openCount = await opener.openCount()
+        XCTAssertEqual(openCount, 1)
+    }
+
+    @MainActor
+    func testPhase16ComposerSummaryFailedReadinessAndDiagnostics() async throws {
+        let failingUploader = MockAttachmentUploadHandler(uploadError: MessageActionError.unavailable("upload failed"))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, attachmentUploadHandler: failingUploader)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let channelID = model.selection.channelID!
+
+        model.addPastedImageData(Data([1, 2, 3, 4]), to: channelID)
+        XCTAssertTrue(model.composerAttachmentSummary(for: channelID)?.contains("1 attachment") == true)
+        XCTAssertTrue(model.composerReadiness(for: channelID).canSend)
+
+        await model.sendDraft(for: channelID)
+
+        XCTAssertFalse(model.composerReadiness(for: channelID).canSend)
+        XCTAssertTrue(model.composerReadiness(for: channelID).reason.contains("failed"))
+        let diagnostics = model.attachmentDiagnostics()
+        XCTAssertEqual(diagnostics.failedUploadCount, 1)
+        XCTAssertFalse(String(describing: diagnostics).contains("/Users/"))
+    }
+
+    func testPhase16LiveMediaURLUsesVerifiedRoutesWithoutQuery() throws {
+        let base = URL(string: "https://cdn.stoatusercontent.com")!
+        let preview = try LiveRemoteAttachmentLoader.mediaURL(baseURL: base, tag: "attachments", fileID: "file id", filename: nil)
+        let original = try LiveRemoteAttachmentLoader.mediaURL(baseURL: base, tag: "attachments", fileID: "file id", filename: "original")
+
+        XCTAssertEqual(preview.absoluteString, "https://cdn.stoatusercontent.com/attachments/file%20id")
+        XCTAssertEqual(original.absoluteString, "https://cdn.stoatusercontent.com/attachments/file%20id/original")
+        XCTAssertNil(URLComponents(url: original, resolvingAgainstBaseURL: false)?.queryItems)
     }
 
     @MainActor

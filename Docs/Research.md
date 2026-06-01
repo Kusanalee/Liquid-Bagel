@@ -97,6 +97,15 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Upload request is `multipart/form-data` with a single `file` field.
 - Upload response is `{ "id": "<file id>" }`; Liquid Bagel exposes this as `UploadedFile`.
 
+### Phase 16 media serving notes
+
+- Current Stoat upload docs say Autumn/media serving has two unique file paths: a preview route and an original route, and clients should not add query parameters to media URLs.
+- Backend Autumn source confirms public fetch routes:
+  - `GET /{tag}/{file_id}` returns an image preview where available and redirects to the original file for non-previewable or animated attachment content.
+  - `GET /{tag}/{file_id}/{file_name}` returns original bytes with `Content-Disposition: attachment`.
+  - Passing `original` as `{file_name}` redirects to the encoded stored filename.
+- Phase 16 uses these routes only after explicit user actions. It does not prefetch visible attachments, attach auth headers to media fetches, store persistent media, or add query parameters.
+
 ### Rate limits
 
 - Docs confirm fixed-window buckets and headers `X-RateLimit-Limit`, `X-RateLimit-Bucket`, `X-RateLimit-Remaining`, `X-RateLimit-Reset-After`.

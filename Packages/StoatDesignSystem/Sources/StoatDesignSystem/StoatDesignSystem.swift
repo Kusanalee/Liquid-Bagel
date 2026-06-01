@@ -203,6 +203,14 @@ public enum StoatAccessibility {
         "Reply preview, \(preview)"
     }
 
+    public static func attachmentLabel(filename: String, kind: String, size: String, state: String) -> String {
+        [filename, kind, size, state].filter { !$0.isEmpty }.joined(separator: ", ")
+    }
+
+    public static func attachmentActionLabel(action: String, filename: String) -> String {
+        "\(action), \(filename)"
+    }
+
     public static func jumpNewestLabel(hasNewMessages: Bool) -> String {
         hasNewMessages ? "Jump to newest messages" : "Jump to newest message"
     }

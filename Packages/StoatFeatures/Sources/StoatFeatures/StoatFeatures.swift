@@ -443,10 +443,18 @@ public final class MainShellViewModel {
     public var calibrationCheckpointNote = ""
     public var importedCalibrationNotes = ""
     public var selectedTimelineTuningPreset: TimelineTuningPreset = .conservative
-    public var attachmentPreview: ComposerAttachmentDraft?
+    public var attachmentPreview: AttachmentPreviewSheetItem?
+    public var attachmentPreviewStates: [String: AttachmentPreviewState] = [:]
+    public var loadedAttachmentData: [String: RemoteAttachmentData] = [:]
+    public var loadedAttachmentOriginalData: [String: RemoteAttachmentData] = [:]
+    public var attachmentLocalFiles: [String: URL] = [:]
+    public var lastAttachmentAction: String?
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var attachmentUploadHandler: any AttachmentUploadHandling
+    @ObservationIgnored public var remoteAttachmentLoader: any RemoteAttachmentLoading
+    @ObservationIgnored public var attachmentSaver: any AttachmentSaving
+    @ObservationIgnored public var attachmentOpener: any AttachmentOpening
     @ObservationIgnored public var channelAckSender: any ChannelAckSending
     @ObservationIgnored public var messageReferenceResolver: any MessageReferenceResolving
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
@@ -454,6 +462,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
     @ObservationIgnored private var ackTask: Task<Void, Never>?
     @ObservationIgnored private var referenceFetchTasks: [MessageID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var attachmentLoadTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var activeTypingChannelID: ChannelID?
     @ObservationIgnored private var lastTypingBeginAt: [ChannelID: Date] = [:]
     @ObservationIgnored private var lastAckedMessageByChannelID: [ChannelID: MessageID] = [:]
@@ -484,6 +493,9 @@ public final class MainShellViewModel {
         messageController: ChannelMessageController? = nil,
         messageActionHandler: (any MessageActionHandling)? = nil,
         attachmentUploadHandler: (any AttachmentUploadHandling)? = nil,
+        remoteAttachmentLoader: (any RemoteAttachmentLoading)? = nil,
+        attachmentSaver: (any AttachmentSaving)? = nil,
+        attachmentOpener: (any AttachmentOpening)? = nil,
         channelAckSender: (any ChannelAckSending)? = nil,
         messageReferenceResolver: (any MessageReferenceResolving)? = nil
     ) {
@@ -498,6 +510,9 @@ public final class MainShellViewModel {
         self.messageController = messageController ?? ChannelMessageController(runtimeMode: runtimeMode, currentUserID: currentUser?.id ?? MockShellData.currentUserID)
         self.messageActionHandler = messageActionHandler ?? MockMessageActionHandler(currentUserID: currentUser?.id ?? MockShellData.currentUserID)
         self.attachmentUploadHandler = attachmentUploadHandler ?? MockAttachmentUploadHandler()
+        self.remoteAttachmentLoader = remoteAttachmentLoader ?? MockRemoteAttachmentLoader()
+        self.attachmentSaver = attachmentSaver ?? AppKitAttachmentSaver()
+        self.attachmentOpener = attachmentOpener ?? AppKitAttachmentOpener()
         self.channelAckSender = channelAckSender ?? NoopChannelAckSender()
         self.messageReferenceResolver = messageReferenceResolver ?? DisabledMessageReferenceResolver()
         self.previousSnapshot = snapshot
@@ -521,6 +536,7 @@ public final class MainShellViewModel {
         typingEndTask?.cancel()
         ackTask?.cancel()
         referenceFetchTasks.values.forEach { $0.cancel() }
+        attachmentLoadTasks.values.forEach { $0.cancel() }
     }
 
     public var servers: [Server] {
@@ -899,6 +915,11 @@ public final class MainShellViewModel {
         messageActionHandler = sessionCoordinator.messageActionHandler
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
         attachmentUploadHandler = liveAPIClient.map { LiveAttachmentUploadHandler(apiClient: $0) } ?? MockAttachmentUploadHandler()
+        if sessionCoordinator.mode == .liveManual {
+            remoteAttachmentLoader = LiveRemoteAttachmentLoader(environment: sessionCoordinator.environment)
+        } else {
+            remoteAttachmentLoader = MockRemoteAttachmentLoader()
+        }
         channelAckSender = liveAPIClient.map { LiveChannelAckSender(apiClient: $0) } ?? NoopChannelAckSender()
         if sessionCoordinator.mode == .mock {
             messageReferenceResolver = InMemoryMessageReferenceResolver(messagesByChannelID: snapshot.messagesByChannelID)
@@ -959,6 +980,7 @@ public final class MainShellViewModel {
                 let draft = try attachmentValidationPolicy.draft(for: url, existingCount: state.attachments.count)
                 state.attachments.append(draft)
                 composerError = nil
+                lastAttachmentAction = "Queued attachment"
             } catch {
                 composerError = error.userFacingMessage
             }
@@ -973,6 +995,7 @@ public final class MainShellViewModel {
             let draft = try attachmentValidationPolicy.imageDraft(data: data, existingCount: state.attachments.count)
             state.attachments.append(draft)
             composerError = nil
+            lastAttachmentAction = "Queued pasted image"
         } catch {
             composerError = error.userFacingMessage
         }
@@ -1001,6 +1024,7 @@ public final class MainShellViewModel {
         var state = composerDraftState(for: channelID)
         state.attachments.removeAll { $0.id == attachmentID }
         composerDrafts[channelID] = state
+        lastAttachmentAction = "Removed attachment"
     }
 
     public func retryAttachmentUpload(_ attachmentID: UUID, in channelID: ChannelID?) async {
@@ -1066,6 +1090,12 @@ public final class MainShellViewModel {
         if state.attachments.contains(where: { $0.status.isWorking }) {
             return (false, "Attachment upload is still in progress.")
         }
+        if state.attachments.contains(where: {
+            if case .failed = $0.status { return true }
+            return false
+        }) {
+            return (false, "Remove or retry failed attachments before sending.")
+        }
         if messageController.sendingChannelIDs.contains(channelID) {
             return (false, "Sending the previous message.")
         }
@@ -1107,6 +1137,14 @@ public final class MainShellViewModel {
         }
     }
 
+    public func composerAttachmentSummary(for channelID: ChannelID?) -> String? {
+        let attachments = composerDraftState(for: channelID).attachments
+        guard !attachments.isEmpty else { return nil }
+        let totalBytes = attachments.reduce(0) { $0 + $1.byteCount }
+        let count = attachments.count == 1 ? "1 attachment" : "\(attachments.count) attachments"
+        return "\(count) · \(ByteCountFormatter.string(fromByteCount: Int64(totalBytes), countStyle: .file))"
+    }
+
     private func systemImage(for kind: ComposerAttachmentKind) -> String {
         switch kind {
         case .image:
@@ -1132,6 +1170,207 @@ public final class MainShellViewModel {
             return .uploaded
         case let .failed(message):
             return .failed(message)
+        }
+    }
+
+    public func attachmentDisplayItems(for message: Message) -> [AttachmentDisplayItem] {
+        (message.attachments ?? []).map { file in
+            var item = AttachmentDisplayItem(file: file, previewState: attachmentPreviewStates["file-\(file.id.rawValue)"] ?? .notLoaded)
+            if loadedAttachmentData[item.id] != nil {
+                item.previewState = .readyRemote
+            }
+            if attachmentLocalFiles[item.id] != nil {
+                item.previewState = .readyLocal
+            }
+            return item
+        }
+    }
+
+    public func previewComposerAttachment(_ attachmentID: UUID, in channelID: ChannelID?) {
+        guard let draft = composerDraftState(for: channelID).attachments.first(where: { $0.id == attachmentID }) else { return }
+        var item = AttachmentDisplayItem(attachmentDraft: draft)
+        var data = draft.previewData
+        var localFile: URL?
+        if case let .fileURL(url) = draft.source {
+            localFile = url
+            if data == nil, draft.kind == .image {
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer {
+                    if scoped { url.stopAccessingSecurityScopedResource() }
+                }
+                data = try? Data(contentsOf: url, options: [.mappedIfSafe])
+            }
+        }
+        if data != nil || localFile != nil {
+            item.previewState = .readyLocal
+        } else if !item.kind.isPreviewable {
+            item.previewState = .unsupported("Preview unavailable")
+        }
+        if let data {
+            loadedAttachmentData[item.id] = RemoteAttachmentData(fileID: item.fileID, filename: item.displayName, contentType: item.contentType, byteCount: data.count, data: data)
+        }
+        if let localFile {
+            attachmentLocalFiles[item.id] = localFile
+        }
+        attachmentPreview = AttachmentPreviewSheetItem(item: item, data: data, localFile: localFile, debugFileID: item.fileID?.rawValue)
+        lastAttachmentAction = "Opened composer attachment preview"
+    }
+
+    public func previewAttachment(_ item: AttachmentDisplayItem) async {
+        var current = itemWithCurrentPreviewState(item)
+        if let data = loadedAttachmentData[current.id] {
+            current.previewState = .readyRemote
+            attachmentPreview = AttachmentPreviewSheetItem(item: current, data: data.data, localFile: attachmentLocalFiles[current.id], debugFileID: current.fileID?.rawValue)
+            lastAttachmentAction = "Opened loaded attachment preview"
+            return
+        }
+        if let localFile = attachmentLocalFiles[current.id] {
+            current.previewState = .readyLocal
+            attachmentPreview = AttachmentPreviewSheetItem(item: current, data: try? Data(contentsOf: localFile), localFile: localFile, debugFileID: current.fileID?.rawValue)
+            lastAttachmentAction = "Opened local attachment preview"
+            return
+        }
+        guard current.kind.isPreviewable else {
+            current.previewState = .unsupported("Preview unavailable. Download instead.")
+            attachmentPreviewStates[current.id] = current.previewState
+            attachmentPreview = AttachmentPreviewSheetItem(item: current, debugFileID: current.fileID?.rawValue, statusMessage: "Preview unavailable. Download instead.")
+            return
+        }
+        if case .loading = attachmentPreviewStates[current.id] {
+            return
+        }
+        attachmentPreviewStates[current.id] = .loading
+        lastAttachmentAction = "Loading attachment preview"
+        do {
+            let loaded = try await remoteAttachmentLoader.load(current, purpose: .preview)
+            loadedAttachmentData[current.id] = loaded
+            current.previewState = .readyRemote
+            attachmentPreviewStates[current.id] = .readyRemote
+            attachmentPreview = AttachmentPreviewSheetItem(item: current, data: loaded.data, localFile: attachmentLocalFiles[current.id], debugFileID: current.fileID?.rawValue)
+            lastAttachmentAction = "Loaded attachment preview"
+        } catch {
+            let message = AttachmentSafety.safeErrorMessage(error)
+            current.previewState = .failed(message)
+            attachmentPreviewStates[current.id] = current.previewState
+            attachmentPreview = AttachmentPreviewSheetItem(item: current, debugFileID: current.fileID?.rawValue, statusMessage: message)
+            lastAttachmentAction = "Attachment preview failed"
+        }
+    }
+
+    public func downloadAttachment(_ item: AttachmentDisplayItem) async {
+        let current = itemWithCurrentPreviewState(item)
+        do {
+            let data: RemoteAttachmentData
+            if let loaded = loadedAttachmentOriginalData[current.id] {
+                data = loaded
+            } else if current.source.isRemoteLoadable {
+                data = try await remoteAttachmentLoader.load(current, purpose: .original)
+                loadedAttachmentOriginalData[current.id] = data
+            } else if let loaded = loadedAttachmentData[current.id] {
+                data = loaded
+            } else {
+                throw AttachmentActionError.unavailable("Attachment is not available to save.")
+            }
+            try await attachmentSaver.save(data: data.data, suggestedFilename: current.displayName)
+            lastAttachmentAction = "Saved attachment"
+            placeholderStatus = "Attachment saved"
+        } catch AttachmentActionError.cancelled {
+            lastAttachmentAction = "Save cancelled"
+        } catch {
+            let message = AttachmentSafety.safeErrorMessage(error)
+            lastAttachmentAction = "Save failed"
+            placeholderStatus = message
+        }
+    }
+
+    public func openAttachmentExternally(_ item: AttachmentDisplayItem) async {
+        var current = itemWithCurrentPreviewState(item)
+        do {
+            let url: URL
+            if let existing = attachmentLocalFiles[current.id] {
+                url = existing
+            } else if let original = loadedAttachmentOriginalData[current.id] ?? loadedAttachmentData[current.id] {
+                url = try writeTemporaryAttachmentFile(data: original.data, filename: current.displayName)
+                attachmentLocalFiles[current.id] = url
+                current.previewState = .readyLocal
+                attachmentPreviewStates[current.id] = .readyLocal
+            } else {
+                throw AttachmentActionError.unavailable("Preview or download this attachment before opening it.")
+            }
+            try await attachmentOpener.open(url)
+            lastAttachmentAction = "Opened attachment externally"
+        } catch {
+            let message = AttachmentSafety.safeErrorMessage(error)
+            lastAttachmentAction = "Open externally failed"
+            placeholderStatus = message
+        }
+    }
+
+    public func retryAttachmentPreview(_ item: AttachmentDisplayItem) async {
+        attachmentPreviewStates[item.id] = .notLoaded
+        loadedAttachmentData[item.id] = nil
+        await previewAttachment(item)
+    }
+
+    public func closeAttachmentPreview() {
+        attachmentPreview = nil
+        lastAttachmentAction = "Closed attachment preview"
+    }
+
+    public func attachmentDiagnostics() -> AttachmentDiagnostics {
+        let drafts = composerDrafts.values.flatMap(\.attachments)
+        let queued = drafts.filter {
+            if case .queued = $0.status { return true }
+            return false
+        }.count
+        let working = drafts.filter(\.status.isWorking).count
+        let failed = drafts.filter {
+            if case .failed = $0.status { return true }
+            return false
+        }.count
+        let displayed = selectedTimelineMessages.reduce(0) { count, timelineMessage in
+            count + (timelineMessage.message.attachments?.count ?? 0)
+        }
+        let failedPreviews = attachmentPreviewStates.values.filter {
+            if case .failed = $0 { return true }
+            return false
+        }.count
+        return AttachmentDiagnostics(
+            queuedDraftCount: queued,
+            uploadingCount: working,
+            failedUploadCount: failed,
+            displayedAttachmentCount: displayed,
+            loadedPreviewCount: loadedAttachmentData.count,
+            failedPreviewCount: failedPreviews,
+            lastAttachmentAction: lastAttachmentAction
+        )
+    }
+
+    private func itemWithCurrentPreviewState(_ item: AttachmentDisplayItem) -> AttachmentDisplayItem {
+        var current = item
+        if let state = attachmentPreviewStates[item.id] {
+            current.previewState = state
+        }
+        if loadedAttachmentData[item.id] != nil {
+            current.previewState = .readyRemote
+        }
+        if attachmentLocalFiles[item.id] != nil {
+            current.previewState = .readyLocal
+        }
+        return current
+    }
+
+    private func writeTemporaryAttachmentFile(data: Data, filename: String) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("LiquidBagelAttachmentPreviews", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(UUID().uuidString + "-" + AttachmentDisplayFormatting.safeFilename(filename))
+        try data.write(to: url, options: [.atomic])
+        return url
+    }
+
+    private func cleanupTemporaryAttachmentFiles() {
+        for url in attachmentLocalFiles.values where url.path.contains("LiquidBagelAttachmentPreviews") {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
@@ -1252,6 +1491,7 @@ public final class MainShellViewModel {
 
         state.attachments[index].status = .reading
         composerDrafts[channelID] = state
+        lastAttachmentAction = "Started attachment upload"
 
         state = composerDraftState(for: channelID)
         guard let readingIndex = state.attachments.firstIndex(where: { $0.id == attachmentID }) else { return }
@@ -1266,12 +1506,14 @@ public final class MainShellViewModel {
             updated.attachments[updatedIndex].status = .uploaded(uploaded.id)
             composerDrafts[channelID] = updated
             composerError = nil
+            lastAttachmentAction = "Uploaded attachment"
         } catch {
             var updated = composerDraftState(for: channelID)
             guard let updatedIndex = updated.attachments.firstIndex(where: { $0.id == attachmentID }) else { return }
             updated.attachments[updatedIndex].status = .failed(error.userFacingMessage)
             composerDrafts[channelID] = updated
             composerError = "Attachment upload failed."
+            lastAttachmentAction = "Attachment upload failed"
         }
     }
 
@@ -1787,7 +2029,19 @@ public final class MainShellViewModel {
     }
 
     public func copyRedactedTimelineDiagnostics() {
-        let text = TimelineCopyFormatter.diagnostics(timelineDiagnostics())
+        let timeline = TimelineCopyFormatter.diagnostics(timelineDiagnostics())
+        let attachments = attachmentDiagnostics()
+        let attachmentText = """
+        Attachment diagnostics
+        queuedDrafts: \(attachments.queuedDraftCount)
+        uploading: \(attachments.uploadingCount)
+        failedUploads: \(attachments.failedUploadCount)
+        displayed: \(attachments.displayedAttachmentCount)
+        loadedPreviews: \(attachments.loadedPreviewCount)
+        failedPreviews: \(attachments.failedPreviewCount)
+        lastAttachmentAction: \(attachments.lastAttachmentAction ?? "-")
+        """
+        let text = Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText))
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -3050,8 +3304,22 @@ public struct MainShellView: View {
         .sheet(isPresented: $viewModel.isCredentialSetupPresented) {
             AccountConnectionSettingsView(viewModel: viewModel)
         }
-        .sheet(item: $viewModel.attachmentPreview) { attachment in
-            AttachmentPreviewSheet(attachment: attachment)
+        .sheet(item: $viewModel.attachmentPreview, onDismiss: {
+            viewModel.closeAttachmentPreview()
+        }) { attachment in
+            AttachmentPreviewSheet(
+                preview: attachment,
+                showDebug: viewModel.isDeveloperControlsEnabled,
+                onDownload: {
+                    Task { await viewModel.downloadAttachment(attachment.item) }
+                },
+                onOpenExternally: {
+                    Task { await viewModel.openAttachmentExternally(attachment.item) }
+                },
+                onRetry: {
+                    Task { await viewModel.retryAttachmentPreview(attachment.item) }
+                }
+            )
         }
         .confirmationDialog(
             "Send current composer text?",
@@ -3265,72 +3533,131 @@ public struct MainShellView: View {
 }
 
 private struct AttachmentPreviewSheet: View {
-    let attachment: ComposerAttachmentDraft
+    @Environment(\.dismiss) private var dismiss
+    let preview: AttachmentPreviewSheetItem
+    let showDebug: Bool
+    let onDownload: () -> Void
+    let onOpenExternally: () -> Void
+    let onRetry: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.medium) {
             HStack {
-                Label(attachment.filename, systemImage: systemImage)
+                Label(preview.item.displayName, systemImage: preview.item.kind.systemImage)
                     .font(.headline)
                 Spacer()
-                Text(attachment.displaySize)
+                Text(AttachmentDisplayFormatting.formattedSize(preview.item.byteCount))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Button("Close") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
             }
-            preview
+            previewBody
                 .frame(minWidth: 420, minHeight: 280)
-            Text(attachment.mimeType)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                Text(metadataLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if showDebug, let id = preview.debugFileID {
+                    Text("File ID \(id)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .textSelection(.enabled)
+                }
+                if let status = preview.statusMessage {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: StoatSpacing.small) {
+                if preview.item.source.isRemoteLoadable || preview.data != nil {
+                    Button {
+                        onDownload()
+                    } label: {
+                        Label("Save As", systemImage: "square.and.arrow.down")
+                    }
+                }
+                if preview.localFile != nil || preview.data != nil {
+                    Button {
+                        onOpenExternally()
+                    } label: {
+                        Label("Open Externally", systemImage: "arrow.up.forward.app")
+                    }
+                }
+                if case .failed = preview.item.previewState {
+                    Button {
+                        onRetry()
+                    } label: {
+                        Label("Retry Preview", systemImage: "arrow.clockwise")
+                    }
+                }
+                Spacer()
+            }
+            .buttonStyle(GlassButtonStyle())
         }
         .padding(StoatSpacing.large)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(StoatAccessibility.attachmentLabel(filename: preview.item.displayName, kind: preview.item.kind.label, size: AttachmentDisplayFormatting.formattedSize(preview.item.byteCount), state: preview.item.previewState.safeLabel))
     }
 
-    @ViewBuilder private var preview: some View {
+    @ViewBuilder private var previewBody: some View {
         #if canImport(AppKit)
-        if let data = attachment.previewData, let image = NSImage(data: data) {
+        if let data = preview.data, let image = NSImage(data: data) {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if case let .fileURL(url) = attachment.source,
-                  attachment.kind == .image,
+        } else if let url = preview.localFile,
+                  preview.item.kind == .image,
                   let image = NSImage(contentsOf: url) {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            unavailablePreview
+            genericPreview
         }
         #else
-        unavailablePreview
+        genericPreview
         #endif
     }
 
-    private var unavailablePreview: some View {
+    private var genericPreview: some View {
         VStack(spacing: StoatSpacing.small) {
-            Image(systemName: systemImage)
+            Image(systemName: preview.item.kind.systemImage)
                 .font(.largeTitle)
                 .foregroundStyle(.secondary)
-            Text("Preview unavailable")
+            Text(genericPreviewText)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            Text(preview.item.displayName)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .lineLimit(2)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
     }
 
-    private var systemImage: String {
-        switch attachment.kind {
-        case .image:
-            return "photo"
-        case .pdf:
-            return "doc.richtext"
-        case .text:
-            return "doc.text"
-        case .file:
-            return "doc"
+    private var metadataLine: String {
+        "\(preview.item.kind.label) · \(preview.item.contentType ?? "unknown type") · \(AttachmentDisplayFormatting.formattedSize(preview.item.byteCount))"
+    }
+
+    private var genericPreviewText: String {
+        switch preview.item.previewState {
+        case .loading:
+            return "Loading preview"
+        case let .failed(message):
+            return message
+        case let .unsupported(message):
+            return message
+        case .notLoaded:
+            return preview.item.kind.isPreviewable ? "Preview not loaded" : "Preview unavailable"
+        case .readyLocal, .readyRemote:
+            return preview.item.kind == .image ? "Image preview unavailable" : "File details"
         }
     }
 }
@@ -3964,6 +4291,7 @@ public struct ChatPlaceholderView: View {
                     isSending: viewModel.messageController.sendingChannelIDs.contains(channel.id),
                     canAttach: viewModel.canUploadFiles(in: channel),
                     attachments: viewModel.composerAttachmentChips(for: channel.id),
+                    attachmentSummary: viewModel.composerAttachmentSummary(for: channel.id),
                     replyAuthor: draftState.replyContext?.authorDisplayName,
                     replyPreview: draftState.replyContext?.contentPreview,
                     focusRequestID: viewModel.composerFocusRequestID,
@@ -3980,7 +4308,7 @@ public struct ChatPlaceholderView: View {
                         viewModel.removeAttachment(attachmentID, from: channel.id)
                     },
                     onPreviewAttachment: { attachmentID in
-                        viewModel.attachmentPreview = viewModel.composerDraftState(for: channel.id).attachments.first { $0.id == attachmentID }
+                        viewModel.previewComposerAttachment(attachmentID, in: channel.id)
                     },
                     onDropFileURLs: { urls in
                         viewModel.addAttachmentURLs(urls, to: channel.id)
@@ -4249,10 +4577,15 @@ public struct MessageTimelineView: View {
     @ViewBuilder private var timelineDiagnosticsView: some View {
         if viewModel.isDeveloperControlsEnabled {
             let diagnostics = viewModel.timelineDiagnostics()
+            let attachments = viewModel.attachmentDiagnostics()
             VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                 Text("Timeline Diagnostics")
                     .font(.caption.weight(.semibold))
                 Text("Loaded \(diagnostics.loadedMessageCount) · visible \(diagnostics.firstVisibleMessageID?.rawValue ?? "-") to \(diagnostics.lastVisibleMessageID?.rawValue ?? "-") · at newest \(diagnostics.atNewest ? "yes" : "no") · pending refs \(diagnostics.pendingReferenceFetchCount) · retries \(diagnostics.pendingRetryCount)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Text("Attachments displayed \(attachments.displayedAttachmentCount) · loaded previews \(attachments.loadedPreviewCount) · failed previews \(attachments.failedPreviewCount) · drafts queued \(attachments.queuedDraftCount) · failed uploads \(attachments.failedUploadCount)")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
@@ -4367,7 +4700,20 @@ public struct TimelineMessageGroupView: View {
                             isCurrentSearchResult: viewModel.isCurrentSearchResult(timelineMessage.message.id),
                             isCompactDensity: viewModel.messageDensity == .compact,
                             searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
-                            replyPreview: viewModel.resolvedReplyPreview(for: timelineMessage.message)
+                            replyPreview: viewModel.resolvedReplyPreview(for: timelineMessage.message),
+                            attachmentItems: viewModel.attachmentDisplayItems(for: timelineMessage.message),
+                            onPreviewAttachment: { item in
+                                Task { await viewModel.previewAttachment(item) }
+                            },
+                            onDownloadAttachment: { item in
+                                Task { await viewModel.downloadAttachment(item) }
+                            },
+                            onOpenAttachment: { item in
+                                Task { await viewModel.openAttachmentExternally(item) }
+                            },
+                            onRetryAttachment: { item in
+                                Task { await viewModel.retryAttachmentPreview(item) }
+                            }
                         )
                         .id(timelineMessage.message.id)
                         .onAppear {
