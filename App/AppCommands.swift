@@ -88,6 +88,56 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("t", modifiers: [.command, .option])
             .disabled(commandHandler?.canPerform(.focusTimeline) == false)
+
+            Button("Search This Channel") {
+                commandHandler?.perform(.openChannelSearch)
+            }
+            .keyboardShortcut("f", modifiers: [.command])
+            .disabled(commandHandler?.canPerform(.openChannelSearch) == false)
+
+            Button("Find in Loaded Messages") {
+                commandHandler?.perform(.openLoadedMessageFind)
+            }
+            .keyboardShortcut("f", modifiers: [.command, .option])
+            .disabled(commandHandler?.canPerform(.openLoadedMessageFind) == false)
+
+            Button("Live Search Selected Channel") {
+                commandHandler?.perform(.openLiveChannelSearch)
+            }
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+            .disabled(commandHandler?.canPerform(.openLiveChannelSearch) == false)
+        }
+
+        CommandMenu("Search") {
+            Button("Pinned in This Channel") {
+                commandHandler?.perform(.openPinnedChannelSearch)
+            }
+            .keyboardShortcut("p", modifiers: [.command, .option])
+            .disabled(commandHandler?.canPerform(.openPinnedChannelSearch) == false)
+
+            Button("Previous Search Result") {
+                commandHandler?.perform(.selectPreviousSearchResult)
+            }
+            .keyboardShortcut(.upArrow, modifiers: [.command, .shift])
+            .disabled(commandHandler?.canPerform(.selectPreviousSearchResult) == false)
+
+            Button("Next Search Result") {
+                commandHandler?.perform(.selectNextSearchResult)
+            }
+            .keyboardShortcut(.downArrow, modifiers: [.command, .shift])
+            .disabled(commandHandler?.canPerform(.selectNextSearchResult) == false)
+
+            Button("Jump to Search Result") {
+                commandHandler?.perform(.jumpToSelectedSearchResult)
+            }
+            .keyboardShortcut(.return, modifiers: [.command])
+            .disabled(commandHandler?.canPerform(.jumpToSelectedSearchResult) == false)
+
+            Button("Load Around Search Result") {
+                commandHandler?.perform(.loadAroundSelectedSearchResult)
+            }
+            .keyboardShortcut(.return, modifiers: [.command, .option])
+            .disabled(commandHandler?.canPerform(.loadAroundSelectedSearchResult) == false)
         }
 
         CommandMenu("Message") {

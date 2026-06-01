@@ -595,9 +595,11 @@ private struct TimelineValidationHarnessView: View {
             Text("Timeline Validation")
                 .font(.headline)
             diagnosticsGrid(diagnostics)
+            routeCapabilities
             warningList(diagnostics.validationWarnings)
             actionGrid
             tuningControls
+            calibrationControls
             findControls
             checklist(diagnostics)
         }
@@ -666,6 +668,16 @@ private struct TimelineValidationHarnessView: View {
     private var tuningControls: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.small) {
             Text("Timeline Tuning").font(.subheadline.weight(.semibold))
+            HStack {
+                Picker("Preset", selection: $viewModel.selectedTimelineTuningPreset) {
+                    ForEach(TimelineTuningPreset.allCases) { preset in
+                        Text(preset.displayName).tag(preset)
+                    }
+                }
+                .labelsHidden()
+                Button("Apply Preset") { viewModel.applyTimelineTuningPreset(viewModel.selectedTimelineTuningPreset) }
+                Button("Reset Defaults") { viewModel.resetTimelineTuningToDefaults() }
+            }
             Stepper("Near newest threshold: \(viewModel.timelineTuning.nearNewestMessageThreshold)", value: binding(\.nearNewestMessageThreshold), in: 0...25)
             Stepper("Visible debounce: \(viewModel.timelineTuning.visibleRangeUpdateDebounceMilliseconds) ms", value: binding(\.visibleRangeUpdateDebounceMilliseconds), in: 0...2000, step: 20)
             Stepper("Load-to-unread attempts: \(viewModel.timelineTuning.loadToUnreadMaxAttempts)", value: binding(\.loadToUnreadMaxAttempts), in: 1...20)
@@ -673,6 +685,67 @@ private struct TimelineValidationHarnessView: View {
             Stepper("Ack debounce: \(viewModel.timelineTuning.ackDebounceMilliseconds) ms", value: binding(\.ackDebounceMilliseconds), in: 0...10000, step: 100)
         }
         .font(.caption)
+    }
+
+    private var routeCapabilities: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            Text("Route Capabilities").font(.subheadline.weight(.semibold))
+            routeRow("Single-message fetch", viewModel.routeVerificationResult.singleMessageFetch)
+            routeRow("Around-message fetch", viewModel.routeVerificationResult.aroundMessageFetch)
+            routeRow("Selected-channel search", viewModel.routeVerificationResult.channelSearch)
+            routeRow("Pinned search", viewModel.routeVerificationResult.pinnedSearch)
+            Text(viewModel.lastRouteVerificationResult == nil ? "Source: not live-probed" : "Source: source-verified, not live-probed")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func routeRow(_ title: String, _ status: TimelineRouteVerificationStatus) -> some View {
+        Label("\(title): \(status.rawValue)", systemImage: status == .supported ? "checkmark.circle.fill" : "questionmark.circle")
+            .font(.caption)
+            .foregroundStyle(status == .supported ? .green : .secondary)
+            .accessibilityLabel(Phase13Accessibility.routeCapabilityLabel(title, status: status))
+    }
+
+    private var calibrationControls: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            Text("Timeline Calibration").font(.subheadline.weight(.semibold))
+            let run = viewModel.activeCalibrationRun
+            HStack {
+                Button(run?.isRunning == true ? "Stop Calibration" : "Start Calibration") {
+                    if run?.isRunning == true {
+                        viewModel.stopTimelineCalibration()
+                    } else {
+                        viewModel.startTimelineCalibration()
+                    }
+                }
+                Button("Add Checkpoint") { viewModel.addTimelineCalibrationCheckpoint() }
+                    .disabled(run?.isRunning != true)
+                Button("Copy Calibration") { viewModel.copyRedactedTimelineCalibration() }
+                    .disabled(run == nil)
+                Button("Apply Recommendation") { viewModel.applyTimelineCalibrationRecommendation() }
+                    .disabled(run?.recommendedAdjustments == nil)
+            }
+            TextField("Checkpoint note", text: $viewModel.calibrationCheckpointNote)
+                .textFieldStyle(.roundedBorder)
+                .disabled(run?.isRunning != true)
+            Text(Phase13Accessibility.calibrationLabel(isRunning: run?.isRunning == true, observationCount: run?.observations.count ?? 0))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let recommendation = run?.recommendedAdjustments {
+                Label("\(recommendation.title): \(recommendation.detail)", systemImage: "lightbulb")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let observations = run?.observations.suffix(4), !observations.isEmpty {
+                ForEach(Array(observations)) { observation in
+                    Text("\(observation.kind.displayName) · loaded \(observation.diagnostics.loadedMessageCount) · warnings \(observation.diagnostics.validationWarnings.count)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .accessibilityLabel(Phase13Accessibility.calibrationLabel(isRunning: viewModel.activeCalibrationRun?.isRunning == true, observationCount: viewModel.activeCalibrationRun?.observations.count ?? 0))
     }
 
     private func binding(_ keyPath: WritableKeyPath<TimelineTuningConfiguration, Int>) -> Binding<Int> {
@@ -711,6 +784,7 @@ private struct TimelineValidationHarnessView: View {
                     .textFieldStyle(.roundedBorder)
                 Toggle("Pinned only", isOn: $viewModel.remoteSearchPinnedOnly)
                 Button("Search") { Task { await viewModel.runSelectedChannelSearch() } }
+                Button("Open Panel") { viewModel.openChannelSearch(mode: .liveChannel) }
             }
             if let status = viewModel.remoteSearchStatus {
                 Text(status).font(.caption).foregroundStyle(.secondary)

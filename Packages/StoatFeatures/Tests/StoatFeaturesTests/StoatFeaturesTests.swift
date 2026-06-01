@@ -1492,6 +1492,93 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(copied.contains("<redacted>"))
     }
 
+    @MainActor
+    func testPhase13CalibrationRecordsObservationsAndRedactsCopy() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        model.startTimelineCalibration()
+        model.addTimelineCalibrationCheckpoint(note: "token=super-secret-value")
+
+        let run = try XCTUnwrap(model.activeCalibrationRun)
+        XCTAssertTrue(run.isRunning)
+        XCTAssertGreaterThanOrEqual(run.observations.count, 2)
+
+        let copied = TimelineCopyFormatter.calibration(run)
+        XCTAssertFalse(copied.contains("super-secret-value"))
+        XCTAssertTrue(copied.contains("<redacted>"))
+
+        model.stopTimelineCalibration()
+        XCTAssertFalse(try XCTUnwrap(model.activeCalibrationRun).isRunning)
+    }
+
+    @MainActor
+    func testPhase13TuningPresetsClampAndReset() {
+        let responsive = TimelineTuningPreset.responsive.configuration
+        XCTAssertEqual(responsive, responsive.validated())
+        XCTAssertEqual(TimelineTuningPreset.debugStrict.configuration.ackDebounceMilliseconds, 0)
+
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.applyTimelineTuningPreset(.responsive)
+        XCTAssertEqual(model.timelineTuning, TimelineTuningPreset.responsive.configuration)
+        model.resetTimelineTuningToDefaults()
+        XCTAssertEqual(model.timelineTuning, .defaults)
+    }
+
+    @MainActor
+    func testPhase13LoadedFindUsesChannelSearchStateAndJumps() async throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        model.channelSearchQuery = ChannelSearchQuery(text: "Phase", mode: .loadedOnly)
+
+        await model.runChannelSearch()
+        guard case let .results(query, results) = model.channelSearchState else {
+            return XCTFail("Expected loaded results")
+        }
+        XCTAssertEqual(query.mode, .loadedOnly)
+        XCTAssertTrue(results.allSatisfy(\.isLoaded))
+
+        model.jumpToSelectedSearchResult()
+        XCTAssertNotNil(model.timelineViewport.pendingScrollIntent)
+    }
+
+    @MainActor
+    func testPhase13LiveSearchRequiresManualConnection() async {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, runtimeMode: .liveManual, sessionState: .readyToConnect)
+        model.selectServer(model.servers[0].id)
+        model.channelSearchQuery = ChannelSearchQuery(text: "needle", mode: .liveChannel)
+
+        await model.runChannelSearch()
+        guard case let .failed(_, message) = model.channelSearchState else {
+            return XCTFail("Expected failed live search state")
+        }
+        XCTAssertEqual(message, "Live search requires manual connection.")
+    }
+
+    @MainActor
+    func testPhase13SearchResultNavigationRouteGatingAndAccessibility() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        let result = ChannelSearchResult(
+            messageID: "outside",
+            channelID: channelID,
+            authorID: "author",
+            snippet: "Result outside loaded range",
+            mode: .liveChannel,
+            isLoaded: false,
+            safeStatus: "Result outside loaded range"
+        )
+        model.channelSearchState = .results(ChannelSearchQuery(text: "needle", mode: .liveChannel), [result])
+        model.selectSearchResult(result)
+
+        XCTAssertFalse(model.canPerform(.loadAroundSelectedSearchResult))
+        XCTAssertEqual(model.disabledReason(for: .loadAroundSelectedSearchResult), "Around-message route is not verified.")
+        XCTAssertTrue(Phase13Accessibility.channelSearchResultLabel(result, isSelected: true).contains("Outside loaded range"))
+
+        model.verifyTimelineRoutes()
+        XCTAssertTrue(model.canPerform(.loadAroundSelectedSearchResult))
+    }
+
     private func message(
         id: String,
         author: UserID,

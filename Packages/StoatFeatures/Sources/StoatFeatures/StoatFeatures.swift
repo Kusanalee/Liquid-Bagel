@@ -433,6 +433,14 @@ public final class MainShellViewModel {
     public var remoteSearchPinnedOnly = false
     public var remoteSearchResults: [LoadedMessageFindResult] = []
     public var remoteSearchStatus: String?
+    public var isChannelSearchPresented = false
+    public var channelSearchQuery = ChannelSearchQuery()
+    public var channelSearchState: ChannelSearchState = .idle
+    public var selectedSearchResultID: MessageID?
+    public var searchNavigationStatus: String?
+    public var activeCalibrationRun: TimelineCalibrationRun?
+    public var calibrationCheckpointNote = ""
+    public var selectedTimelineTuningPreset: TimelineTuningPreset = .conservative
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var channelAckSender: any ChannelAckSending
@@ -1109,6 +1117,7 @@ public final class MainShellViewModel {
             let target = anchor.flatMap { loadedIDs.contains($0) ? $0 : nil } ?? selectedTimelineMessages.first?.message.id
             timelineViewport = viewportReducer.preserveAfterPrepend(timelineViewport, previousOldestID: target)
             lastTimelineActionResult = "Loaded older messages"
+            recordTimelineCalibrationObservation(kind: .afterLoadOlder)
         } else {
             lastTimelineActionResult = "Load older unavailable or failed"
         }
@@ -1417,6 +1426,7 @@ public final class MainShellViewModel {
         timelineViewport = viewportReducer.jumpNewest(timelineViewport, newestMessageID: newest.message.id)
         requestFocus(.timeline)
         acknowledgeSelectedChannel()
+        recordTimelineCalibrationObservation(kind: .afterJumpNewest)
     }
 
     public func jumpToFirstUnreadMessage() {
@@ -1440,6 +1450,7 @@ public final class MainShellViewModel {
         timelineSelection = TimelineSelection(channelID: activeChannelID, messageID: unreadID, source: .scrollJump)
         timelineViewport = viewportReducer.jumpFirstUnread(timelineViewport, unreadMessageID: unreadID, loadedMessageIDs: Set(selectedTimelineMessages.map(\.message.id)))
         requestFocus(.timeline)
+        recordTimelineCalibrationObservation(kind: .afterJumpUnread)
     }
 
     public var selectedTimelineMessage: TimelineMessage? {
@@ -1636,11 +1647,84 @@ public final class MainShellViewModel {
         validateTimelineState()
     }
 
+    public func applyTimelineTuningPreset(_ preset: TimelineTuningPreset) {
+        selectedTimelineTuningPreset = preset
+        updateTimelineTuning(preset.configuration)
+        lastTimelineActionResult = "Applied \(preset.displayName) tuning preset"
+    }
+
+    public func resetTimelineTuningToDefaults() {
+        selectedTimelineTuningPreset = .conservative
+        updateTimelineTuning(.defaults)
+        lastTimelineActionResult = "Reset timeline tuning to defaults"
+    }
+
+    public func startTimelineCalibration() {
+        let channelID = selection.channelID ?? selection.dmChannelID
+        activeCalibrationRun = TimelineCalibrationRun(
+            environmentID: sessionCoordinator?.preferences.selectedEnvironmentProfile.id ?? "mock",
+            channelID: channelID,
+            tuning: timelineTuning
+        )
+        recordTimelineCalibrationObservation(kind: .manualCheckpoint, note: "Calibration started")
+        placeholderStatus = "Timeline calibration started"
+    }
+
+    public func stopTimelineCalibration() {
+        guard let run = activeCalibrationRun else { return }
+        activeCalibrationRun = run.stopped()
+        placeholderStatus = "Timeline calibration stopped"
+    }
+
+    public func addTimelineCalibrationCheckpoint(note: String? = nil) {
+        let explicitNote = note ?? calibrationCheckpointNote
+        recordTimelineCalibrationObservation(kind: .manualCheckpoint, note: explicitNote.isEmpty ? nil : explicitNote)
+        calibrationCheckpointNote = ""
+        placeholderStatus = "Calibration checkpoint recorded"
+    }
+
+    public func applyTimelineCalibrationRecommendation() {
+        guard let recommendation = activeCalibrationRun?.recommendedAdjustments else {
+            placeholderStatus = "No calibration recommendation to apply"
+            return
+        }
+        updateTimelineTuning(recommendation.recommendedTuning)
+        lastTimelineActionResult = "Applied calibration recommendation"
+    }
+
+    public func copyRedactedTimelineCalibration() {
+        guard let run = activeCalibrationRun else {
+            placeholderStatus = "No calibration run to copy"
+            return
+        }
+        let text = TimelineCopyFormatter.calibration(run)
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+        placeholderStatus = "Calibration copied"
+        lastTimelineActionResult = "Copied redacted calibration"
+    }
+
+    public func recordTimelineCalibrationObservation(kind: TimelineCalibrationObservationKind, note: String? = nil) {
+        guard let run = activeCalibrationRun, run.isRunning else { return }
+        let warnings = validateTimelineState()
+        let diagnostics = timelineDiagnostics()
+        var updated = run.adding(TimelineCalibrationObservation(kind: warnings.isEmpty ? kind : .warning, diagnostics: diagnostics, note: note))
+        if !warnings.isEmpty {
+            updated.warnings = warnings
+        }
+        activeCalibrationRun = updated
+    }
+
     public func refreshLoadedMessageFind() {
         loadedMessageFindResults = loadedMessageFinder.find(
             query: loadedMessageFindQuery,
             messages: selectedTimelineMessages
         )
+        channelSearchQuery = ChannelSearchQuery(text: loadedMessageFindQuery, mode: .loadedOnly)
+        let results = loadedMessageFindResults.map { channelSearchResult(from: $0, mode: .loadedOnly, isLoaded: true) }
+        channelSearchState = results.isEmpty ? .empty(channelSearchQuery) : .results(channelSearchQuery, results)
     }
 
     public func jumpToLoadedFindResult(_ result: LoadedMessageFindResult) {
@@ -1648,6 +1732,147 @@ public final class MainShellViewModel {
         timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
         timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
         lastTimelineActionResult = "Jumped to loaded find result"
+        recordTimelineCalibrationObservation(kind: .afterSearchJump)
+    }
+
+    public func openChannelSearch(mode: ChannelSearchMode = .loadedOnly) {
+        channelSearchQuery.mode = mode
+        channelSearchQuery.pinnedOnly = mode == .pinned
+        isChannelSearchPresented = true
+        selectedSearchResultID = channelSearchState.results.first?.messageID
+        previousFocusTarget = focusTarget
+        focusTarget = .quickSwitcher
+    }
+
+    public func closeChannelSearch() {
+        isChannelSearchPresented = false
+        focusTarget = previousFocusTarget
+    }
+
+    public func runChannelSearch() async {
+        let query = channelSearchQuery
+        let trimmed = query.trimmedText
+        selectedSearchResultID = nil
+        searchNavigationStatus = nil
+
+        switch query.mode {
+        case .loadedOnly:
+            let found = loadedMessageFinder.find(query: trimmed, messages: selectedTimelineMessages)
+            loadedMessageFindQuery = query.text
+            loadedMessageFindResults = found
+            let results = found.map { channelSearchResult(from: $0, mode: .loadedOnly, isLoaded: true) }
+            channelSearchState = results.isEmpty ? .empty(query) : .results(query, results)
+            selectedSearchResultID = results.first?.messageID
+        case .liveChannel, .pinned:
+            guard effectiveRuntimeMode == .liveManual,
+                  effectiveSessionState == .connected,
+                  let channelID = selection.channelID ?? selection.dmChannelID,
+                  let apiClient = sessionCoordinator?.apiClient
+            else {
+                let message = "Live search requires manual connection."
+                channelSearchState = .failed(query, message)
+                remoteSearchStatus = message
+                return
+            }
+            guard query.mode == .pinned || !trimmed.isEmpty else {
+                let message = "Enter search text or choose pinned in this channel."
+                channelSearchState = .failed(query, message)
+                remoteSearchStatus = message
+                return
+            }
+            channelSearchState = .searching(query)
+            do {
+                let messages = try await apiClient.searchMessages(
+                    channelID: channelID,
+                    request: ChannelMessageSearchRequest(
+                        query: query.mode == .pinned ? nil : trimmed,
+                        pinned: query.mode == .pinned ? true : (query.pinnedOnly ? true : nil),
+                        limit: 25,
+                        sort: query.mode == .pinned ? .latest : .relevance
+                    )
+                )
+                let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
+                let results = messages.map { message in
+                    channelSearchResult(from: message, mode: query.mode, matching: trimmed, loadedIDs: loadedIDs)
+                }
+                channelSearchState = results.isEmpty ? .empty(query) : .results(query, results)
+                selectedSearchResultID = results.first?.messageID
+                remoteSearchResults = results.map {
+                    LoadedMessageFindResult(messageID: $0.messageID, channelID: $0.channelID, authorID: $0.authorID, createdAt: $0.createdAt, snippet: $0.snippet)
+                }
+                remoteSearchStatus = results.isEmpty ? "No selected-channel results." : "\(results.count) selected-channel result(s)."
+                lastTimelineActionResult = "Selected-channel search completed"
+            } catch {
+                let message = "Selected-channel search failed: \(error.userFacingMessage)"
+                channelSearchState = .failed(query, message)
+                remoteSearchResults = []
+                remoteSearchStatus = message
+                lastTimelineActionResult = "Selected-channel search failed"
+            }
+        }
+    }
+
+    public var selectedSearchResult: ChannelSearchResult? {
+        let results = channelSearchState.results
+        guard let selectedSearchResultID else { return results.first }
+        return results.first { $0.messageID == selectedSearchResultID } ?? results.first
+    }
+
+    public func selectSearchResult(_ result: ChannelSearchResult) {
+        selectedSearchResultID = result.messageID
+        searchNavigationStatus = result.isLoaded ? nil : "Result outside loaded range."
+    }
+
+    public func selectAdjacentSearchResult(_ delta: Int) {
+        let results = channelSearchState.results
+        guard !results.isEmpty else { return }
+        let current = selectedSearchResultID.flatMap { id in results.firstIndex { $0.messageID == id } } ?? 0
+        let next = min(max(current + delta, 0), results.count - 1)
+        selectedSearchResultID = results[next].messageID
+    }
+
+    public func jumpToSelectedSearchResult() {
+        guard let result = selectedSearchResult else { return }
+        selectSearchResult(result)
+        guard result.channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        if result.isLoaded || selectedTimelineMessages.contains(where: { $0.message.id == result.messageID }) {
+            timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
+            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
+            searchNavigationStatus = "Jumped to search result"
+            lastTimelineActionResult = "Jumped to search result"
+            recordTimelineCalibrationObservation(kind: .afterSearchJump)
+        } else {
+            searchNavigationStatus = "Result outside loaded range."
+            lastTimelineActionResult = "Search result outside loaded range"
+        }
+    }
+
+    public func loadAroundSelectedSearchResult() async {
+        guard let result = selectedSearchResult else { return }
+        await loadAroundSearchResult(result)
+    }
+
+    public func loadAroundSearchResult(_ result: ChannelSearchResult) async {
+        guard result.channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        guard routeVerificationResult.aroundMessageFetch == .supported || lastRouteVerificationResult != nil else {
+            searchNavigationStatus = "Around-message route is not verified."
+            return
+        }
+        let loaded = await messageController.loadMessagesAround(channelID: result.channelID, targetMessageID: result.messageID)
+        if loaded, selectedTimelineMessages.contains(where: { $0.message.id == result.messageID }) {
+            timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
+            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
+            searchNavigationStatus = "Loaded around result"
+            lastTimelineActionResult = "Loaded around search result"
+            markSearchResultLoaded(result.messageID)
+            recordTimelineCalibrationObservation(kind: .afterSearchJump)
+        } else if loaded {
+            searchNavigationStatus = "Loaded around result, but target was not returned."
+            lastTimelineActionResult = "Around-message fetch did not include target"
+        } else {
+            searchNavigationStatus = "Load around result failed."
+            lastTimelineActionResult = "Load around search result failed"
+        }
     }
 
     public func loadAroundMessage(_ messageID: MessageID) async {
@@ -1659,6 +1884,7 @@ public final class MainShellViewModel {
                 timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: anchor, reason: .loadOlder)
             }
             lastTimelineActionResult = "Loaded messages around target"
+            recordTimelineCalibrationObservation(kind: .afterLoadOlder)
         } else {
             lastTimelineActionResult = "Around-message fetch unavailable or failed"
         }
@@ -1702,11 +1928,56 @@ public final class MainShellViewModel {
             }
             remoteSearchStatus = messages.isEmpty ? "No selected-channel results." : "\(messages.count) selected-channel result(s)."
             lastTimelineActionResult = "Selected-channel search completed"
+            channelSearchQuery = ChannelSearchQuery(text: remoteSearchQuery, mode: remoteSearchPinnedOnly ? .pinned : .liveChannel, pinnedOnly: remoteSearchPinnedOnly)
+            let phase13Results = messages.map { channelSearchResult(from: $0, mode: remoteSearchPinnedOnly ? .pinned : .liveChannel, matching: query, loadedIDs: loadedIDs) }
+            channelSearchState = phase13Results.isEmpty ? .empty(channelSearchQuery) : .results(channelSearchQuery, phase13Results)
         } catch {
             remoteSearchResults = []
             remoteSearchStatus = "Selected-channel search failed: \(error.userFacingMessage)"
             lastTimelineActionResult = "Selected-channel search failed"
         }
+    }
+
+    private func channelSearchResult(from result: LoadedMessageFindResult, mode: ChannelSearchMode, isLoaded: Bool) -> ChannelSearchResult {
+        ChannelSearchResult(
+            messageID: result.messageID,
+            channelID: result.channelID,
+            authorID: result.authorID,
+            authorDisplayName: snapshot.usersByID[result.authorID]?.displayName ?? snapshot.usersByID[result.authorID]?.username,
+            createdAt: result.createdAt,
+            snippet: result.snippet,
+            mode: mode,
+            isLoaded: isLoaded,
+            safeStatus: isLoaded ? nil : "Result outside loaded range"
+        )
+    }
+
+    private func channelSearchResult(from message: Message, mode: ChannelSearchMode, matching query: String, loadedIDs: Set<MessageID>) -> ChannelSearchResult {
+        let isLoaded = loadedIDs.contains(message.id)
+        let snippet = isLoaded ? LoadedMessageFinder.snippet(message.content ?? "Message", matching: query.isEmpty ? (message.content ?? "") : query) : "Result outside loaded range"
+        return ChannelSearchResult(
+            messageID: message.id,
+            channelID: message.channelID,
+            authorID: message.authorID,
+            authorDisplayName: snapshot.usersByID[message.authorID]?.displayName ?? snapshot.usersByID[message.authorID]?.username,
+            createdAt: message.createdAt,
+            snippet: snippet,
+            mode: mode,
+            isPinned: message.isPinned || mode == .pinned,
+            isLoaded: isLoaded,
+            safeStatus: isLoaded ? nil : "Result outside loaded range"
+        )
+    }
+
+    private func markSearchResultLoaded(_ messageID: MessageID) {
+        guard case let .results(query, results) = channelSearchState else { return }
+        channelSearchState = .results(query, results.map { result in
+            guard result.messageID == messageID else { return result }
+            var updated = result
+            updated.isLoaded = true
+            updated.safeStatus = nil
+            return updated
+        })
     }
 
     public func reconcileTimelineSelection(deletedHint: MessageID? = nil, replacementHint: MessageID? = nil) {
@@ -2000,6 +2271,7 @@ public final class MainShellViewModel {
                 await MainActor.run {
                     self?.lastAckedMessageByChannelID[channelID] = messageID
                     self?.lastAckResult = "Sent"
+                    self?.recordTimelineCalibrationObservation(kind: .afterAck)
                     if var state = self?.localReadStates[channelID] {
                         state.mentionCount = 0
                         self?.localReadStates[channelID] = state
@@ -2084,8 +2356,22 @@ public final class MainShellViewModel {
 extension MainShellViewModel: AppCommandHandling {
     public func canPerform(_ command: AppCommand) -> Bool {
         switch command {
-        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover, .focusTimeline:
+        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover, .focusTimeline, .copyTimelineDiagnostics:
             return true
+        case .openChannelSearch, .openLoadedMessageFind:
+            return selectedChannel != nil || selection.dmChannelID != nil
+        case .openLiveChannelSearch:
+            return (selectedChannel != nil || selection.dmChannelID != nil) && effectiveRuntimeMode == .liveManual && effectiveSessionState == .connected
+        case .openPinnedChannelSearch:
+            return selectedChannel != nil || selection.dmChannelID != nil
+        case .selectNextSearchResult, .selectPreviousSearchResult, .jumpToSelectedSearchResult:
+            return !channelSearchState.results.isEmpty
+        case .loadAroundSelectedSearchResult:
+            return selectedSearchResult.map { !$0.isLoaded } == true && routeVerificationResult.aroundMessageFetch == .supported
+        case .startTimelineCalibration:
+            return isDeveloperControlsEnabled
+        case .addTimelineCalibrationCheckpoint:
+            return isDeveloperControlsEnabled && activeCalibrationRun?.isRunning == true
         case .focusComposer:
             return selectedChannel != nil || selection.dmChannelID != nil
         case .reconnect:
@@ -2161,6 +2447,15 @@ extension MainShellViewModel: AppCommandHandling {
             return "That channel is unavailable."
         case .selectNextChannel, .selectPreviousChannel, .selectNextUnreadChannel, .selectPreviousUnreadChannel, .selectNextMessage, .selectPreviousMessage, .jumpToNewestMessage, .jumpToFirstUnreadMessage:
             return isTextEntryFocused ? "Keyboard navigation is paused while typing." : "No selectable target."
+        case .openChannelSearch, .openLoadedMessageFind, .openLiveChannelSearch, .openPinnedChannelSearch:
+            if command == .openLiveChannelSearch { return "Live search requires manual connection." }
+            return "Select a channel before searching."
+        case .selectNextSearchResult, .selectPreviousSearchResult, .jumpToSelectedSearchResult:
+            return "No search result is selected."
+        case .loadAroundSelectedSearchResult:
+            return routeVerificationResult.aroundMessageFetch == .supported ? "Selected result is already loaded." : "Around-message route is not verified."
+        case .startTimelineCalibration, .addTimelineCalibrationCheckpoint:
+            return isDeveloperControlsEnabled ? "Start a calibration run first." : "Developer controls are disabled."
         case .copySelectedMessage, .copySelectedMessageID, .editSelectedMessage, .deleteSelectedMessage, .reactToSelectedMessage, .retrySelectedMessage, .discardSelectedFailedMessage, .editAndRetrySelectedFailedMessage, .pinOrUnpinSelectedMessage, .replyToSelectedMessage:
             if isTextEntryFocused { return "Message actions are paused while typing." }
             if command == .copySelectedMessageID && !isDeveloperControlsEnabled { return "Developer controls are disabled." }
@@ -2234,6 +2529,28 @@ extension MainShellViewModel: AppCommandHandling {
             jumpToNewestMessage()
         case .jumpToFirstUnreadMessage:
             jumpToFirstUnreadMessage()
+        case .openChannelSearch:
+            openChannelSearch(mode: .loadedOnly)
+        case .openLoadedMessageFind:
+            openChannelSearch(mode: .loadedOnly)
+        case .openLiveChannelSearch:
+            openChannelSearch(mode: .liveChannel)
+        case .openPinnedChannelSearch:
+            openChannelSearch(mode: .pinned)
+        case .selectNextSearchResult:
+            selectAdjacentSearchResult(1)
+        case .selectPreviousSearchResult:
+            selectAdjacentSearchResult(-1)
+        case .jumpToSelectedSearchResult:
+            jumpToSelectedSearchResult()
+        case .loadAroundSelectedSearchResult:
+            Task { [weak self] in await self?.loadAroundSelectedSearchResult() }
+        case .startTimelineCalibration:
+            startTimelineCalibration()
+        case .addTimelineCalibrationCheckpoint:
+            addTimelineCalibrationCheckpoint()
+        case .copyTimelineDiagnostics:
+            copyRedactedTimelineDiagnostics()
         case .replyToSelectedMessage:
             if let selectedTimelineMessage {
                 beginReply(to: selectedTimelineMessage)
@@ -2261,6 +2578,8 @@ extension MainShellViewModel: AppCommandHandling {
         case .closeTransientUI:
             if isQuickSwitcherPresented {
                 closeQuickSwitcher()
+            } else if isChannelSearchPresented {
+                closeChannelSearch()
             } else if inlineEditState != nil {
                 cancelInlineEdit()
             } else {
@@ -2416,6 +2735,9 @@ public struct MainShellView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .sheet(isPresented: $viewModel.isQuickSwitcherPresented) {
             QuickSwitcherView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.isChannelSearchPresented) {
+            ChannelSearchPanel(viewModel: viewModel)
         }
         .sheet(isPresented: $viewModel.isCredentialSetupPresented) {
             AccountConnectionSettingsView(viewModel: viewModel)
@@ -3229,8 +3551,12 @@ public struct ChatPlaceholderView: View {
                         Text(topic).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer()
-                    GlassIconButton("Pinned messages unavailable in Phase 3", systemImage: "pin", isDisabled: true) {}
-                    GlassIconButton("Search unavailable in Phase 3", systemImage: "magnifyingglass", isDisabled: true) {}
+                    GlassIconButton("Pinned in this channel", systemImage: "pin") {
+                        viewModel.openChannelSearch(mode: .pinned)
+                    }
+                    GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
+                        viewModel.openChannelSearch(mode: .loadedOnly)
+                    }
                     GlassIconButton("Toggle member panel", systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
                     GlassIconButton("Channel settings unavailable in Phase 3", systemImage: "gearshape", isDisabled: true) {}
                 }
@@ -3996,6 +4322,163 @@ public struct DiscoverPlaceholderView: View {
         }
         .padding(StoatSpacing.xxLarge)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+public struct ChannelSearchPanel: View {
+    @Bindable private var viewModel: MainShellViewModel
+    @FocusState private var fieldFocused: Bool
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            HStack {
+                Text("Search this channel")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { viewModel.closeChannelSearch() }
+            }
+
+            Picker("Search mode", selection: $viewModel.channelSearchQuery.mode) {
+                ForEach(ChannelSearchMode.allCases) { mode in
+                    Text(mode.displayName).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityLabel("Search mode")
+
+            HStack {
+                TextField(searchPlaceholder, text: $viewModel.channelSearchQuery.text)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($fieldFocused)
+                    .disabled(viewModel.channelSearchQuery.mode == .pinned)
+                    .onSubmit { Task { await viewModel.runChannelSearch() } }
+                    .accessibilityLabel(viewModel.channelSearchQuery.mode.displayName)
+                Button("Search") {
+                    Task { await viewModel.runChannelSearch() }
+                }
+                .keyboardShortcut(.return, modifiers: [])
+            }
+
+            modeStatus
+            resultsContent
+            navigationControls
+        }
+        .padding(StoatSpacing.large)
+        .frame(minWidth: 560, minHeight: 420, alignment: .topLeading)
+        .onAppear { fieldFocused = viewModel.channelSearchQuery.mode != .pinned }
+        .accessibilityLabel(Phase13Accessibility.channelSearchPanelLabel(mode: viewModel.channelSearchQuery.mode, resultCount: viewModel.channelSearchState.results.count))
+    }
+
+    private var searchPlaceholder: String {
+        switch viewModel.channelSearchQuery.mode {
+        case .loadedOnly: "Find in loaded messages"
+        case .liveChannel: "Search this channel"
+        case .pinned: "Pinned messages in this channel"
+        }
+    }
+
+    @ViewBuilder private var modeStatus: some View {
+        switch viewModel.channelSearchQuery.mode {
+        case .loadedOnly:
+            Text("Loaded messages only. No network calls.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .liveChannel:
+            Text(viewModel.effectiveRuntimeMode == .liveManual && viewModel.effectiveSessionState == .connected ? "Live channel search runs only when you press Search." : "Live search requires manual connection.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .pinned:
+            Text("Pinned search is selected-channel only and runs only when you press Search.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var resultsContent: some View {
+        switch viewModel.channelSearchState {
+        case .idle:
+            ContentUnavailableView("No search yet", systemImage: "magnifyingglass", description: Text("Search this channel or find in loaded messages."))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .searching:
+            LoadingStateView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case let .empty(query):
+            ContentUnavailableView("No results", systemImage: query.mode == .pinned ? "pin.slash" : "magnifyingglass", description: Text(query.mode.displayName))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case let .failed(_, message):
+            ErrorStateView(message)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case let .results(_, results):
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                    ForEach(results) { result in
+                        searchResultRow(result)
+                    }
+                }
+            }
+        }
+    }
+
+    private func searchResultRow(_ result: ChannelSearchResult) -> some View {
+        let selected = viewModel.selectedSearchResultID == result.messageID
+        return Button {
+            viewModel.selectSearchResult(result)
+        } label: {
+            HStack(alignment: .top, spacing: StoatSpacing.small) {
+                Image(systemName: result.isPinned ? "pin.fill" : (result.isLoaded ? "text.bubble" : "arrow.down.message"))
+                    .frame(width: 20)
+                    .foregroundStyle(result.isLoaded ? .primary : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text(result.authorDisplayName ?? result.authorID.rawValue)
+                            .font(.caption.weight(.semibold))
+                        if let createdAt = result.createdAt {
+                            Text(createdAt.formatted(date: .abbreviated, time: .shortened))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(result.mode == .loadedOnly ? "Loaded" : (result.isLoaded ? "Loaded" : "Outside range"))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(result.snippet)
+                        .font(.caption)
+                        .foregroundStyle(result.isLoaded ? .primary : .secondary)
+                        .lineLimit(2)
+                }
+            }
+            .padding(StoatSpacing.small)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Phase13Accessibility.channelSearchResultLabel(result, isSelected: selected))
+    }
+
+    private var navigationControls: some View {
+        HStack {
+            Button("Previous") { viewModel.selectAdjacentSearchResult(-1) }
+                .disabled(viewModel.channelSearchState.results.isEmpty)
+            Button("Next") { viewModel.selectAdjacentSearchResult(1) }
+                .disabled(viewModel.channelSearchState.results.isEmpty)
+            Button("Jump") { viewModel.jumpToSelectedSearchResult() }
+                .disabled(viewModel.selectedSearchResult == nil)
+            Button("Load around result") {
+                Task { await viewModel.loadAroundSelectedSearchResult() }
+            }
+            .disabled(viewModel.canPerform(.loadAroundSelectedSearchResult) == false)
+            Spacer()
+            if let status = viewModel.searchNavigationStatus {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 

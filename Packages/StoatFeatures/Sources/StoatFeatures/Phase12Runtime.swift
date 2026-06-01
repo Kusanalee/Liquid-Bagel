@@ -230,6 +230,27 @@ public enum TimelineCopyFormatter {
         return Phase6UIHelpers.safeDiagnostics(redactTokenLikeStrings(text))
     }
 
+    public static func calibration(_ run: TimelineCalibrationRun) -> String {
+        let observations = run.observations.map { observation in
+            let note = observation.note.map { " note=\(redactTokenLikeStrings($0))" } ?? ""
+            return "- \(observation.kind.displayName) at \(observation.timestamp.formatted(date: .numeric, time: .standard)): loaded=\(observation.diagnostics.loadedMessageCount), atNewest=\(observation.diagnostics.atNewest), warnings=\(observation.diagnostics.validationWarnings.count)\(note)"
+        }.joined(separator: "\n")
+        let recommendation = run.recommendedAdjustments.map { "\($0.title): \($0.detail)" } ?? "-"
+        let text = """
+        Timeline calibration
+        id: \(shortID(run.id.uuidString))
+        environment: \(shortID(run.environmentID))
+        channel: \(shortID(run.channelID?.rawValue))
+        started: \(run.startedAt.formatted(date: .numeric, time: .standard))
+        ended: \(run.endedAt?.formatted(date: .numeric, time: .standard) ?? "-")
+        tuning: nearNewest=\(run.tuning.nearNewestMessageThreshold), visibleDebounce=\(run.tuning.visibleRangeUpdateDebounceMilliseconds), loadToUnread=\(run.tuning.loadToUnreadMaxAttempts), ackDebounce=\(run.tuning.ackDebounceMilliseconds)
+        recommendation: \(recommendation)
+        observations:
+        \(observations.isEmpty ? "-" : observations)
+        """
+        return Phase6UIHelpers.safeDiagnostics(redactTokenLikeStrings(text))
+    }
+
     public static func shortID(_ value: String?) -> String {
         guard let value, !value.isEmpty else { return "-" }
         guard value.count > 12 else { return value }

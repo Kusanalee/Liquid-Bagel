@@ -113,4 +113,12 @@ final class StoatPersistenceTests: XCTestCase {
             eventsURL: URL(string: "ws://localhost:14703")!
         ))
     }
+
+    func testTimelineTuningPresetsUseValidatedSafeValues() {
+        for preset in TimelineTuningPreset.allCases {
+            XCTAssertEqual(preset.configuration, preset.configuration.validated())
+        }
+        XCTAssertEqual(TimelineTuningPreset.conservative.configuration, .defaults)
+        XCTAssertEqual(TimelineTuningPreset.debugStrict.configuration.nearNewestMessageThreshold, 0)
+    }
 }

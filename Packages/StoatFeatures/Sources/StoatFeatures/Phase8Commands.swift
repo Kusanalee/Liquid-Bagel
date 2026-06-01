@@ -29,6 +29,17 @@ public enum AppCommand: Hashable, Sendable {
     case selectPreviousMessage
     case jumpToNewestMessage
     case jumpToFirstUnreadMessage
+    case openChannelSearch
+    case openLoadedMessageFind
+    case openLiveChannelSearch
+    case openPinnedChannelSearch
+    case selectNextSearchResult
+    case selectPreviousSearchResult
+    case jumpToSelectedSearchResult
+    case loadAroundSelectedSearchResult
+    case startTimelineCalibration
+    case addTimelineCalibrationCheckpoint
+    case copyTimelineDiagnostics
     case replyToSelectedMessage
     case cancelReply
     case focusTimeline
@@ -283,12 +294,21 @@ public final class QuickSwitcherViewModel {
         [
             commandResult(.focusComposer, title: "Focus Composer", subtitle: "Move keyboard focus to the message composer"),
             commandResult(.focusTimeline, title: "Focus Timeline", subtitle: "Move keyboard focus to the message timeline"),
-            commandResult(.replyToSelectedMessage, title: "Reply to Message", subtitle: "Reply to the focused message"),
-            commandResult(.cancelReply, title: "Cancel Reply", subtitle: "Clear the active reply context"),
             commandResult(.refresh, title: "Refresh", subtitle: "Refresh the current runtime context"),
             commandResult(.reconnect, title: "Reconnect", subtitle: "Explicitly reconnect Live Manual"),
             commandResult(.disconnect, title: "Disconnect", subtitle: "Disconnect the live realtime session"),
             commandResult(.resetToMock, title: "Reset to Mock", subtitle: "Return to mock runtime"),
+            commandResult(.openChannelSearch, title: "Search This Channel", subtitle: "Open selected-channel search"),
+            commandResult(.openLoadedMessageFind, title: "Find in Loaded Messages", subtitle: "Search loaded messages only"),
+            commandResult(.openLiveChannelSearch, title: "Live Search Selected Channel", subtitle: "Search this channel after Live Manual connection"),
+            commandResult(.openPinnedChannelSearch, title: "Pinned in This Channel", subtitle: "Search pinned messages in the selected channel"),
+            commandResult(.jumpToSelectedSearchResult, title: "Jump to Search Result", subtitle: "Jump to the selected search result"),
+            commandResult(.loadAroundSelectedSearchResult, title: "Load Around Search Result", subtitle: "Fetch messages around the selected result"),
+            commandResult(.replyToSelectedMessage, title: "Reply to Message", subtitle: "Reply to the focused message"),
+            commandResult(.cancelReply, title: "Cancel Reply", subtitle: "Clear the active reply context"),
+            commandResult(.startTimelineCalibration, title: "Start Timeline Calibration", subtitle: "Begin a manual calibration run"),
+            commandResult(.addTimelineCalibrationCheckpoint, title: "Add Calibration Checkpoint", subtitle: "Record current timeline diagnostics"),
+            commandResult(.copyTimelineDiagnostics, title: "Copy Timeline Diagnostics", subtitle: "Copy redacted timeline diagnostics"),
             commandResult(.toggleMemberPanel, title: "Toggle Member Panel", subtitle: "Show or hide the member panel"),
             commandResult(.openAccountSettings, title: "Account Settings", subtitle: "Open Account & Connection settings"),
             commandResult(.openConnectionSettings, title: "Connection Settings", subtitle: "Open connection settings")

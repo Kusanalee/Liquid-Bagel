@@ -92,6 +92,58 @@ public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
     }
 }
 
+public enum TimelineTuningPreset: String, Codable, Hashable, Sendable, CaseIterable, Identifiable {
+    case conservative
+    case balanced
+    case responsive
+    case debugStrict
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .conservative: "Conservative"
+        case .balanced: "Balanced"
+        case .responsive: "Responsive"
+        case .debugStrict: "Debug Strict"
+        }
+    }
+
+    public var configuration: TimelineTuningConfiguration {
+        switch self {
+        case .conservative:
+            TimelineTuningConfiguration.defaults
+        case .balanced:
+            TimelineTuningConfiguration(
+                nearNewestMessageThreshold: 3,
+                visibleRangeUpdateDebounceMilliseconds: 100,
+                loadToUnreadMaxAttempts: 5,
+                referenceFetchMaxAttempts: 1,
+                referenceFetchCooldownSeconds: 60,
+                ackDebounceMilliseconds: 1400
+            )
+        case .responsive:
+            TimelineTuningConfiguration(
+                nearNewestMessageThreshold: 4,
+                visibleRangeUpdateDebounceMilliseconds: 60,
+                loadToUnreadMaxAttempts: 6,
+                referenceFetchMaxAttempts: 2,
+                referenceFetchCooldownSeconds: 45,
+                ackDebounceMilliseconds: 1000
+            )
+        case .debugStrict:
+            TimelineTuningConfiguration(
+                nearNewestMessageThreshold: 0,
+                visibleRangeUpdateDebounceMilliseconds: 0,
+                loadToUnreadMaxAttempts: 2,
+                referenceFetchMaxAttempts: 0,
+                referenceFetchCooldownSeconds: 0,
+                ackDebounceMilliseconds: 0
+            )
+        }
+    }
+}
+
 public struct EnvironmentProfile: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var name: String
