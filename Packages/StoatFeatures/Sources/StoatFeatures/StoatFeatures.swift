@@ -7,6 +7,7 @@ import StoatPersistence
 import StoatRealtime
 import StoatUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 #if canImport(AppKit)
 import AppKit
@@ -493,6 +494,18 @@ public final class MainShellViewModel {
     public var channelEditState: ManagementActionState<Channel> = .idle
     public var pendingChannelDeletion: PendingChannelDeletion?
     public var phase24Status: String?
+    public var selectedServerSettingsTab: ServerSettingsTab = .overview
+    public var serverSettingsState: ManagementActionState<ServerSettingsDetails> = .idle
+    public var serverSettingsForm: ServerSettingsForm?
+    public var serverSettingsSaveState: ManagementActionState<Server> = .idle
+    public var serverIconDraft: ServerMediaDraft?
+    public var serverBannerDraft: ServerMediaDraft?
+    public var categoryEditorForm: CategoryEditorForm?
+    public var categoryEditorState: ManagementActionState<Server> = .idle
+    public var roleEditorForm: RoleEditorForm?
+    public var roleEditorState: ManagementActionState<Role> = .idle
+    public var pendingRoleDeletion: Role?
+    public var phase25Status: String?
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var messageCopier: any MessageCopying
@@ -721,6 +734,18 @@ public final class MainShellViewModel {
             return snapshot.usersByID.values.sorted { $0.username < $1.username }
         }
         return users.sorted { ($0.displayName ?? $0.username) < ($1.displayName ?? $1.username) }
+    }
+
+    public func serverMembers(for serverID: ServerID?) -> [ServerMember] {
+        guard let serverID else { return [] }
+        return snapshot.membersByServerAndUserID.values
+            .filter { $0.id.serverID == serverID }
+            .sorted { $0.id.userID.rawValue < $1.id.userID.rawValue }
+    }
+
+    public var selectedServerMember: ServerMember? {
+        guard let serverID = selection.serverID, let currentUserID else { return nil }
+        return snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: currentUserID)]
     }
 
     public var friendItems: [FriendListItem] {
@@ -1225,26 +1250,49 @@ public final class MainShellViewModel {
         )
     }
 
+    public func serverSettingsDetails() -> ServerSettingsDetails? {
+        guard let server = selectedServer else { return nil }
+        let fallbackChannel = selectedChannel ?? firstVisibleTextChannel(in: server.id)
+        let permissionPreview = Phase25PermissionResolver.resolve(server: server, channel: fallbackChannel, member: selectedServerMember, currentUserID: currentUserID)
+        return ServerSettingsDetails(
+            server: server,
+            channels: channels(for: server.id),
+            members: serverMembers(for: server.id),
+            runtimeLine: runtimeSubtitleForManagement,
+            capabilities: serverManagementCapabilities(),
+            permissionPreview: permissionPreview
+        )
+    }
+
     public func openServerOverview() {
         isServerOverviewPresented = true
-        if let details = serverOverviewDetails() {
-            serverOverviewState = .loaded(details)
+        selectedServerSettingsTab = .overview
+        if let details = serverSettingsDetails() {
+            serverSettingsState = .loaded(details)
+            serverSettingsForm = ServerSettingsForm(server: details.server)
+            categoryEditorForm = CategoryEditorForm(server: details.server)
+            serverOverviewState = serverOverviewDetails().map { .loaded($0) } ?? .failed("Select a server before opening server overview.")
         } else {
+            serverSettingsState = .failed("Select a server before opening server settings.")
             serverOverviewState = .failed("Select a server before opening server overview.")
         }
         phase24Status = nil
+        phase25Status = nil
     }
 
     public func refreshSelectedServerDetails() async {
         guard let serverID = selection.serverID else {
             serverOverviewState = .failed("Select a server before refreshing details.")
+            serverSettingsState = .failed("Select a server before refreshing details.")
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
             serverOverviewState = .failed("Connect manually before refreshing server details.")
+            serverSettingsState = .failed("Connect manually before refreshing server details.")
             return
         }
         serverOverviewState = .loading
+        serverSettingsState = .loading
         do {
             let response = try await apiClient.fetchServer(id: serverID, includeChannels: true)
             snapshot = Phase24SnapshotIntegrator.upserting(server: response.server, channels: response.channels, into: snapshot)
@@ -1252,9 +1300,294 @@ public final class MainShellViewModel {
             if let details = serverOverviewDetails() {
                 serverOverviewState = .loaded(details)
             }
+            if let details = serverSettingsDetails() {
+                serverSettingsState = .loaded(details)
+                serverSettingsForm = ServerSettingsForm(server: details.server)
+                categoryEditorForm = CategoryEditorForm(server: details.server)
+            }
         } catch {
             serverOverviewState = .failed(Phase23Safety.safeError(error))
+            serverSettingsState = .failed(Phase23Safety.safeError(error))
         }
+    }
+
+    public func serverSettingsDisabledReason() -> String? {
+        let capabilities = serverManagementCapabilities()
+        guard capabilities.isConnectedForLiveActions else { return "Connect manually to edit server settings." }
+        guard capabilities.canManageServer else {
+            return capabilities.permissionResolutionIncomplete ? "Permission resolution is incomplete for this action." : "You do not have permission to manage this server."
+        }
+        return nil
+    }
+
+    public func roleManagementDisabledReason() -> String? {
+        let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
+        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Connect manually to manage roles." }
+        guard resolution.canManageRoles || currentUserID == selectedServer?.ownerID else {
+            return resolution.warnings.isEmpty ? "You do not have permission to manage roles." : "Permission resolution is incomplete for role management."
+        }
+        return nil
+    }
+
+    public func saveServerSettings() async {
+        guard let server = selectedServer, let form = serverSettingsForm else {
+            serverSettingsSaveState = .failed("Select a server before saving settings.")
+            return
+        }
+        guard let draft = form.draft(original: server) else {
+            serverSettingsSaveState = .failed("Change the server name or description before saving.")
+            return
+        }
+        guard serverSettingsDisabledReason() == nil else {
+            serverSettingsSaveState = .failed(serverSettingsDisabledReason() ?? "Server settings are unavailable.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            serverSettingsSaveState = .failed("Connect manually before editing server settings.")
+            return
+        }
+        serverSettingsSaveState = .loading
+        do {
+            let saved = try await apiClient.editServer(id: server.id, draft: draft)
+            snapshot = Phase24SnapshotIntegrator.upserting(server: saved, channels: [], into: snapshot)
+            serverSettingsForm = ServerSettingsForm(server: saved)
+            refreshLoadedServerSettings()
+            quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+            serverSettingsSaveState = .loaded(saved)
+            phase25Status = "Server settings updated"
+        } catch {
+            serverSettingsSaveState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func chooseServerIconDraft() {
+        chooseServerMediaDraft(tag: .icons)
+    }
+
+    public func chooseServerBannerDraft() {
+        chooseServerMediaDraft(tag: .banners)
+    }
+
+    public func saveServerAppearance() async {
+        guard let server = selectedServer else {
+            serverSettingsSaveState = .failed("Select a server before saving appearance.")
+            return
+        }
+        guard serverIconDraft != nil || serverBannerDraft != nil else {
+            serverSettingsSaveState = .failed("Choose an icon or banner draft before saving.")
+            return
+        }
+        guard serverSettingsDisabledReason() == nil else {
+            serverSettingsSaveState = .failed(serverSettingsDisabledReason() ?? "Server appearance is unavailable.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            serverSettingsSaveState = .failed("Connect manually before editing server appearance.")
+            return
+        }
+        serverSettingsSaveState = .loading
+        do {
+            let iconID: FileID?
+            if let draft = serverIconDraft {
+                iconID = try await apiClient.uploadFile(data: draft.data, filename: draft.filename, mimeType: draft.mimeType, tag: .icons).id
+            } else {
+                iconID = nil
+            }
+            let bannerID: FileID?
+            if let draft = serverBannerDraft {
+                bannerID = try await apiClient.uploadFile(data: draft.data, filename: draft.filename, mimeType: draft.mimeType, tag: .banners).id
+            } else {
+                bannerID = nil
+            }
+            let saved = try await apiClient.editServer(id: server.id, draft: ServerEditDraft(icon: iconID, banner: bannerID))
+            snapshot = Phase24SnapshotIntegrator.upserting(server: saved, channels: [], into: snapshot)
+            serverIconDraft = nil
+            serverBannerDraft = nil
+            loadImageResource(for: saved.icon, kind: .serverIcon)
+            loadImageResource(for: saved.banner, kind: .serverBanner)
+            refreshLoadedServerSettings()
+            serverSettingsSaveState = .loaded(saved)
+            phase25Status = "Server appearance updated"
+        } catch {
+            serverSettingsSaveState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func createCategoryDraft(title: String) {
+        guard categoryEditorForm != nil else { return }
+        let id = "local-category-\(UUID().uuidString)"
+        categoryEditorForm?.createCategory(title: title, id: id)
+    }
+
+    public func applyCategoryChanges() async {
+        guard let server = selectedServer, let form = categoryEditorForm else {
+            categoryEditorState = .failed("Select a server before editing categories.")
+            return
+        }
+        guard channelManagementDisabledReason() == nil else {
+            categoryEditorState = .failed(channelManagementDisabledReason() ?? "Category editing is unavailable.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            categoryEditorState = .failed("Connect manually before editing categories.")
+            return
+        }
+        let draft = ServerEditDraft(categories: form.categories)
+        guard draft.categories != server.categories else {
+            categoryEditorState = .failed("Change categories before applying.")
+            return
+        }
+        categoryEditorState = .loading
+        do {
+            let saved = try await apiClient.editServer(id: server.id, draft: draft)
+            snapshot = Phase24SnapshotIntegrator.upserting(server: saved, channels: [], into: snapshot)
+            categoryEditorForm = CategoryEditorForm(server: saved)
+            refreshLoadedServerSettings()
+            quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+            categoryEditorState = .loaded(saved)
+            phase25Status = "Categories updated"
+        } catch {
+            categoryEditorState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func openCreateRole() {
+        guard roleManagementDisabledReason() == nil else {
+            phase25Status = roleManagementDisabledReason()
+            return
+        }
+        roleEditorForm = RoleEditorForm()
+        roleEditorState = .idle
+        selectedServerSettingsTab = .roles
+    }
+
+    public func openEditRole(_ role: Role) {
+        guard roleManagementDisabledReason() == nil else {
+            phase25Status = roleManagementDisabledReason()
+            return
+        }
+        guard Phase25PermissionResolver.isRoleEditable(role, currentMember: selectedServerMember, server: selectedServer, currentUserID: currentUserID) else {
+            phase25Status = "This role is at or above your role rank."
+            return
+        }
+        roleEditorForm = RoleEditorForm(role: role)
+        roleEditorState = .idle
+        selectedServerSettingsTab = .roles
+    }
+
+    public func saveRoleEditor() async {
+        guard let server = selectedServer, let form = roleEditorForm else {
+            roleEditorState = .failed("Select a server before editing roles.")
+            return
+        }
+        guard roleManagementDisabledReason() == nil else {
+            roleEditorState = .failed(roleManagementDisabledReason() ?? "Role management is unavailable.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            roleEditorState = .failed("Connect manually before editing roles.")
+            return
+        }
+        roleEditorState = .loading
+        do {
+            if let roleID = form.roleID {
+                guard let original = server.roles[roleID], let draft = form.editDraft(original: original) else {
+                    roleEditorState = .failed("Change the role before saving.")
+                    return
+                }
+                let role = try await apiClient.editRole(serverID: server.id, roleID: roleID, draft: draft)
+                upsert(role: role, in: server.id)
+                roleEditorState = .loaded(role)
+                phase25Status = "Role updated"
+            } else {
+                guard let draft = form.createDraft() else {
+                    roleEditorState = .failed("Role name must be 1 to 32 characters.")
+                    return
+                }
+                let response = try await apiClient.createRole(serverID: server.id, draft: draft)
+                upsert(role: response.role, in: server.id)
+                roleEditorState = .loaded(response.role)
+                phase25Status = "Role created"
+            }
+            roleEditorForm = nil
+            refreshLoadedServerSettings()
+        } catch {
+            roleEditorState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func requestDeleteRole(_ role: Role) {
+        guard Phase25PermissionResolver.isRoleEditable(role, currentMember: selectedServerMember, server: selectedServer, currentUserID: currentUserID) else {
+            phase25Status = "This role is at or above your role rank."
+            return
+        }
+        pendingRoleDeletion = role
+    }
+
+    public func confirmDeleteRole(named confirmation: String) async {
+        guard let server = selectedServer, let role = pendingRoleDeletion else { return }
+        guard confirmation == role.name else {
+            phase25Status = "Type the role name to confirm deletion."
+            return
+        }
+        pendingRoleDeletion = nil
+        guard roleManagementDisabledReason() == nil, let apiClient = apiClientForCommunityAction() else {
+            phase25Status = roleManagementDisabledReason() ?? "Connect manually before deleting roles."
+            return
+        }
+        do {
+            try await apiClient.deleteRole(serverID: server.id, roleID: role.id)
+            if var server = snapshot.serversByID[server.id] {
+                server.roles.removeValue(forKey: role.id)
+                snapshot.serversByID[server.id] = server
+            }
+            refreshLoadedServerSettings()
+            phase25Status = "Role deleted"
+        } catch {
+            phase25Status = Phase23Safety.safeError(error)
+        }
+    }
+
+    private func upsert(role: Role, in serverID: ServerID) {
+        guard var server = snapshot.serversByID[serverID] else { return }
+        server.roles[role.id] = role
+        snapshot.serversByID[serverID] = server
+        quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+    }
+
+    private func refreshLoadedServerSettings() {
+        if let settings = serverSettingsDetails() {
+            serverSettingsState = .loaded(settings)
+        }
+        if let overview = serverOverviewDetails() {
+            serverOverviewState = .loaded(overview)
+        }
+    }
+
+    private func chooseServerMediaDraft(tag: UploadTag) {
+        #if canImport(AppKit)
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.image]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try Data(contentsOf: url)
+            let filename = url.lastPathComponent
+            let mimeType = filename.lowercased().hasSuffix(".jpg") || filename.lowercased().hasSuffix(".jpeg") ? "image/jpeg" : "image/png"
+            let draft = ServerMediaDraft(data: data, filename: filename, mimeType: mimeType)
+            if tag == .icons {
+                serverIconDraft = draft
+            } else {
+                serverBannerDraft = draft
+            }
+            phase25Status = tag == .icons ? "Icon draft selected; save to upload." : "Banner draft selected; save to upload."
+        } catch {
+            phase25Status = "Could not read selected image."
+        }
+        #else
+        phase25Status = "Image picking is unavailable on this platform."
+        #endif
     }
 
     public func openCreateChannel(categoryID: String? = nil) {
@@ -4321,8 +4654,12 @@ extension MainShellViewModel: AppCommandHandling {
         switch command {
         case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .openJoinInvite, .openCreateServer, .openDiscoverInBrowser, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
             return true
-        case .openServerOverview:
+        case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions:
             return selection.serverID != nil
+        case .createRole:
+            return selection.serverID != nil && roleManagementDisabledReason() == nil
+        case .createCategory:
+            return selection.serverID != nil && channelManagementDisabledReason() == nil
         case .openCreateChannel:
             return selection.serverID != nil && channelManagementDisabledReason() == nil
         case .openChannelSettings:
@@ -4420,8 +4757,12 @@ extension MainShellViewModel: AppCommandHandling {
         switch command {
         case .focusComposer:
             return "Select a channel before focusing the composer."
-        case .openServerOverview:
-            return "Select a server before opening server overview."
+        case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions:
+            return "Select a server before opening server settings."
+        case .createRole:
+            return roleManagementDisabledReason() ?? "Select a server before creating a role."
+        case .createCategory:
+            return channelManagementDisabledReason() ?? "Select a server before creating a category."
         case .openCreateChannel:
             return channelManagementDisabledReason() ?? "Select a server before creating a channel."
         case .openChannelSettings:
@@ -4532,6 +4873,25 @@ extension MainShellViewModel: AppCommandHandling {
             openCreateServer()
         case .openServerOverview:
             openServerOverview()
+        case .openServerAppearance:
+            openServerOverview()
+            selectedServerSettingsTab = .appearance
+        case .openCategoryEditor:
+            openServerOverview()
+            selectedServerSettingsTab = .categories
+        case .openRoles:
+            openServerOverview()
+            selectedServerSettingsTab = .roles
+        case .openPermissions:
+            openServerOverview()
+            selectedServerSettingsTab = .permissions
+        case .createRole:
+            openServerOverview()
+            openCreateRole()
+        case .createCategory:
+            openServerOverview()
+            selectedServerSettingsTab = .categories
+            createCategoryDraft(title: "New Category")
         case .openCreateChannel:
             openCreateChannel()
         case .openChannelSettings:
@@ -7657,6 +8017,8 @@ public struct InviteManagementView: View {
 
 public struct ServerOverviewView: View {
     @Bindable private var viewModel: MainShellViewModel
+    @State private var newCategoryTitle = ""
+    @State private var roleDeleteConfirmation = ""
 
     public init(viewModel: MainShellViewModel) {
         self.viewModel = viewModel
@@ -7666,36 +8028,67 @@ public struct ServerOverviewView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: StoatSpacing.large) {
                 HStack {
-                    Text("Server Overview")
+                    Text("Server Settings")
                         .font(.title2.weight(.semibold))
                     Spacer()
                     Button("Close") { viewModel.isServerOverviewPresented = false }
                 }
 
-                switch viewModel.serverOverviewState {
+                switch viewModel.serverSettingsState {
                 case .idle:
-                    EmptyStateView(title: "No server selected", message: "Select a server to review management options.", systemImage: "server.rack")
+                    EmptyStateView(title: "No server selected", message: "Select a server to review settings.", systemImage: "server.rack")
                 case .loading:
                     ProgressView("Loading server details")
                 case let .failed(message):
-                    EmptyStateView(title: "Server overview unavailable", message: message, systemImage: "exclamationmark.triangle")
+                    EmptyStateView(title: "Server settings unavailable", message: message, systemImage: "exclamationmark.triangle")
                 case let .loaded(details):
-                    overview(details)
+                    settings(details)
                 }
             }
             .padding(StoatSpacing.xLarge)
         }
-        .frame(width: 560)
-        .frame(minHeight: 520)
+        .frame(width: 680)
+        .frame(minHeight: 620)
         .onAppear {
-            if let details = viewModel.serverOverviewDetails() {
-                viewModel.serverOverviewState = .loaded(details)
+            if let details = viewModel.serverSettingsDetails() {
+                viewModel.serverSettingsState = .loaded(details)
+                viewModel.serverSettingsForm = viewModel.serverSettingsForm ?? ServerSettingsForm(server: details.server)
+                viewModel.categoryEditorForm = viewModel.categoryEditorForm ?? CategoryEditorForm(server: details.server)
             }
         }
-        .accessibilityLabel("Server overview")
+        .accessibilityLabel("Server settings")
     }
 
-    private func overview(_ details: ServerOverviewDetails) -> some View {
+    private func settings(_ details: ServerSettingsDetails) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            Picker("Section", selection: $viewModel.selectedServerSettingsTab) {
+                ForEach(ServerSettingsTab.allCases, id: \.self) { tab in
+                    Text(tab.title).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityHint("Choose a server settings section")
+
+            switch viewModel.selectedServerSettingsTab {
+            case .overview:
+                overview(details)
+            case .appearance:
+                appearance(details)
+            case .categories:
+                categories(details)
+            case .roles:
+                roles(details)
+            case .permissions:
+                permissions(details)
+            case .members:
+                members(details)
+            case .danger:
+                EmptyStateView(title: "Server deletion deferred", message: "Danger Zone is intentionally disabled in Phase 25.", systemImage: "lock.shield")
+            }
+        }
+    }
+
+    private func overview(_ details: ServerSettingsDetails) -> some View {
         VStack(alignment: .leading, spacing: StoatSpacing.large) {
             GlassPanel {
                 VStack(alignment: .leading, spacing: StoatSpacing.medium) {
@@ -7711,7 +8104,9 @@ public struct ServerOverviewView: View {
                         }
                     }
                     LabeledContent("Channels", value: "\(details.channels.count)")
-                    LabeledContent("Members", value: "\(details.memberCount)")
+                    LabeledContent("Members", value: "\(details.members.count)")
+                    LabeledContent("Roles", value: "\(details.server.roles.count)")
+                    LabeledContent("Categories", value: "\(details.server.categories?.count ?? 0)")
                     LabeledContent("Runtime", value: details.runtimeLine)
                     LabeledContent("Owner", value: details.server.ownerID.rawValue)
                 }
@@ -7719,51 +8114,254 @@ public struct ServerOverviewView: View {
 
             GlassPanel {
                 VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                    Text("Management")
+                    Text("Overview")
                         .font(.headline)
-                    Button {
-                        viewModel.openCreateChannel()
-                    } label: {
-                        Label("Create Channel", systemImage: "plus")
-                            .frame(maxWidth: .infinity)
+                    if viewModel.serverSettingsForm != nil {
+                        TextField("Server name", text: Binding(
+                            get: { viewModel.serverSettingsForm?.name ?? "" },
+                            set: { viewModel.serverSettingsForm?.name = $0 }
+                        ))
+                        TextField("Description", text: Binding(
+                            get: { viewModel.serverSettingsForm?.description ?? "" },
+                            set: { viewModel.serverSettingsForm?.description = $0 }
+                        ))
                     }
-                    .buttonStyle(GlassButtonStyle())
-                    .disabled(Phase24Management.disabledReasonForChannelManagement(details.capabilities) != nil)
-                    .accessibilityHint(Phase24Management.disabledReasonForChannelManagement(details.capabilities) ?? "Create a text channel")
-
-                    Button {
-                        viewModel.openInviteManagement()
-                    } label: {
-                        Label("Invite Management", systemImage: "link")
-                            .frame(maxWidth: .infinity)
+                    stateMessage(viewModel.serverSettingsSaveState, loading: "Saving server", success: "Server updated")
+                    HStack {
+                        Button {
+                            viewModel.serverSettingsForm = ServerSettingsForm(server: details.server)
+                        } label: {
+                            Label("Cancel", systemImage: "xmark")
+                        }
+                        Spacer()
+                        Button {
+                            Task { await viewModel.saveServerSettings() }
+                        } label: {
+                            Label("Save", systemImage: "checkmark")
+                        }
+                        .buttonStyle(GlassButtonStyle())
+                        .disabled(viewModel.serverSettingsForm?.draft(original: details.server) == nil || viewModel.serverSettingsDisabledReason() != nil)
+                        .accessibilityHint(viewModel.serverSettingsDisabledReason() ?? "Save server name and description")
                     }
-                    .buttonStyle(GlassButtonStyle())
-                    .disabled(Phase24Management.disabledReasonForInvites(details.capabilities) != nil)
-                    .accessibilityHint(Phase24Management.disabledReasonForInvites(details.capabilities) ?? "Open selected server invites")
-
-                    Button {
-                        Task { await viewModel.refreshSelectedServerDetails() }
-                    } label: {
-                        Label("Refresh Details", systemImage: "arrow.clockwise")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(GlassButtonStyle())
-                    .disabled(viewModel.effectiveRuntimeMode != .liveManual || viewModel.effectiveSessionState != .connected)
-                    .accessibilityHint("Refresh runs only when explicitly requested")
                 }
             }
+        }
+    }
 
-            if let categories = details.server.categories, !categories.isEmpty {
-                GlassPanel {
-                    VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                        Text("Categories")
+    private func appearance(_ details: ServerSettingsDetails) -> some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                Text("Appearance")
+                    .font(.headline)
+                HStack(spacing: StoatSpacing.large) {
+                    ServerIconView(name: details.server.name, imageData: viewModel.serverIconDraft?.data ?? viewModel.imageData(for: details.server.icon, kind: .serverIcon))
+                    VStack(alignment: .leading) {
+                        Button { viewModel.chooseServerIconDraft() } label: { Label("Choose Icon", systemImage: "photo") }
+                        Text(viewModel.serverIconDraft == nil ? "No icon draft selected" : "Icon draft selected; save to upload.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                HStack {
+                    Button { viewModel.chooseServerBannerDraft() } label: { Label("Choose Banner", systemImage: "rectangle") }
+                    Text(viewModel.serverBannerDraft == nil ? "No banner draft selected" : "Banner draft selected; save to upload.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                stateMessage(viewModel.serverSettingsSaveState, loading: "Saving appearance", success: "Appearance updated")
+                HStack {
+                    Button { viewModel.serverIconDraft = nil; viewModel.serverBannerDraft = nil } label: { Label("Clear Drafts", systemImage: "trash") }
+                    Spacer()
+                    Button { Task { await viewModel.saveServerAppearance() } } label: { Label("Save Appearance", systemImage: "square.and.arrow.up") }
+                        .buttonStyle(GlassButtonStyle())
+                        .disabled((viewModel.serverIconDraft == nil && viewModel.serverBannerDraft == nil) || viewModel.serverSettingsDisabledReason() != nil)
+                        .accessibilityHint("Uploads selected media only after this button is pressed")
+                }
+            }
+        }
+    }
+
+    private func categories(_ details: ServerSettingsDetails) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    Text("Categories")
+                        .font(.headline)
+                    HStack {
+                        TextField("New category", text: $newCategoryTitle)
+                        Button { viewModel.createCategoryDraft(title: newCategoryTitle); newCategoryTitle = "" } label: { Label("Add", systemImage: "plus") }
+                            .disabled(newCategoryTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.channelManagementDisabledReason() != nil)
+                    }
+                    ForEach(viewModel.categoryEditorForm?.categories ?? []) { category in
+                        HStack {
+                            TextField("Category title", text: Binding(
+                                get: { viewModel.categoryEditorForm?.categories.first(where: { $0.id == category.id })?.title ?? category.title },
+                                set: { viewModel.categoryEditorForm?.renameCategory(id: category.id, title: $0) }
+                            ))
+                            Text("\(category.channels.count)")
+                                .foregroundStyle(.secondary)
+                            Button(role: .destructive) { viewModel.categoryEditorForm?.deleteCategory(id: category.id) } label: { Image(systemName: "trash") }
+                                .accessibilityHint("Deletes this category draft; channels become uncategorized after Apply")
+                        }
+                    }
+                    ForEach(details.channels) { channel in
+                        Picker(channel.displayName, selection: Binding(
+                            get: { categoryID(containing: channel.id) },
+                            set: { viewModel.categoryEditorForm?.move(channelID: channel.id, toCategory: $0) }
+                        )) {
+                            Text("Uncategorized").tag(String?.none)
+                            ForEach(viewModel.categoryEditorForm?.categories ?? []) { category in
+                                Text(category.title).tag(Optional(category.id))
+                            }
+                        }
+                    }
+                    stateMessage(viewModel.categoryEditorState, loading: "Applying categories", success: "Categories updated")
+                    HStack {
+                        Spacer()
+                        Button { Task { await viewModel.applyCategoryChanges() } } label: { Label("Apply Categories", systemImage: "checkmark") }
+                            .buttonStyle(GlassButtonStyle())
+                            .disabled(viewModel.channelManagementDisabledReason() != nil)
+                    }
+                }
+            }
+        }
+    }
+
+    private func roles(_ details: ServerSettingsDetails) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    HStack {
+                        Text("Roles")
                             .font(.headline)
-                        ForEach(categories) { category in
-                            LabeledContent(category.title, value: "\(category.channels.count) channels")
+                        Spacer()
+                        Button { viewModel.openCreateRole() } label: { Label("Create Role", systemImage: "plus") }
+                            .disabled(viewModel.roleManagementDisabledReason() != nil)
+                    }
+                    ForEach(details.server.roles.values.sorted { $0.rank < $1.rank }) { role in
+                        HStack {
+                            Circle()
+                                .fill(roleColor(role.colour))
+                                .frame(width: 10, height: 10)
+                            VStack(alignment: .leading) {
+                                Text(role.name)
+                                Text("Rank \(role.rank) · \(permissionSummary(role.permissions.allow))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button { viewModel.openEditRole(role) } label: { Image(systemName: "pencil") }
+                                .disabled(viewModel.roleManagementDisabledReason() != nil)
+                            Button(role: .destructive) { viewModel.requestDeleteRole(role) } label: { Image(systemName: "trash") }
+                                .disabled(viewModel.roleManagementDisabledReason() != nil)
+                        }
+                    }
+                    if let pending = viewModel.pendingRoleDeletion {
+                        Divider()
+                        Text("Type \(pending.name) to delete this role.")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                        TextField("Role name", text: $roleDeleteConfirmation)
+                        HStack {
+                            Button("Cancel") { viewModel.pendingRoleDeletion = nil; roleDeleteConfirmation = "" }
+                            Spacer()
+                            Button("Delete Role", role: .destructive) {
+                                Task { await viewModel.confirmDeleteRole(named: roleDeleteConfirmation); roleDeleteConfirmation = "" }
+                            }
+                            .disabled(roleDeleteConfirmation != pending.name)
+                        }
+                    }
+                    if viewModel.roleEditorForm != nil {
+                        Divider()
+                        Text(viewModel.roleEditorForm?.roleID == nil ? "Create Role" : "Edit Role")
+                            .font(.headline)
+                        TextField("Role name", text: Binding(get: { viewModel.roleEditorForm?.name ?? "" }, set: { viewModel.roleEditorForm?.name = $0 }))
+                        TextField("Colour", text: Binding(get: { viewModel.roleEditorForm?.colour ?? "" }, set: { viewModel.roleEditorForm?.colour = $0 }))
+                        Toggle("Show separately", isOn: Binding(get: { viewModel.roleEditorForm?.hoist ?? false }, set: { viewModel.roleEditorForm?.hoist = $0 }))
+                        stateMessage(viewModel.roleEditorState, loading: "Saving role", success: "Role saved")
+                        HStack {
+                            Button("Cancel") { viewModel.roleEditorForm = nil }
+                            Spacer()
+                            Button { Task { await viewModel.saveRoleEditor() } } label: { Label("Save Role", systemImage: "checkmark") }
+                                .buttonStyle(GlassButtonStyle())
                         }
                     }
                 }
             }
+        }
+    }
+
+    private func permissions(_ details: ServerSettingsDetails) -> some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                Text("Permission Preview")
+                    .font(.headline)
+                LabeledContent("Effective bits", value: "\(details.permissionPreview.effectivePermissions.rawValue)")
+                LabeledContent("Manage server", value: details.permissionPreview.canManageServer ? "Allowed" : "Denied")
+                LabeledContent("Manage channels", value: details.permissionPreview.canManageChannels ? "Allowed" : "Denied")
+                LabeledContent("Manage roles", value: details.permissionPreview.canManageRoles ? "Allowed" : "Denied")
+                LabeledContent("Assign roles", value: details.permissionPreview.canAssignRoles ? "Allowed" : "Denied")
+                LabeledContent("Upload files", value: details.permissionPreview.canUploadFiles ? "Allowed" : "Denied")
+                if !details.permissionPreview.warnings.isEmpty {
+                    Text("Resolution warnings: \(details.permissionPreview.warnings.map(\.rawValue).joined(separator: ", "))")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private func members(_ details: ServerSettingsDetails) -> some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                Text("Members")
+                    .font(.headline)
+                if details.members.isEmpty {
+                    Text("Member role assignment is available when member data is present in the current snapshot.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(details.members, id: \.id) { member in
+                    LabeledContent(member.id.userID.rawValue, value: member.roles.count == 1 ? "1 role" : "\(member.roles.count) roles")
+                }
+            }
+        }
+    }
+
+    private func categoryID(containing channelID: ChannelID) -> String? {
+        viewModel.categoryEditorForm?.categories.first { $0.channels.contains(channelID) }?.id
+    }
+
+    private func permissionSummary(_ permissions: Permissions) -> String {
+        var labels: [String] = []
+        if permissions.contains(.manageServer) { labels.append("Manage Server") }
+        if permissions.contains(.manageChannel) { labels.append("Manage Channels") }
+        if permissions.contains(.manageRole) { labels.append("Manage Roles") }
+        if permissions.contains(.assignRoles) { labels.append("Assign Roles") }
+        if permissions.contains(.uploadFiles) { labels.append("Upload Files") }
+        return labels.isEmpty ? "No highlighted permissions" : labels.joined(separator: ", ")
+    }
+
+    private func roleColor(_ hex: String?) -> Color {
+        guard let hex, let color = NSColor.phase25Hex(hex) else { return .secondary }
+        return Color(nsColor: color)
+    }
+
+    @ViewBuilder private func stateMessage<Value: Hashable & Sendable>(_ state: ManagementActionState<Value>, loading: String, success: String) -> some View {
+        switch state {
+        case .idle:
+            Text("Changes apply only after an explicit save.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .loading:
+            ProgressView(loading)
+        case let .failed(message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+        case .loaded:
+            Text(success)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 }
@@ -8078,6 +8676,22 @@ public struct ChannelSearchPanel: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+private extension NSColor {
+    static func phase25Hex(_ value: String) -> NSColor? {
+        var hex = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if hex.hasPrefix("#") {
+            hex.removeFirst()
+        }
+        guard hex.count == 6, let int = UInt64(hex, radix: 16) else { return nil }
+        return NSColor(
+            red: CGFloat((int >> 16) & 0xFF) / 255,
+            green: CGFloat((int >> 8) & 0xFF) / 255,
+            blue: CGFloat(int & 0xFF) / 255,
+            alpha: 1
+        )
     }
 }
 

@@ -494,7 +494,76 @@ public actor MockStoatAPIClient: StoatAPIClient {
         if let categories = draft.categories {
             servers[index].categories = categories
         }
+        if let name = draft.name {
+            servers[index].name = name
+        }
+        if draft.remove.contains(.description) {
+            servers[index].description = nil
+        } else if let description = draft.description {
+            servers[index].description = description
+        }
+        if draft.remove.contains(.icon) {
+            servers[index].icon = nil
+        } else if let icon = draft.icon {
+            servers[index].icon = File(id: icon, tag: UploadTag.icons.rawAPIValue, filename: "mock-server-icon.png", metadata: .image(width: 96, height: 96, thumbhash: nil, animated: nil), contentType: "image/png", size: 1024, serverID: id)
+        }
+        if draft.remove.contains(.banner) {
+            servers[index].banner = nil
+        } else if let banner = draft.banner {
+            servers[index].banner = File(id: banner, tag: UploadTag.banners.rawAPIValue, filename: "mock-server-banner.png", metadata: .image(width: 960, height: 320, thumbhash: nil, animated: nil), contentType: "image/png", size: 4096, serverID: id)
+        }
         return servers[index]
+    }
+
+    public func createRole(serverID: ServerID, draft: RoleCreateDraft) async throws -> RoleCreateResponse {
+        guard let serverIndex = servers.firstIndex(where: { $0.id == serverID }) else {
+            throw StoatAPIError.notFound
+        }
+        guard let validated = draft.validatedForCreate else {
+            throw StoatAPIError.invalidEnvironment("Role name must be 1 to 32 characters.")
+        }
+        let roleID = RoleID(rawValue: "mock-role-\(servers[serverIndex].roles.count + 1)")
+        let role = Role(id: roleID, name: validated.name, permissions: PermissionOverride(), rank: Int64(servers[serverIndex].roles.count + 1))
+        servers[serverIndex].roles[roleID] = role
+        return RoleCreateResponse(id: roleID, role: role)
+    }
+
+    public func editRole(serverID: ServerID, roleID: RoleID, draft: RoleEditDraft) async throws -> Role {
+        guard let serverIndex = servers.firstIndex(where: { $0.id == serverID }),
+              var role = servers[serverIndex].roles[roleID]
+        else {
+            throw StoatAPIError.notFound
+        }
+        if let name = draft.name {
+            role.name = name
+        }
+        if draft.remove.contains(.colour) {
+            role.colour = nil
+        } else if let colour = draft.colour {
+            role.colour = colour
+        }
+        if let hoist = draft.hoist {
+            role.hoist = hoist
+        }
+        servers[serverIndex].roles[roleID] = role
+        return role
+    }
+
+    public func deleteRole(serverID: ServerID, roleID: RoleID) async throws {
+        guard let serverIndex = servers.firstIndex(where: { $0.id == serverID }),
+              servers[serverIndex].roles[roleID] != nil
+        else {
+            throw StoatAPIError.notFound
+        }
+        servers[serverIndex].roles.removeValue(forKey: roleID)
+    }
+
+    public func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember {
+        guard servers.contains(where: { $0.id == serverID }) else {
+            throw StoatAPIError.notFound
+        }
+        let roles = draft.remove.contains(.roles) ? [] : (draft.roles ?? [])
+        return ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date(timeIntervalSince1970: 1_700_000_000), roles: roles)
     }
 
     public func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel {

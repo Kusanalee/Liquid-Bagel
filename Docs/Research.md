@@ -136,6 +136,39 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Realtime protocol already documents channel create/update/delete and server update/delete events. Phase 24 updates local snapshot from trusted REST responses and lets later realtime events dedupe by ID.
 - Deferred despite route support: server deletion, role editor, channel permission editor, category creation/reorder/move UI, voice UI, server owner transfer, public Discover editing, and full permission resolution.
 
+### Phase 25 server settings, roles, categories, and permissions notes
+
+- Sources inspected:
+  - `stoatchat/javascript-client-api` commit `366e0882d50d61c977883deb30fe6aa6eec71a73`.
+  - `stoatchat/stoatchat` commit `0896e6888274451b7bfb8abb012ae1bf32ad224a`.
+  - Official permissions docs: https://developers.stoat.chat/developers/api/permissions/
+  - Official events protocol docs: https://developers.stoat.chat/developers/events/protocol/
+  - Official upload docs: https://developers.stoat.chat/developers/api/uploading-files/
+- Generated client route/schema confirms:
+  - `PATCH /servers/{target}` with `DataEditServer` supports `name`, `description`, `icon`, `banner`, `categories`, and `remove`.
+  - `POST /servers/{target}/roles` creates a role with `DataCreateRole.name`; create-time `rank` is marked removed/no effect.
+  - `PATCH /servers/{target}/roles/{role_id}` edits role `name`, `colour`, `hoist`, `icon`, and `remove`; `rank` is marked removed/no effect.
+  - `DELETE /servers/{target}/roles/{role_id}` deletes a role.
+  - `PATCH /servers/{server_id}/members/{member_id}` accepts `DataMemberEdit.roles` for member role assignment.
+  - `PUT /servers/{target}/permissions/{role_id}`, `PUT /servers/{target}/permissions/default`, `PUT /channels/{target}/permissions/{role_id}`, and `PUT /channels/{target}/permissions/default` exist, but Phase 25 keeps permission editing read-only.
+  - `PATCH /servers/{target}/roles/ranks` exists, but Phase 25 keeps role rank reorder deferred because it rewrites all role ordering.
+- Backend permission checks confirm:
+  - server name, description, icon, banner, system messages, analytics, or remove require `ManageServer`;
+  - category updates through server edit require `ManageChannel`;
+  - role create/edit/delete and role-rank reorder require `ManageRole`;
+  - server permission edits require `ManagePermissions` and rank/grant checks;
+  - member role assignment requires `AssignRoles`, rank checks, and valid target role IDs.
+- Backend server edit validates category channel membership and removes duplicate channel assignment by rejecting invalid category structures. Phase 25 sends the full category array only on explicit Apply.
+- Backend role create returns `{ id, role }`; create supports name only. Role colour/hoist are edited through the role edit route after creation.
+- Permission resolver source confirms:
+  - owner or privileged users receive `GrantAllSafe`;
+  - server permissions start from `default_permissions`, then apply ordered role overrides;
+  - role overrides apply allow first, then deny;
+  - server channel permissions apply default channel overwrite, then ordered channel role overwrites;
+  - timeout restricts to `ViewChannel` and `ReadMessageHistory`;
+  - missing `ViewChannel` revokes all channel permissions.
+- Phase 25 implements server settings edit, icon/banner set/update, category create/rename/delete/move by full category array, role overview/create/edit/delete for non-permission fields, and read-only permission preview. Permission writes, role rank reorder, server deletion, moderation, bot management, and voice/video remain deferred.
+
 ### Rate limits
 
 - Docs confirm fixed-window buckets and headers `X-RateLimit-Limit`, `X-RateLimit-Bucket`, `X-RateLimit-Remaining`, `X-RateLimit-Reset-After`.

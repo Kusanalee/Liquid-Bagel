@@ -2561,6 +2561,91 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.inviteManagementState, .idle)
     }
 
+    @MainActor
+    func testPhase25ServerSettingsCategoriesRolesAndCommandsUseMockAPI() async {
+        var snapshot = MockShellData.snapshot
+        let seedServer = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        snapshot.serversByID[seedServer.id]?.defaultPermissions.insert(.manageRole)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+
+        model.selectServer(server.id)
+        model.openServerOverview()
+
+        guard case let .loaded(settings) = model.serverSettingsState else {
+            return XCTFail("Expected server settings")
+        }
+        XCTAssertEqual(settings.server.id, server.id)
+        XCTAssertTrue(model.canPerform(.openServerAppearance))
+        XCTAssertTrue(model.canPerform(.openCategoryEditor))
+        XCTAssertTrue(model.canPerform(.openRoles))
+        XCTAssertTrue(model.canPerform(.openPermissions))
+
+        model.serverSettingsForm?.name = "Bagel Lab Phase 25"
+        model.serverSettingsForm?.description = "Settings test"
+        await model.saveServerSettings()
+        XCTAssertEqual(model.snapshot.serversByID[server.id]?.name, "Bagel Lab Phase 25")
+        XCTAssertEqual(model.snapshot.serversByID[server.id]?.description, "Settings test")
+
+        model.createCategoryDraft(title: "Phase 25")
+        let createdCategoryID = try? XCTUnwrap(model.categoryEditorForm?.categories.last?.id)
+        let firstChannelID = try? XCTUnwrap(model.snapshot.serversByID[server.id]?.channelIDs.first)
+        model.categoryEditorForm?.move(channelID: firstChannelID!, toCategory: createdCategoryID!)
+        await model.applyCategoryChanges()
+        XCTAssertTrue(model.snapshot.serversByID[server.id]?.categories?.contains { $0.title == "Phase 25" && $0.channels.contains(firstChannelID!) } == true)
+
+        model.snapshot.serversByID[server.id]?.defaultPermissions.insert(.manageRole)
+        model.openCreateRole()
+        model.roleEditorForm?.name = "Phase 25 Role"
+        model.roleEditorForm?.colour = "#33AAEE"
+        model.roleEditorForm?.hoist = true
+        await model.saveRoleEditor()
+        XCTAssertTrue(model.snapshot.serversByID[server.id]?.roles.values.contains { $0.name == "Phase 25 Role" } == true)
+    }
+
+    func testPhase25PermissionResolverAppliesRoleAndChannelOverrides() {
+        let currentUser: UserID = "user-1"
+        let roleID: RoleID = "role-1"
+        let server = Server(
+            id: "server-1",
+            ownerID: "owner",
+            name: "Lab",
+            channelIDs: ["channel-1"],
+            roles: [
+                roleID: Role(id: roleID, name: "Managers", permissions: PermissionOverride(allow: [.manageServer, .uploadFiles]), rank: 1)
+            ],
+            defaultPermissions: [.viewChannel, .readMessageHistory, .sendMessage]
+        )
+        let member = ServerMember(id: MemberCompositeKey(serverID: server.id, userID: currentUser), joinedAt: Date(), roles: [roleID])
+        let channel = Channel(
+            id: "channel-1",
+            kind: .textChannel,
+            serverID: server.id,
+            name: "general",
+            defaultPermissions: PermissionOverride(deny: [.sendMessage]),
+            rolePermissions: [roleID: PermissionOverride(allow: [.manageChannel])]
+        )
+
+        let result = Phase25PermissionResolver.resolve(server: server, channel: channel, member: member, currentUserID: currentUser)
+
+        XCTAssertTrue(result.canManageServer)
+        XCTAssertTrue(result.canManageChannels)
+        XCTAssertTrue(result.canUploadFiles)
+        XCTAssertFalse(result.effectivePermissions.contains(.sendMessage))
+        XCTAssertTrue(result.warnings.isEmpty)
+    }
+
+    func testPhase25PermissionResolverOwnerBypassesIncompleteMemberData() {
+        let server = Server(id: "server-1", ownerID: "owner", name: "Lab", defaultPermissions: [])
+
+        let result = Phase25PermissionResolver.resolve(server: server, channel: nil, member: nil, currentUserID: "owner")
+
+        XCTAssertTrue(result.canManageServer)
+        XCTAssertTrue(result.canManageRoles)
+        XCTAssertTrue(result.canManagePermissions)
+        XCTAssertTrue(result.warnings.isEmpty)
+    }
+
     private func phase18Snapshot(currentUserID: UserID, otherUserID: UserID, textChannelID: ChannelID, dmChannelID: ChannelID) -> RealtimeSnapshot {
         let currentUser = User(id: currentUserID, username: "me", displayName: "Me")
         let otherUser = User(id: otherUserID, username: "other", displayName: "Other")

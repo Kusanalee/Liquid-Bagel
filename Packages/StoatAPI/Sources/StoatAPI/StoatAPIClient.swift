@@ -44,6 +44,10 @@ public protocol StoatAPIClient: Sendable {
     func createServer(draft: ServerCreateDraft) async throws -> ServerCreateResponse
     func fetchServer(id: ServerID, includeChannels: Bool) async throws -> ServerFetchResponse
     func editServer(id: ServerID, draft: ServerEditDraft) async throws -> Server
+    func createRole(serverID: ServerID, draft: RoleCreateDraft) async throws -> RoleCreateResponse
+    func editRole(serverID: ServerID, roleID: RoleID, draft: RoleEditDraft) async throws -> Role
+    func deleteRole(serverID: ServerID, roleID: RoleID) async throws
+    func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember
     func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel
     func editChannel(id: ChannelID, draft: ChannelEditDraft) async throws -> Channel
     func deleteChannel(id: ChannelID) async throws
@@ -160,6 +164,22 @@ public extension StoatAPIClient {
 
     func editServer(id: ServerID, draft: ServerEditDraft) async throws -> Server {
         throw StoatAPIError.unimplementedEndpoint("Server edit is not implemented by this API client.")
+    }
+
+    func createRole(serverID: ServerID, draft: RoleCreateDraft) async throws -> RoleCreateResponse {
+        throw StoatAPIError.unimplementedEndpoint("Role creation is not implemented by this API client.")
+    }
+
+    func editRole(serverID: ServerID, roleID: RoleID, draft: RoleEditDraft) async throws -> Role {
+        throw StoatAPIError.unimplementedEndpoint("Role editing is not implemented by this API client.")
+    }
+
+    func deleteRole(serverID: ServerID, roleID: RoleID) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Role deletion is not implemented by this API client.")
+    }
+
+    func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember {
+        throw StoatAPIError.unimplementedEndpoint("Member editing is not implemented by this API client.")
     }
 
     func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel {
@@ -507,6 +527,48 @@ public actor LiveStoatAPIClient: StoatAPIClient {
             StoatRequest<Server>(
                 method: .patch,
                 path: "/servers/\(id.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func createRole(serverID: ServerID, draft: RoleCreateDraft) async throws -> RoleCreateResponse {
+        guard let validated = draft.validatedForCreate else {
+            throw StoatAPIError.invalidEnvironment("Role name must be 1 to 32 characters.")
+        }
+        return try await perform(
+            StoatRequest<RoleCreateResponse>(
+                method: .post,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/roles",
+                body: .json(try encoder.encode(validated))
+            )
+        )
+    }
+
+    public func editRole(serverID: ServerID, roleID: RoleID, draft: RoleEditDraft) async throws -> Role {
+        try await perform(
+            StoatRequest<Role>(
+                method: .patch,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/roles/\(roleID.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func deleteRole(serverID: ServerID, roleID: RoleID) async throws {
+        _ = try await perform(
+            StoatRequest<EmptyResponse>(
+                method: .delete,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/roles/\(roleID.rawValue.stoatPathComponentEscaped)"
+            )
+        )
+    }
+
+    public func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember {
+        try await perform(
+            StoatRequest<ServerMember>(
+                method: .patch,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/members/\(userID.rawValue.stoatPathComponentEscaped)",
                 body: .json(try encoder.encode(draft))
             )
         )

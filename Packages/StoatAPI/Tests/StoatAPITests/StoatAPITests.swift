@@ -579,6 +579,74 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(uploaded.id.rawValue, "file-upload-1")
     }
 
+    func testPhase25ServerRoleAndMemberEndpointRequests() async throws {
+        let serverJSON = Data(#"{"_id":"server-1","owner":"user-1","name":"Lab Updated","description":"Updated","channels":[],"default_permissions":0}"#.utf8)
+        let serverTransport = RecordingHTTPTransport(data: serverJSON)
+        let serverClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: serverTransport
+        )
+        _ = try await serverClient.editServer(id: "server-1", draft: ServerEditDraft(name: "Lab Updated", description: "Updated", icon: "file-icon", banner: "file-banner"))
+        let capturedServerRequest = await serverTransport.lastRequest()
+        let serverRequest = try XCTUnwrap(capturedServerRequest)
+        let serverBody = String(data: try XCTUnwrap(serverRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(serverRequest.httpMethod, "PATCH")
+        XCTAssertEqual(serverRequest.url?.path, "/servers/server-1")
+        XCTAssertTrue(serverBody?.contains(#""name":"Lab Updated""#) == true)
+        XCTAssertTrue(serverBody?.contains(#""icon":"file-icon""#) == true)
+        XCTAssertTrue(serverBody?.contains(#""banner":"file-banner""#) == true)
+
+        let roleResponseJSON = Data(#"{"id":"role-1","role":{"_id":"role-1","name":"Operators","permissions":{"a":0,"d":0},"rank":1}}"#.utf8)
+        let createRoleTransport = RecordingHTTPTransport(data: roleResponseJSON)
+        let createRoleClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: createRoleTransport
+        )
+        _ = try await createRoleClient.createRole(serverID: "server-1", draft: RoleCreateDraft(name: "Operators"))
+        let capturedCreateRoleRequest = await createRoleTransport.lastRequest()
+        let createRoleRequest = try XCTUnwrap(capturedCreateRoleRequest)
+        XCTAssertEqual(createRoleRequest.httpMethod, "POST")
+        XCTAssertEqual(createRoleRequest.url?.path, "/servers/server-1/roles")
+        XCTAssertTrue(String(data: try XCTUnwrap(createRoleRequest.httpBody), encoding: .utf8)?.contains(#""name":"Operators""#) == true)
+
+        let roleJSON = Data(##"{"_id":"role-1","name":"Ops","permissions":{"a":0,"d":0},"colour":"#FFAA00","hoist":true,"rank":1}"##.utf8)
+        let editRoleTransport = RecordingHTTPTransport(data: roleJSON)
+        let editRoleClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: editRoleTransport
+        )
+        _ = try await editRoleClient.editRole(serverID: "server-1", roleID: "role-1", draft: RoleEditDraft(name: "Ops", colour: "#FFAA00", hoist: true))
+        let capturedEditRoleRequest = await editRoleTransport.lastRequest()
+        let editRoleRequest = try XCTUnwrap(capturedEditRoleRequest)
+        XCTAssertEqual(editRoleRequest.httpMethod, "PATCH")
+        XCTAssertEqual(editRoleRequest.url?.path, "/servers/server-1/roles/role-1")
+        XCTAssertTrue(String(data: try XCTUnwrap(editRoleRequest.httpBody), encoding: .utf8)?.contains(##""colour":"#FFAA00""##) == true)
+
+        let deleteRoleTransport = RecordingHTTPTransport(statusCode: 204)
+        let deleteRoleClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: deleteRoleTransport
+        )
+        try await deleteRoleClient.deleteRole(serverID: "server-1", roleID: "role-1")
+        let capturedDeleteRoleRequest = await deleteRoleTransport.lastRequest()
+        let deleteRoleRequest = try XCTUnwrap(capturedDeleteRoleRequest)
+        XCTAssertEqual(deleteRoleRequest.httpMethod, "DELETE")
+        XCTAssertEqual(deleteRoleRequest.url?.path, "/servers/server-1/roles/role-1")
+
+        let memberJSON = Data(#"{"_id":{"server":"server-1","user":"user-2"},"joined_at":"2026-06-02T00:00:00.000Z","roles":["role-1"]}"#.utf8)
+        let memberTransport = RecordingHTTPTransport(data: memberJSON)
+        let memberClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: memberTransport
+        )
+        _ = try await memberClient.editMember(serverID: "server-1", userID: "user-2", draft: MemberEditDraft(roles: ["role-1"]))
+        let capturedMemberRequest = await memberTransport.lastRequest()
+        let memberRequest = try XCTUnwrap(capturedMemberRequest)
+        XCTAssertEqual(memberRequest.httpMethod, "PATCH")
+        XCTAssertEqual(memberRequest.url?.path, "/servers/server-1/members/user-2")
+        XCTAssertTrue(String(data: try XCTUnwrap(memberRequest.httpBody), encoding: .utf8)?.contains(#""roles":["role-1"]"#) == true)
+    }
+
     private func assertThrows<T>(_ expression: @autoclosure () throws -> T, _ expected: StoatAPIError) {
         XCTAssertThrowsError(try expression()) { error in
             guard let apiError = error as? StoatAPIError else {

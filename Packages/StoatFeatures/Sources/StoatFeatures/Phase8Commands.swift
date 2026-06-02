@@ -34,6 +34,12 @@ public enum AppCommand: Hashable, Sendable {
     case createInviteForCurrentChannel
     case openDiscoverInBrowser
     case openServerOverview
+    case openServerAppearance
+    case openCategoryEditor
+    case openRoles
+    case openPermissions
+    case createRole
+    case createCategory
     case openCreateChannel
     case openChannelSettings
     case deleteSelectedChannel
@@ -324,7 +330,13 @@ public final class QuickSwitcherViewModel {
             commandResult(.openInviteManagement, title: "Manage Invites", subtitle: "Create, copy, or revoke invites for the selected server"),
             commandResult(.createInviteForCurrentChannel, title: "Create Invite", subtitle: "Create and copy an invite for the selected channel"),
             commandResult(.openDiscoverInBrowser, title: "Open Discover in Browser", subtitle: "Open the web-backed Discover surface"),
-            commandResult(.openServerOverview, title: "Server Overview", subtitle: "Review selected server details and management actions"),
+            commandResult(.openServerOverview, title: "Server Settings", subtitle: "Review selected server settings and management actions"),
+            commandResult(.openServerAppearance, title: "Server Appearance", subtitle: "Edit selected server icon and banner"),
+            commandResult(.openCategoryEditor, title: "Category Editor", subtitle: "Create, rename, delete, and move channels between categories"),
+            commandResult(.openRoles, title: "Roles", subtitle: "Review and manage selected server roles"),
+            commandResult(.openPermissions, title: "Permissions", subtitle: "Preview effective permissions for the selected server"),
+            commandResult(.createRole, title: "Create Role", subtitle: "Create a role in the selected server"),
+            commandResult(.createCategory, title: "Create Category", subtitle: "Create a draft category in the selected server"),
             commandResult(.openCreateChannel, title: "Create Channel", subtitle: "Create a text channel in the selected server"),
             commandResult(.openChannelSettings, title: "Channel Settings", subtitle: "Edit the selected text channel"),
             commandResult(.deleteSelectedChannel, title: "Delete Channel", subtitle: "Delete the selected text channel after confirmation"),
