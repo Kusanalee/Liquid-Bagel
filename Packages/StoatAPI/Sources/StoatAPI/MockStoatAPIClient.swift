@@ -70,8 +70,12 @@ public actor MockStoatAPIClient: StoatAPIClient {
                 name: "Bagel Lab",
                 description: "Phase 1 mock workspace",
                 channelIDs: [general, apiResearch, macNative],
+                categories: [
+                    ServerCategory(id: "mock-cat-core", title: "Core", channels: [general, apiResearch]),
+                    ServerCategory(id: "mock-cat-native", title: "Native", channels: [macNative])
+                ],
                 roles: [coreRole.id: coreRole],
-                defaultPermissions: memberPermissions,
+                defaultPermissions: memberPermissions.union([.manageChannel, .manageServer, .inviteOthers]),
                 discoverable: false
             ),
             Server(
@@ -473,6 +477,81 @@ public actor MockStoatAPIClient: StoatAPIClient {
         servers.append(server)
         channels.append(channel)
         return ServerCreateResponse(server: server, channels: [channel])
+    }
+
+    public func fetchServer(id: ServerID, includeChannels: Bool = false) async throws -> ServerFetchResponse {
+        guard let server = servers.first(where: { $0.id == id }) else {
+            throw StoatAPIError.notFound
+        }
+        let serverChannels = includeChannels ? channels.filter { $0.serverID == id } : nil
+        return ServerFetchResponse(server: server, channels: serverChannels)
+    }
+
+    public func editServer(id: ServerID, draft: ServerEditDraft) async throws -> Server {
+        guard let index = servers.firstIndex(where: { $0.id == id }) else {
+            throw StoatAPIError.notFound
+        }
+        if let categories = draft.categories {
+            servers[index].categories = categories
+        }
+        return servers[index]
+    }
+
+    public func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel {
+        guard let serverIndex = servers.firstIndex(where: { $0.id == serverID }) else {
+            throw StoatAPIError.notFound
+        }
+        guard let validated = draft.validatedForCreate else {
+            throw StoatAPIError.invalidEnvironment("Channel name must be 1 to 32 characters.")
+        }
+        let channelID = ChannelID(rawValue: "mock-channel-\(channels.count + 1)")
+        let channel = Channel(
+            id: channelID,
+            kind: validated.type == .voiceChannel ? .voiceChannel : .textChannel,
+            serverID: serverID,
+            name: validated.name,
+            description: validated.description,
+            permissions: [.viewChannel, .readMessageHistory, .sendMessage, .uploadFiles, .react, .manageChannel, .inviteOthers],
+            nsfw: validated.nsfw ?? false
+        )
+        channels.append(channel)
+        servers[serverIndex].channelIDs.append(channelID)
+        return channel
+    }
+
+    public func editChannel(id: ChannelID, draft: ChannelEditDraft) async throws -> Channel {
+        guard let index = channels.firstIndex(where: { $0.id == id }) else {
+            throw StoatAPIError.notFound
+        }
+        if let name = draft.name {
+            channels[index].name = name
+        }
+        if draft.remove.contains(.description) {
+            channels[index].description = nil
+        } else if let description = draft.description {
+            channels[index].description = description
+        }
+        if let nsfw = draft.nsfw {
+            channels[index].nsfw = nsfw
+        }
+        return channels[index]
+    }
+
+    public func deleteChannel(id: ChannelID) async throws {
+        guard let channel = channels.first(where: { $0.id == id }) else {
+            throw StoatAPIError.notFound
+        }
+        channels.removeAll { $0.id == id }
+        messagesByChannel[id] = nil
+        if let serverID = channel.serverID,
+           let serverIndex = servers.firstIndex(where: { $0.id == serverID }) {
+            servers[serverIndex].channelIDs.removeAll { $0 == id }
+            servers[serverIndex].categories = servers[serverIndex].categories?.map { category in
+                var category = category
+                category.channels.removeAll { $0 == id }
+                return category
+            }
+        }
     }
 
     private func setPinned(_ pinned: Bool, channelID: ChannelID, messageID: MessageID) throws {

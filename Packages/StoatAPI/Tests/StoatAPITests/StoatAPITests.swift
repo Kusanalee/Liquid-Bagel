@@ -190,6 +190,64 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
     }
 
+    func testPhase24ServerAndChannelManagementEndpointRequests() async throws {
+        let serverJSON = Data(#"{"server":{"_id":"server-1","owner":"user-1","name":"Lab","channels":["channel-1"],"default_permissions":0},"channels":[{"_id":"channel-1","channel_type":"TextChannel","server":"server-1","name":"general"}]}"#.utf8)
+        let fetchTransport = RecordingHTTPTransport(data: serverJSON)
+        let fetchClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: fetchTransport
+        )
+
+        let response = try await fetchClient.fetchServer(id: "server-1", includeChannels: true)
+        let capturedFetchRequest = await fetchTransport.lastRequest()
+        let fetchRequest = try XCTUnwrap(capturedFetchRequest)
+        XCTAssertEqual(response.server.id, "server-1")
+        XCTAssertEqual(response.channels.first?.id, "channel-1")
+        XCTAssertEqual(fetchRequest.httpMethod, "GET")
+        XCTAssertEqual(fetchRequest.url?.path, "/servers/server-1")
+        XCTAssertEqual(URLComponents(url: try XCTUnwrap(fetchRequest.url), resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "include_channels" }?.value, "true")
+
+        let channelJSON = Data(#"{"_id":"channel-2","channel_type":"TextChannel","server":"server-1","name":"ops","description":"Ops"}"#.utf8)
+        let createTransport = RecordingHTTPTransport(data: channelJSON)
+        let createClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: createTransport
+        )
+        _ = try await createClient.createChannel(serverID: "server-1", draft: ChannelCreateDraft(name: "ops", description: "Ops", nsfw: true))
+        let capturedCreateRequest = await createTransport.lastRequest()
+        let createRequest = try XCTUnwrap(capturedCreateRequest)
+        let createBody = String(data: try XCTUnwrap(createRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(createRequest.httpMethod, "POST")
+        XCTAssertEqual(createRequest.url?.path, "/servers/server-1/channels")
+        XCTAssertTrue(createBody?.contains(#""type":"Text""#) == true)
+        XCTAssertTrue(createBody?.contains(#""name":"ops""#) == true)
+
+        let editTransport = RecordingHTTPTransport(data: channelJSON)
+        let editClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: editTransport
+        )
+        _ = try await editClient.editChannel(id: "channel-2", draft: ChannelEditDraft(name: "ops-renamed", description: nil, remove: [.description]))
+        let capturedEditRequest = await editTransport.lastRequest()
+        let editRequest = try XCTUnwrap(capturedEditRequest)
+        let editBody = String(data: try XCTUnwrap(editRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(editRequest.httpMethod, "PATCH")
+        XCTAssertEqual(editRequest.url?.path, "/channels/channel-2")
+        XCTAssertTrue(editBody?.contains(#""name":"ops-renamed""#) == true)
+        XCTAssertTrue(editBody?.contains(#""remove":["Description"]"#) == true)
+
+        let deleteTransport = RecordingHTTPTransport(statusCode: 204)
+        let deleteClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: deleteTransport
+        )
+        try await deleteClient.deleteChannel(id: "channel-2")
+        let capturedDeleteRequest = await deleteTransport.lastRequest()
+        let deleteRequest = try XCTUnwrap(capturedDeleteRequest)
+        XCTAssertEqual(deleteRequest.httpMethod, "DELETE")
+        XCTAssertEqual(deleteRequest.url?.path, "/channels/channel-2")
+    }
+
     func testPhase22DirectMessageAndProfileEndpointRequests() async throws {
         let profileTransport = RecordingHTTPTransport(data: Data(#"{"content":"hello"}"#.utf8))
         let profileClient = LiveStoatAPIClient(

@@ -119,6 +119,23 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Attachment references in message send payloads are `string[]` file IDs, matching uploaded Autumn IDs.
 - Phase 20 keeps media loading explicit and uses Autumn preview/original routes without query parameters.
 
+### Phase 24 server and channel management notes
+
+- Generated OpenAPI confirms:
+  - `GET /servers/{target}` returns server data, or server plus visible channels when `include_channels=true`.
+  - `POST /servers/{server}/channels` creates a server text or voice channel with `name`, `type`, optional `description`, optional `nsfw`, and optional voice info.
+  - `PATCH /channels/{target}` edits channel `name`, `description`, `icon`, `nsfw`, `voice`, `slowmode`, and supports `remove`.
+  - `DELETE /channels/{target}` deletes server text channels, closes DMs, or leaves groups depending on channel type.
+  - `PATCH /servers/{target}` can update server `categories`, but Phase 24 only uses this for safe category preservation after channel create.
+  - `POST /channels/{target}/invites`, `GET /servers/{target}/invites`, and `DELETE /invites/{target}` are verified invite-management routes.
+- Backend route source confirms permission checks:
+  - channel create/edit/delete require `ManageChannel`;
+  - server invite listing requires `ManageServer`;
+  - invite creation requires `InviteOthers`;
+  - server category edits require `ManageChannel` through the server edit route.
+- Realtime protocol already documents channel create/update/delete and server update/delete events. Phase 24 updates local snapshot from trusted REST responses and lets later realtime events dedupe by ID.
+- Deferred despite route support: server deletion, role editor, channel permission editor, category creation/reorder/move UI, voice UI, server owner transfer, public Discover editing, and full permission resolution.
+
 ### Rate limits
 
 - Docs confirm fixed-window buckets and headers `X-RateLimit-Limit`, `X-RateLimit-Bucket`, `X-RateLimit-Remaining`, `X-RateLimit-Reset-After`.

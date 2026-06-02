@@ -483,6 +483,16 @@ public final class MainShellViewModel {
     public var inviteManagementState: InviteManagementState = .idle
     public var pendingInviteDeletion: PendingInviteDeletion?
     public var phase23Status: String?
+    public var isServerOverviewPresented = false
+    public var serverOverviewState: ManagementActionState<ServerOverviewDetails> = .idle
+    public var isCreateChannelPresented = false
+    public var channelCreateForm = ChannelCreateForm()
+    public var channelCreateState: ManagementActionState<Channel> = .idle
+    public var isChannelSettingsPresented = false
+    public var channelEditForm: ChannelEditForm?
+    public var channelEditState: ManagementActionState<Channel> = .idle
+    public var pendingChannelDeletion: PendingChannelDeletion?
+    public var phase24Status: String?
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var messageCopier: any MessageCopying
@@ -1069,7 +1079,7 @@ public final class MainShellViewModel {
     public func openInviteManagement() {
         isInviteManagementPresented = true
         phase23Status = nil
-        Task { [weak self] in await self?.refreshServerInvites() }
+        inviteManagementState = .idle
     }
 
     public func refreshServerInvites() async {
@@ -1090,7 +1100,8 @@ public final class MainShellViewModel {
     }
 
     public func createInviteForSelectedChannel() async {
-        guard let channelID = selection.channelID ?? firstVisibleTextChannel(in: selection.serverID)?.id else {
+        let fallbackChannelID = selection.serverID.flatMap { firstVisibleTextChannel(in: $0)?.id }
+        guard let channelID = selection.channelID ?? fallbackChannelID else {
             inviteManagementState = .failed("Select or create a text channel before creating an invite.")
             return
         }
@@ -1182,6 +1193,214 @@ public final class MainShellViewModel {
         scheduleSelectedChannelLoad()
         loadImageResource(for: server.icon, kind: .serverIcon)
         loadImageResource(for: server.banner, kind: .serverBanner)
+    }
+
+    public func serverManagementCapabilities() -> ServerManagementCapabilities {
+        let fallbackChannel = selection.serverID.flatMap { firstVisibleTextChannel(in: $0) }
+        return Phase24Management.capabilities(
+            server: selectedServer,
+            selectedChannel: selectedChannel ?? fallbackChannel,
+            currentUserID: currentUserID,
+            runtimeMode: effectiveRuntimeMode,
+            sessionState: effectiveSessionState
+        )
+    }
+
+    public func channelManagementDisabledReason(destructive: Bool = false) -> String? {
+        Phase24Management.disabledReasonForChannelManagement(serverManagementCapabilities(), destructive: destructive)
+    }
+
+    public func inviteManagementDisabledReason() -> String? {
+        Phase24Management.disabledReasonForInvites(serverManagementCapabilities())
+    }
+
+    public func serverOverviewDetails() -> ServerOverviewDetails? {
+        guard let server = selectedServer else { return nil }
+        return ServerOverviewDetails(
+            server: server,
+            channels: channels(for: server.id),
+            memberCount: members(for: server.id).count,
+            runtimeLine: runtimeSubtitleForManagement,
+            capabilities: serverManagementCapabilities()
+        )
+    }
+
+    public func openServerOverview() {
+        isServerOverviewPresented = true
+        if let details = serverOverviewDetails() {
+            serverOverviewState = .loaded(details)
+        } else {
+            serverOverviewState = .failed("Select a server before opening server overview.")
+        }
+        phase24Status = nil
+    }
+
+    public func refreshSelectedServerDetails() async {
+        guard let serverID = selection.serverID else {
+            serverOverviewState = .failed("Select a server before refreshing details.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            serverOverviewState = .failed("Connect manually before refreshing server details.")
+            return
+        }
+        serverOverviewState = .loading
+        do {
+            let response = try await apiClient.fetchServer(id: serverID, includeChannels: true)
+            snapshot = Phase24SnapshotIntegrator.upserting(server: response.server, channels: response.channels, into: snapshot)
+            quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+            if let details = serverOverviewDetails() {
+                serverOverviewState = .loaded(details)
+            }
+        } catch {
+            serverOverviewState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func openCreateChannel(categoryID: String? = nil) {
+        guard selectedServer != nil else {
+            phase24Status = "Select a server before creating a channel."
+            return
+        }
+        if let reason = channelManagementDisabledReason() {
+            phase24Status = reason
+            return
+        }
+        isCreateChannelPresented = true
+        channelCreateForm = ChannelCreateForm(categoryID: categoryID)
+        channelCreateState = .idle
+        phase24Status = nil
+    }
+
+    public func createChannelFromDraft() async {
+        guard let server = selectedServer else {
+            channelCreateState = .failed("Select a server before creating a channel.")
+            return
+        }
+        guard let draft = channelCreateForm.draft() else {
+            channelCreateState = .failed("Channel name must be 1 to 32 characters.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            channelCreateState = .failed("Connect manually before creating channels.")
+            return
+        }
+        channelCreateState = .loading
+        do {
+            let channel = try await apiClient.createChannel(serverID: server.id, draft: draft)
+            snapshot = Phase24SnapshotIntegrator.upserting(channel: channel, into: snapshot)
+            if let categoryID = channelCreateForm.categoryID {
+                let updatedServer = Phase24SnapshotIntegrator.server(snapshot.serversByID[server.id] ?? server, appending: channel.id, toCategory: categoryID)
+                snapshot.serversByID[server.id] = updatedServer
+                if effectiveRuntimeMode == .liveManual {
+                    do {
+                        let savedServer = try await apiClient.editServer(id: server.id, draft: ServerEditDraft(categories: updatedServer.categories))
+                        snapshot.serversByID[server.id] = savedServer
+                    } catch {
+                        phase24Status = "Channel created; category update failed."
+                    }
+                }
+            }
+            selectChannel(channel.id)
+            channelCreateState = .loaded(channel)
+            isCreateChannelPresented = false
+            channelCreateForm = ChannelCreateForm()
+            phase24Status = "Channel created"
+            quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+            messageController.hydrate(from: snapshot)
+        } catch {
+            channelCreateState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func openChannelSettings() {
+        guard let channel = selectedChannel else {
+            phase24Status = "Select a channel before opening channel settings."
+            return
+        }
+        if let reason = channelManagementDisabledReason() {
+            phase24Status = reason
+            return
+        }
+        channelEditForm = ChannelEditForm(channel: channel)
+        channelEditState = .idle
+        isChannelSettingsPresented = true
+        phase24Status = nil
+    }
+
+    public func saveChannelSettings() async {
+        guard let form = channelEditForm,
+              let original = snapshot.channelsByID[form.channelID]
+        else {
+            channelEditState = .failed("Selected channel is no longer available.")
+            return
+        }
+        guard let draft = form.draft(original: original) else {
+            channelEditState = .failed("Change the channel name or description before saving.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            channelEditState = .failed("Connect manually before editing channels.")
+            return
+        }
+        channelEditState = .loading
+        do {
+            let channel = try await apiClient.editChannel(id: form.channelID, draft: draft)
+            snapshot = Phase24SnapshotIntegrator.upserting(channel: channel, into: snapshot)
+            channelEditState = .loaded(channel)
+            isChannelSettingsPresented = false
+            phase24Status = "Channel updated"
+            quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+        } catch {
+            channelEditState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func requestDeleteSelectedChannel() {
+        guard let channel = selectedChannel else {
+            phase24Status = "Select a channel before deleting it."
+            return
+        }
+        if let reason = channelManagementDisabledReason(destructive: true) {
+            phase24Status = reason
+            return
+        }
+        pendingChannelDeletion = PendingChannelDeletion(channel: channel)
+    }
+
+    public func confirmPendingChannelDeletion() async {
+        guard let pendingChannelDeletion else { return }
+        self.pendingChannelDeletion = nil
+        guard let apiClient = apiClientForCommunityAction() else {
+            phase24Status = "Connect manually before deleting channels."
+            return
+        }
+        do {
+            try await apiClient.deleteChannel(id: pendingChannelDeletion.channel.id)
+            let result = Phase24SnapshotIntegrator.deleting(channelID: pendingChannelDeletion.channel.id, selectedChannelID: selection.channelID, in: snapshot)
+            snapshot = result.0
+            if let fallback = result.1 {
+                selectChannel(fallback)
+            } else if let serverID = pendingChannelDeletion.channel.serverID {
+                selection.space = .server(serverID)
+                selection.serverID = serverID
+                selection.channelID = nil
+            }
+            phase24Status = "Channel deleted"
+            quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+            messageController.hydrate(from: snapshot)
+        } catch {
+            phase24Status = Phase23Safety.safeError(error)
+        }
+    }
+
+    private var runtimeSubtitleForManagement: String {
+        switch effectiveRuntimeMode {
+        case .mock:
+            "Preview Data"
+        case .liveManual:
+            effectiveSessionState == .connected ? "Live Manual connected" : "Live Manual disconnected"
+        }
     }
 
     public func selectHome() {
@@ -4102,10 +4321,18 @@ extension MainShellViewModel: AppCommandHandling {
         switch command {
         case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .openJoinInvite, .openCreateServer, .openDiscoverInBrowser, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
             return true
-        case .openInviteManagement:
+        case .openServerOverview:
             return selection.serverID != nil
+        case .openCreateChannel:
+            return selection.serverID != nil && channelManagementDisabledReason() == nil
+        case .openChannelSettings:
+            return selectedChannel?.kind == .textChannel && channelManagementDisabledReason() == nil
+        case .deleteSelectedChannel:
+            return selectedChannel?.kind == .textChannel && channelManagementDisabledReason(destructive: true) == nil
+        case .openInviteManagement:
+            return selection.serverID != nil && inviteManagementDisabledReason() == nil
         case .createInviteForCurrentChannel:
-            return selection.channelID != nil || firstVisibleTextChannel(in: selection.serverID) != nil
+            return (selection.channelID != nil || selection.serverID.flatMap { firstVisibleTextChannel(in: $0) } != nil) && inviteManagementDisabledReason() == nil
         case .openChannelSearch, .openLoadedMessageFind:
             return selectedChannel != nil || selection.dmChannelID != nil
         case .openLiveChannelSearch:
@@ -4193,10 +4420,18 @@ extension MainShellViewModel: AppCommandHandling {
         switch command {
         case .focusComposer:
             return "Select a channel before focusing the composer."
+        case .openServerOverview:
+            return "Select a server before opening server overview."
+        case .openCreateChannel:
+            return channelManagementDisabledReason() ?? "Select a server before creating a channel."
+        case .openChannelSettings:
+            return channelManagementDisabledReason() ?? "Select a text channel before opening channel settings."
+        case .deleteSelectedChannel:
+            return channelManagementDisabledReason(destructive: true) ?? "Select a text channel before deleting it."
         case .openInviteManagement:
-            return "Select a server before managing invites."
+            return inviteManagementDisabledReason() ?? "Select a server before managing invites."
         case .createInviteForCurrentChannel:
-            return "Select a server text channel before creating an invite."
+            return inviteManagementDisabledReason() ?? "Select a server text channel before creating an invite."
         case .reconnect:
             return sessionCoordinator?.hasSavedCredential == true ? "Realtime is already connecting." : "No saved credential for this environment."
         case .disconnect:
@@ -4295,6 +4530,14 @@ extension MainShellViewModel: AppCommandHandling {
             openJoinInvite()
         case .openCreateServer:
             openCreateServer()
+        case .openServerOverview:
+            openServerOverview()
+        case .openCreateChannel:
+            openCreateChannel()
+        case .openChannelSettings:
+            openChannelSettings()
+        case .deleteSelectedChannel:
+            requestDeleteSelectedChannel()
         case .openInviteManagement:
             openInviteManagement()
         case .createInviteForCurrentChannel:
@@ -4563,6 +4806,15 @@ public struct MainShellView: View {
         .sheet(isPresented: $viewModel.isInviteManagementPresented) {
             InviteManagementView(viewModel: viewModel)
         }
+        .sheet(isPresented: $viewModel.isServerOverviewPresented) {
+            ServerOverviewView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.isCreateChannelPresented) {
+            CreateChannelView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.isChannelSettingsPresented) {
+            ChannelSettingsView(viewModel: viewModel)
+        }
         .sheet(item: $viewModel.attachmentPreview, onDismiss: {
             viewModel.closeAttachmentPreview()
         }) { attachment in
@@ -4657,8 +4909,24 @@ public struct MainShellView: View {
         } message: {
             Text("This invite code stops working after the API confirms revocation.")
         }
+        .confirmationDialog(
+            "Delete \(viewModel.pendingChannelDeletion?.channel.displayName ?? "this channel")?",
+            isPresented: Binding(
+                get: { viewModel.pendingChannelDeletion != nil },
+                set: { if !$0 { viewModel.pendingChannelDeletion = nil } }
+            )
+        ) {
+            Button("Delete Channel", role: .destructive) {
+                Task { await viewModel.confirmPendingChannelDeletion() }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingChannelDeletion = nil
+            }
+        } message: {
+            Text("This removes the channel after the API confirms deletion. Messages in that channel will no longer be visible here.")
+        }
         .overlay(alignment: .bottom) {
-            if let status = viewModel.placeholderStatus ?? viewModel.phase23Status ?? viewModel.relationshipActionStatus ?? viewModel.messageActionStatus ?? viewModel.composerError ?? viewModel.sessionCoordinator?.lastErrorMessage {
+            if let status = viewModel.placeholderStatus ?? viewModel.phase24Status ?? viewModel.phase23Status ?? viewModel.relationshipActionStatus ?? viewModel.messageActionStatus ?? viewModel.composerError ?? viewModel.sessionCoordinator?.lastErrorMessage {
                 Text(status)
                     .font(.caption)
                     .padding(.horizontal, StoatSpacing.medium)
@@ -5477,13 +5745,23 @@ public struct ChannelListView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-            Text(headerTitle)
-                .font(StoatTypography.sidebarHeader)
-                .lineLimit(1)
-            Text(runtimeSubtitle)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        HStack(alignment: .top, spacing: StoatSpacing.small) {
+            VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                Text(headerTitle)
+                    .font(StoatTypography.sidebarHeader)
+                    .lineLimit(1)
+                Text(runtimeSubtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if viewModel.selection.serverID != nil {
+                GlassIconButton("Server overview", systemImage: "gearshape") {
+                    viewModel.openServerOverview()
+                }
+                .accessibilityLabel("Server overview")
+                .accessibilityHint("Open selected server overview and management actions")
+            }
         }
         .padding(.horizontal, StoatSpacing.large)
     }
@@ -5599,10 +5877,32 @@ public struct ChannelListView: View {
                     }
                 }
             }
-            Button("Create Channel unavailable in Phase 3") {}
+            VStack(spacing: StoatSpacing.xSmall) {
+                Button {
+                    viewModel.openCreateChannel()
+                } label: {
+                    Label("Create Channel", systemImage: "plus")
+                        .frame(maxWidth: .infinity)
+                }
                 .buttonStyle(GlassButtonStyle())
-                .disabled(true)
-                .padding(.horizontal, StoatSpacing.medium)
+                .disabled(viewModel.channelManagementDisabledReason() != nil)
+                .accessibilityLabel("Create channel")
+                .accessibilityHint(viewModel.channelManagementDisabledReason() ?? "Create a text channel in this server")
+
+                if let channel = viewModel.selectedChannel {
+                    Button {
+                        viewModel.openChannelSettings()
+                    } label: {
+                        Label("Channel Settings", systemImage: "slider.horizontal.3")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .disabled(channel.kind != .textChannel || viewModel.channelManagementDisabledReason() != nil)
+                    .accessibilityLabel("Channel settings for \(channel.displayName)")
+                    .accessibilityHint(viewModel.channelManagementDisabledReason() ?? "Edit this text channel")
+                }
+            }
+            .padding(.horizontal, StoatSpacing.medium)
         }
     }
 
@@ -7351,6 +7651,270 @@ public struct InviteManagementView: View {
                     }
                 }
             }
+        }
+    }
+}
+
+public struct ServerOverviewView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: StoatSpacing.large) {
+                HStack {
+                    Text("Server Overview")
+                        .font(.title2.weight(.semibold))
+                    Spacer()
+                    Button("Close") { viewModel.isServerOverviewPresented = false }
+                }
+
+                switch viewModel.serverOverviewState {
+                case .idle:
+                    EmptyStateView(title: "No server selected", message: "Select a server to review management options.", systemImage: "server.rack")
+                case .loading:
+                    ProgressView("Loading server details")
+                case let .failed(message):
+                    EmptyStateView(title: "Server overview unavailable", message: message, systemImage: "exclamationmark.triangle")
+                case let .loaded(details):
+                    overview(details)
+                }
+            }
+            .padding(StoatSpacing.xLarge)
+        }
+        .frame(width: 560)
+        .frame(minHeight: 520)
+        .onAppear {
+            if let details = viewModel.serverOverviewDetails() {
+                viewModel.serverOverviewState = .loaded(details)
+            }
+        }
+        .accessibilityLabel("Server overview")
+    }
+
+    private func overview(_ details: ServerOverviewDetails) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    HStack(spacing: StoatSpacing.medium) {
+                        ServerIconView(name: details.server.name, imageData: viewModel.imageData(for: details.server.icon, kind: .serverIcon))
+                        VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                            Text(details.server.name)
+                                .font(.title3.weight(.semibold))
+                            Text(details.server.description?.isEmpty == false ? details.server.description! : "No description")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                    LabeledContent("Channels", value: "\(details.channels.count)")
+                    LabeledContent("Members", value: "\(details.memberCount)")
+                    LabeledContent("Runtime", value: details.runtimeLine)
+                    LabeledContent("Owner", value: details.server.ownerID.rawValue)
+                }
+            }
+
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    Text("Management")
+                        .font(.headline)
+                    Button {
+                        viewModel.openCreateChannel()
+                    } label: {
+                        Label("Create Channel", systemImage: "plus")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .disabled(Phase24Management.disabledReasonForChannelManagement(details.capabilities) != nil)
+                    .accessibilityHint(Phase24Management.disabledReasonForChannelManagement(details.capabilities) ?? "Create a text channel")
+
+                    Button {
+                        viewModel.openInviteManagement()
+                    } label: {
+                        Label("Invite Management", systemImage: "link")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .disabled(Phase24Management.disabledReasonForInvites(details.capabilities) != nil)
+                    .accessibilityHint(Phase24Management.disabledReasonForInvites(details.capabilities) ?? "Open selected server invites")
+
+                    Button {
+                        Task { await viewModel.refreshSelectedServerDetails() }
+                    } label: {
+                        Label("Refresh Details", systemImage: "arrow.clockwise")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .disabled(viewModel.effectiveRuntimeMode != .liveManual || viewModel.effectiveSessionState != .connected)
+                    .accessibilityHint("Refresh runs only when explicitly requested")
+                }
+            }
+
+            if let categories = details.server.categories, !categories.isEmpty {
+                GlassPanel {
+                    VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                        Text("Categories")
+                            .font(.headline)
+                        ForEach(categories) { category in
+                            LabeledContent(category.title, value: "\(category.channels.count) channels")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+public struct CreateChannelView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            HStack {
+                Text("Create Channel")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button("Close") { viewModel.isCreateChannelPresented = false }
+            }
+            TextField("Channel name", text: $viewModel.channelCreateForm.name)
+                .accessibilityLabel("Channel name")
+            TextField("Description", text: $viewModel.channelCreateForm.description)
+                .accessibilityLabel("Channel description")
+            Toggle("Age restricted", isOn: $viewModel.channelCreateForm.isNSFW)
+                .accessibilityHint("Marks the channel as age restricted")
+
+            if let categories = viewModel.selectedServer?.categories, !categories.isEmpty {
+                Picker("Category", selection: $viewModel.channelCreateForm.categoryID) {
+                    Text("No category").tag(String?.none)
+                    ForEach(categories) { category in
+                        Text(category.title).tag(Optional(category.id))
+                    }
+                }
+                .accessibilityHint("Choose an existing category for the new channel")
+            }
+
+            stateMessage(viewModel.channelCreateState)
+
+            HStack {
+                Spacer()
+                Button("Create") {
+                    Task { await viewModel.createChannelFromDraft() }
+                }
+                .buttonStyle(GlassButtonStyle())
+                .disabled(viewModel.channelCreateForm.draft() == nil)
+                .accessibilityLabel("Create channel")
+                .accessibilityHint("Creates the channel only after this button is pressed")
+            }
+        }
+        .padding(StoatSpacing.xLarge)
+        .frame(width: 440)
+    }
+
+    @ViewBuilder private func stateMessage(_ state: ManagementActionState<Channel>) -> some View {
+        switch state {
+        case .idle:
+            Text("Create runs only when requested.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .loading:
+            ProgressView("Creating channel")
+        case let .failed(message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+        case .loaded:
+            Text("Channel created")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+public struct ChannelSettingsView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            HStack {
+                Text("Channel Settings")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button("Close") { viewModel.isChannelSettingsPresented = false }
+            }
+            if viewModel.channelEditForm != nil {
+                TextField("Channel name", text: Binding(
+                    get: { viewModel.channelEditForm?.name ?? "" },
+                    set: { viewModel.channelEditForm?.name = $0 }
+                ))
+                .accessibilityLabel("Channel name")
+                TextField("Description", text: Binding(
+                    get: { viewModel.channelEditForm?.description ?? "" },
+                    set: { viewModel.channelEditForm?.description = $0 }
+                ))
+                .accessibilityLabel("Channel description")
+                Toggle("Age restricted", isOn: Binding(
+                    get: { viewModel.channelEditForm?.isNSFW ?? false },
+                    set: { viewModel.channelEditForm?.isNSFW = $0 }
+                ))
+
+                stateMessage(viewModel.channelEditState)
+
+                HStack {
+                    Button("Delete Channel", role: .destructive) {
+                        viewModel.requestDeleteSelectedChannel()
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .accessibilityHint("Requires confirmation before deleting this channel")
+                    Spacer()
+                    Button("Save") {
+                        Task { await viewModel.saveChannelSettings() }
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .disabled(saveDisabled)
+                    .accessibilityLabel("Save channel settings")
+                }
+            } else {
+                EmptyStateView(title: "No channel selected", message: "Select a text channel before editing.", systemImage: "number")
+            }
+        }
+        .padding(StoatSpacing.xLarge)
+        .frame(width: 440)
+    }
+
+    private var saveDisabled: Bool {
+        guard let form = viewModel.channelEditForm,
+              let original = viewModel.snapshot.channelsByID[form.channelID]
+        else { return true }
+        return form.draft(original: original) == nil
+    }
+
+    @ViewBuilder private func stateMessage(_ state: ManagementActionState<Channel>) -> some View {
+        switch state {
+        case .idle:
+            Text("Save runs only when requested.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .loading:
+            ProgressView("Saving channel")
+        case let .failed(message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+        case .loaded:
+            Text("Channel updated")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 }

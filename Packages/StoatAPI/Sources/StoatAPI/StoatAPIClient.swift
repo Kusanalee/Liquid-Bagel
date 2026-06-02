@@ -42,6 +42,11 @@ public protocol StoatAPIClient: Sendable {
     func fetchServerInvites(serverID: ServerID) async throws -> [Invite]
     func deleteInvite(code: InviteCode) async throws
     func createServer(draft: ServerCreateDraft) async throws -> ServerCreateResponse
+    func fetchServer(id: ServerID, includeChannels: Bool) async throws -> ServerFetchResponse
+    func editServer(id: ServerID, draft: ServerEditDraft) async throws -> Server
+    func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel
+    func editChannel(id: ChannelID, draft: ChannelEditDraft) async throws -> Channel
+    func deleteChannel(id: ChannelID) async throws
 }
 
 public extension StoatAPIClient {
@@ -147,6 +152,26 @@ public extension StoatAPIClient {
 
     func createServer(draft: ServerCreateDraft) async throws -> ServerCreateResponse {
         throw StoatAPIError.unimplementedEndpoint("Server creation is not implemented by this API client.")
+    }
+
+    func fetchServer(id: ServerID, includeChannels: Bool = false) async throws -> ServerFetchResponse {
+        throw StoatAPIError.unimplementedEndpoint("Server fetch is not implemented by this API client.")
+    }
+
+    func editServer(id: ServerID, draft: ServerEditDraft) async throws -> Server {
+        throw StoatAPIError.unimplementedEndpoint("Server edit is not implemented by this API client.")
+    }
+
+    func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel {
+        throw StoatAPIError.unimplementedEndpoint("Channel creation is not implemented by this API client.")
+    }
+
+    func editChannel(id: ChannelID, draft: ChannelEditDraft) async throws -> Channel {
+        throw StoatAPIError.unimplementedEndpoint("Channel editing is not implemented by this API client.")
+    }
+
+    func deleteChannel(id: ChannelID) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Channel deletion is not implemented by this API client.")
     }
 }
 
@@ -464,6 +489,54 @@ public actor LiveStoatAPIClient: StoatAPIClient {
                 body: .json(try encoder.encode(validated))
             )
         )
+    }
+
+    public func fetchServer(id: ServerID, includeChannels: Bool = false) async throws -> ServerFetchResponse {
+        let queryItems = includeChannels ? [URLQueryItem(name: "include_channels", value: "true")] : []
+        return try await perform(
+            StoatRequest<ServerFetchResponse>(
+                method: .get,
+                path: "/servers/\(id.rawValue.stoatPathComponentEscaped)",
+                queryItems: queryItems
+            )
+        )
+    }
+
+    public func editServer(id: ServerID, draft: ServerEditDraft) async throws -> Server {
+        try await perform(
+            StoatRequest<Server>(
+                method: .patch,
+                path: "/servers/\(id.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel {
+        guard let validated = draft.validatedForCreate else {
+            throw StoatAPIError.invalidEnvironment("Channel name must be 1 to 32 characters.")
+        }
+        return try await perform(
+            StoatRequest<Channel>(
+                method: .post,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/channels",
+                body: .json(try encoder.encode(validated))
+            )
+        )
+    }
+
+    public func editChannel(id: ChannelID, draft: ChannelEditDraft) async throws -> Channel {
+        try await perform(
+            StoatRequest<Channel>(
+                method: .patch,
+                path: "/channels/\(id.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func deleteChannel(id: ChannelID) async throws {
+        _ = try await perform(StoatRequest<EmptyResponse>(method: .delete, path: "/channels/\(id.rawValue.stoatPathComponentEscaped)"))
     }
 
     private func perform<Response: Decodable & Sendable>(_ request: StoatRequest<Response>) async throws -> Response {

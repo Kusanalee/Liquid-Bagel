@@ -2497,6 +2497,70 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(snapshot.usersByID[user.id]?.relationship, .incoming)
     }
 
+    @MainActor
+    func testPhase24ServerOverviewAndPermissionGating() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+
+        model.selectServer(server.id)
+        model.openServerOverview()
+
+        guard case let .loaded(details) = model.serverOverviewState else {
+            return XCTFail("Expected server overview details")
+        }
+        XCTAssertEqual(details.server.id, server.id)
+        XCTAssertGreaterThan(details.channels.count, 0)
+        XCTAssertNil(model.channelManagementDisabledReason())
+        XCTAssertTrue(model.canPerform(.openCreateChannel))
+        XCTAssertTrue(model.canPerform(.openChannelSettings))
+    }
+
+    @MainActor
+    func testPhase24ChannelCreateEditAndDeleteUseMockAPIAndSnapshotIntegration() async {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+
+        model.openCreateChannel(categoryID: "cat-text")
+        model.channelCreateForm.name = "phase-24"
+        model.channelCreateForm.description = "Management test"
+        await model.createChannelFromDraft()
+
+        let created = try? XCTUnwrap(model.selectedChannel)
+        XCTAssertEqual(created?.displayName, "phase-24")
+        XCTAssertEqual(model.phase24Status, "Channel created")
+        XCTAssertTrue(model.snapshot.serversByID[server.id]?.channelIDs.contains(created!.id) == true)
+        XCTAssertTrue(model.snapshot.serversByID[server.id]?.categories?.first { $0.id == "cat-text" }?.channels.contains(created!.id) == true)
+
+        model.openChannelSettings()
+        model.channelEditForm?.name = "phase-24-renamed"
+        model.channelEditForm?.description = ""
+        await model.saveChannelSettings()
+
+        XCTAssertEqual(model.snapshot.channelsByID[created!.id]?.displayName, "phase-24-renamed")
+        XCTAssertNil(model.snapshot.channelsByID[created!.id]?.description)
+
+        model.requestDeleteSelectedChannel()
+        XCTAssertEqual(model.pendingChannelDeletion?.channel.id, created!.id)
+        await model.confirmPendingChannelDeletion()
+
+        XCTAssertNil(model.snapshot.channelsByID[created!.id])
+        XCTAssertNotEqual(model.selection.channelID, created!.id)
+        XCTAssertEqual(model.phase24Status, "Channel deleted")
+    }
+
+    @MainActor
+    func testPhase24InviteManagementDoesNotAutoRefreshOnOpen() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+
+        model.selectServer(server.id)
+        model.openInviteManagement()
+
+        XCTAssertTrue(model.isInviteManagementPresented)
+        XCTAssertEqual(model.inviteManagementState, .idle)
+    }
+
     private func phase18Snapshot(currentUserID: UserID, otherUserID: UserID, textChannelID: ChannelID, dmChannelID: ChannelID) -> RealtimeSnapshot {
         let currentUser = User(id: currentUserID, username: "me", displayName: "Me")
         let otherUser = User(id: otherUserID, username: "other", displayName: "Other")

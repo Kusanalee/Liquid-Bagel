@@ -33,6 +33,10 @@ public enum AppCommand: Hashable, Sendable {
     case openInviteManagement
     case createInviteForCurrentChannel
     case openDiscoverInBrowser
+    case openServerOverview
+    case openCreateChannel
+    case openChannelSettings
+    case deleteSelectedChannel
     case selectNextMessage
     case selectPreviousMessage
     case jumpToNewestMessage
@@ -309,6 +313,9 @@ public final class QuickSwitcherViewModel {
             commandResult(.focusComposer, title: "Focus Composer", subtitle: "Move keyboard focus to the message composer"),
             commandResult(.focusTimeline, title: "Focus Timeline", subtitle: "Move keyboard focus to the message timeline"),
             commandResult(.refresh, title: "Refresh", subtitle: "Refresh the current runtime context"),
+            commandResult(.reconnect, title: "Reconnect", subtitle: "Explicitly reconnect Live Manual"),
+            commandResult(.disconnect, title: "Disconnect", subtitle: "Disconnect the live realtime session"),
+            commandResult(.resetToMock, title: "Open Preview Data", subtitle: "Use local developer preview data"),
             commandResult(.jumpToFriends, title: "Open Friends", subtitle: "Open the friends and requests view"),
             commandResult(.jumpToAddFriend, title: "Add Friend", subtitle: "Open the add friend view"),
             commandResult(.jumpToDiscover, title: "Open Discover", subtitle: "Open server discovery and invite tools"),
@@ -317,9 +324,10 @@ public final class QuickSwitcherViewModel {
             commandResult(.openInviteManagement, title: "Manage Invites", subtitle: "Create, copy, or revoke invites for the selected server"),
             commandResult(.createInviteForCurrentChannel, title: "Create Invite", subtitle: "Create and copy an invite for the selected channel"),
             commandResult(.openDiscoverInBrowser, title: "Open Discover in Browser", subtitle: "Open the web-backed Discover surface"),
-            commandResult(.reconnect, title: "Reconnect", subtitle: "Explicitly reconnect Live Manual"),
-            commandResult(.disconnect, title: "Disconnect", subtitle: "Disconnect the live realtime session"),
-            commandResult(.resetToMock, title: "Open Preview Data", subtitle: "Use local developer preview data"),
+            commandResult(.openServerOverview, title: "Server Overview", subtitle: "Review selected server details and management actions"),
+            commandResult(.openCreateChannel, title: "Create Channel", subtitle: "Create a text channel in the selected server"),
+            commandResult(.openChannelSettings, title: "Channel Settings", subtitle: "Edit the selected text channel"),
+            commandResult(.deleteSelectedChannel, title: "Delete Channel", subtitle: "Delete the selected text channel after confirmation"),
             commandResult(.openChannelSearch, title: "Search This Channel", subtitle: "Open selected-channel search"),
             commandResult(.openLoadedMessageFind, title: "Find in Loaded Messages", subtitle: "Search loaded messages only"),
             commandResult(.openLiveChannelSearch, title: "Live Search Selected Channel", subtitle: "Search this channel after Live Manual connection"),
