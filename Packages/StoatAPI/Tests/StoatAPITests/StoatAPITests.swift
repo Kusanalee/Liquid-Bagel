@@ -190,6 +190,108 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
     }
 
+    func testPhase22DirectMessageAndProfileEndpointRequests() async throws {
+        let profileTransport = RecordingHTTPTransport(data: Data(#"{"content":"hello"}"#.utf8))
+        let profileClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: profileTransport
+        )
+
+        let profile = try await profileClient.fetchUserProfile(userID: "user-1")
+        let capturedProfileRequest = await profileTransport.lastRequest()
+        let profileRequest = try XCTUnwrap(capturedProfileRequest)
+        XCTAssertEqual(profile.content, "hello")
+        XCTAssertEqual(profileRequest.httpMethod, "GET")
+        XCTAssertEqual(profileRequest.url?.path, "/users/user-1/profile")
+
+        let dmsTransport = RecordingHTTPTransport(data: Data(#"[{"_id":"dm-1","channel_type":"DirectMessage","active":true,"recipients":["me","user-1"]}]"#.utf8))
+        let dmsClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: dmsTransport
+        )
+
+        let dms = try await dmsClient.fetchDirectMessages()
+        let capturedDMSRequest = await dmsTransport.lastRequest()
+        let dmsRequest = try XCTUnwrap(capturedDMSRequest)
+        XCTAssertEqual(dms.first?.id, "dm-1")
+        XCTAssertEqual(dmsRequest.httpMethod, "GET")
+        XCTAssertEqual(dmsRequest.url?.path, "/users/dms")
+
+        let openTransport = RecordingHTTPTransport(data: Data(#"{"_id":"dm-2","channel_type":"DirectMessage","active":true,"recipients":["me","user-2"]}"#.utf8))
+        let openClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: openTransport
+        )
+
+        let opened = try await openClient.openDirectMessage(userID: "user-2")
+        let capturedOpenRequest = await openTransport.lastRequest()
+        let openRequest = try XCTUnwrap(capturedOpenRequest)
+        XCTAssertEqual(opened.id, "dm-2")
+        XCTAssertEqual(openRequest.httpMethod, "GET")
+        XCTAssertEqual(openRequest.url?.path, "/users/user-2/dm")
+    }
+
+    func testPhase22RelationshipEndpointRequests() async throws {
+        let userJSON = Data(#"{"_id":"user-1","username":"friend","relationship":"Friend","online":true}"#.utf8)
+
+        let sendTransport = RecordingHTTPTransport(data: userJSON)
+        let sendClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: sendTransport
+        )
+        _ = try await sendClient.sendFriendRequest(username: "friend#0000")
+        let capturedSendRequest = await sendTransport.lastRequest()
+        let sendRequest = try XCTUnwrap(capturedSendRequest)
+        let sendBody = String(data: try XCTUnwrap(sendRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(sendRequest.httpMethod, "POST")
+        XCTAssertEqual(sendRequest.url?.path, "/users/friend")
+        XCTAssertTrue(sendBody?.contains(#""username":"friend#0000""#) == true)
+
+        let acceptTransport = RecordingHTTPTransport(data: userJSON)
+        let acceptClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: acceptTransport
+        )
+        _ = try await acceptClient.acceptFriendRequest(userID: "user-1")
+        let capturedAcceptRequest = await acceptTransport.lastRequest()
+        let acceptRequest = try XCTUnwrap(capturedAcceptRequest)
+        XCTAssertEqual(acceptRequest.httpMethod, "PUT")
+        XCTAssertEqual(acceptRequest.url?.path, "/users/user-1/friend")
+
+        let removeTransport = RecordingHTTPTransport(data: userJSON)
+        let removeClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: removeTransport
+        )
+        _ = try await removeClient.removeFriend(userID: "user-1")
+        let capturedRemoveRequest = await removeTransport.lastRequest()
+        let removeRequest = try XCTUnwrap(capturedRemoveRequest)
+        XCTAssertEqual(removeRequest.httpMethod, "DELETE")
+        XCTAssertEqual(removeRequest.url?.path, "/users/user-1/friend")
+
+        let blockTransport = RecordingHTTPTransport(data: userJSON)
+        let blockClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: blockTransport
+        )
+        _ = try await blockClient.blockUser(userID: "user-1")
+        let capturedBlockRequest = await blockTransport.lastRequest()
+        let blockRequest = try XCTUnwrap(capturedBlockRequest)
+        XCTAssertEqual(blockRequest.httpMethod, "PUT")
+        XCTAssertEqual(blockRequest.url?.path, "/users/user-1/block")
+
+        let unblockTransport = RecordingHTTPTransport(data: userJSON)
+        let unblockClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: unblockTransport
+        )
+        _ = try await unblockClient.unblockUser(userID: "user-1")
+        let capturedUnblockRequest = await unblockTransport.lastRequest()
+        let unblockRequest = try XCTUnwrap(capturedUnblockRequest)
+        XCTAssertEqual(unblockRequest.httpMethod, "DELETE")
+        XCTAssertEqual(unblockRequest.url?.path, "/users/user-1/block")
+    }
+
     func testSingleMessageFetchEndpointRequest() async throws {
         let transport = RecordingHTTPTransport(data: Data(#"{"_id":"message-1","channel":"channel-1","author":"user-1","content":"hello"}"#.utf8))
         let client = LiveStoatAPIClient(

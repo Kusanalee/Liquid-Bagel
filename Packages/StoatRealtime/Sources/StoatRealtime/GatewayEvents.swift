@@ -410,6 +410,12 @@ public struct UserRelationshipEvent: Codable, Hashable, Sendable {
     public var id: UserID?
     public var user: User
     public var status: RelationshipStatus?
+
+    public init(id: UserID? = nil, user: User, status: RelationshipStatus? = nil) {
+        self.id = id
+        self.user = user
+        self.status = status
+    }
 }
 
 public struct UserPresenceEvent: Codable, Hashable, Sendable {
@@ -605,4 +611,3 @@ private struct EventEnvelope: Decodable {
         try EventEnvelope(from: decoder).v
     }
 }
-

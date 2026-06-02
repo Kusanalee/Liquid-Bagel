@@ -101,6 +101,16 @@ public struct UserStatus: Codable, Hashable, Sendable {
     }
 }
 
+public struct UserProfile: Codable, Hashable, Sendable {
+    public var content: String?
+    public var background: File?
+
+    public init(content: String? = nil, background: File? = nil) {
+        self.content = content
+        self.background = background
+    }
+}
+
 public enum Presence: Codable, Hashable, Sendable {
     case online
     case idle

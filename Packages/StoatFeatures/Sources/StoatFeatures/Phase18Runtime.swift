@@ -195,7 +195,7 @@ public enum NotificationContentFormatter {
         guard privacy == .showSenderAndContent else { return "New Stoat notification" }
         let author = message.user ?? snapshot.usersByID[message.authorID]
         let authorName = author?.displayName ?? author?.username ?? "Someone"
-        if channel.kind == .directMessage {
+        if channel.kind == .directMessage || channel.kind == .group {
             return authorName
         }
         return "\(authorName) in #\(channel.displayName)"
@@ -255,7 +255,7 @@ public enum NotificationClassifier {
         }
 
         let isMention = (message.mentions ?? []).contains(currentUserID) || message.mentionsEveryone
-        let isDirect = channel.kind == .directMessage
+        let isDirect = channel.kind == .directMessage || channel.kind == .group
         let kind: NotificationClassificationKind
         if isMention {
             kind = .mention

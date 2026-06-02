@@ -230,6 +230,48 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Self-hosted/custom environments are assumed to expose the same auth/session routes when they run the same Stoat backend, but Liquid Bagel does not verify that automatically.
 - hCaptcha, onboarding completion, account flags, and richer login failure handling remain deferred unless official/current client behavior requires them in a later phase.
 
+## Phase 22 Notes
+
+### Sources inspected
+
+- Generated API routes: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/routes.ts
+- Generated API schema: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/schema.ts
+- Official events protocol: https://developers.stoat.chat/developers/events/protocol/
+- Official web Friends UI: https://raw.githubusercontent.com/stoatchat/for-web/main/packages/client/src/interface/Friends.tsx
+- Official web Home sidebar: https://raw.githubusercontent.com/stoatchat/for-web/main/packages/client/src/interface/navigation/channels/HomeSidebar.tsx
+- Official web profile actions: https://raw.githubusercontent.com/stoatchat/for-web/main/packages/client/components/ui/components/features/profiles/ProfileActions.tsx
+- Official JS SDK user actions: https://raw.githubusercontent.com/stoatchat/javascript-client-sdk/main/src/classes/User.ts
+
+### Verified relationship, profile, and DM routes
+
+- There is no separate `GET /relationships` route in the generated API. The current user's relationship list is available on `GET /users/@me` as `User.relations`, while each visible user also carries a `relationship` field.
+- `GET /users/dms` fetches current direct-message and group-DM channels.
+- `GET /users/{target}/dm` opens a DM with a user; the generated operation notes that targeting self returns a Saved Messages channel.
+- `GET /users/{target}/profile` returns `UserProfile` with optional `content` and `background`.
+- `POST /users/friend` sends a friend request with `DataSendFriendRequest`, whose current body is `{ "username": "name#discriminator" }`.
+- `PUT /users/{target}/friend` accepts an incoming friend request.
+- `DELETE /users/{target}/friend` denies an incoming request, cancels an outgoing request, or removes an existing friend.
+- `PUT /users/{target}/block` blocks a user.
+- `DELETE /users/{target}/block` unblocks a user.
+- `POST /channels/create` creates a group channel with `DataCreateGroup`, but new group creation remains deferred for Phase 22.
+
+### Verified schemas and realtime behavior
+
+- `RelationshipStatus` values are `None`, `User`, `Friend`, `Outgoing`, `Incoming`, `Blocked`, and `BlockedOther`; Liquid Bagel keeps unknown-case decoding.
+- `UserProfile` contains optional profile text and optional background `File`; profile background rendering is deferred beyond compact card support.
+- `Channel` supports `SavedMessages`, `DirectMessage`, `Group`, and server channel variants. Direct messages include `active`, `recipients`, and optional `last_message_id`; group DMs include `name`, `owner`, `recipients`, optional icon, and optional `last_message_id`.
+- Realtime `Ready` may include `users`, `channels`, and `channel_unreads`, which are sufficient to build the Friends and existing DM lists without REST calls after manual connection.
+- Realtime `UserRelationship` carries a `user` object and optional `status`; Phase 22 applies the explicit status before updating the snapshot.
+- Realtime `ChannelCreate`, `ChannelDelete`, `ChannelAck`, `UserUpdate`, and `UserPresence` are already modeled and feed the same snapshot used by Friends/DM derivations.
+
+### Phase 22 safety decisions
+
+- Liquid Bagel does not fetch friends, profiles, or DMs on launch.
+- Manual refresh may call `GET /users/@me` and `GET /users/dms` only after the user is connected.
+- Friend, block, profile, and open-DM calls are explicit user actions only.
+- Errors shown in the Friends/Profile surfaces are short and do not expose raw response bodies.
+- Notification routing continues to store only safe route IDs.
+
 ## Phase 6 Notes
 
 ### Session management re-check

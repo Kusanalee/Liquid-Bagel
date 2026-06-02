@@ -2434,6 +2434,69 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertNil(URLComponents(url: bannerURL!, resolvingAgainstBaseURL: false)?.queryItems)
     }
 
+    func testPhase22FriendAndDMDerivationsUseRelationshipsAndUnreads() {
+        var snapshot = MockShellData.snapshot
+        let incoming = User(id: "phase22-incoming", username: "incoming", displayName: "Incoming", relationship: .incoming, online: true)
+        let outgoing = User(id: "phase22-outgoing", username: "outgoing", displayName: "Outgoing", relationship: .outgoing)
+        let blocked = User(id: "phase22-blocked", username: "blocked", displayName: "Blocked", relationship: .blocked)
+        snapshot.usersByID[incoming.id] = incoming
+        snapshot.usersByID[outgoing.id] = outgoing
+        snapshot.usersByID[blocked.id] = blocked
+
+        let current = snapshot.usersByID[MockShellData.currentUserID]
+        let pending = Phase22Derivations.friendItems(for: .pending, snapshot: snapshot, currentUserID: MockShellData.currentUserID, currentUser: current)
+        let blockedItems = Phase22Derivations.friendItems(for: .blocked, snapshot: snapshot, currentUserID: MockShellData.currentUserID, currentUser: current)
+        let dms = Phase22Derivations.directMessageItems(snapshot: snapshot, currentUserID: MockShellData.currentUserID)
+
+        XCTAssertEqual(Set(pending.map(\.relationshipStatus)), [.incoming, .outgoing])
+        XCTAssertEqual(blockedItems.map(\.id), [blocked.id])
+        XCTAssertTrue(dms.contains { $0.channel.kind == .directMessage && $0.displayName == "Design Pilot" })
+    }
+
+    @MainActor
+    func testPhase22MockRelationshipActionsAndDMSelection() async {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let design = UserID(rawValue: "01HX0000000000000000000003")
+
+        await model.performRelationshipAction(.block, userID: design)
+        XCTAssertEqual(model.snapshot.usersByID[design]?.relationship, .blocked)
+        XCTAssertEqual(model.relationshipActionStatus, "User blocked")
+
+        await model.performRelationshipAction(.unblock, userID: design)
+        XCTAssertEqual(model.snapshot.usersByID[design]?.relationship, RelationshipStatus.none)
+
+        await model.openDirectMessage(with: design)
+        XCTAssertEqual(model.selection.space, .directMessages)
+        XCTAssertNotNil(model.selection.dmChannelID)
+    }
+
+    @MainActor
+    func testPhase22QuickSwitcherRoutesFriendsAndAddFriend() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+
+        model.perform(.jumpToFriends)
+        XCTAssertEqual(model.selection.space, .directMessages)
+        XCTAssertEqual(model.friendsTab, .online)
+
+        model.perform(.jumpToAddFriend)
+        XCTAssertEqual(model.selection.space, .directMessages)
+        XCTAssertEqual(model.friendsTab, .addFriend)
+
+        let switcher = QuickSwitcherViewModel(snapshot: MockShellData.snapshot)
+        let friends = QuickSwitcherResult(id: "route-friends", title: "Friends", kind: .route(.friends))
+        XCTAssertEqual(switcher.command(for: friends), .jumpToFriends)
+    }
+
+    func testPhase22RealtimeRelationshipEventAppliesExplicitStatus() async {
+        let user = User(id: "phase22-user", username: "phase22", relationship: .none)
+        let store = RealtimeStateStore()
+
+        await store.apply(.userRelationship(UserRelationshipEvent(id: MockShellData.currentUserID, user: user, status: .incoming)))
+        let snapshot = await store.snapshot()
+
+        XCTAssertEqual(snapshot.usersByID[user.id]?.relationship, .incoming)
+    }
+
     private func phase18Snapshot(currentUserID: UserID, otherUserID: UserID, textChannelID: ChannelID, dmChannelID: ChannelID) -> RealtimeSnapshot {
         let currentUser = User(id: currentUserID, username: "me", displayName: "Me")
         let otherUser = User(id: otherUserID, username: "other", displayName: "Other")

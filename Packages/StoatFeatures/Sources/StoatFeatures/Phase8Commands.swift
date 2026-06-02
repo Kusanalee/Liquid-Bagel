@@ -25,6 +25,8 @@ public enum AppCommand: Hashable, Sendable {
     case selectNextUnreadChannel
     case selectPreviousUnreadChannel
     case jumpToHome
+    case jumpToFriends
+    case jumpToAddFriend
     case jumpToDiscover
     case selectNextMessage
     case selectPreviousMessage
@@ -249,6 +251,8 @@ public final class QuickSwitcherViewModel {
             return command
         case .route(.home):
             return .jumpToHome
+        case .route(.friends):
+            return .jumpToFriends
         case .route(.discover):
             return .jumpToDiscover
         case let .route(.server(serverID, channelID)):
@@ -258,14 +262,13 @@ public final class QuickSwitcherViewModel {
         case let .route(.directMessage(channelID)):
             guard let channelID else { return nil }
             return .selectChannel(channelID)
-        case .route(.friends):
-            return nil
         }
     }
 
     private func indexedResults() -> [QuickSwitcherResult] {
         var output: [QuickSwitcherResult] = [
             QuickSwitcherResult(id: "route-home", title: "Home", subtitle: "Open home", kind: .route(.home), badgeText: "Route"),
+            QuickSwitcherResult(id: "route-friends", title: "Friends", subtitle: "Open friends", kind: .route(.friends), badgeText: "Route"),
             QuickSwitcherResult(id: "route-discover", title: "Discover", subtitle: "Open server discovery placeholder", kind: .route(.discover), badgeText: "Route")
         ]
 
@@ -301,6 +304,8 @@ public final class QuickSwitcherViewModel {
             commandResult(.focusComposer, title: "Focus Composer", subtitle: "Move keyboard focus to the message composer"),
             commandResult(.focusTimeline, title: "Focus Timeline", subtitle: "Move keyboard focus to the message timeline"),
             commandResult(.refresh, title: "Refresh", subtitle: "Refresh the current runtime context"),
+            commandResult(.jumpToFriends, title: "Open Friends", subtitle: "Open the friends and requests view"),
+            commandResult(.jumpToAddFriend, title: "Add Friend", subtitle: "Open the add friend view"),
             commandResult(.reconnect, title: "Reconnect", subtitle: "Explicitly reconnect Live Manual"),
             commandResult(.disconnect, title: "Disconnect", subtitle: "Disconnect the live realtime session"),
             commandResult(.resetToMock, title: "Open Preview Data", subtitle: "Use local developer preview data"),

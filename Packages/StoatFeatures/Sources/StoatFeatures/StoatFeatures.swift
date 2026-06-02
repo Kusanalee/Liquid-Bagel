@@ -460,6 +460,15 @@ public final class MainShellViewModel {
     public var notificationDiagnostics = NotificationDiagnostics()
     public var appLifecyclePhase: AppLifecyclePhase = .active
     public var queuedNotificationRoutes: [QueuedNotificationRoute] = []
+    public var friendsTab: FriendsTab = .online
+    public var addFriendText: String = ""
+    public var relationshipActionStatus: String?
+    public var isRelationshipRefreshInProgress = false
+    public var profileUserID: UserID?
+    public var userProfilesByID: [UserID: UserProfile] = [:]
+    public var profileErrorsByID: [UserID: String] = [:]
+    public var profileLoadingUserIDs: Set<UserID> = []
+    public var pendingRelationshipAction: PendingRelationshipAction?
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var messageCopier: any MessageCopying
@@ -685,6 +694,253 @@ public final class MainShellViewModel {
             return snapshot.usersByID.values.sorted { $0.username < $1.username }
         }
         return users.sorted { ($0.displayName ?? $0.username) < ($1.displayName ?? $1.username) }
+    }
+
+    public var friendItems: [FriendListItem] {
+        Phase22Derivations.friendItems(
+            for: friendsTab,
+            snapshot: snapshot,
+            currentUserID: currentUserID,
+            currentUser: currentUser,
+            localReadStates: localReadStates
+        )
+    }
+
+    public var allFriendItems: [FriendListItem] {
+        Phase22Derivations.friendItems(
+            snapshot: snapshot,
+            currentUserID: currentUserID,
+            currentUser: currentUser,
+            localReadStates: localReadStates
+        )
+    }
+
+    public var directMessageItems: [DirectMessageListItem] {
+        Phase22Derivations.directMessageItems(
+            snapshot: snapshot,
+            currentUserID: currentUserID,
+            localReadStates: localReadStates
+        )
+    }
+
+    public var incomingFriendRequestCount: Int {
+        Phase22Derivations.pendingIncomingCount(snapshot: snapshot, currentUserID: currentUserID, currentUser: currentUser)
+    }
+
+    public func relationshipStatus(for user: User) -> RelationshipStatus {
+        Phase22Derivations.relationshipStatus(for: user, currentUserID: currentUserID, currentUser: currentUser)
+    }
+
+    public func openFriends(tab: FriendsTab = .online) {
+        friendsTab = tab
+        selectDirectMessages()
+    }
+
+    public func showUserProfile(_ userID: UserID) {
+        profileUserID = userID
+        selection.selectedUserID = userID
+        Task { [weak self] in await self?.fetchUserProfileIfNeeded(userID) }
+    }
+
+    public func closeUserProfile() {
+        profileUserID = nil
+    }
+
+    public func fetchUserProfileIfNeeded(_ userID: UserID) async {
+        guard userProfilesByID[userID] == nil,
+              !profileLoadingUserIDs.contains(userID)
+        else { return }
+        guard effectiveRuntimeMode == .liveManual,
+              effectiveSessionState == .connected,
+              let apiClient = sessionCoordinator?.apiClient
+        else { return }
+        profileLoadingUserIDs.insert(userID)
+        profileErrorsByID[userID] = nil
+        do {
+            let profile = try await apiClient.fetchUserProfile(userID: userID)
+            userProfilesByID[userID] = profile
+        } catch {
+            profileErrorsByID[userID] = "Profile unavailable."
+        }
+        profileLoadingUserIDs.remove(userID)
+    }
+
+    public func refreshRelationshipsAndDirectMessages() async {
+        guard effectiveRuntimeMode == .liveManual,
+              effectiveSessionState == .connected,
+              let apiClient = sessionCoordinator?.apiClient
+        else {
+            relationshipActionStatus = "Connect manually before refreshing friends and DMs."
+            return
+        }
+        isRelationshipRefreshInProgress = true
+        defer { isRelationshipRefreshInProgress = false }
+        do {
+            let user = try await apiClient.fetchCurrentUser()
+            applyRelationshipUser(user)
+            let dms = try await apiClient.fetchDirectMessages()
+            for channel in dms {
+                snapshot.channelsByID[channel.id] = channel
+            }
+            relationshipActionStatus = "Friends and DMs refreshed"
+        } catch {
+            relationshipActionStatus = "Refresh failed."
+        }
+    }
+
+    public func sendFriendRequestFromInput() async {
+        let username = addFriendText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !username.isEmpty else {
+            relationshipActionStatus = "Enter a username first."
+            return
+        }
+        if effectiveRuntimeMode == .mock {
+            guard let user = snapshot.usersByID.values.first(where: { "\($0.username)#\($0.discriminator)" == username || $0.username == username }) else {
+                relationshipActionStatus = "User not found in preview data."
+                return
+            }
+            updatePreviewRelationship(userID: user.id, status: .outgoing)
+            addFriendText = ""
+            relationshipActionStatus = "Friend request sent"
+            return
+        }
+        guard let apiClient = availableRelationshipAPIClient() else { return }
+        do {
+            let user = try await apiClient.sendFriendRequest(username: username)
+            upsertUser(user)
+            addFriendText = ""
+            relationshipActionStatus = "Friend request sent"
+        } catch {
+            relationshipActionStatus = "Friend request failed."
+        }
+    }
+
+    public func requestRelationshipAction(_ kind: RelationshipActionKind, userID: UserID) {
+        pendingRelationshipAction = PendingRelationshipAction(kind: kind, userID: userID)
+    }
+
+    public func confirmPendingRelationshipAction() async {
+        guard let action = pendingRelationshipAction else { return }
+        pendingRelationshipAction = nil
+        await performRelationshipAction(action.kind, userID: action.userID)
+    }
+
+    public func performRelationshipAction(_ kind: RelationshipActionKind, userID: UserID) async {
+        if effectiveRuntimeMode == .mock {
+            switch kind {
+            case .accept:
+                updatePreviewRelationship(userID: userID, status: .friend)
+            case .deny, .remove, .unblock:
+                updatePreviewRelationship(userID: userID, status: .none)
+            case .block:
+                updatePreviewRelationship(userID: userID, status: .blocked)
+            }
+            relationshipActionStatus = relationshipSuccessMessage(for: kind)
+            return
+        }
+        guard let apiClient = availableRelationshipAPIClient() else { return }
+        do {
+            let user: User
+            switch kind {
+            case .accept:
+                user = try await apiClient.acceptFriendRequest(userID: userID)
+            case .deny:
+                user = try await apiClient.denyFriendRequest(userID: userID)
+            case .remove:
+                user = try await apiClient.removeFriend(userID: userID)
+            case .block:
+                user = try await apiClient.blockUser(userID: userID)
+            case .unblock:
+                user = try await apiClient.unblockUser(userID: userID)
+            }
+            upsertUser(user)
+            relationshipActionStatus = relationshipSuccessMessage(for: kind)
+        } catch {
+            relationshipActionStatus = "Relationship action failed."
+        }
+    }
+
+    public func openDirectMessage(with userID: UserID) async {
+        if let existing = directMessageItems.first(where: { $0.participants.contains { $0.id == userID } }) {
+            selectChannel(existing.id)
+            return
+        }
+        if effectiveRuntimeMode == .mock {
+            let channel = Channel(
+                id: ChannelID(rawValue: "mock-dm-\(userID.rawValue)"),
+                kind: userID == currentUserID ? .savedMessages : .directMessage,
+                userID: userID == currentUserID ? currentUserID : nil,
+                active: true,
+                recipients: [currentUserID, userID].compactMap { $0 }
+            )
+            snapshot.channelsByID[channel.id] = channel
+            selectChannel(channel.id)
+            relationshipActionStatus = "Direct message opened"
+            return
+        }
+        guard let apiClient = availableRelationshipAPIClient() else { return }
+        do {
+            let channel = try await apiClient.openDirectMessage(userID: userID)
+            snapshot.channelsByID[channel.id] = channel
+            selectChannel(channel.id)
+            relationshipActionStatus = "Direct message opened"
+        } catch {
+            relationshipActionStatus = "Could not open direct message."
+        }
+    }
+
+    private func availableRelationshipAPIClient() -> (any StoatAPIClient)? {
+        if effectiveRuntimeMode == .mock {
+            relationshipActionStatus = "Relationship actions use preview data here."
+            return nil
+        }
+        guard effectiveSessionState == .connected,
+              let apiClient = sessionCoordinator?.apiClient
+        else {
+            relationshipActionStatus = "Connect manually before using friend and DM actions."
+            return nil
+        }
+        return apiClient
+    }
+
+    private func updatePreviewRelationship(userID: UserID, status: RelationshipStatus) {
+        guard var user = snapshot.usersByID[userID] else { return }
+        user.relationship = status
+        snapshot.usersByID[userID] = user
+        guard var currentUser else { return }
+        currentUser.relations.removeAll { $0.id == userID }
+        if status != .none {
+            currentUser.relations.append(Relationship(id: userID, status: status))
+        }
+        self.currentUser = currentUser
+    }
+
+    private func applyRelationshipUser(_ user: User) {
+        currentUser = user
+        upsertUser(user)
+        for relation in user.relations {
+            if var related = snapshot.usersByID[relation.id] {
+                related.relationship = relation.status
+                snapshot.usersByID[relation.id] = related
+            }
+        }
+    }
+
+    private func upsertUser(_ user: User) {
+        snapshot.usersByID[user.id] = user
+        if currentUserID == user.id {
+            currentUser = user
+        }
+    }
+
+    private func relationshipSuccessMessage(for kind: RelationshipActionKind) -> String {
+        switch kind {
+        case .accept: "Friend request accepted"
+        case .deny: "Friend request denied"
+        case .remove: "Friend removed"
+        case .block: "User blocked"
+        case .unblock: "User unblocked"
+        }
     }
 
     public func selectHome() {
@@ -3603,7 +3859,7 @@ public final class MainShellViewModel {
 extension MainShellViewModel: AppCommandHandling {
     public func canPerform(_ command: AppCommand) -> Bool {
         switch command {
-        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToDiscover, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
+        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
             return true
         case .openChannelSearch, .openLoadedMessageFind:
             return selectedChannel != nil || selection.dmChannelID != nil
@@ -3780,6 +4036,10 @@ extension MainShellViewModel: AppCommandHandling {
             selectPreviousUnreadChannel()
         case .jumpToHome:
             selectHome()
+        case .jumpToFriends:
+            openFriends(tab: .online)
+        case .jumpToAddFriend:
+            openFriends(tab: .addFriend)
         case .jumpToDiscover:
             selectDiscover()
         case .selectNextMessage:
@@ -4079,8 +4339,26 @@ public struct MainShellView: View {
         } message: {
             Text("This removes the message from the local timeline after the API confirms deletion.")
         }
+        .confirmationDialog(
+            viewModel.pendingRelationshipAction?.confirmationTitle ?? "Confirm relationship action?",
+            isPresented: Binding(
+                get: { viewModel.pendingRelationshipAction != nil },
+                set: { if !$0 { viewModel.pendingRelationshipAction = nil } }
+            )
+        ) {
+            if let action = viewModel.pendingRelationshipAction {
+                Button(action.buttonTitle, role: action.isDestructive ? .destructive : nil) {
+                    Task { await viewModel.confirmPendingRelationshipAction() }
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingRelationshipAction = nil
+            }
+        } message: {
+            Text("Liquid Bagel will perform this friend or block action only after this confirmation.")
+        }
         .overlay(alignment: .bottom) {
-            if let status = viewModel.placeholderStatus ?? viewModel.messageActionStatus ?? viewModel.composerError ?? viewModel.sessionCoordinator?.lastErrorMessage {
+            if let status = viewModel.placeholderStatus ?? viewModel.relationshipActionStatus ?? viewModel.messageActionStatus ?? viewModel.composerError ?? viewModel.sessionCoordinator?.lastErrorMessage {
                 Text(status)
                     .font(.caption)
                     .padding(.horizontal, StoatSpacing.medium)
@@ -4947,8 +5225,20 @@ public struct ChannelListView: View {
 
     private var homeRows: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-            SidebarButton(title: "Friends", systemImage: "person.2", isSelected: false) {
-                viewModel.selectDirectMessages()
+            SidebarButton(
+                title: viewModel.incomingFriendRequestCount > 0 ? "Friends (\(viewModel.incomingFriendRequestCount))" : "Friends",
+                systemImage: "person.2",
+                isSelected: false
+            ) {
+                viewModel.openFriends(tab: .online)
+            }
+            if !viewModel.directMessageItems.isEmpty {
+                section("Direct Messages") {
+                    ForEach(viewModel.directMessageItems.prefix(8)) { item in
+                        DirectMessageItemButton(viewModel: viewModel, item: item)
+                            .padding(.horizontal, StoatSpacing.medium)
+                    }
+                }
             }
             SidebarButton(title: "Discover", systemImage: "safari", isSelected: false) {
                 viewModel.selectDiscover()
@@ -4958,10 +5248,27 @@ public struct ChannelListView: View {
 
     private var dmRows: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-            SidebarButton(title: "Friends", systemImage: "person.2.fill", isSelected: true) {}
-            ForEach(viewModel.snapshot.channelsByID.values.filter { $0.kind == .directMessage }) { channel in
-                ChannelRow(channel: channel, isSelected: viewModel.selection.dmChannelID == channel.id) {
-                    viewModel.selectChannel(channel.id)
+            SidebarButton(
+                title: viewModel.incomingFriendRequestCount > 0 ? "Friends (\(viewModel.incomingFriendRequestCount))" : "Friends",
+                systemImage: "person.2.fill",
+                isSelected: viewModel.selection.dmChannelID == nil
+            ) {
+                viewModel.openFriends(tab: .online)
+            }
+            SidebarButton(title: "Add Friend", systemImage: "person.badge.plus", isSelected: viewModel.friendsTab == .addFriend) {
+                viewModel.openFriends(tab: .addFriend)
+            }
+            section("Direct Messages") {
+                if viewModel.directMessageItems.isEmpty {
+                    Text("No direct messages")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, StoatSpacing.medium)
+                } else {
+                    ForEach(viewModel.directMessageItems) { item in
+                        DirectMessageItemButton(viewModel: viewModel, item: item)
+                            .padding(.horizontal, StoatSpacing.medium)
+                    }
                 }
             }
         }
@@ -5865,51 +6172,130 @@ public struct MemberPanelView: View {
 }
 
 public struct HomeView: View {
-    private let viewModel: MainShellViewModel
+    @Bindable private var viewModel: MainShellViewModel
 
     public init(viewModel: MainShellViewModel) {
         self.viewModel = viewModel
     }
 
     public var body: some View {
-        if shouldShowLiveStartup {
-            LiveStartupView(viewModel: viewModel)
-        } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: StoatSpacing.xLarge) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: StoatSpacing.xLarge) {
+                HStack {
                     Text("Home")
                         .font(.largeTitle.weight(.semibold))
-                    HStack(alignment: .top, spacing: StoatSpacing.large) {
-                        GlassPanel {
-                            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                                Text("Current User").font(.headline)
-                                if let user = viewModel.currentUserID.flatMap({ viewModel.snapshot.usersByID[$0] }) ?? viewModel.currentUser {
-                                    MemberRow(user: user, subtitle: user.status?.text, imageData: viewModel.imageData(for: user.avatar, kind: .userAvatar))
-                                        .onAppear { viewModel.loadImageResource(for: user.avatar, kind: .userAvatar) }
-                                }
-                            }
-                        }
-                        GlassPanel {
-                            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                                Text("Recent DMs").font(.headline)
-                                ForEach(viewModel.snapshot.channelsByID.values.filter { $0.kind == .directMessage }) { channel in
-                                    Button(channel.displayName) { viewModel.selectChannel(channel.id) }
-                                        .buttonStyle(GlassButtonStyle())
-                                }
-                            }
-                        }
+                    Spacer()
+                    Button("Refresh Friends & DMs") {
+                        Task { await viewModel.refreshRelationshipsAndDirectMessages() }
                     }
-                    FriendsPlaceholderView(viewModel: viewModel)
+                    .buttonStyle(GlassButtonStyle())
+                    .disabled(!canRefreshRelationships || viewModel.isRelationshipRefreshInProgress)
                 }
-                .padding(StoatSpacing.xxLarge)
-                .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(alignment: .top, spacing: StoatSpacing.large) {
+                    currentUserPanel
+                    statusPanel
+                    recentDMsPanel
+                }
+
+                quickActions
+
+                FriendsPlaceholderView(viewModel: viewModel, compact: true)
             }
+            .padding(StoatSpacing.xxLarge)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
-    private var shouldShowLiveStartup: Bool {
-        viewModel.effectiveRuntimeMode == .liveManual &&
-            (viewModel.effectiveSessionState != .connected || viewModel.snapshot.serversByID.isEmpty)
+    private var currentUserPanel: some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                Text("Current User").font(.headline)
+                if let user = viewModel.currentUserID.flatMap({ viewModel.snapshot.usersByID[$0] }) ?? viewModel.currentUser {
+                    Button {
+                        viewModel.showUserProfile(user.id)
+                    } label: {
+                        MemberRow(user: user, subtitle: user.status?.text, imageData: viewModel.imageData(for: user.avatar, kind: .userAvatar))
+                    }
+                    .buttonStyle(.plain)
+                    .popover(isPresented: Binding(get: { viewModel.profileUserID == user.id }, set: { if !$0 { viewModel.closeUserProfile() } })) {
+                        UserProfileCardView(viewModel: viewModel, user: user)
+                    }
+                    .onAppear { viewModel.loadImageResource(for: user.avatar, kind: .userAvatar) }
+                } else {
+                    EmptyStateView(title: "Signed out", message: "Set up a session before connecting.", systemImage: "person.crop.circle.badge.exclamationmark")
+                }
+            }
+        }
+        .frame(maxWidth: 320, alignment: .topLeading)
+    }
+
+    private var statusPanel: some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                Text("Connection").font(.headline)
+                LabeledContent("Session", value: sessionStateText)
+                LabeledContent("DMs", value: "\(viewModel.directMessageItems.count)")
+                LabeledContent("Friends", value: "\(viewModel.allFriendItems.filter { $0.relationshipStatus == .friend }.count)")
+                LabeledContent("Requests", value: "\(viewModel.incomingFriendRequestCount)")
+                if let status = viewModel.relationshipActionStatus {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: 280, alignment: .topLeading)
+    }
+
+    private var recentDMsPanel: some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                Text("Recent DMs").font(.headline)
+                if viewModel.directMessageItems.isEmpty {
+                    EmptyStateView(title: "No DMs", message: "Existing direct messages will appear after Ready or manual refresh.", systemImage: "bubble.left.and.bubble.right")
+                } else {
+                    ForEach(viewModel.directMessageItems.prefix(5)) { item in
+                        DirectMessageItemButton(viewModel: viewModel, item: item)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: 360, alignment: .topLeading)
+    }
+
+    private var quickActions: some View {
+        HStack(spacing: StoatSpacing.medium) {
+            Button("Friends") { viewModel.openFriends(tab: .online) }
+            Button("Pending Requests") { viewModel.openFriends(tab: .pending) }
+            Button("Add Friend") { viewModel.openFriends(tab: .addFriend) }
+            Button("Account & Connection") { viewModel.showAccountSessions() }
+        }
+        .buttonStyle(GlassButtonStyle())
+    }
+
+    private var canRefreshRelationships: Bool {
+        viewModel.effectiveRuntimeMode == .mock ||
+            (viewModel.effectiveRuntimeMode == .liveManual && viewModel.effectiveSessionState == .connected)
+    }
+
+    private var sessionStateText: String {
+        switch viewModel.effectiveSessionState {
+        case .mock: "Preview Data"
+        case .signedOut: "Signed Out"
+        case .loadingCredential: "Loading Credential"
+        case .savedCredentialUnvalidated: "Saved Credential"
+        case .validatingCredential: "Validating"
+        case .validatedReady: "Validated"
+        case .readyToConnect: "Ready"
+        case .connecting: "Connecting"
+        case .connected: "Connected"
+        case .invalidSession: "Invalid Session"
+        case .validationFailed: "Validation Failed"
+        case .connectionFailed: "Connection Failed"
+        case .keychainFailed: "Keychain Failed"
+        case .failed: "Failed"
+        }
     }
 }
 
@@ -6033,12 +6419,12 @@ public struct LiveStartupView: View {
 }
 
 public struct FriendsPlaceholderView: View {
-    private let viewModel: MainShellViewModel
-    @State private var tab = "Online"
-    private let tabs = ["Online", "All", "Pending", "Blocked"]
+    @Bindable private var viewModel: MainShellViewModel
+    private let compact: Bool
 
-    public init(viewModel: MainShellViewModel) {
+    public init(viewModel: MainShellViewModel, compact: Bool = false) {
         self.viewModel = viewModel
+        self.compact = compact
     }
 
     public var body: some View {
@@ -6047,30 +6433,309 @@ public struct FriendsPlaceholderView: View {
                 Text("Friends")
                     .font(.title2.weight(.semibold))
                 Spacer()
-                Picker("Friend filter", selection: $tab) {
-                    ForEach(tabs, id: \.self) { Text($0).tag($0) }
+                Picker("Friend filter", selection: $viewModel.friendsTab) {
+                    ForEach(FriendsTab.allCases, id: \.self) { tab in
+                        Text(tab.title).tag(tab)
+                    }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 330)
+                .frame(width: 430)
             }
-            GlassPanel {
-                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                    ForEach(friendRows) { user in
-                        MemberRow(user: user, subtitle: user.relationship.rawAPIValue)
+
+            if viewModel.friendsTab == .addFriend {
+                addFriendPanel
+            } else {
+                GlassPanel {
+                    VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                        if viewModel.friendItems.isEmpty {
+                            EmptyStateView(title: emptyTitle, message: emptyMessage, systemImage: emptyIcon)
+                        } else if viewModel.friendsTab == .pending {
+                            pendingSection(title: "Incoming", items: viewModel.friendItems.filter { $0.relationshipStatus == .incoming })
+                            pendingSection(title: "Outgoing", items: viewModel.friendItems.filter { $0.relationshipStatus == .outgoing })
+                        } else {
+                            ForEach(viewModel.friendItems) { item in
+                                FriendItemRow(viewModel: viewModel, item: item)
+                            }
+                        }
                     }
-                    Button("Add Friend unavailable in Phase 3") {}
-                        .buttonStyle(GlassButtonStyle())
-                        .disabled(true)
                 }
             }
         }
-        .padding(StoatSpacing.xxLarge)
+        .padding(compact ? 0 : StoatSpacing.xxLarge)
     }
 
-    private var friendRows: [User] {
-        viewModel.snapshot.usersByID.values
-            .filter { $0.id != MockShellData.currentUserID }
-            .sorted { $0.username < $1.username }
+    private var addFriendPanel: some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                HStack {
+                    TextField("username#0000", text: $viewModel.addFriendText)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Send Request") {
+                        Task { await viewModel.sendFriendRequestFromInput() }
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .disabled(viewModel.addFriendText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                if let status = viewModel.relationshipActionStatus {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func pendingSection(title: String, items: [FriendListItem]) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            Text("\(title.uppercased()) - \(items.count)")
+                .font(StoatTypography.section)
+                .foregroundStyle(.secondary)
+            if items.isEmpty {
+                Text("Nobody here right now.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, StoatSpacing.small)
+            } else {
+                ForEach(items) { item in
+                    FriendItemRow(viewModel: viewModel, item: item)
+                }
+            }
+        }
+    }
+
+    private var emptyTitle: String {
+        switch viewModel.friendsTab {
+        case .online: "No friends online"
+        case .all: "No friends"
+        case .pending: "No pending requests"
+        case .blocked: "No blocked users"
+        case .addFriend: "Add Friend"
+        }
+    }
+
+    private var emptyMessage: String {
+        switch viewModel.friendsTab {
+        case .online: "Online friends from Ready will appear here."
+        case .all: "Friends from Ready or manual refresh will appear here."
+        case .pending: "Incoming and outgoing requests will appear here."
+        case .blocked: "Blocked users appear only when the relationship state is available."
+        case .addFriend: ""
+        }
+    }
+
+    private var emptyIcon: String {
+        switch viewModel.friendsTab {
+        case .blocked: "hand.raised"
+        case .pending: "tray"
+        default: "person.2"
+        }
+    }
+}
+
+private struct DirectMessageItemButton: View {
+    @Bindable var viewModel: MainShellViewModel
+    let item: DirectMessageListItem
+
+    var body: some View {
+        Button {
+            viewModel.selectChannel(item.id)
+        } label: {
+            HStack(spacing: StoatSpacing.medium) {
+                AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.avatarUser?.online == true, imageData: item.avatarUser.flatMap { viewModel.imageData(for: $0.avatar, kind: .userAvatar) })
+                VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                    Text(item.displayName)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    Text(item.lastMessagePreview ?? "No loaded messages")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if item.mentionCount > 0 {
+                    MentionBadge(count: item.mentionCount)
+                } else if item.unreadCount > 0 {
+                    Circle().fill(Color.secondary).frame(width: 7, height: 7)
+                }
+            }
+            .padding(StoatSpacing.small)
+            .background(viewModel.selection.dmChannelID == item.id ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onAppear {
+            if let user = item.avatarUser {
+                viewModel.loadImageResource(for: user.avatar, kind: .userAvatar)
+            }
+        }
+    }
+}
+
+private struct FriendItemRow: View {
+    @Bindable var viewModel: MainShellViewModel
+    let item: FriendListItem
+
+    var body: some View {
+        HStack(spacing: StoatSpacing.medium) {
+            Button {
+                viewModel.showUserProfile(item.user.id)
+            } label: {
+                MemberRow(
+                    user: item.user,
+                    subtitle: subtitle,
+                    imageData: viewModel.imageData(for: item.user.avatar, kind: .userAvatar)
+                )
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: Binding(get: { viewModel.profileUserID == item.user.id }, set: { if !$0 { viewModel.closeUserProfile() } })) {
+                UserProfileCardView(viewModel: viewModel, user: item.user)
+            }
+
+            Spacer()
+
+            if item.mentionCount > 0 {
+                MentionBadge(count: item.mentionCount)
+            } else if item.unreadCount > 0 {
+                Circle().fill(Color.secondary).frame(width: 7, height: 7)
+            }
+
+            relationshipButtons
+        }
+        .onAppear { viewModel.loadImageResource(for: item.user.avatar, kind: .userAvatar) }
+    }
+
+    @ViewBuilder private var relationshipButtons: some View {
+        switch item.relationshipStatus {
+        case .friend:
+            Button("Message") { Task { await viewModel.openDirectMessage(with: item.user.id) } }
+                .buttonStyle(GlassButtonStyle())
+            Button("Remove") { viewModel.requestRelationshipAction(.remove, userID: item.user.id) }
+                .buttonStyle(GlassButtonStyle())
+        case .incoming:
+            Button("Accept") { Task { await viewModel.performRelationshipAction(.accept, userID: item.user.id) } }
+                .buttonStyle(GlassButtonStyle())
+            Button("Deny") { viewModel.requestRelationshipAction(.deny, userID: item.user.id) }
+                .buttonStyle(GlassButtonStyle())
+        case .outgoing:
+            Button("Cancel") { viewModel.requestRelationshipAction(.remove, userID: item.user.id) }
+                .buttonStyle(GlassButtonStyle())
+        case .blocked:
+            Button("Unblock") { viewModel.requestRelationshipAction(.unblock, userID: item.user.id) }
+                .buttonStyle(GlassButtonStyle())
+        case .none:
+            Button("Add") {
+                viewModel.addFriendText = "\(item.user.username)#\(item.user.discriminator)"
+                Task { await viewModel.sendFriendRequestFromInput() }
+            }
+            .buttonStyle(GlassButtonStyle())
+        case .user:
+            Button("Profile") { viewModel.showUserProfile(item.user.id) }
+                .buttonStyle(GlassButtonStyle())
+        case .blockedOther, .unknown:
+            Text(item.relationshipStatus.rawAPIValue)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var subtitle: String {
+        let presence = item.user.online ? "Online" : "Offline"
+        return "\(presence) · \(item.relationshipStatus.rawAPIValue)"
+    }
+}
+
+private struct UserProfileCardView: View {
+    @Bindable var viewModel: MainShellViewModel
+    let user: User
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            HStack(alignment: .center, spacing: StoatSpacing.medium) {
+                AvatarView(title: displayName, size: StoatSize.avatar, isOnline: user.online, imageData: viewModel.imageData(for: user.avatar, kind: .userAvatar))
+                VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                    Text(displayName)
+                        .font(.title3.weight(.semibold))
+                    Text("@\(user.username)#\(user.discriminator)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(viewModel.relationshipStatus(for: user).rawAPIValue)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if viewModel.profileLoadingUserIDs.contains(user.id) {
+                HStack(spacing: StoatSpacing.small) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading profile")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if let profile = viewModel.userProfilesByID[user.id], let content = profile.content, !content.isEmpty {
+                Text(content)
+                    .font(.callout)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if let error = viewModel.profileErrorsByID[user.id] {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: StoatSpacing.small) {
+                profileActions
+                Spacer()
+                if viewModel.isDeveloperControlsEnabled {
+                    Button("Copy ID") {
+                        Task { await viewModel.messageCopier.copy(user.id.rawValue) }
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                }
+            }
+        }
+        .padding(StoatSpacing.large)
+        .frame(width: 360, alignment: .leading)
+        .onAppear {
+            viewModel.loadImageResource(for: user.avatar, kind: .userAvatar)
+            Task { await viewModel.fetchUserProfileIfNeeded(user.id) }
+        }
+    }
+
+    @ViewBuilder private var profileActions: some View {
+        let status = viewModel.relationshipStatus(for: user)
+        switch status {
+        case .user:
+            Button("Account") { viewModel.showAccountSessions() }
+                .buttonStyle(GlassButtonStyle())
+        case .friend:
+            Button("Message") { Task { await viewModel.openDirectMessage(with: user.id) } }
+                .buttonStyle(GlassButtonStyle())
+            Button("Remove") { viewModel.requestRelationshipAction(.remove, userID: user.id) }
+                .buttonStyle(GlassButtonStyle())
+        case .incoming:
+            Button("Accept") { Task { await viewModel.performRelationshipAction(.accept, userID: user.id) } }
+                .buttonStyle(GlassButtonStyle())
+            Button("Deny") { viewModel.requestRelationshipAction(.deny, userID: user.id) }
+                .buttonStyle(GlassButtonStyle())
+        case .outgoing:
+            Button("Cancel") { viewModel.requestRelationshipAction(.remove, userID: user.id) }
+                .buttonStyle(GlassButtonStyle())
+        case .blocked:
+            Button("Unblock") { viewModel.requestRelationshipAction(.unblock, userID: user.id) }
+                .buttonStyle(GlassButtonStyle())
+        case .none:
+            Button("Add Friend") {
+                viewModel.addFriendText = "\(user.username)#\(user.discriminator)"
+                Task { await viewModel.sendFriendRequestFromInput() }
+            }
+            .buttonStyle(GlassButtonStyle())
+        case .blockedOther, .unknown:
+            Text(status.rawAPIValue)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var displayName: String {
+        user.displayName?.isEmpty == false ? user.displayName! : user.username
     }
 }
 

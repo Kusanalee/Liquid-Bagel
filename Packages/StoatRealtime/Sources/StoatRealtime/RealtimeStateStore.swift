@@ -224,7 +224,11 @@ public actor RealtimeStateStore {
             }
             currentSnapshot.usersByID[event.id] = user
         case let .userRelationship(event):
-            currentSnapshot.usersByID[event.user.id] = event.user
+            var user = event.user
+            if let status = event.status {
+                user.relationship = status
+            }
+            currentSnapshot.usersByID[user.id] = user
         case let .userPresence(event):
             if var user = currentSnapshot.usersByID[event.id] {
                 user.online = event.online
@@ -335,4 +339,3 @@ public actor RealtimeStateStore {
         currentSnapshot.messagesByChannelID[channelID] = messages
     }
 }
-

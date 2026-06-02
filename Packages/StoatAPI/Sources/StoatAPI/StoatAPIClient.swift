@@ -4,8 +4,11 @@ import StoatModels
 public protocol StoatAPIClient: Sendable {
     func fetchRootConfiguration() async throws -> StoatConfig
     func fetchCurrentUser() async throws -> User
+    func fetchUserProfile(userID: UserID) async throws -> UserProfile
     func fetchServers() async throws -> [Server]
     func fetchChannels() async throws -> [Channel]
+    func fetchDirectMessages() async throws -> [Channel]
+    func openDirectMessage(userID: UserID) async throws -> Channel
     func fetchChannel(id: ChannelID) async throws -> Channel
     func fetchMessage(channelID: ChannelID, messageID: MessageID) async throws -> Message
     func fetchMessages(channelID: ChannelID, options: MessageFetchOptions) async throws -> [Message]
@@ -27,6 +30,12 @@ public protocol StoatAPIClient: Sendable {
     func revokeSession(id: SessionID) async throws
     func revokeAllSessions(revokeSelf: Bool) async throws
     func renameSession(id: SessionID, friendlyName: String) async throws -> SessionInfo
+    func sendFriendRequest(username: String) async throws -> User
+    func acceptFriendRequest(userID: UserID) async throws -> User
+    func denyFriendRequest(userID: UserID) async throws -> User
+    func removeFriend(userID: UserID) async throws -> User
+    func blockUser(userID: UserID) async throws -> User
+    func unblockUser(userID: UserID) async throws -> User
 }
 
 public extension StoatAPIClient {
@@ -40,6 +49,18 @@ public extension StoatAPIClient {
 
     func searchMessages(channelID: ChannelID, request: ChannelMessageSearchRequest) async throws -> [Message] {
         throw StoatAPIError.unimplementedEndpoint("Channel message search is not implemented by this API client.")
+    }
+
+    func fetchUserProfile(userID: UserID) async throws -> UserProfile {
+        throw StoatAPIError.unimplementedEndpoint("User profile fetch is not implemented by this API client.")
+    }
+
+    func fetchDirectMessages() async throws -> [Channel] {
+        throw StoatAPIError.unimplementedEndpoint("Direct message listing is not implemented by this API client.")
+    }
+
+    func openDirectMessage(userID: UserID) async throws -> Channel {
+        throw StoatAPIError.unimplementedEndpoint("Direct message opening is not implemented by this API client.")
     }
 
     func ackChannel(channelID: ChannelID, messageID: MessageID) async throws {
@@ -72,6 +93,30 @@ public extension StoatAPIClient {
 
     func renameSession(id: SessionID, friendlyName: String) async throws -> SessionInfo {
         throw StoatAPIError.unimplementedEndpoint("Session rename is not implemented by this API client.")
+    }
+
+    func sendFriendRequest(username: String) async throws -> User {
+        throw StoatAPIError.unimplementedEndpoint("Friend requests are not implemented by this API client.")
+    }
+
+    func acceptFriendRequest(userID: UserID) async throws -> User {
+        throw StoatAPIError.unimplementedEndpoint("Friend requests are not implemented by this API client.")
+    }
+
+    func denyFriendRequest(userID: UserID) async throws -> User {
+        try await removeFriend(userID: userID)
+    }
+
+    func removeFriend(userID: UserID) async throws -> User {
+        throw StoatAPIError.unimplementedEndpoint("Friend removal is not implemented by this API client.")
+    }
+
+    func blockUser(userID: UserID) async throws -> User {
+        throw StoatAPIError.unimplementedEndpoint("User blocking is not implemented by this API client.")
+    }
+
+    func unblockUser(userID: UserID) async throws -> User {
+        throw StoatAPIError.unimplementedEndpoint("User unblocking is not implemented by this API client.")
     }
 }
 
@@ -106,12 +151,24 @@ public actor LiveStoatAPIClient: StoatAPIClient {
         try await perform(StoatRequest<User>(method: .get, path: "/users/@me"))
     }
 
+    public func fetchUserProfile(userID: UserID) async throws -> UserProfile {
+        try await perform(StoatRequest<UserProfile>(method: .get, path: "/users/\(userID.rawValue.stoatPathComponentEscaped)/profile"))
+    }
+
     public func fetchServers() async throws -> [Server] {
         throw StoatAPIError.unimplementedEndpoint("No verified REST route lists the current user's servers; use Ready over realtime in Phase 2.")
     }
 
     public func fetchChannels() async throws -> [Channel] {
         throw StoatAPIError.unimplementedEndpoint("No verified REST route lists all current-user channels; use Ready/users/dms plus server channels later.")
+    }
+
+    public func fetchDirectMessages() async throws -> [Channel] {
+        try await perform(StoatRequest<[Channel]>(method: .get, path: "/users/dms"))
+    }
+
+    public func openDirectMessage(userID: UserID) async throws -> Channel {
+        try await perform(StoatRequest<Channel>(method: .get, path: "/users/\(userID.rawValue.stoatPathComponentEscaped)/dm"))
     }
 
     public func fetchChannel(id: ChannelID) async throws -> Channel {
@@ -316,6 +373,36 @@ public actor LiveStoatAPIClient: StoatAPIClient {
         )
     }
 
+    public func sendFriendRequest(username: String) async throws -> User {
+        try await perform(
+            StoatRequest<User>(
+                method: .post,
+                path: "/users/friend",
+                body: .json(try encoder.encode(FriendRequestBody(username: username)))
+            )
+        )
+    }
+
+    public func acceptFriendRequest(userID: UserID) async throws -> User {
+        try await perform(StoatRequest<User>(method: .put, path: "/users/\(userID.rawValue.stoatPathComponentEscaped)/friend"))
+    }
+
+    public func denyFriendRequest(userID: UserID) async throws -> User {
+        try await removeFriend(userID: userID)
+    }
+
+    public func removeFriend(userID: UserID) async throws -> User {
+        try await perform(StoatRequest<User>(method: .delete, path: "/users/\(userID.rawValue.stoatPathComponentEscaped)/friend"))
+    }
+
+    public func blockUser(userID: UserID) async throws -> User {
+        try await perform(StoatRequest<User>(method: .put, path: "/users/\(userID.rawValue.stoatPathComponentEscaped)/block"))
+    }
+
+    public func unblockUser(userID: UserID) async throws -> User {
+        try await perform(StoatRequest<User>(method: .delete, path: "/users/\(userID.rawValue.stoatPathComponentEscaped)/block"))
+    }
+
     private func perform<Response: Decodable & Sendable>(_ request: StoatRequest<Response>) async throws -> Response {
         let credential = request.requiresAuthentication ? try await credentialProvider.credential() : nil
         let urlRequest = try requestBuilder.build(request, credential: credential)
@@ -330,4 +417,8 @@ private struct SessionEditRequest: Encodable {
     private enum CodingKeys: String, CodingKey {
         case friendlyName = "friendly_name"
     }
+}
+
+private struct FriendRequestBody: Encodable {
+    var username: String
 }

@@ -146,12 +146,44 @@ public actor MockStoatAPIClient: StoatAPIClient {
         currentUser
     }
 
+    public func fetchUserProfile(userID: UserID) async throws -> UserProfile {
+        guard let user = users[userID] else {
+            throw StoatAPIError.notFound
+        }
+        return UserProfile(content: "Mock profile for \(user.displayName ?? user.username).")
+    }
+
     public func fetchServers() async throws -> [Server] {
         servers
     }
 
     public func fetchChannels() async throws -> [Channel] {
         channels
+    }
+
+    public func fetchDirectMessages() async throws -> [Channel] {
+        channels.filter { $0.kind == .directMessage || $0.kind == .group || $0.kind == .savedMessages }
+    }
+
+    public func openDirectMessage(userID: UserID) async throws -> Channel {
+        if let existing = channels.first(where: { channel in
+            (channel.kind == .directMessage || channel.kind == .savedMessages) &&
+                (channel.userID == userID || channel.recipients.contains(userID))
+        }) {
+            return existing
+        }
+        guard users[userID] != nil || userID == currentUser.id else {
+            throw StoatAPIError.notFound
+        }
+        let channel = Channel(
+            id: ChannelID(rawValue: "mock-dm-\(userID.rawValue)"),
+            kind: userID == currentUser.id ? .savedMessages : .directMessage,
+            userID: userID == currentUser.id ? currentUser.id : nil,
+            active: true,
+            recipients: userID == currentUser.id ? [] : [currentUser.id, userID]
+        )
+        channels.append(channel)
+        return channel
     }
 
     public func fetchChannel(id: ChannelID) async throws -> Channel {
@@ -301,6 +333,35 @@ public actor MockStoatAPIClient: StoatAPIClient {
         UploadedFile(id: FileID(rawValue: "mock-\(tag.rawAPIValue)-\(abs(filename.hashValue))"))
     }
 
+    public func sendFriendRequest(username: String) async throws -> User {
+        guard let userID = users.first(where: { _, user in
+            "\(user.username)#\(user.discriminator)" == username || user.username == username
+        })?.key else {
+            throw StoatAPIError.notFound
+        }
+        return try updateRelationship(userID: userID, status: .outgoing)
+    }
+
+    public func acceptFriendRequest(userID: UserID) async throws -> User {
+        try updateRelationship(userID: userID, status: .friend)
+    }
+
+    public func denyFriendRequest(userID: UserID) async throws -> User {
+        try updateRelationship(userID: userID, status: .none)
+    }
+
+    public func removeFriend(userID: UserID) async throws -> User {
+        try updateRelationship(userID: userID, status: .none)
+    }
+
+    public func blockUser(userID: UserID) async throws -> User {
+        try updateRelationship(userID: userID, status: .blocked)
+    }
+
+    public func unblockUser(userID: UserID) async throws -> User {
+        try updateRelationship(userID: userID, status: .none)
+    }
+
     private func setPinned(_ pinned: Bool, channelID: ChannelID, messageID: MessageID) throws {
         guard var messages = messagesByChannel[channelID],
               let index = messages.firstIndex(where: { $0.id == messageID })
@@ -309,5 +370,18 @@ public actor MockStoatAPIClient: StoatAPIClient {
         }
         messages[index].pinned = pinned
         messagesByChannel[channelID] = messages
+    }
+
+    private func updateRelationship(userID: UserID, status: RelationshipStatus) throws -> User {
+        guard var user = users[userID] else {
+            throw StoatAPIError.notFound
+        }
+        user.relationship = status
+        users[userID] = user
+        currentUser.relations.removeAll { $0.id == userID }
+        if status != .none {
+            currentUser.relations.append(Relationship(id: userID, status: status))
+        }
+        return user
     }
 }
