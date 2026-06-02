@@ -2646,6 +2646,81 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(result.warnings.isEmpty)
     }
 
+    @MainActor
+    func testPhase26MemberRoleAssignmentRequiresDiffConfirmation() async {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let targetUserID: UserID = "01HX0000000000000000000002"
+        let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
+        let targetMember = snapshot.membersByServerAndUserID[targetKey]!
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+
+        model.selectServer(server.id)
+        model.openServerOverview()
+        model.openMemberRoleAssignment(targetMember)
+        model.toggleRole("01HX0000000000000000000301", inMemberRoleDraft: true)
+        await model.confirmSaveMemberRoles()
+
+        guard case let .failed(unconfirmedMessage) = model.memberActionState else {
+            return XCTFail("Expected unconfirmed role save to fail")
+        }
+        XCTAssertTrue(unconfirmedMessage.contains("confirm"))
+
+        model.requestSaveMemberRoles()
+        XCTAssertTrue(model.memberRoleSaveRequiresConfirmation)
+        await model.confirmSaveMemberRoles()
+
+        XCTAssertEqual(model.snapshot.membersByServerAndUserID[targetKey]?.roles, ["01HX0000000000000000000301"])
+    }
+
+    @MainActor
+    func testPhase26PermissionEditorShowsDiffAndSavesThroughMockAPI() async {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+        let key = Phase26Permissions.editableKeys.first { $0.permission == .managePermissions }!
+
+        model.selectServer(server.id)
+        model.openPermissionEditor(scope: .serverDefault(serverID: server.id))
+        model.setPermissionState(.allow, for: key)
+        XCTAssertEqual(model.permissionEditDraft?.diff(keys: Phase26Permissions.editableKeys).count, 1)
+
+        await model.confirmSavePermissionEdit()
+        guard case let .failed(unconfirmedMessage) = model.permissionEditorState else {
+            return XCTFail("Expected unconfirmed permission save to fail")
+        }
+        XCTAssertTrue(unconfirmedMessage.contains("confirm"))
+
+        model.requestSavePermissionEdit()
+        XCTAssertTrue(model.permissionSaveRequiresConfirmation)
+        await model.confirmSavePermissionEdit()
+
+        XCTAssertTrue(model.snapshot.serversByID[server.id]?.defaultPermissions.contains(.managePermissions) == true)
+    }
+
+    @MainActor
+    func testPhase26MemberModerationIsConfirmedAndDoesNotAutoLoadBans() async {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let targetUserID: UserID = "01HX0000000000000000000002"
+        let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
+        let targetMember = snapshot.membersByServerAndUserID[targetKey]!
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+
+        model.selectServer(server.id)
+        model.openServerOverview()
+        XCTAssertEqual(model.banListState, .idle)
+        XCTAssertTrue(model.canPerform(.openMembers))
+        XCTAssertTrue(model.canPerform(.openPermissionEditor))
+
+        model.requestMemberAction(.ban, for: targetMember)
+        XCTAssertNotNil(model.pendingMemberModerationAction)
+        XCTAssertNotNil(model.snapshot.membersByServerAndUserID[targetKey])
+
+        await model.confirmPendingMemberAction()
+        XCTAssertNil(model.snapshot.membersByServerAndUserID[targetKey])
+    }
+
     private func phase18Snapshot(currentUserID: UserID, otherUserID: UserID, textChannelID: ChannelID, dmChannelID: ChannelID) -> RealtimeSnapshot {
         let currentUser = User(id: currentUserID, username: "me", displayName: "Me")
         let otherUser = User(id: otherUserID, username: "other", displayName: "Other")

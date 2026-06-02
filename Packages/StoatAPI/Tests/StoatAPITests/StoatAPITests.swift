@@ -647,6 +647,89 @@ final class StoatAPITests: XCTestCase {
         XCTAssertTrue(String(data: try XCTUnwrap(memberRequest.httpBody), encoding: .utf8)?.contains(#""roles":["role-1"]"#) == true)
     }
 
+    func testPhase26MemberModerationAndPermissionEndpointRequests() async throws {
+        let memberJSON = Data(#"{"_id":{"server":"server-1","user":"user-2"},"joined_at":"2026-06-02T00:00:00.000Z","nickname":"Ops","timeout":"2026-06-03T00:00:00.000Z","roles":["role-1"]}"#.utf8)
+        let memberTransport = RecordingHTTPTransport(data: memberJSON)
+        let memberClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: memberTransport
+        )
+        _ = try await memberClient.editMember(serverID: "server-1", userID: "user-2", draft: MemberEditDraft(nickname: "Ops", timeout: Date(timeIntervalSince1970: 1_801_440_000), remove: [.avatar]))
+        let capturedPhase26MemberRequest = await memberTransport.lastRequest()
+        let memberRequest = try XCTUnwrap(capturedPhase26MemberRequest)
+        let memberBody = String(data: try XCTUnwrap(memberRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(memberRequest.httpMethod, "PATCH")
+        XCTAssertEqual(memberRequest.url?.path, "/servers/server-1/members/user-2")
+        XCTAssertTrue(memberBody?.contains(#""nickname":"Ops""#) == true)
+        XCTAssertTrue(memberBody?.contains(#""remove":["Avatar"]"#) == true)
+
+        let kickTransport = RecordingHTTPTransport(statusCode: 204)
+        let kickClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: kickTransport)
+        try await kickClient.kickMember(serverID: "server-1", userID: "user-2")
+        let capturedKickRequest = await kickTransport.lastRequest()
+        let kickRequest = try XCTUnwrap(capturedKickRequest)
+        XCTAssertEqual(kickRequest.httpMethod, "DELETE")
+        XCTAssertEqual(kickRequest.url?.path, "/servers/server-1/members/user-2")
+
+        let banJSON = Data(#"{"_id":{"server":"server-1","user":"user-2"},"reason":"spam"}"#.utf8)
+        let banTransport = RecordingHTTPTransport(data: banJSON)
+        let banClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: banTransport)
+        _ = try await banClient.banMember(serverID: "server-1", userID: "user-2", draft: BanCreateDraft(reason: "spam", deleteMessageSeconds: 3600))
+        let capturedBanRequest = await banTransport.lastRequest()
+        let banRequest = try XCTUnwrap(capturedBanRequest)
+        let banBody = String(data: try XCTUnwrap(banRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(banRequest.httpMethod, "PUT")
+        XCTAssertEqual(banRequest.url?.path, "/servers/server-1/bans/user-2")
+        XCTAssertTrue(banBody?.contains(#""reason":"spam""#) == true)
+        XCTAssertTrue(banBody?.contains(#""delete_message_seconds":3600"#) == true)
+
+        let banListJSON = Data(#"{"users":[{"_id":"user-2","username":"target","discriminator":"0001"}],"bans":[{"_id":{"server":"server-1","user":"user-2"},"reason":"spam"}]}"#.utf8)
+        let banListTransport = RecordingHTTPTransport(data: banListJSON)
+        let banListClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: banListTransport)
+        _ = try await banListClient.fetchServerBans(serverID: "server-1")
+        let capturedBanListRequest = await banListTransport.lastRequest()
+        let banListRequest = try XCTUnwrap(capturedBanListRequest)
+        XCTAssertEqual(banListRequest.httpMethod, "GET")
+        XCTAssertEqual(banListRequest.url?.path, "/servers/server-1/bans")
+
+        let unbanTransport = RecordingHTTPTransport(statusCode: 204)
+        let unbanClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: unbanTransport)
+        try await unbanClient.unbanMember(serverID: "server-1", userID: "user-2")
+        let capturedUnbanRequest = await unbanTransport.lastRequest()
+        let unbanRequest = try XCTUnwrap(capturedUnbanRequest)
+        XCTAssertEqual(unbanRequest.httpMethod, "DELETE")
+        XCTAssertEqual(unbanRequest.url?.path, "/servers/server-1/bans/user-2")
+
+        let serverJSON = Data(#"{"_id":"server-1","owner":"user-1","name":"Lab","channels":[],"roles":{"role-1":{"_id":"role-1","name":"Ops","permissions":{"a":4,"d":0},"rank":1}},"default_permissions":2097152}"#.utf8)
+        let serverPermissionTransport = RecordingHTTPTransport(data: serverJSON)
+        let serverPermissionClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: serverPermissionTransport)
+        _ = try await serverPermissionClient.setServerRolePermissions(serverID: "server-1", roleID: "role-1", draft: ServerRolePermissionDraft(permissions: PermissionWriteOverride(allow: .managePermissions, deny: [])))
+        let capturedServerPermissionRequest = await serverPermissionTransport.lastRequest()
+        let serverPermissionRequest = try XCTUnwrap(capturedServerPermissionRequest)
+        let serverPermissionBody = String(data: try XCTUnwrap(serverPermissionRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(serverPermissionRequest.httpMethod, "PUT")
+        XCTAssertEqual(serverPermissionRequest.url?.path, "/servers/server-1/permissions/role-1")
+        XCTAssertTrue(serverPermissionBody?.contains(#""allow":4"#) == true)
+        XCTAssertFalse(serverPermissionBody?.contains(#""a":"#) == true)
+
+        let serverDefaultTransport = RecordingHTTPTransport(data: serverJSON)
+        let serverDefaultClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: serverDefaultTransport)
+        _ = try await serverDefaultClient.setServerDefaultPermissions(serverID: "server-1", draft: ServerDefaultPermissionDraft(permissions: [.viewChannel, .readMessageHistory]))
+        let capturedServerDefaultRequest = await serverDefaultTransport.lastRequest()
+        let serverDefaultRequest = try XCTUnwrap(capturedServerDefaultRequest)
+        XCTAssertEqual(serverDefaultRequest.httpMethod, "PUT")
+        XCTAssertEqual(serverDefaultRequest.url?.path, "/servers/server-1/permissions/default")
+
+        let channelJSON = Data(#"{"_id":"channel-1","channel_type":"TextChannel","server":"server-1","name":"general","default_permissions":{"a":4194304,"d":0},"role_permissions":{"role-1":{"a":4,"d":0}}}"#.utf8)
+        let channelPermissionTransport = RecordingHTTPTransport(data: channelJSON)
+        let channelPermissionClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: channelPermissionTransport)
+        _ = try await channelPermissionClient.setChannelDefaultPermissions(channelID: "channel-1", draft: .override(PermissionWriteOverride(allow: .sendMessage, deny: [])))
+        let capturedChannelPermissionRequest = await channelPermissionTransport.lastRequest()
+        let channelPermissionRequest = try XCTUnwrap(capturedChannelPermissionRequest)
+        XCTAssertEqual(channelPermissionRequest.httpMethod, "PUT")
+        XCTAssertEqual(channelPermissionRequest.url?.path, "/channels/channel-1/permissions/default")
+    }
+
     private func assertThrows<T>(_ expression: @autoclosure () throws -> T, _ expected: StoatAPIError) {
         XCTAssertThrowsError(try expression()) { error in
             guard let apiError = error as? StoatAPIError else {

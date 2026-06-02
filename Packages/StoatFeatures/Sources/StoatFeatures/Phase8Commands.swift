@@ -38,6 +38,9 @@ public enum AppCommand: Hashable, Sendable {
     case openCategoryEditor
     case openRoles
     case openPermissions
+    case openMembers
+    case openPermissionEditor
+    case openBanList
     case createRole
     case createCategory
     case openCreateChannel
@@ -335,6 +338,9 @@ public final class QuickSwitcherViewModel {
             commandResult(.openCategoryEditor, title: "Category Editor", subtitle: "Create, rename, delete, and move channels between categories"),
             commandResult(.openRoles, title: "Roles", subtitle: "Review and manage selected server roles"),
             commandResult(.openPermissions, title: "Permissions", subtitle: "Preview effective permissions for the selected server"),
+            commandResult(.openMembers, title: "Members", subtitle: "Manage selected server members and roles"),
+            commandResult(.openPermissionEditor, title: "Permission Editor", subtitle: "Edit selected server default permissions after confirmation"),
+            commandResult(.openBanList, title: "Ban List", subtitle: "Fetch selected server bans after manual connection"),
             commandResult(.createRole, title: "Create Role", subtitle: "Create a role in the selected server"),
             commandResult(.createCategory, title: "Create Category", subtitle: "Create a draft category in the selected server"),
             commandResult(.openCreateChannel, title: "Create Channel", subtitle: "Create a text channel in the selected server"),

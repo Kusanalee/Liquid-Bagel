@@ -8,6 +8,8 @@ public actor MockStoatAPIClient: StoatAPIClient {
     private var channels: [Channel]
     private var messagesByChannel: [ChannelID: [Message]]
     private var invites: [InviteID: Invite]
+    private var members: [MemberCompositeKey: ServerMember]
+    private var bans: [MemberCompositeKey: ServerBan]
 
     public init() {
         let liquid = User(
@@ -95,6 +97,12 @@ public actor MockStoatAPIClient: StoatAPIClient {
         self.invites = [
             "bagel-lab": Invite(id: "bagel-lab", kind: .server, serverID: lab, creatorID: liquid.id, channelID: general)
         ]
+        self.members = [
+            MemberCompositeKey(serverID: lab, userID: liquid.id): ServerMember(id: MemberCompositeKey(serverID: lab, userID: liquid.id), joinedAt: Date(timeIntervalSince1970: 1_700_000_000), roles: [coreRole.id]),
+            MemberCompositeKey(serverID: lab, userID: stoat.id): ServerMember(id: MemberCompositeKey(serverID: lab, userID: stoat.id), joinedAt: Date(timeIntervalSince1970: 1_700_000_100)),
+            MemberCompositeKey(serverID: lab, userID: design.id): ServerMember(id: MemberCompositeKey(serverID: lab, userID: design.id), joinedAt: Date(timeIntervalSince1970: 1_700_000_200))
+        ]
+        self.bans = [:]
         self.messagesByChannel = [
             general: [
                 Message(
@@ -562,8 +570,107 @@ public actor MockStoatAPIClient: StoatAPIClient {
         guard servers.contains(where: { $0.id == serverID }) else {
             throw StoatAPIError.notFound
         }
-        let roles = draft.remove.contains(.roles) ? [] : (draft.roles ?? [])
-        return ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date(timeIntervalSince1970: 1_700_000_000), roles: roles)
+        let key = MemberCompositeKey(serverID: serverID, userID: userID)
+        var member = members[key] ?? ServerMember(id: key, joinedAt: Date(timeIntervalSince1970: 1_700_000_000))
+        if draft.remove.contains(.nickname) {
+            member.nickname = nil
+        } else if let nickname = draft.nickname {
+            member.nickname = nickname
+        }
+        if draft.remove.contains(.avatar) {
+            member.avatar = nil
+        } else if let avatar = draft.avatar {
+            member.avatar = File(id: avatar, tag: UploadTag.avatars.rawAPIValue, filename: "mock-member-avatar.png", metadata: .image(width: 96, height: 96, thumbhash: nil, animated: nil), contentType: "image/png", size: 1024)
+        }
+        if draft.remove.contains(.roles) {
+            member.roles = []
+        } else if let roles = draft.roles {
+            member.roles = roles
+        }
+        if draft.remove.contains(.timeout) {
+            member.timeout = nil
+        } else if let timeout = draft.timeout {
+            member.timeout = timeout
+        }
+        members[key] = member
+        return member
+    }
+
+    public func kickMember(serverID: ServerID, userID: UserID) async throws {
+        let key = MemberCompositeKey(serverID: serverID, userID: userID)
+        guard members.removeValue(forKey: key) != nil else {
+            throw StoatAPIError.notFound
+        }
+    }
+
+    public func banMember(serverID: ServerID, userID: UserID, draft: BanCreateDraft) async throws -> ServerBan {
+        guard servers.contains(where: { $0.id == serverID }) else {
+            throw StoatAPIError.notFound
+        }
+        let key = MemberCompositeKey(serverID: serverID, userID: userID)
+        members.removeValue(forKey: key)
+        let ban = ServerBan(id: key, reason: draft.reason)
+        bans[key] = ban
+        return ban
+    }
+
+    public func unbanMember(serverID: ServerID, userID: UserID) async throws {
+        let key = MemberCompositeKey(serverID: serverID, userID: userID)
+        guard bans.removeValue(forKey: key) != nil else {
+            throw StoatAPIError.notFound
+        }
+    }
+
+    public func fetchServerBans(serverID: ServerID) async throws -> BanListResult {
+        guard servers.contains(where: { $0.id == serverID }) else {
+            throw StoatAPIError.notFound
+        }
+        let serverBans = bans.values.filter { $0.id.serverID == serverID }.sorted { $0.id.userID.rawValue < $1.id.userID.rawValue }
+        let bannedUsers = serverBans.compactMap { ban -> BannedUser? in
+            guard let user = users[ban.id.userID] else { return nil }
+            return BannedUser(id: user.id, username: user.username, discriminator: user.discriminator, avatar: user.avatar)
+        }
+        return BanListResult(users: bannedUsers, bans: serverBans)
+    }
+
+    public func setServerRolePermissions(serverID: ServerID, roleID: RoleID, draft: ServerRolePermissionDraft) async throws -> Server {
+        guard let serverIndex = servers.firstIndex(where: { $0.id == serverID }),
+              var role = servers[serverIndex].roles[roleID]
+        else {
+            throw StoatAPIError.notFound
+        }
+        role.permissions = PermissionOverride(allow: draft.permissions.allow, deny: draft.permissions.deny)
+        servers[serverIndex].roles[roleID] = role
+        return servers[serverIndex]
+    }
+
+    public func setServerDefaultPermissions(serverID: ServerID, draft: ServerDefaultPermissionDraft) async throws -> Server {
+        guard let serverIndex = servers.firstIndex(where: { $0.id == serverID }) else {
+            throw StoatAPIError.notFound
+        }
+        servers[serverIndex].defaultPermissions = draft.permissions
+        return servers[serverIndex]
+    }
+
+    public func setChannelRolePermissions(channelID: ChannelID, roleID: RoleID, draft: ServerRolePermissionDraft) async throws -> Channel {
+        guard let channelIndex = channels.firstIndex(where: { $0.id == channelID }) else {
+            throw StoatAPIError.notFound
+        }
+        channels[channelIndex].rolePermissions[roleID] = PermissionOverride(allow: draft.permissions.allow, deny: draft.permissions.deny)
+        return channels[channelIndex]
+    }
+
+    public func setChannelDefaultPermissions(channelID: ChannelID, draft: ChannelDefaultPermissionDraft) async throws -> Channel {
+        guard let channelIndex = channels.firstIndex(where: { $0.id == channelID }) else {
+            throw StoatAPIError.notFound
+        }
+        switch draft {
+        case let .value(permissions):
+            channels[channelIndex].permissions = permissions
+        case let .override(override):
+            channels[channelIndex].defaultPermissions = PermissionOverride(allow: override.allow, deny: override.deny)
+        }
+        return channels[channelIndex]
     }
 
     public func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel {

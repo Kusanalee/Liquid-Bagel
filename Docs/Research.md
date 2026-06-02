@@ -169,6 +169,29 @@ Phase 0 captures enough current API and client research to keep the native macOS
   - missing `ViewChannel` revokes all channel permissions.
 - Phase 25 implements server settings edit, icon/banner set/update, category create/rename/delete/move by full category array, role overview/create/edit/delete for non-permission fields, and read-only permission preview. Permission writes, role rank reorder, server deletion, moderation, bot management, and voice/video remain deferred.
 
+### Phase 26 member moderation and permission write notes
+
+- Sources refreshed for Phase 26:
+  - Generated API/OpenAPI package: `stoatchat/javascript-client-api` `main` as of 2026-06-02.
+  - Backend route files in `stoatchat/stoatchat` `main` under `crates/delta/src/routes/servers/*` and `crates/delta/src/routes/channels/*`.
+- Generated client route/schema confirms:
+  - `GET /servers/{target}/members`, `GET /servers/{server_id}/members/{member_id}`, and `GET /servers/{target}/members_experimental_query` exist, but Phase 26 does not add hidden member refresh; the settings UI uses the current Ready snapshot unless the user explicitly invokes an action.
+  - `PATCH /servers/{server_id}/members/{member_id}` accepts `DataMemberEdit.nickname`, `avatar`, `roles`, `timeout`, `can_publish`, `can_receive`, `voice_channel`, and `remove`.
+  - `DELETE /servers/{server_id}/members/{member_id}` removes/kicks a member.
+  - `PUT /servers/{server}/bans/{target}` creates a ban with `reason` and optional `delete_message_seconds`; `DELETE /servers/{server}/bans/{target}` removes a ban; `GET /servers/{target}/bans` lists bans.
+  - Permission writes are `PUT /servers/{target}/permissions/default`, `PUT /servers/{target}/permissions/{role_id}`, `PUT /channels/{target}/permissions/default`, and `PUT /channels/{target}/permissions/{role_id}`.
+  - Server default permission write uses a direct `permissions` bitset; server role and text-channel overwrite writes use `permissions.allow` / `permissions.deny`. Existing stored role/channel override models still decode `a` / `d`.
+- Backend permission checks confirm:
+  - member nickname self-edit requires `ChangeNickname`; editing another member nickname requires `ManageNicknames`;
+  - member avatar self-edit requires `ChangeAvatar`; removing another member avatar requires `RemoveAvatars`;
+  - member role edits require `AssignRoles`, target rank checks, and added-role rank checks;
+  - timeout edit/clear requires `TimeoutMembers`, and timeout cannot be applied to users who already have timeout permission;
+  - kick requires `KickMembers`, blocks self/owner targets, and enforces target rank checks;
+  - ban/list/unban require `BanMembers`; ban enforces rank checks only when the target is still a server member;
+  - permission writes require `ManagePermissions`, rank checks for role scopes, and `CannotGiveMissingPermissions` style grant checks.
+- Phase 26 implements guarded role assignment, nickname edit/reset, avatar remove, kick, ban, unban/list, timeout/clear, server default permission edits, server role permission edits, text-channel default overwrites, and text-channel role overwrites.
+- Deferred despite verified fields/routes: voice mute/deafen/move, role rank reorder, server deletion, hidden/background member sync, automatic live tests with credentials, full moderation dashboard, audit logs, bot management, voice/video UI, and bulk permission templates.
+
 ### Rate limits
 
 - Docs confirm fixed-window buckets and headers `X-RateLimit-Limit`, `X-RateLimit-Bucket`, `X-RateLimit-Remaining`, `X-RateLimit-Reset-After`.

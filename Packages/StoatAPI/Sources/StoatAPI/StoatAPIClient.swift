@@ -48,6 +48,14 @@ public protocol StoatAPIClient: Sendable {
     func editRole(serverID: ServerID, roleID: RoleID, draft: RoleEditDraft) async throws -> Role
     func deleteRole(serverID: ServerID, roleID: RoleID) async throws
     func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember
+    func kickMember(serverID: ServerID, userID: UserID) async throws
+    func banMember(serverID: ServerID, userID: UserID, draft: BanCreateDraft) async throws -> ServerBan
+    func unbanMember(serverID: ServerID, userID: UserID) async throws
+    func fetchServerBans(serverID: ServerID) async throws -> BanListResult
+    func setServerRolePermissions(serverID: ServerID, roleID: RoleID, draft: ServerRolePermissionDraft) async throws -> Server
+    func setServerDefaultPermissions(serverID: ServerID, draft: ServerDefaultPermissionDraft) async throws -> Server
+    func setChannelRolePermissions(channelID: ChannelID, roleID: RoleID, draft: ServerRolePermissionDraft) async throws -> Channel
+    func setChannelDefaultPermissions(channelID: ChannelID, draft: ChannelDefaultPermissionDraft) async throws -> Channel
     func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel
     func editChannel(id: ChannelID, draft: ChannelEditDraft) async throws -> Channel
     func deleteChannel(id: ChannelID) async throws
@@ -180,6 +188,38 @@ public extension StoatAPIClient {
 
     func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember {
         throw StoatAPIError.unimplementedEndpoint("Member editing is not implemented by this API client.")
+    }
+
+    func kickMember(serverID: ServerID, userID: UserID) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Member removal is not implemented by this API client.")
+    }
+
+    func banMember(serverID: ServerID, userID: UserID, draft: BanCreateDraft) async throws -> ServerBan {
+        throw StoatAPIError.unimplementedEndpoint("Member banning is not implemented by this API client.")
+    }
+
+    func unbanMember(serverID: ServerID, userID: UserID) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Member unbanning is not implemented by this API client.")
+    }
+
+    func fetchServerBans(serverID: ServerID) async throws -> BanListResult {
+        throw StoatAPIError.unimplementedEndpoint("Ban listing is not implemented by this API client.")
+    }
+
+    func setServerRolePermissions(serverID: ServerID, roleID: RoleID, draft: ServerRolePermissionDraft) async throws -> Server {
+        throw StoatAPIError.unimplementedEndpoint("Server role permission editing is not implemented by this API client.")
+    }
+
+    func setServerDefaultPermissions(serverID: ServerID, draft: ServerDefaultPermissionDraft) async throws -> Server {
+        throw StoatAPIError.unimplementedEndpoint("Server default permission editing is not implemented by this API client.")
+    }
+
+    func setChannelRolePermissions(channelID: ChannelID, roleID: RoleID, draft: ServerRolePermissionDraft) async throws -> Channel {
+        throw StoatAPIError.unimplementedEndpoint("Channel role permission editing is not implemented by this API client.")
+    }
+
+    func setChannelDefaultPermissions(channelID: ChannelID, draft: ChannelDefaultPermissionDraft) async throws -> Channel {
+        throw StoatAPIError.unimplementedEndpoint("Channel default permission editing is not implemented by this API client.")
     }
 
     func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel {
@@ -569,6 +609,83 @@ public actor LiveStoatAPIClient: StoatAPIClient {
             StoatRequest<ServerMember>(
                 method: .patch,
                 path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/members/\(userID.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func kickMember(serverID: ServerID, userID: UserID) async throws {
+        _ = try await perform(
+            StoatRequest<EmptyResponse>(
+                method: .delete,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/members/\(userID.rawValue.stoatPathComponentEscaped)"
+            )
+        )
+    }
+
+    public func banMember(serverID: ServerID, userID: UserID, draft: BanCreateDraft) async throws -> ServerBan {
+        try await perform(
+            StoatRequest<ServerBan>(
+                method: .put,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/bans/\(userID.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func unbanMember(serverID: ServerID, userID: UserID) async throws {
+        _ = try await perform(
+            StoatRequest<EmptyResponse>(
+                method: .delete,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/bans/\(userID.rawValue.stoatPathComponentEscaped)"
+            )
+        )
+    }
+
+    public func fetchServerBans(serverID: ServerID) async throws -> BanListResult {
+        try await perform(
+            StoatRequest<BanListResult>(
+                method: .get,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/bans"
+            )
+        )
+    }
+
+    public func setServerRolePermissions(serverID: ServerID, roleID: RoleID, draft: ServerRolePermissionDraft) async throws -> Server {
+        try await perform(
+            StoatRequest<Server>(
+                method: .put,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/permissions/\(roleID.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func setServerDefaultPermissions(serverID: ServerID, draft: ServerDefaultPermissionDraft) async throws -> Server {
+        try await perform(
+            StoatRequest<Server>(
+                method: .put,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/permissions/default",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func setChannelRolePermissions(channelID: ChannelID, roleID: RoleID, draft: ServerRolePermissionDraft) async throws -> Channel {
+        try await perform(
+            StoatRequest<Channel>(
+                method: .put,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/permissions/\(roleID.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
+    }
+
+    public func setChannelDefaultPermissions(channelID: ChannelID, draft: ChannelDefaultPermissionDraft) async throws -> Channel {
+        try await perform(
+            StoatRequest<Channel>(
+                method: .put,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/permissions/default",
                 body: .json(try encoder.encode(draft))
             )
         )

@@ -138,18 +138,24 @@ public struct PartialServer: Codable, Hashable, Sendable {
 
 public struct PartialServerMember: Codable, Hashable, Sendable {
     public var nickname: String?
+    public var avatar: File?
     public var roles: [RoleID]?
+    public var timeout: Date?
     public var raw: JSONValue?
 
     private enum CodingKeys: String, CodingKey {
         case nickname
+        case avatar
         case roles
+        case timeout
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         nickname = try container.decodeIfPresent(String.self, forKey: .nickname)
+        avatar = try container.decodeIfPresent(File.self, forKey: .avatar)
         roles = try container.decodeIfPresent([RoleID].self, forKey: .roles)
+        timeout = try container.decodeIfPresent(Date.self, forKey: .timeout)
         raw = try? JSONValue(from: decoder)
     }
 }

@@ -505,7 +505,20 @@ public final class MainShellViewModel {
     public var roleEditorForm: RoleEditorForm?
     public var roleEditorState: ManagementActionState<Role> = .idle
     public var pendingRoleDeletion: Role?
+    public var memberSearchText: String = ""
+    public var selectedMemberDetailID: MemberCompositeKey?
+    public var memberRoleDraft: MemberRoleAssignmentDraft?
+    public var memberRoleSaveRequiresConfirmation = false
+    public var memberNicknameDraft: String = ""
+    public var memberTimeoutHours: Double = 1
+    public var pendingMemberModerationAction: PendingMemberModerationAction?
+    public var memberActionState: ManagementActionState<ServerMember> = .idle
+    public var banListState: ManagementActionState<BanListResult> = .idle
+    public var permissionEditDraft: PermissionEditDraft?
+    public var permissionSaveRequiresConfirmation = false
+    public var permissionEditorState: ManagementActionState<String> = .idle
     public var phase25Status: String?
+    public var phase26Status: String?
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var messageCopier: any MessageCopying
@@ -746,6 +759,25 @@ public final class MainShellViewModel {
     public var selectedServerMember: ServerMember? {
         guard let serverID = selection.serverID, let currentUserID else { return nil }
         return snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: currentUserID)]
+    }
+
+    public var selectedMemberDetail: ServerMember? {
+        guard let selectedMemberDetailID else { return nil }
+        return snapshot.membersByServerAndUserID[ServerMemberKey(selectedMemberDetailID)]
+    }
+
+    public func memberManagementItems(for details: ServerSettingsDetails) -> [MemberManagementItem] {
+        let query = memberSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let items = details.members.map { member in
+            MemberManagementItem(member: member, user: snapshot.usersByID[member.id.userID], server: details.server)
+        }
+        guard !query.isEmpty else { return items }
+        return items.filter { item in
+            item.displayName.localizedCaseInsensitiveContains(query)
+                || item.username.localizedCaseInsensitiveContains(query)
+                || item.roles.contains { $0.name.localizedCaseInsensitiveContains(query) }
+                || (isDeveloperControlsEnabled && item.member.id.userID.rawValue.localizedCaseInsensitiveContains(query))
+        }
     }
 
     public var friendItems: [FriendListItem] {
@@ -1553,6 +1585,344 @@ public final class MainShellViewModel {
         server.roles[role.id] = role
         snapshot.serversByID[serverID] = server
         quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+    }
+
+    public func openMemberDetail(_ member: ServerMember) {
+        selectedMemberDetailID = member.id
+        memberNicknameDraft = member.nickname ?? ""
+        memberTimeoutHours = 1
+        memberRoleDraft = nil
+        memberRoleSaveRequiresConfirmation = false
+        selectedServerSettingsTab = .members
+    }
+
+    public func closeMemberDetail() {
+        selectedMemberDetailID = nil
+        memberRoleDraft = nil
+        memberRoleSaveRequiresConfirmation = false
+        pendingMemberModerationAction = nil
+    }
+
+    public func memberRoleAssignmentDisabledReason(for member: ServerMember) -> String? {
+        let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
+        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Connect manually to assign roles." }
+        guard member.id.userID != currentUserID else { return "You cannot assign roles to yourself from this guarded flow." }
+        guard resolution.canAssignRoles || currentUserID == selectedServer?.ownerID else {
+            return resolution.warnings.isEmpty ? "You do not have permission to assign roles." : "Permission resolution is incomplete for role assignment."
+        }
+        guard Phase26MemberSafety.canActOn(member: member, currentMember: selectedServerMember, server: selectedServer, currentUserID: currentUserID) || currentUserID == selectedServer?.ownerID else {
+            return "Role rank is incomplete or this member is at or above your rank."
+        }
+        guard let server = selectedServer, !Phase26MemberSafety.assignableRoles(in: server, currentMember: selectedServerMember, currentUserID: currentUserID).isEmpty else {
+            return "No assignable roles are below your rank."
+        }
+        return nil
+    }
+
+    public func openMemberRoleAssignment(_ member: ServerMember) {
+        guard memberRoleAssignmentDisabledReason(for: member) == nil else {
+            phase26Status = memberRoleAssignmentDisabledReason(for: member)
+            return
+        }
+        openMemberDetail(member)
+        memberRoleDraft = MemberRoleAssignmentDraft(member: member)
+        memberRoleSaveRequiresConfirmation = false
+    }
+
+    public func toggleRole(_ roleID: RoleID, inMemberRoleDraft isOn: Bool) {
+        guard memberRoleDraft != nil else { return }
+        if isOn {
+            memberRoleDraft?.selectedRoleIDs.insert(roleID)
+        } else {
+            memberRoleDraft?.selectedRoleIDs.remove(roleID)
+        }
+        memberRoleSaveRequiresConfirmation = false
+    }
+
+    public func requestSaveMemberRoles() {
+        guard memberRoleDraft?.hasChanges == true else {
+            phase26Status = "Change member roles before saving."
+            return
+        }
+        memberRoleSaveRequiresConfirmation = true
+    }
+
+    public func confirmSaveMemberRoles() async {
+        guard let server = selectedServer,
+              let draft = memberRoleDraft,
+              let memberDraft = draft.memberDraft()
+        else {
+            memberActionState = .failed("Change member roles before saving.")
+            return
+        }
+        guard memberRoleAssignmentDisabledReason(for: draft.member) == nil else {
+            memberActionState = .failed(memberRoleAssignmentDisabledReason(for: draft.member) ?? "Role assignment is unavailable.")
+            return
+        }
+        guard memberRoleSaveRequiresConfirmation else {
+            memberActionState = .failed("Review and confirm the role changes before saving.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            memberActionState = .failed("Connect manually before assigning roles.")
+            return
+        }
+        memberActionState = .loading
+        do {
+            let member = try await apiClient.editMember(serverID: server.id, userID: draft.member.id.userID, draft: memberDraft)
+            upsert(member: member)
+            memberRoleDraft = nil
+            memberRoleSaveRequiresConfirmation = false
+            refreshLoadedServerSettings()
+            memberActionState = .loaded(member)
+            phase26Status = "Member roles updated"
+        } catch {
+            memberActionState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func memberActionDisabledReason(for member: ServerMember, action: MemberModerationAction) -> String? {
+        let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
+        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Connect manually before member moderation." }
+        guard member.id.userID != currentUserID else { return "You cannot moderate yourself from this guarded flow." }
+        guard Phase26MemberSafety.canActOn(member: member, currentMember: selectedServerMember, server: selectedServer, currentUserID: currentUserID) || currentUserID == selectedServer?.ownerID else {
+            return "Rank data is incomplete or this member is protected."
+        }
+        let allowed: Bool
+        switch action {
+        case .saveNickname, .resetNickname:
+            allowed = resolution.effectivePermissions.contains(.manageNicknames) || currentUserID == selectedServer?.ownerID
+        case .removeAvatar:
+            allowed = resolution.effectivePermissions.contains(.removeAvatars) || currentUserID == selectedServer?.ownerID
+        case .kick:
+            allowed = resolution.effectivePermissions.contains(.kickMembers) || currentUserID == selectedServer?.ownerID
+        case .ban:
+            allowed = resolution.effectivePermissions.contains(.banMembers) || currentUserID == selectedServer?.ownerID
+        case .timeout, .clearTimeout:
+            allowed = resolution.effectivePermissions.contains(.timeoutMembers) || currentUserID == selectedServer?.ownerID
+        }
+        guard allowed else {
+            return resolution.warnings.isEmpty ? "You do not have permission for this member action." : "Permission resolution is incomplete for this member action."
+        }
+        return nil
+    }
+
+    public func requestMemberAction(_ action: MemberModerationAction, for member: ServerMember) {
+        guard memberActionDisabledReason(for: member, action: action) == nil else {
+            phase26Status = memberActionDisabledReason(for: member, action: action)
+            return
+        }
+        let timeoutUntil = action == .timeout ? Date().addingTimeInterval(max(1, memberTimeoutHours) * 3600) : nil
+        pendingMemberModerationAction = PendingMemberModerationAction(member: member, action: action, timeoutUntil: timeoutUntil)
+    }
+
+    public func confirmPendingMemberAction() async {
+        guard let pending = pendingMemberModerationAction, let server = selectedServer else { return }
+        guard memberActionDisabledReason(for: pending.member, action: pending.action) == nil else {
+            memberActionState = .failed(memberActionDisabledReason(for: pending.member, action: pending.action) ?? "Member action is unavailable.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            memberActionState = .failed("Connect manually before member moderation.")
+            return
+        }
+        pendingMemberModerationAction = nil
+        memberActionState = .loading
+        do {
+            switch pending.action {
+            case .saveNickname:
+                let nickname = memberNicknameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !nickname.isEmpty else {
+                    memberActionState = .failed("Enter a nickname before saving.")
+                    return
+                }
+                let member = try await apiClient.editMember(serverID: server.id, userID: pending.member.id.userID, draft: MemberEditDraft(nickname: String(nickname.prefix(32))))
+                upsert(member: member)
+                memberActionState = .loaded(member)
+            case .resetNickname:
+                let member = try await apiClient.editMember(serverID: server.id, userID: pending.member.id.userID, draft: MemberEditDraft(remove: [.nickname]))
+                upsert(member: member)
+                memberActionState = .loaded(member)
+            case .removeAvatar:
+                let member = try await apiClient.editMember(serverID: server.id, userID: pending.member.id.userID, draft: MemberEditDraft(remove: [.avatar]))
+                upsert(member: member)
+                memberActionState = .loaded(member)
+            case .timeout:
+                guard let timeoutUntil = pending.timeoutUntil else {
+                    memberActionState = .failed("Choose a timeout duration before saving.")
+                    return
+                }
+                let member = try await apiClient.editMember(serverID: server.id, userID: pending.member.id.userID, draft: MemberEditDraft(timeout: timeoutUntil))
+                upsert(member: member)
+                memberActionState = .loaded(member)
+            case .clearTimeout:
+                let member = try await apiClient.editMember(serverID: server.id, userID: pending.member.id.userID, draft: MemberEditDraft(remove: [.timeout]))
+                upsert(member: member)
+                memberActionState = .loaded(member)
+            case .kick:
+                try await apiClient.kickMember(serverID: server.id, userID: pending.member.id.userID)
+                removeMember(serverID: server.id, userID: pending.member.id.userID)
+                memberActionState = .idle
+                selectedMemberDetailID = nil
+            case .ban:
+                _ = try await apiClient.banMember(serverID: server.id, userID: pending.member.id.userID, draft: BanCreateDraft(reason: pending.reason.isEmpty ? nil : pending.reason))
+                removeMember(serverID: server.id, userID: pending.member.id.userID)
+                memberActionState = .idle
+                selectedMemberDetailID = nil
+            }
+            refreshLoadedServerSettings()
+            phase26Status = "Member action completed"
+        } catch {
+            memberActionState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func refreshBanList() async {
+        guard let server = selectedServer else {
+            banListState = .failed("Select a server before loading bans.")
+            return
+        }
+        let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
+        guard serverManagementCapabilities().isConnectedForLiveActions else {
+            banListState = .failed("Connect manually before loading bans.")
+            return
+        }
+        guard resolution.effectivePermissions.contains(.banMembers) || currentUserID == server.ownerID else {
+            banListState = .failed("You do not have permission to view bans.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            banListState = .failed("Connect manually before loading bans.")
+            return
+        }
+        banListState = .loading
+        do {
+            banListState = .loaded(try await apiClient.fetchServerBans(serverID: server.id))
+        } catch {
+            banListState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func unban(userID: UserID) async {
+        guard let server = selectedServer, let apiClient = apiClientForCommunityAction() else {
+            banListState = .failed("Connect manually before removing bans.")
+            return
+        }
+        do {
+            try await apiClient.unbanMember(serverID: server.id, userID: userID)
+            await refreshBanList()
+        } catch {
+            banListState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func permissionEditingDisabledReason() -> String? {
+        let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
+        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Connect manually before editing permissions." }
+        guard resolution.canManagePermissions || currentUserID == selectedServer?.ownerID else {
+            return resolution.warnings.isEmpty ? "You do not have permission to manage permissions." : "Permission resolution is incomplete for permission editing."
+        }
+        return nil
+    }
+
+    public func openPermissionEditor(scope: PermissionEditScope) {
+        guard permissionEditingDisabledReason() == nil else {
+            phase26Status = permissionEditingDisabledReason()
+            return
+        }
+        guard let draft = makePermissionEditDraft(scope: scope) else {
+            phase26Status = "Permission editing is unavailable for this scope."
+            return
+        }
+        permissionEditDraft = draft
+        permissionSaveRequiresConfirmation = false
+        selectedServerSettingsTab = .permissions
+        permissionEditorState = .idle
+    }
+
+    public func setPermissionState(_ state: PermissionTriState, for key: PermissionKey) {
+        permissionEditDraft?.set(state, for: key)
+        permissionSaveRequiresConfirmation = false
+    }
+
+    public func requestSavePermissionEdit() {
+        guard permissionEditDraft?.diff(keys: Phase26Permissions.editableKeys).isEmpty == false else {
+            permissionEditorState = .failed("Change permissions before saving.")
+            return
+        }
+        permissionSaveRequiresConfirmation = true
+    }
+
+    public func confirmSavePermissionEdit() async {
+        guard let draft = permissionEditDraft else {
+            permissionEditorState = .failed("Open a permission editor before saving.")
+            return
+        }
+        guard permissionSaveRequiresConfirmation else {
+            permissionEditorState = .failed("Review and confirm the permission diff before saving.")
+            return
+        }
+        guard permissionEditingDisabledReason() == nil else {
+            permissionEditorState = .failed(permissionEditingDisabledReason() ?? "Permission editing is unavailable.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            permissionEditorState = .failed("Connect manually before editing permissions.")
+            return
+        }
+        permissionEditorState = .loading
+        do {
+            switch draft.scope {
+            case let .serverDefault(serverID):
+                let server = try await apiClient.setServerDefaultPermissions(serverID: serverID, draft: ServerDefaultPermissionDraft(permissions: draft.defaultPermissionsDraft(keys: Phase26Permissions.editableKeys)))
+                snapshot = Phase24SnapshotIntegrator.upserting(server: server, channels: [], into: snapshot)
+            case let .serverRole(serverID, roleID):
+                let server = try await apiClient.setServerRolePermissions(serverID: serverID, roleID: roleID, draft: ServerRolePermissionDraft(permissions: draft.overrideDraft(keys: Phase26Permissions.editableKeys)))
+                snapshot = Phase24SnapshotIntegrator.upserting(server: server, channels: [], into: snapshot)
+            case let .channelDefault(channelID):
+                let channel = try await apiClient.setChannelDefaultPermissions(channelID: channelID, draft: .override(draft.overrideDraft(keys: Phase26Permissions.editableKeys)))
+                snapshot = Phase24SnapshotIntegrator.upserting(channel: channel, into: snapshot)
+            case let .channelRole(channelID, roleID):
+                let channel = try await apiClient.setChannelRolePermissions(channelID: channelID, roleID: roleID, draft: ServerRolePermissionDraft(permissions: draft.overrideDraft(keys: Phase26Permissions.editableKeys)))
+                snapshot = Phase24SnapshotIntegrator.upserting(channel: channel, into: snapshot)
+            }
+            permissionEditDraft = nil
+            permissionSaveRequiresConfirmation = false
+            refreshLoadedServerSettings()
+            quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+            permissionEditorState = .loaded("Permissions updated")
+            phase26Status = "Permissions updated"
+        } catch {
+            permissionEditorState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    private func makePermissionEditDraft(scope: PermissionEditScope) -> PermissionEditDraft? {
+        switch scope {
+        case let .serverDefault(serverID):
+            guard let server = snapshot.serversByID[serverID] else { return nil }
+            return PermissionEditDraft(scope: scope, originalAllow: server.defaultPermissions, originalDeny: [], allowsInherit: false, keys: Phase26Permissions.editableKeys)
+        case let .serverRole(serverID, roleID):
+            guard let role = snapshot.serversByID[serverID]?.roles[roleID] else { return nil }
+            return PermissionEditDraft(scope: scope, originalAllow: role.permissions.allow, originalDeny: role.permissions.deny, allowsInherit: true, keys: Phase26Permissions.editableKeys)
+        case let .channelDefault(channelID):
+            guard let channel = snapshot.channelsByID[channelID] else { return nil }
+            let original = channel.defaultPermissions ?? PermissionOverride()
+            return PermissionEditDraft(scope: scope, originalAllow: original.allow, originalDeny: original.deny, allowsInherit: true, keys: Phase26Permissions.editableKeys)
+        case let .channelRole(channelID, roleID):
+            guard let channel = snapshot.channelsByID[channelID] else { return nil }
+            let original = channel.rolePermissions[roleID] ?? PermissionOverride()
+            return PermissionEditDraft(scope: scope, originalAllow: original.allow, originalDeny: original.deny, allowsInherit: true, keys: Phase26Permissions.editableKeys)
+        }
+    }
+
+    private func upsert(member: ServerMember) {
+        snapshot.membersByServerAndUserID[ServerMemberKey(member.id)] = member
+        selectedMemberDetailID = member.id
+    }
+
+    private func removeMember(serverID: ServerID, userID: UserID) {
+        snapshot.membersByServerAndUserID.removeValue(forKey: ServerMemberKey(serverID: serverID, userID: userID))
     }
 
     private func refreshLoadedServerSettings() {
@@ -4654,8 +5024,12 @@ extension MainShellViewModel: AppCommandHandling {
         switch command {
         case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .openJoinInvite, .openCreateServer, .openDiscoverInBrowser, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
             return true
-        case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions:
+        case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions, .openMembers:
             return selection.serverID != nil
+        case .openPermissionEditor:
+            return selection.serverID != nil && permissionEditingDisabledReason() == nil
+        case .openBanList:
+            return selection.serverID != nil && serverManagementCapabilities().isConnectedForLiveActions
         case .createRole:
             return selection.serverID != nil && roleManagementDisabledReason() == nil
         case .createCategory:
@@ -4757,8 +5131,12 @@ extension MainShellViewModel: AppCommandHandling {
         switch command {
         case .focusComposer:
             return "Select a channel before focusing the composer."
-        case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions:
+        case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions, .openMembers:
             return "Select a server before opening server settings."
+        case .openPermissionEditor:
+            return permissionEditingDisabledReason() ?? "Select a server before editing permissions."
+        case .openBanList:
+            return "Connect manually before loading the ban list."
         case .createRole:
             return roleManagementDisabledReason() ?? "Select a server before creating a role."
         case .createCategory:
@@ -4885,6 +5263,18 @@ extension MainShellViewModel: AppCommandHandling {
         case .openPermissions:
             openServerOverview()
             selectedServerSettingsTab = .permissions
+        case .openMembers:
+            openServerOverview()
+            selectedServerSettingsTab = .members
+        case .openPermissionEditor:
+            openServerOverview()
+            if let serverID = selection.serverID {
+                openPermissionEditor(scope: .serverDefault(serverID: serverID))
+            }
+        case .openBanList:
+            openServerOverview()
+            selectedServerSettingsTab = .members
+            Task { [weak self] in await self?.refreshBanList() }
         case .createRole:
             openServerOverview()
             openCreateRole()
@@ -8292,36 +8682,300 @@ public struct ServerOverviewView: View {
     }
 
     private func permissions(_ details: ServerSettingsDetails) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    HStack {
+                        Text("Permission Preview")
+                            .font(.headline)
+                        Spacer()
+                        Button { viewModel.openPermissionEditor(scope: .serverDefault(serverID: details.server.id)) } label: { Label("Edit Defaults", systemImage: "slider.horizontal.3") }
+                            .disabled(viewModel.permissionEditingDisabledReason() != nil)
+                    }
+                    LabeledContent("Effective bits", value: "\(details.permissionPreview.effectivePermissions.rawValue)")
+                    LabeledContent("Manage server", value: details.permissionPreview.canManageServer ? "Allowed" : "Denied")
+                    LabeledContent("Manage channels", value: details.permissionPreview.canManageChannels ? "Allowed" : "Denied")
+                    LabeledContent("Manage roles", value: details.permissionPreview.canManageRoles ? "Allowed" : "Denied")
+                    LabeledContent("Assign roles", value: details.permissionPreview.canAssignRoles ? "Allowed" : "Denied")
+                    LabeledContent("Upload files", value: details.permissionPreview.canUploadFiles ? "Allowed" : "Denied")
+                    if !details.permissionPreview.warnings.isEmpty {
+                        Text("Resolution warnings: \(details.permissionPreview.warnings.map(\.rawValue).joined(separator: ", "))")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    Text("Permission Scopes")
+                        .font(.headline)
+                    Button { viewModel.openPermissionEditor(scope: .serverDefault(serverID: details.server.id)) } label: { Label("Server defaults", systemImage: "server.rack") }
+                        .disabled(viewModel.permissionEditingDisabledReason() != nil)
+                    ForEach(details.server.roles.values.sorted { $0.rank < $1.rank }) { role in
+                        HStack {
+                            Text(role.name)
+                            Spacer()
+                            Button { viewModel.openPermissionEditor(scope: .serverRole(serverID: details.server.id, roleID: role.id)) } label: { Label("Edit", systemImage: "pencil") }
+                                .disabled(viewModel.permissionEditingDisabledReason() != nil || !Phase25PermissionResolver.isRoleEditable(role, currentMember: viewModel.selectedServerMember, server: details.server, currentUserID: viewModel.currentUserID))
+                        }
+                    }
+                    ForEach(details.channels.filter { $0.kind == .textChannel }) { channel in
+                        HStack {
+                            Text(channel.displayName)
+                            Spacer()
+                            Button { viewModel.openPermissionEditor(scope: .channelDefault(channelID: channel.id)) } label: { Label("Default", systemImage: "number") }
+                                .disabled(viewModel.permissionEditingDisabledReason() != nil)
+                        }
+                    }
+                }
+            }
+
+            if let draft = viewModel.permissionEditDraft {
+                permissionEditor(draft)
+            }
+        }
+    }
+
+    private func permissionEditor(_ draft: PermissionEditDraft) -> some View {
         GlassPanel {
             VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                Text("Permission Preview")
-                    .font(.headline)
-                LabeledContent("Effective bits", value: "\(details.permissionPreview.effectivePermissions.rawValue)")
-                LabeledContent("Manage server", value: details.permissionPreview.canManageServer ? "Allowed" : "Denied")
-                LabeledContent("Manage channels", value: details.permissionPreview.canManageChannels ? "Allowed" : "Denied")
-                LabeledContent("Manage roles", value: details.permissionPreview.canManageRoles ? "Allowed" : "Denied")
-                LabeledContent("Assign roles", value: details.permissionPreview.canAssignRoles ? "Allowed" : "Denied")
-                LabeledContent("Upload files", value: details.permissionPreview.canUploadFiles ? "Allowed" : "Denied")
-                if !details.permissionPreview.warnings.isEmpty {
-                    Text("Resolution warnings: \(details.permissionPreview.warnings.map(\.rawValue).joined(separator: ", "))")
+                HStack {
+                    Text("Permission Editor")
+                        .font(.headline)
+                    Spacer()
+                    Text(draft.scope.title)
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(Dictionary(grouping: Phase26Permissions.editableKeys, by: \.group).keys.sorted(), id: \.self) { group in
+                    Text(group)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(Phase26Permissions.editableKeys.filter { $0.group == group }) { key in
+                        HStack {
+                            Text(key.title)
+                            if key.isDangerous {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange)
+                            }
+                            Spacer()
+                            Picker(key.title, selection: Binding(
+                                get: { viewModel.permissionEditDraft?.state(for: key) ?? .inherit },
+                                set: { viewModel.setPermissionState($0, for: key) }
+                            )) {
+                                if draft.allowsInherit {
+                                    Text("Inherit").tag(PermissionTriState.inherit)
+                                }
+                                Text("Allow").tag(PermissionTriState.allow)
+                                Text("Deny").tag(PermissionTriState.deny)
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: draft.allowsInherit ? 240 : 160)
+                        }
+                    }
+                }
+                let diff = draft.diff(keys: Phase26Permissions.editableKeys)
+                if viewModel.permissionSaveRequiresConfirmation {
+                    Divider()
+                    Text("Diff Preview")
+                        .font(.headline)
+                    ForEach(diff) { row in
+                        Text("\(row.key.title): \(row.previous.rawValue) -> \(row.next.rawValue)")
+                            .font(.caption)
+                            .foregroundStyle(row.key.isDangerous ? .orange : .secondary)
+                    }
+                }
+                stateMessage(viewModel.permissionEditorState, loading: "Saving permissions", success: "Permissions saved")
+                HStack {
+                    Button("Cancel") {
+                        viewModel.permissionEditDraft = nil
+                        viewModel.permissionSaveRequiresConfirmation = false
+                    }
+                    Spacer()
+                    if viewModel.permissionSaveRequiresConfirmation {
+                        Button(role: .destructive) { Task { await viewModel.confirmSavePermissionEdit() } } label: { Label("Confirm Save", systemImage: "checkmark.shield") }
+                            .buttonStyle(GlassButtonStyle())
+                    } else {
+                        Button { viewModel.requestSavePermissionEdit() } label: { Label("Review Diff", systemImage: "doc.text.magnifyingglass") }
+                            .buttonStyle(GlassButtonStyle())
+                            .disabled(diff.isEmpty)
+                    }
                 }
             }
         }
     }
 
     private func members(_ details: ServerSettingsDetails) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    HStack {
+                        Text("Members")
+                            .font(.headline)
+                        Spacer()
+                        Button { Task { await viewModel.refreshBanList() } } label: { Label("Ban List", systemImage: "hand.raised") }
+                            .disabled(viewModel.serverManagementCapabilities().isConnectedForLiveActions == false)
+                    }
+                    TextField("Search members", text: $viewModel.memberSearchText)
+                        .textFieldStyle(.roundedBorder)
+                    if details.members.isEmpty {
+                        Text("Member management is available when member data is present in the current snapshot.")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(viewModel.memberManagementItems(for: details)) { item in
+                        HStack {
+                            AvatarView(title: item.displayName, size: 32, isOnline: item.user?.online == true, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
+                            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                                Text(item.displayName)
+                                Text("\(item.username) · \(item.roles.map(\.name).joined(separator: ", ").isEmpty ? "No roles" : item.roles.map(\.name).joined(separator: ", "))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if let timeoutSummary = item.timeoutSummary {
+                                    Text(timeoutSummary)
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                            Spacer()
+                            Button { viewModel.openMemberDetail(item.member) } label: { Label("Details", systemImage: "person.text.rectangle") }
+                        }
+                    }
+                }
+            }
+
+            if let member = viewModel.selectedMemberDetail {
+                memberDetail(member, details: details)
+            }
+
+            banList()
+        }
+    }
+
+    private func memberDetail(_ member: ServerMember, details: ServerSettingsDetails) -> some View {
         GlassPanel {
             VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                Text("Members")
-                    .font(.headline)
-                if details.members.isEmpty {
-                    Text("Member role assignment is available when member data is present in the current snapshot.")
-                        .foregroundStyle(.secondary)
+                let user = viewModel.snapshot.usersByID[member.id.userID]
+                HStack {
+                    Text(member.nickname ?? user?.displayName ?? user?.username ?? "Member")
+                        .font(.headline)
+                    Spacer()
+                    Button("Close") { viewModel.closeMemberDetail() }
                 }
-                ForEach(details.members, id: \.id) { member in
-                    LabeledContent(member.id.userID.rawValue, value: member.roles.count == 1 ? "1 role" : "\(member.roles.count) roles")
+                Text(user.map { "@\($0.username)#\($0.discriminator)" } ?? "Unknown user")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if viewModel.isDeveloperControlsEnabled {
+                    LabeledContent("User ID", value: member.id.userID.rawValue)
+                }
+
+                HStack {
+                    TextField("Nickname", text: $viewModel.memberNicknameDraft)
+                    Button { viewModel.requestMemberAction(.saveNickname, for: member) } label: { Label("Save", systemImage: "checkmark") }
+                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .saveNickname) != nil)
+                    Button { viewModel.requestMemberAction(.resetNickname, for: member) } label: { Label("Reset", systemImage: "xmark") }
+                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .resetNickname) != nil)
+                }
+
+                HStack {
+                    Button { viewModel.openMemberRoleAssignment(member) } label: { Label("Assign Roles", systemImage: "person.badge.key") }
+                        .disabled(viewModel.memberRoleAssignmentDisabledReason(for: member) != nil)
+                    Button { viewModel.requestMemberAction(.removeAvatar, for: member) } label: { Label("Remove Avatar", systemImage: "person.crop.circle.badge.xmark") }
+                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .removeAvatar) != nil)
+                    Button(role: .destructive) { viewModel.requestMemberAction(.kick, for: member) } label: { Label("Kick", systemImage: "rectangle.portrait.and.arrow.right") }
+                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .kick) != nil)
+                    Button(role: .destructive) { viewModel.requestMemberAction(.ban, for: member) } label: { Label("Ban", systemImage: "hand.raised.fill") }
+                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .ban) != nil)
+                }
+
+                HStack {
+                    Stepper(value: $viewModel.memberTimeoutHours, in: 1...168, step: 1) {
+                        Text("Timeout \(Int(viewModel.memberTimeoutHours))h")
+                    }
+                    Button { viewModel.requestMemberAction(.timeout, for: member) } label: { Label("Apply Timeout", systemImage: "clock.badge.exclamationmark") }
+                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .timeout) != nil)
+                    Button { viewModel.requestMemberAction(.clearTimeout, for: member) } label: { Label("Clear Timeout", systemImage: "clock.arrow.circlepath") }
+                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .clearTimeout) != nil)
+                }
+
+                if let draft = viewModel.memberRoleDraft {
+                    roleAssignment(draft, details: details)
+                }
+                if let pending = viewModel.pendingMemberModerationAction {
+                    Divider()
+                    Text("Confirm \(pending.action.rawValue)")
+                        .font(.headline)
+                    Text("This action affects \(user?.username ?? pending.member.id.userID.rawValue).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Button("Cancel") { viewModel.pendingMemberModerationAction = nil }
+                        Spacer()
+                        Button("Confirm", role: .destructive) { Task { await viewModel.confirmPendingMemberAction() } }
+                    }
+                }
+                stateMessage(viewModel.memberActionState, loading: "Applying member action", success: "Member updated")
+            }
+        }
+    }
+
+    private func roleAssignment(_ draft: MemberRoleAssignmentDraft, details: ServerSettingsDetails) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            Divider()
+            Text("Role Assignment")
+                .font(.headline)
+            ForEach(Phase26MemberSafety.assignableRoles(in: details.server, currentMember: viewModel.selectedServerMember, currentUserID: viewModel.currentUserID)) { role in
+                Toggle(role.name, isOn: Binding(
+                    get: { viewModel.memberRoleDraft?.selectedRoleIDs.contains(role.id) == true },
+                    set: { viewModel.toggleRole(role.id, inMemberRoleDraft: $0) }
+                ))
+            }
+            if viewModel.memberRoleSaveRequiresConfirmation {
+                Text("Added: \(draft.addedRoleIDs.compactMap { details.server.roles[$0]?.name }.joined(separator: ", "))")
+                    .font(.caption)
+                Text("Removed: \(draft.removedRoleIDs.compactMap { details.server.roles[$0]?.name }.joined(separator: ", "))")
+                    .font(.caption)
+            }
+            HStack {
+                Button("Cancel") { viewModel.memberRoleDraft = nil }
+                Spacer()
+                if viewModel.memberRoleSaveRequiresConfirmation {
+                    Button(role: .destructive) { Task { await viewModel.confirmSaveMemberRoles() } } label: { Label("Confirm Roles", systemImage: "checkmark.shield") }
+                } else {
+                    Button { viewModel.requestSaveMemberRoles() } label: { Label("Review Diff", systemImage: "doc.text.magnifyingglass") }
+                        .disabled(!draft.hasChanges)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func banList() -> some View {
+        switch viewModel.banListState {
+        case .idle:
+            EmptyView()
+        case .loading:
+            ProgressView("Loading bans")
+        case let .failed(message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+        case let .loaded(result):
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    Text("Ban List")
+                        .font(.headline)
+                    if result.bans.isEmpty {
+                        Text("No bans returned.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(result.bans) { ban in
+                        HStack {
+                            Text(result.users.first { $0.id == ban.id.userID }?.username ?? ban.id.userID.rawValue)
+                            Spacer()
+                            Button("Unban") { Task { await viewModel.unban(userID: ban.id.userID) } }
+                        }
+                    }
                 }
             }
         }

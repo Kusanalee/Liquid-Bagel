@@ -226,6 +226,23 @@ struct AppCommands: Commands {
         }
 
         CommandMenu("Servers") {
+            Button("Members") {
+                commandHandler?.perform(.openMembers)
+            }
+            .disabled(commandHandler?.canPerform(.openMembers) == false)
+
+            Button("Permission Editor") {
+                commandHandler?.perform(.openPermissionEditor)
+            }
+            .disabled(commandHandler?.canPerform(.openPermissionEditor) == false)
+
+            Button("Ban List") {
+                commandHandler?.perform(.openBanList)
+            }
+            .disabled(commandHandler?.canPerform(.openBanList) == false)
+
+            Divider()
+
             ForEach(1...9, id: \.self) { index in
                 Button("Select Server \(index)") {
                     commandHandler?.perform(.selectServer(index: index))

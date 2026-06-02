@@ -178,11 +178,15 @@ public actor RealtimeStateStore {
             let key = ServerMemberKey(event.id)
             guard var member = currentSnapshot.membersByServerAndUserID[key] else { break }
             if let nickname = event.data.nickname { member.nickname = nickname }
+            if let avatar = event.data.avatar { member.avatar = avatar }
             if let roles = event.data.roles { member.roles = roles }
+            if let timeout = event.data.timeout { member.timeout = timeout }
             for field in event.clear {
                 switch field {
                 case "Nickname": member.nickname = nil
+                case "Avatar": member.avatar = nil
                 case "Roles": member.roles = []
+                case "Timeout": member.timeout = nil
                 default: break
                 }
             }

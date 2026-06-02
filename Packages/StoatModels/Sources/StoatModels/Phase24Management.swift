@@ -288,15 +288,158 @@ public enum RoleEditRemovedField: String, Codable, Hashable, Sendable {
 }
 
 public struct MemberEditDraft: Codable, Hashable, Sendable {
+    public var nickname: String?
+    public var avatar: FileID?
     public var roles: [RoleID]?
+    public var timeout: Date?
     public var remove: [MemberEditRemovedField]
 
-    public init(roles: [RoleID]? = nil, remove: [MemberEditRemovedField] = []) {
+    public init(
+        nickname: String? = nil,
+        avatar: FileID? = nil,
+        roles: [RoleID]? = nil,
+        timeout: Date? = nil,
+        remove: [MemberEditRemovedField] = []
+    ) {
+        self.nickname = nickname
+        self.avatar = avatar
         self.roles = roles
+        self.timeout = timeout
         self.remove = remove
+    }
+
+    public var hasChanges: Bool {
+        nickname != nil || avatar != nil || roles != nil || timeout != nil || !remove.isEmpty
     }
 }
 
 public enum MemberEditRemovedField: String, Codable, Hashable, Sendable {
+    case nickname = "Nickname"
+    case avatar = "Avatar"
     case roles = "Roles"
+    case timeout = "Timeout"
+    case canReceive = "CanReceive"
+    case canPublish = "CanPublish"
+    case joinedAt = "JoinedAt"
+    case voiceChannel = "VoiceChannel"
+}
+
+public struct BanCreateDraft: Codable, Hashable, Sendable {
+    public var reason: String?
+    public var deleteMessageSeconds: Int64?
+
+    public init(reason: String? = nil, deleteMessageSeconds: Int64? = nil) {
+        self.reason = reason
+        self.deleteMessageSeconds = deleteMessageSeconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case reason
+        case deleteMessageSeconds = "delete_message_seconds"
+    }
+}
+
+public struct ServerBan: Codable, Hashable, Sendable, Identifiable {
+    public var id: MemberCompositeKey
+    public var reason: String?
+
+    public init(id: MemberCompositeKey, reason: String? = nil) {
+        self.id = id
+        self.reason = reason
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id = "_id"
+        case reason
+    }
+}
+
+public struct BannedUser: Codable, Hashable, Sendable, Identifiable {
+    public var id: UserID
+    public var username: String
+    public var discriminator: String?
+    public var avatar: File?
+
+    public init(id: UserID, username: String, discriminator: String? = nil, avatar: File? = nil) {
+        self.id = id
+        self.username = username
+        self.discriminator = discriminator
+        self.avatar = avatar
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id = "_id"
+        case username
+        case discriminator
+        case avatar
+    }
+}
+
+public struct BanListResult: Codable, Hashable, Sendable {
+    public var users: [BannedUser]
+    public var bans: [ServerBan]
+
+    public init(users: [BannedUser], bans: [ServerBan]) {
+        self.users = users
+        self.bans = bans
+    }
+}
+
+public struct PermissionWriteOverride: Codable, Hashable, Sendable {
+    public var allow: Permissions
+    public var deny: Permissions
+
+    public init(allow: Permissions = [], deny: Permissions = []) {
+        self.allow = allow
+        self.deny = deny
+    }
+
+    public init(_ override: PermissionOverride) {
+        self.allow = override.allow
+        self.deny = override.deny
+    }
+}
+
+public struct ServerRolePermissionDraft: Codable, Hashable, Sendable {
+    public var permissions: PermissionWriteOverride
+
+    public init(permissions: PermissionWriteOverride) {
+        self.permissions = permissions
+    }
+}
+
+public struct ServerDefaultPermissionDraft: Codable, Hashable, Sendable {
+    public var permissions: Permissions
+
+    public init(permissions: Permissions) {
+        self.permissions = permissions
+    }
+}
+
+public enum ChannelDefaultPermissionDraft: Codable, Hashable, Sendable {
+    case value(Permissions)
+    case override(PermissionWriteOverride)
+
+    private enum CodingKeys: String, CodingKey {
+        case permissions
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .value(permissions):
+            try container.encode(permissions, forKey: .permissions)
+        case let .override(override):
+            try container.encode(override, forKey: .permissions)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let permissions = try? container.decode(Permissions.self, forKey: .permissions) {
+            self = .value(permissions)
+        } else {
+            self = .override(try container.decode(PermissionWriteOverride.self, forKey: .permissions))
+        }
+    }
 }
