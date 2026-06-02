@@ -7,6 +7,7 @@ public actor MockStoatAPIClient: StoatAPIClient {
     private var servers: [Server]
     private var channels: [Channel]
     private var messagesByChannel: [ChannelID: [Message]]
+    private var invites: [InviteID: Invite]
 
     public init() {
         let liquid = User(
@@ -86,6 +87,9 @@ public actor MockStoatAPIClient: StoatAPIClient {
             Channel(id: apiResearch, kind: .textChannel, serverID: lab, name: "api-research"),
             Channel(id: macNative, kind: .textChannel, serverID: lab, name: "macos-native"),
             Channel(id: "01HX0000000000000000000104", kind: .directMessage, active: true, recipients: [liquid.id, design.id])
+        ]
+        self.invites = [
+            "bagel-lab": Invite(id: "bagel-lab", kind: .server, serverID: lab, creatorID: liquid.id, channelID: general)
         ]
         self.messagesByChannel = [
             general: [
@@ -360,6 +364,115 @@ public actor MockStoatAPIClient: StoatAPIClient {
 
     public func unblockUser(userID: UserID) async throws -> User {
         try updateRelationship(userID: userID, status: .none)
+    }
+
+    public func fetchInvitePreview(code: InviteCode) async throws -> InvitePreview {
+        guard let invite = invites[InviteID(rawValue: code.rawValue)] else {
+            throw StoatAPIError.notFound
+        }
+        switch invite.kind {
+        case .server:
+            guard let serverID = invite.serverID,
+                  let server = servers.first(where: { $0.id == serverID }),
+                  let channel = channels.first(where: { $0.id == invite.channelID })
+            else {
+                throw StoatAPIError.notFound
+            }
+            return InvitePreview(
+                code: code,
+                kind: .server,
+                serverID: server.id,
+                serverName: server.name,
+                serverIcon: server.icon,
+                serverBanner: server.banner,
+                channelID: channel.id,
+                channelName: channel.displayName,
+                channelDescription: channel.description,
+                inviterName: users[invite.creatorID]?.displayName ?? users[invite.creatorID]?.username ?? "Unknown User",
+                inviterAvatar: users[invite.creatorID]?.avatar,
+                memberCount: 4,
+                isAlreadyJoined: true
+            )
+        case .group:
+            guard let channel = channels.first(where: { $0.id == invite.channelID }) else {
+                throw StoatAPIError.notFound
+            }
+            return InvitePreview(
+                code: code,
+                kind: .group,
+                channelID: channel.id,
+                channelName: channel.displayName,
+                channelDescription: channel.description,
+                inviterName: users[invite.creatorID]?.displayName ?? users[invite.creatorID]?.username ?? "Unknown User",
+                inviterAvatar: users[invite.creatorID]?.avatar
+            )
+        case .unknown:
+            throw StoatAPIError.unimplementedEndpoint("Unknown invite type.")
+        }
+    }
+
+    public func joinInvite(code: InviteCode) async throws -> InviteJoinResponse {
+        let preview = try await fetchInvitePreview(code: code)
+        switch preview.kind {
+        case .server:
+            guard let serverID = preview.serverID,
+                  let server = servers.first(where: { $0.id == serverID })
+            else {
+                throw StoatAPIError.notFound
+            }
+            return .server(server: server, channels: channels.filter { $0.serverID == serverID })
+        case .group:
+            guard let channel = channels.first(where: { $0.id == preview.channelID }) else {
+                throw StoatAPIError.notFound
+            }
+            return .group(channel: channel, users: channel.recipients.compactMap { users[$0] })
+        case .unknown:
+            throw StoatAPIError.unimplementedEndpoint("Unknown invite type.")
+        }
+    }
+
+    public func createInvite(channelID: ChannelID) async throws -> Invite {
+        guard let channel = channels.first(where: { $0.id == channelID }) else {
+            throw StoatAPIError.notFound
+        }
+        let code = InviteID(rawValue: "mock-\(channelID.rawValue.suffix(6))")
+        let invite = Invite(id: code, kind: channel.serverID == nil ? .group : .server, serverID: channel.serverID, creatorID: currentUser.id, channelID: channelID)
+        invites[code] = invite
+        return invite
+    }
+
+    public func fetchServerInvites(serverID: ServerID) async throws -> [Invite] {
+        guard servers.contains(where: { $0.id == serverID }) else {
+            throw StoatAPIError.notFound
+        }
+        return invites.values.filter { $0.serverID == serverID }.sorted { $0.id.rawValue < $1.id.rawValue }
+    }
+
+    public func deleteInvite(code: InviteCode) async throws {
+        guard invites.removeValue(forKey: InviteID(rawValue: code.rawValue)) != nil else {
+            throw StoatAPIError.notFound
+        }
+    }
+
+    public func createServer(draft: ServerCreateDraft) async throws -> ServerCreateResponse {
+        guard let validated = draft.validatedForCreate else {
+            throw StoatAPIError.invalidEnvironment("Server name must be 1 to 32 characters.")
+        }
+        let serverID = ServerID(rawValue: "mock-server-\(servers.count + 1)")
+        let channelID = ChannelID(rawValue: "mock-channel-\(channels.count + 1)")
+        let server = Server(
+            id: serverID,
+            ownerID: currentUser.id,
+            name: validated.name,
+            description: validated.description,
+            channelIDs: [channelID],
+            defaultPermissions: [.viewChannel, .readMessageHistory, .sendMessage, .uploadFiles, .react],
+            nsfw: validated.nsfw ?? false
+        )
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        servers.append(server)
+        channels.append(channel)
+        return ServerCreateResponse(server: server, channels: [channel])
     }
 
     private func setPinned(_ pinned: Bool, channelID: ChannelID, messageID: MessageID) throws {

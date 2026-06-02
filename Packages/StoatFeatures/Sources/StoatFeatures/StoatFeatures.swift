@@ -469,6 +469,20 @@ public final class MainShellViewModel {
     public var profileErrorsByID: [UserID: String] = [:]
     public var profileLoadingUserIDs: Set<UserID> = []
     public var pendingRelationshipAction: PendingRelationshipAction?
+    public var isJoinInvitePresented = false
+    public var inviteInput = ""
+    public var invitePreviewState: InvitePreviewState = .idle
+    public var pendingInviteJoin: PendingInviteJoin?
+    public var discoverState: DiscoverState = .webBacked
+    public var isCreateServerPresented = false
+    public var serverCreateName = ""
+    public var serverCreateDescription = ""
+    public var serverCreateIsNSFW = false
+    public var serverCreateState: ServerCreateState = .idle
+    public var isInviteManagementPresented = false
+    public var inviteManagementState: InviteManagementState = .idle
+    public var pendingInviteDeletion: PendingInviteDeletion?
+    public var phase23Status: String?
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var messageCopier: any MessageCopying
@@ -483,6 +497,7 @@ public final class MainShellViewModel {
     @ObservationIgnored public var notificationDeliverer: any NotificationDelivering
     @ObservationIgnored public var notificationPermissionManager: any NotificationPermissionManaging
     @ObservationIgnored public var dockBadgeManager: any DockBadgeManaging
+    @ObservationIgnored public var communityAPIClient: any StoatAPIClient
     @ObservationIgnored public var notificationRouteCenter: NotificationRouteCenter
     @ObservationIgnored public var appLifecycleCenter: AppLifecycleCenter
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
@@ -537,6 +552,7 @@ public final class MainShellViewModel {
         notificationDeliverer: (any NotificationDelivering)? = nil,
         notificationPermissionManager: (any NotificationPermissionManaging)? = nil,
         dockBadgeManager: (any DockBadgeManaging)? = nil,
+        communityAPIClient: (any StoatAPIClient)? = nil,
         notificationRouteCenter: NotificationRouteCenter = .shared,
         appLifecycleCenter: AppLifecycleCenter = .shared
     ) {
@@ -562,6 +578,7 @@ public final class MainShellViewModel {
         self.notificationDeliverer = notificationDeliverer ?? UserNotificationsNotificationService()
         self.notificationPermissionManager = notificationPermissionManager ?? UserNotificationsPermissionManager()
         self.dockBadgeManager = dockBadgeManager ?? AppKitDockBadgeManager()
+        self.communityAPIClient = communityAPIClient ?? MockStoatAPIClient()
         self.notificationRouteCenter = notificationRouteCenter
         self.appLifecycleCenter = appLifecycleCenter
         self.appLifecyclePhase = appLifecycleCenter.phase
@@ -941,6 +958,230 @@ public final class MainShellViewModel {
         case .block: "User blocked"
         case .unblock: "User unblocked"
         }
+    }
+
+    public func openJoinInvite(prefill: String = "") {
+        isJoinInvitePresented = true
+        if !prefill.isEmpty {
+            inviteInput = prefill
+            invitePreviewState = .idle
+        }
+        phase23Status = nil
+    }
+
+    public func previewInviteFromInput() async {
+        invitePreviewState = .parsing
+        let parsed = InviteCodeParser.parse(inviteInput)
+        guard case let .code(code) = parsed else {
+            if case let .invalid(message) = parsed {
+                invitePreviewState = .failed(nil, message)
+            }
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            invitePreviewState = .failed(code, "Connect manually before previewing invites.")
+            return
+        }
+        invitePreviewState = .loading(code)
+        do {
+            let preview = try await apiClient.fetchInvitePreview(code: code)
+            invitePreviewState = .loaded(markAlreadyJoined(preview))
+            loadImageResource(for: preview.serverIcon, kind: .serverIcon)
+        } catch {
+            invitePreviewState = .failed(code, Phase23Safety.safeError(error))
+        }
+    }
+
+    public func requestJoinLoadedInvite() {
+        guard case let .loaded(preview) = invitePreviewState else { return }
+        if preview.isAlreadyJoined, let serverID = preview.serverID, snapshot.serversByID[serverID] != nil {
+            selectJoinedInvitePreview(preview)
+            return
+        }
+        pendingInviteJoin = PendingInviteJoin(code: preview.code, preview: preview)
+    }
+
+    public func confirmPendingInviteJoin() async {
+        guard let pendingInviteJoin else { return }
+        self.pendingInviteJoin = nil
+        guard let apiClient = apiClientForCommunityAction() else {
+            invitePreviewState = .failed(pendingInviteJoin.code, "Connect manually before joining an invite.")
+            return
+        }
+        invitePreviewState = .loading(pendingInviteJoin.code)
+        do {
+            let joined = try await apiClient.joinInvite(code: pendingInviteJoin.code)
+            switch joined {
+            case let .server(server, channels):
+                applyJoinedOrCreatedServer(server, channels: channels, status: "Joined \(server.name)")
+                invitePreviewState = .loaded(pendingInviteJoin.preview.markingAlreadyJoined(true))
+                isJoinInvitePresented = false
+            case let .group(channel, users):
+                for user in users { snapshot.usersByID[user.id] = user }
+                snapshot.channelsByID[channel.id] = channel
+                selectChannel(channel.id)
+                invitePreviewState = .loaded(pendingInviteJoin.preview.markingAlreadyJoined(true))
+                isJoinInvitePresented = false
+                phase23Status = "Joined group"
+            case .unknown:
+                invitePreviewState = .failed(pendingInviteJoin.code, "Invite joined, waiting for server data.")
+                phase23Status = "Joined, waiting for server data."
+            }
+        } catch {
+            invitePreviewState = .failed(pendingInviteJoin.code, Phase23Safety.safeError(error))
+        }
+    }
+
+    public func openCreateServer() {
+        isCreateServerPresented = true
+        serverCreateState = .idle
+        phase23Status = nil
+    }
+
+    public func createServerFromDraft() async {
+        guard let apiClient = apiClientForCommunityAction() else {
+            serverCreateState = .failed("Connect manually before creating a server.")
+            return
+        }
+        let draft = ServerCreateDraft(
+            name: serverCreateName,
+            description: serverCreateDescription,
+            nsfw: serverCreateIsNSFW ? true : nil
+        )
+        guard let validated = draft.validatedForCreate else {
+            serverCreateState = .failed("Server name must be 1 to 32 characters.")
+            return
+        }
+        serverCreateState = .creating
+        do {
+            let response = try await apiClient.createServer(draft: validated)
+            applyJoinedOrCreatedServer(response.server, channels: response.channels, status: "Created \(response.server.name)")
+            serverCreateState = .created(response.server.id)
+            isCreateServerPresented = false
+            serverCreateName = ""
+            serverCreateDescription = ""
+            serverCreateIsNSFW = false
+        } catch {
+            serverCreateState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func openInviteManagement() {
+        isInviteManagementPresented = true
+        phase23Status = nil
+        Task { [weak self] in await self?.refreshServerInvites() }
+    }
+
+    public func refreshServerInvites() async {
+        guard let serverID = selection.serverID else {
+            inviteManagementState = .failed("Select a server before managing invites.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            inviteManagementState = .failed("Connect manually before managing invites.")
+            return
+        }
+        inviteManagementState = .loading
+        do {
+            inviteManagementState = .loaded(try await apiClient.fetchServerInvites(serverID: serverID))
+        } catch {
+            inviteManagementState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func createInviteForSelectedChannel() async {
+        guard let channelID = selection.channelID ?? firstVisibleTextChannel(in: selection.serverID)?.id else {
+            inviteManagementState = .failed("Select or create a text channel before creating an invite.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            inviteManagementState = .failed("Connect manually before creating invites.")
+            return
+        }
+        do {
+            let invite = try await apiClient.createInvite(channelID: channelID)
+            let code = InviteCode(rawValue: invite.id.rawValue)
+            await messageCopier.copy(InviteCodeParser.inviteURLString(code: code))
+            phase23Status = "Invite copied"
+            await refreshServerInvites()
+        } catch {
+            inviteManagementState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func copyInvite(_ invite: Invite) async {
+        let code = InviteCode(rawValue: invite.id.rawValue)
+        await messageCopier.copy(InviteCodeParser.inviteURLString(code: code))
+        phase23Status = "Invite copied"
+    }
+
+    public func requestDeleteInvite(_ invite: Invite) {
+        pendingInviteDeletion = PendingInviteDeletion(code: InviteCode(rawValue: invite.id.rawValue))
+    }
+
+    public func confirmPendingInviteDeletion() async {
+        guard let pendingInviteDeletion else { return }
+        self.pendingInviteDeletion = nil
+        guard let apiClient = apiClientForCommunityAction() else {
+            inviteManagementState = .failed("Connect manually before revoking invites.")
+            return
+        }
+        do {
+            try await apiClient.deleteInvite(code: pendingInviteDeletion.code)
+            phase23Status = "Invite revoked"
+            await refreshServerInvites()
+        } catch {
+            inviteManagementState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func openDiscoverInBrowser() {
+        guard let url = URL(string: "https://stt.gg/discover/servers") else { return }
+        #if canImport(AppKit)
+        NSWorkspace.shared.open(url)
+        #endif
+        phase23Status = "Opened Discover in browser"
+    }
+
+    private func apiClientForCommunityAction() -> (any StoatAPIClient)? {
+        if effectiveRuntimeMode == .mock {
+            return communityAPIClient
+        }
+        guard effectiveRuntimeMode == .liveManual,
+              effectiveSessionState == .connected,
+              let apiClient = sessionCoordinator?.apiClient
+        else {
+            return nil
+        }
+        return apiClient
+    }
+
+    private func markAlreadyJoined(_ preview: InvitePreview) -> InvitePreview {
+        guard let serverID = preview.serverID else { return preview }
+        return preview.markingAlreadyJoined(snapshot.serversByID[serverID] != nil)
+    }
+
+    private func selectJoinedInvitePreview(_ preview: InvitePreview) {
+        if let channelID = preview.channelID as ChannelID?, snapshot.channelsByID[channelID] != nil {
+            selectChannel(channelID)
+        } else if let serverID = preview.serverID {
+            selectServer(serverID)
+        }
+        isJoinInvitePresented = false
+        phase23Status = "Opened joined server"
+    }
+
+    private func applyJoinedOrCreatedServer(_ server: Server, channels: [Channel], status: String) {
+        snapshot = Phase23SnapshotIntegrator.upserting(server: server, channels: channels, into: snapshot)
+        selection = Phase23SnapshotIntegrator.selection(for: server, channels: channels, memberPanelVisible: selection.isMemberPanelVisible)
+        placeholderStatus = nil
+        phase23Status = status
+        quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+        validateSelection()
+        messageController.hydrate(from: snapshot)
+        scheduleSelectedChannelLoad()
+        loadImageResource(for: server.icon, kind: .serverIcon)
+        loadImageResource(for: server.banner, kind: .serverBanner)
     }
 
     public func selectHome() {
@@ -3859,8 +4100,12 @@ public final class MainShellViewModel {
 extension MainShellViewModel: AppCommandHandling {
     public func canPerform(_ command: AppCommand) -> Bool {
         switch command {
-        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
+        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .openJoinInvite, .openCreateServer, .openDiscoverInBrowser, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
             return true
+        case .openInviteManagement:
+            return selection.serverID != nil
+        case .createInviteForCurrentChannel:
+            return selection.channelID != nil || firstVisibleTextChannel(in: selection.serverID) != nil
         case .openChannelSearch, .openLoadedMessageFind:
             return selectedChannel != nil || selection.dmChannelID != nil
         case .openLiveChannelSearch:
@@ -3948,6 +4193,10 @@ extension MainShellViewModel: AppCommandHandling {
         switch command {
         case .focusComposer:
             return "Select a channel before focusing the composer."
+        case .openInviteManagement:
+            return "Select a server before managing invites."
+        case .createInviteForCurrentChannel:
+            return "Select a server text channel before creating an invite."
         case .reconnect:
             return sessionCoordinator?.hasSavedCredential == true ? "Realtime is already connecting." : "No saved credential for this environment."
         case .disconnect:
@@ -4042,6 +4291,16 @@ extension MainShellViewModel: AppCommandHandling {
             openFriends(tab: .addFriend)
         case .jumpToDiscover:
             selectDiscover()
+        case .openJoinInvite:
+            openJoinInvite()
+        case .openCreateServer:
+            openCreateServer()
+        case .openInviteManagement:
+            openInviteManagement()
+        case .createInviteForCurrentChannel:
+            Task { [weak self] in await self?.createInviteForSelectedChannel() }
+        case .openDiscoverInBrowser:
+            openDiscoverInBrowser()
         case .selectNextMessage:
             selectNextMessage()
         case .selectPreviousMessage:
@@ -4295,6 +4554,15 @@ public struct MainShellView: View {
         .sheet(isPresented: $viewModel.isCredentialSetupPresented) {
             AccountConnectionSettingsView(viewModel: viewModel)
         }
+        .sheet(isPresented: $viewModel.isJoinInvitePresented) {
+            JoinInviteView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.isCreateServerPresented) {
+            CreateServerView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.isInviteManagementPresented) {
+            InviteManagementView(viewModel: viewModel)
+        }
         .sheet(item: $viewModel.attachmentPreview, onDismiss: {
             viewModel.closeAttachmentPreview()
         }) { attachment in
@@ -4357,8 +4625,40 @@ public struct MainShellView: View {
         } message: {
             Text("Liquid Bagel will perform this friend or block action only after this confirmation.")
         }
+        .confirmationDialog(
+            "Join this server?",
+            isPresented: Binding(
+                get: { viewModel.pendingInviteJoin != nil },
+                set: { if !$0 { viewModel.pendingInviteJoin = nil } }
+            )
+        ) {
+            Button("Join Server") {
+                Task { await viewModel.confirmPendingInviteJoin() }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingInviteJoin = nil
+            }
+        } message: {
+            Text("Liquid Bagel will join only after this confirmation.")
+        }
+        .confirmationDialog(
+            "Revoke this invite?",
+            isPresented: Binding(
+                get: { viewModel.pendingInviteDeletion != nil },
+                set: { if !$0 { viewModel.pendingInviteDeletion = nil } }
+            )
+        ) {
+            Button("Revoke Invite", role: .destructive) {
+                Task { await viewModel.confirmPendingInviteDeletion() }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingInviteDeletion = nil
+            }
+        } message: {
+            Text("This invite code stops working after the API confirms revocation.")
+        }
         .overlay(alignment: .bottom) {
-            if let status = viewModel.placeholderStatus ?? viewModel.relationshipActionStatus ?? viewModel.messageActionStatus ?? viewModel.composerError ?? viewModel.sessionCoordinator?.lastErrorMessage {
+            if let status = viewModel.placeholderStatus ?? viewModel.phase23Status ?? viewModel.relationshipActionStatus ?? viewModel.messageActionStatus ?? viewModel.composerError ?? viewModel.sessionCoordinator?.lastErrorMessage {
                 Text(status)
                     .font(.caption)
                     .padding(.horizontal, StoatSpacing.medium)
@@ -4427,7 +4727,7 @@ public struct MainShellView: View {
         case .home:
             HomeView(viewModel: viewModel)
         case .discover:
-            DiscoverPlaceholderView()
+            DiscoverView(viewModel: viewModel)
         case .directMessages:
             FriendsPlaceholderView(viewModel: viewModel)
         case .server:
@@ -6739,35 +7039,319 @@ private struct UserProfileCardView: View {
     }
 }
 
-public struct DiscoverPlaceholderView: View {
-    @State private var invite = ""
+public struct DiscoverView: View {
+    @Bindable private var viewModel: MainShellViewModel
 
-    public init() {}
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.xLarge) {
-            Text("Discover")
-                .font(.largeTitle.weight(.semibold))
-            GlassPanel {
-                VStack(alignment: .leading, spacing: StoatSpacing.large) {
-                    Text("Server discovery placeholder")
-                        .font(.title3.weight(.semibold))
-                    Text("Discovery, invites, and joins are intentionally deferred.")
-                        .foregroundStyle(.secondary)
-                    HStack {
-                        TextField("Paste invite code", text: $invite)
-                            .textFieldStyle(.roundedBorder)
-                        Button("Join") {}
+        ScrollView {
+            VStack(alignment: .leading, spacing: StoatSpacing.xLarge) {
+                Text("Discover")
+                    .font(.largeTitle.weight(.semibold))
+                GlassPanel {
+                    VStack(alignment: .leading, spacing: StoatSpacing.large) {
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                                Text("Web-backed Discover")
+                                    .font(.title3.weight(.semibold))
+                                Text("Native community listings are deferred until a first-party Discover API is verified.")
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button {
+                                viewModel.openDiscoverInBrowser()
+                            } label: {
+                                Label("Open Browser", systemImage: "safari")
+                            }
                             .buttonStyle(GlassButtonStyle())
-                            .disabled(true)
+                            .accessibilityLabel("Open Discover in browser")
+                        }
+                        HStack(spacing: StoatSpacing.small) {
+                            Button {
+                                viewModel.openJoinInvite()
+                            } label: {
+                                Label("Join Invite", systemImage: "link")
+                            }
+                            Button {
+                                viewModel.openCreateServer()
+                            } label: {
+                                Label("Create Server", systemImage: "plus.circle")
+                            }
+                            .buttonStyle(GlassButtonStyle())
+                        }
+                        .buttonStyle(GlassButtonStyle())
+                    }
+                }
+                GlassPanel {
+                    VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                        Text("Invite")
+                            .font(.title3.weight(.semibold))
+                        HStack {
+                            TextField("Paste invite code or link", text: $viewModel.inviteInput)
+                                .textFieldStyle(.roundedBorder)
+                                .onSubmit {
+                                    viewModel.openJoinInvite(prefill: viewModel.inviteInput)
+                                    Task { await viewModel.previewInviteFromInput() }
+                                }
+                                .accessibilityLabel("Invite code or link")
+                            Button {
+                                viewModel.openJoinInvite(prefill: viewModel.inviteInput)
+                                Task { await viewModel.previewInviteFromInput() }
+                            } label: {
+                                Label("Preview", systemImage: "eye")
+                            }
+                            .buttonStyle(GlassButtonStyle())
+                        }
+                    }
+                }
+                Spacer(minLength: StoatSpacing.xxLarge)
+            }
+            .padding(StoatSpacing.xxLarge)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+}
+
+public struct JoinInviteView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            HStack {
+                Text("Join Invite")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button("Close") { viewModel.isJoinInvitePresented = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            HStack {
+                TextField("Invite code or link", text: $viewModel.inviteInput)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { Task { await viewModel.previewInviteFromInput() } }
+                    .accessibilityLabel("Invite code or link")
+                    .accessibilityHint("Paste a Stoat invite code or supported invite URL")
+                Button {
+                    Task { await viewModel.previewInviteFromInput() }
+                } label: {
+                    Label("Preview", systemImage: "eye")
+                }
+                .buttonStyle(GlassButtonStyle())
+            }
+            inviteState
+            Spacer()
+        }
+        .padding(StoatSpacing.large)
+        .frame(width: 520, height: 360, alignment: .topLeading)
+    }
+
+    @ViewBuilder private var inviteState: some View {
+        switch viewModel.invitePreviewState {
+        case .idle, .parsing:
+            EmptyStateView(title: "No invite preview", message: "Preview runs only when you press Preview.", systemImage: "link")
+        case let .loading(code):
+            ProgressView("Loading \(InviteCodeParser.sanitizeDisplay(code))")
+        case let .failed(_, message):
+            EmptyStateView(title: "Invite unavailable", message: message, systemImage: "exclamationmark.triangle")
+        case let .loaded(preview):
+            InvitePreviewCard(viewModel: viewModel, preview: preview)
+        }
+    }
+}
+
+private struct InvitePreviewCard: View {
+    @Bindable var viewModel: MainShellViewModel
+    let preview: InvitePreview
+
+    var body: some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                HStack(spacing: StoatSpacing.medium) {
+                    ServerIconView(name: preview.serverName ?? preview.channelName, imageData: viewModel.imageData(for: preview.serverIcon, kind: .serverIcon))
+                        .frame(width: 44, height: 44)
+                    VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                        Text(preview.serverName ?? preview.channelName)
+                            .font(.headline)
+                        Text(channelLine)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                if let description = preview.channelDescription, !description.isEmpty {
+                    Text(description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+                HStack {
+                    if let memberCount = preview.memberCount {
+                        Label("\(memberCount) members", systemImage: "person.2")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        viewModel.requestJoinLoadedInvite()
+                    } label: {
+                        Label(preview.isAlreadyJoined ? "Open" : "Join", systemImage: preview.isAlreadyJoined ? "arrow.right.circle" : "plus.circle")
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .accessibilityLabel(preview.isAlreadyJoined ? "Open joined server" : "Join server")
+                }
+            }
+        }
+        .onAppear {
+            viewModel.loadImageResource(for: preview.serverIcon, kind: .serverIcon)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Invite preview for \(preview.serverName ?? preview.channelName)")
+    }
+
+    private var channelLine: String {
+        if preview.kind == .server {
+            return "# \(preview.channelName) · invited by \(preview.inviterName)"
+        }
+        return "Group · invited by \(preview.inviterName)"
+    }
+}
+
+public struct CreateServerView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            HStack {
+                Text("Create Server")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button("Close") { viewModel.isCreateServerPresented = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            TextField("Server name", text: $viewModel.serverCreateName)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Server name")
+            TextField("Description", text: $viewModel.serverCreateDescription)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Server description")
+            Toggle("Age-restricted", isOn: $viewModel.serverCreateIsNSFW)
+                .accessibilityLabel("Age-restricted server")
+            if case let .failed(message) = viewModel.serverCreateState {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button {
+                    Task { await viewModel.createServerFromDraft() }
+                } label: {
+                    Label("Create", systemImage: "plus.circle")
+                }
+                .buttonStyle(GlassButtonStyle())
+                .disabled(isCreating)
+            }
+        }
+        .padding(StoatSpacing.large)
+        .frame(width: 460, height: 300, alignment: .topLeading)
+    }
+
+    private var isCreating: Bool {
+        if case .creating = viewModel.serverCreateState { return true }
+        return false
+    }
+}
+
+public struct InviteManagementView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            HStack {
+                Text("Server Invites")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button("Close") { viewModel.isInviteManagementPresented = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            HStack {
+                Button {
+                    Task { await viewModel.createInviteForSelectedChannel() }
+                } label: {
+                    Label("Create Invite", systemImage: "link.badge.plus")
+                }
+                Button {
+                    Task { await viewModel.refreshServerInvites() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+            }
+            .buttonStyle(GlassButtonStyle())
+            inviteList
+            Spacer()
+        }
+        .padding(StoatSpacing.large)
+        .frame(width: 560, height: 420, alignment: .topLeading)
+    }
+
+    @ViewBuilder private var inviteList: some View {
+        switch viewModel.inviteManagementState {
+        case .idle:
+            EmptyStateView(title: "No invite list", message: "Refresh runs only when requested.", systemImage: "link")
+        case .loading:
+            ProgressView("Loading invites")
+        case let .failed(message):
+            EmptyStateView(title: "Invites unavailable", message: message, systemImage: "exclamationmark.triangle")
+        case let .loaded(invites):
+            if invites.isEmpty {
+                EmptyStateView(title: "No invites", message: "Create an invite for the selected channel.", systemImage: "link")
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
+                        ForEach(invites) { invite in
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(invite.id.rawValue)
+                                        .font(.body.monospaced())
+                                    Text(invite.channelID.rawValue)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button {
+                                    Task { await viewModel.copyInvite(invite) }
+                                } label: {
+                                    Label("Copy", systemImage: "doc.on.doc")
+                                }
+                                Button(role: .destructive) {
+                                    viewModel.requestDeleteInvite(invite)
+                                } label: {
+                                    Label("Revoke", systemImage: "trash")
+                                }
+                            }
+                            .padding(StoatSpacing.small)
+                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("Invite \(invite.id.rawValue)")
+                        }
                     }
                 }
             }
-            EmptyStateView(title: "Public discovery comes later", message: "Phase 6 can wire real discovery and invite flows.", systemImage: "safari")
-            Spacer()
         }
-        .padding(StoatSpacing.xxLarge)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 

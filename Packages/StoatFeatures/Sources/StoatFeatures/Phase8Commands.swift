@@ -28,6 +28,11 @@ public enum AppCommand: Hashable, Sendable {
     case jumpToFriends
     case jumpToAddFriend
     case jumpToDiscover
+    case openJoinInvite
+    case openCreateServer
+    case openInviteManagement
+    case createInviteForCurrentChannel
+    case openDiscoverInBrowser
     case selectNextMessage
     case selectPreviousMessage
     case jumpToNewestMessage
@@ -306,6 +311,12 @@ public final class QuickSwitcherViewModel {
             commandResult(.refresh, title: "Refresh", subtitle: "Refresh the current runtime context"),
             commandResult(.jumpToFriends, title: "Open Friends", subtitle: "Open the friends and requests view"),
             commandResult(.jumpToAddFriend, title: "Add Friend", subtitle: "Open the add friend view"),
+            commandResult(.jumpToDiscover, title: "Open Discover", subtitle: "Open server discovery and invite tools"),
+            commandResult(.openJoinInvite, title: "Join Invite", subtitle: "Paste and preview an invite code or link"),
+            commandResult(.openCreateServer, title: "Create Server", subtitle: "Create a new server after manual connection"),
+            commandResult(.openInviteManagement, title: "Manage Invites", subtitle: "Create, copy, or revoke invites for the selected server"),
+            commandResult(.createInviteForCurrentChannel, title: "Create Invite", subtitle: "Create and copy an invite for the selected channel"),
+            commandResult(.openDiscoverInBrowser, title: "Open Discover in Browser", subtitle: "Open the web-backed Discover surface"),
             commandResult(.reconnect, title: "Reconnect", subtitle: "Explicitly reconnect Live Manual"),
             commandResult(.disconnect, title: "Disconnect", subtitle: "Disconnect the live realtime session"),
             commandResult(.resetToMock, title: "Open Preview Data", subtitle: "Use local developer preview data"),

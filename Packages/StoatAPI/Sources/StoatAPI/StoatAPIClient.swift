@@ -36,6 +36,12 @@ public protocol StoatAPIClient: Sendable {
     func removeFriend(userID: UserID) async throws -> User
     func blockUser(userID: UserID) async throws -> User
     func unblockUser(userID: UserID) async throws -> User
+    func fetchInvitePreview(code: InviteCode) async throws -> InvitePreview
+    func joinInvite(code: InviteCode) async throws -> InviteJoinResponse
+    func createInvite(channelID: ChannelID) async throws -> Invite
+    func fetchServerInvites(serverID: ServerID) async throws -> [Invite]
+    func deleteInvite(code: InviteCode) async throws
+    func createServer(draft: ServerCreateDraft) async throws -> ServerCreateResponse
 }
 
 public extension StoatAPIClient {
@@ -117,6 +123,30 @@ public extension StoatAPIClient {
 
     func unblockUser(userID: UserID) async throws -> User {
         throw StoatAPIError.unimplementedEndpoint("User unblocking is not implemented by this API client.")
+    }
+
+    func fetchInvitePreview(code: InviteCode) async throws -> InvitePreview {
+        throw StoatAPIError.unimplementedEndpoint("Invite preview is not implemented by this API client.")
+    }
+
+    func joinInvite(code: InviteCode) async throws -> InviteJoinResponse {
+        throw StoatAPIError.unimplementedEndpoint("Invite join is not implemented by this API client.")
+    }
+
+    func createInvite(channelID: ChannelID) async throws -> Invite {
+        throw StoatAPIError.unimplementedEndpoint("Invite creation is not implemented by this API client.")
+    }
+
+    func fetchServerInvites(serverID: ServerID) async throws -> [Invite] {
+        throw StoatAPIError.unimplementedEndpoint("Server invite listing is not implemented by this API client.")
+    }
+
+    func deleteInvite(code: InviteCode) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Invite deletion is not implemented by this API client.")
+    }
+
+    func createServer(draft: ServerCreateDraft) async throws -> ServerCreateResponse {
+        throw StoatAPIError.unimplementedEndpoint("Server creation is not implemented by this API client.")
     }
 }
 
@@ -401,6 +431,39 @@ public actor LiveStoatAPIClient: StoatAPIClient {
 
     public func unblockUser(userID: UserID) async throws -> User {
         try await perform(StoatRequest<User>(method: .delete, path: "/users/\(userID.rawValue.stoatPathComponentEscaped)/block"))
+    }
+
+    public func fetchInvitePreview(code: InviteCode) async throws -> InvitePreview {
+        try await perform(StoatRequest<InvitePreview>(method: .get, path: "/invites/\(code.rawValue.stoatPathComponentEscaped)", requiresAuthentication: false))
+    }
+
+    public func joinInvite(code: InviteCode) async throws -> InviteJoinResponse {
+        try await perform(StoatRequest<InviteJoinResponse>(method: .post, path: "/invites/\(code.rawValue.stoatPathComponentEscaped)"))
+    }
+
+    public func createInvite(channelID: ChannelID) async throws -> Invite {
+        try await perform(StoatRequest<Invite>(method: .post, path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/invites"))
+    }
+
+    public func fetchServerInvites(serverID: ServerID) async throws -> [Invite] {
+        try await perform(StoatRequest<[Invite]>(method: .get, path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/invites"))
+    }
+
+    public func deleteInvite(code: InviteCode) async throws {
+        _ = try await perform(StoatRequest<EmptyResponse>(method: .delete, path: "/invites/\(code.rawValue.stoatPathComponentEscaped)"))
+    }
+
+    public func createServer(draft: ServerCreateDraft) async throws -> ServerCreateResponse {
+        guard let validated = draft.validatedForCreate else {
+            throw StoatAPIError.invalidEnvironment("Server name must be 1 to 32 characters.")
+        }
+        return try await perform(
+            StoatRequest<ServerCreateResponse>(
+                method: .post,
+                path: "/servers/create",
+                body: .json(try encoder.encode(validated))
+            )
+        )
     }
 
     private func perform<Response: Decodable & Sendable>(_ request: StoatRequest<Response>) async throws -> Response {
