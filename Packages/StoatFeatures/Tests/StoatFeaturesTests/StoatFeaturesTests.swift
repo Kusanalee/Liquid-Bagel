@@ -2202,7 +2202,7 @@ final class StoatFeaturesTests: XCTestCase {
 
         let delivered = await service.events()
         XCTAssertEqual(delivered.count, 1)
-        XCTAssertEqual(delivered.first?.title, "Liquid Bagel notification demo")
+        XCTAssertEqual(delivered.first?.title, "Liquid Bagel test notification")
     }
 
     func testPhase19LifecycleControlsActiveChannelVisibility() {
@@ -2587,6 +2587,109 @@ final class StoatFeaturesTests: XCTestCase {
         let acks = await sender.acks
         XCTAssertEqual(acks.last?.0, dmID)
         XCTAssertEqual(acks.last?.1, message.id)
+    }
+
+    @MainActor
+    func testPhase28DirectMessageLikeSelectionLoadsGroupDMs() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase28-me"
+        let otherUserID: UserID = "phase28-other"
+        let groupID: ChannelID = "phase28-group"
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Dogfood DM", active: true, recipients: [currentUserID, otherUserID])
+        snapshot.messagesByChannelID[groupID] = [
+            Message(id: "01J00000000000000000280001", channelID: groupID, authorID: otherUserID, content: "hello")
+        ]
+
+        let model = MainShellViewModel(snapshot: snapshot)
+        model.selectDirectMessages()
+
+        XCTAssertEqual(model.selection.space, .directMessages)
+        XCTAssertEqual(model.selection.dmChannelID, groupID)
+        XCTAssertEqual(model.selectedConversationChannel?.id, groupID)
+        XCTAssertEqual(model.selectedTimelineMessages.count, 1)
+        model.updateDraft("hello", for: groupID)
+        XCTAssertTrue(model.composerReadiness(for: groupID).canSend)
+        XCTAssertEqual(model.composerReadiness(for: groupID).reason, "Send message")
+    }
+
+    func testPhase28DisplayResolverUsesSafeFallbacks() {
+        let userID: UserID = "01JABCDEFGHIJKLMNOPQRSTUV"
+        let member = ServerMember(id: MemberCompositeKey(serverID: "server", userID: userID), joinedAt: Date(), nickname: "Nick")
+        let user = User(id: userID, username: "username", displayName: "Display")
+
+        XCTAssertEqual(UserDisplayResolver.displayName(user: user, member: member, fallbackID: userID), "Nick")
+        XCTAssertEqual(UserDisplayResolver.displayName(user: user, fallbackID: userID), "Display")
+        XCTAssertEqual(UserDisplayResolver.displayName(user: User(id: userID, username: "username"), fallbackID: userID), "username")
+        XCTAssertEqual(UserDisplayResolver.displayName(user: nil, fallbackID: userID), "01JA...STUV")
+    }
+
+    @MainActor
+    func testPhase28MemberListGroupsLargeServerWithoutDroppingUnknownUsers() {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase28-server"
+        let roleID: RoleID = "phase28-role"
+        let role = Role(id: roleID, name: "Core", permissions: PermissionOverride(), hoist: true, rank: 10)
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Phase 28", roles: [roleID: role])
+        for index in 0..<250 {
+            let userID = UserID(rawValue: "phase28-user-\(index)")
+            if index % 26 != 0 {
+                snapshot.usersByID[userID] = User(id: userID, username: "user\(index)", displayName: index % 2 == 0 ? "User \(index)" : nil, bot: index % 40 == 0 ? BotInformation(ownerID: "owner") : nil, online: index % 3 == 0)
+            }
+            snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(
+                id: MemberCompositeKey(serverID: serverID, userID: userID),
+                joinedAt: Date(),
+                roles: index % 5 == 0 ? [roleID] : []
+            )
+        }
+
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot)
+        let groups = model.memberListGroups(for: serverID)
+
+        XCTAssertEqual(groups.reduce(0) { $0 + $1.items.count }, 250)
+        XCTAssertTrue(groups.contains { $0.id == "role-\(roleID.rawValue)" })
+        XCTAssertTrue(groups.contains { $0.id == "unknown" })
+        XCTAssertEqual(model.memberListPerformanceDiagnostics.totalMembers, 250)
+    }
+
+    @MainActor
+    func testPhase28NotificationPermissionRequestUpdatesDiagnostics() async throws {
+        let manager = MockNotificationPermissionManager(status: .notDetermined)
+        let model = MainShellViewModel(
+            snapshot: MockShellData.snapshot,
+            notificationDeliverer: MockNotificationService(),
+            notificationPermissionManager: manager,
+            dockBadgeManager: MockDockBadgeManager()
+        )
+
+        model.requestNotificationPermission()
+        for _ in 0..<10 where model.lastNotificationPermissionRequest != "result authorized" {
+            try await Task.sleep(for: .milliseconds(30))
+        }
+
+        let requestCount = await manager.requestCount
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(model.notificationPermissionStatus, .authorized)
+        XCTAssertEqual(model.lastNotificationPermissionRequest, "result authorized")
+        XCTAssertTrue(model.phase28DogfoodDiagnostics.notificationAuthorizerKind.contains("MockNotificationPermissionManager"))
+    }
+
+    @MainActor
+    func testPhase28TimelineDiagnosticsAvoidNoOpVisibleRangeSpam() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let server = try XCTUnwrap(model.servers.first)
+        model.selectServer(server.id)
+        let channelID = try XCTUnwrap(model.selectedConversationChannel?.id)
+        let messageID = try XCTUnwrap(model.selectedTimelineMessages.first?.message.id)
+
+        model.updateTimelineVisibility(messageID: messageID, channelID: channelID, isVisible: true)
+        _ = model.selectedTimelineMessageGroups
+        let firstCount = model.timelinePerformanceDiagnostics.visibleRangeUpdateCount
+        model.updateTimelineVisibility(messageID: messageID, channelID: channelID, isVisible: true)
+
+        _ = model.selectedTimelineMessageGroups
+        XCTAssertEqual(model.timelinePerformanceDiagnostics.visibleRangeUpdateCount, firstCount)
+        XCTAssertGreaterThanOrEqual(model.timelinePerformanceDiagnostics.loadedMessageCount, 1)
     }
 
     @MainActor

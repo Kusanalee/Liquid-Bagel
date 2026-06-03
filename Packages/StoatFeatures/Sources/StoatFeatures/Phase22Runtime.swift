@@ -193,7 +193,7 @@ public enum Phase22Derivations {
         localReadStates: [ChannelID: LocalReadState] = [:]
     ) -> [DirectMessageListItem] {
         snapshot.channelsByID.values
-            .filter { $0.kind == .directMessage || $0.kind == .group || $0.kind == .savedMessages }
+            .filter(DMChannelClassifier.isDirectMessageLike)
             .map { channel in
                 let participants = channel.recipients.compactMap { snapshot.usersByID[$0] }
                 let visibleParticipants = currentUserID.map { id in participants.filter { $0.id != id } } ?? participants
@@ -251,9 +251,15 @@ public enum Phase22Derivations {
             return "Saved Notes"
         case .group:
             if let name = channel.name, !name.isEmpty { return name }
-            return participants.map(displayName).joined(separator: ", ")
+            let names = participants.map { UserDisplayResolver.displayName(user: $0, fallbackID: $0.id) }
+            if !names.isEmpty { return names.joined(separator: ", ") }
+            let fallbackIDs = channel.recipients.filter { $0 != currentUserID }.map(UserDisplayResolver.shortenedID)
+            return fallbackIDs.isEmpty ? channel.displayName : fallbackIDs.joined(separator: ", ")
         case .directMessage:
-            return participants.first.map(displayName) ?? channel.displayName
+            if let participant = participants.first {
+                return UserDisplayResolver.displayName(user: participant, fallbackID: participant.id)
+            }
+            return channel.recipients.first(where: { $0 != currentUserID }).map(UserDisplayResolver.shortenedID) ?? channel.displayName
         default:
             return channel.displayName
         }

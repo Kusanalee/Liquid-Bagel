@@ -468,6 +468,11 @@ public final class MainShellViewModel {
     public var notificationPermissionStatus: NotificationPermissionStatus = .unknown
     public var notificationBanners: [NotificationEvent] = []
     public var notificationDiagnostics = NotificationDiagnostics()
+    public var lastNotificationPermissionRequest: String?
+    public var notificationAuthorizerKind: String = "unknown"
+    public var lastServerSettingsButtonAction: String?
+    public var memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics()
+    public var timelinePerformanceDiagnostics = TimelinePerformanceDiagnostics()
     public var appLifecyclePhase: AppLifecyclePhase = .active
     public var queuedNotificationRoutes: [QueuedNotificationRoute] = []
     public var friendsTab: FriendsTab = .online
@@ -572,6 +577,11 @@ public final class MainShellViewModel {
     @ObservationIgnored private let attachmentValidationPolicy = AttachmentValidationPolicy()
     @ObservationIgnored private var visibleRangeUpdateTasks: [ChannelID: Task<Void, Never>] = [:]
     @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
+    @ObservationIgnored private var selectedTimelineGroupCacheKey: String?
+    @ObservationIgnored private var selectedTimelineGroupCache: [TimelineMessageGroup] = []
+    @ObservationIgnored private var memberListGroupCacheKey: String?
+    @ObservationIgnored private var memberListGroupCache: [MemberListGroup] = []
+    @ObservationIgnored private var timelineVisibleRangeUpdateCount = 0
 
     public init(
         selection: ShellSelection = ShellSelection(),
@@ -622,6 +632,7 @@ public final class MainShellViewModel {
         self.messageReferenceResolver = messageReferenceResolver ?? DisabledMessageReferenceResolver()
         self.notificationDeliverer = notificationDeliverer ?? UserNotificationsNotificationService()
         self.notificationPermissionManager = notificationPermissionManager ?? UserNotificationsPermissionManager()
+        self.notificationAuthorizerKind = String(describing: type(of: self.notificationPermissionManager))
         self.dockBadgeManager = dockBadgeManager ?? AppKitDockBadgeManager()
         self.communityAPIClient = communityAPIClient ?? MockStoatAPIClient()
         self.notificationRouteCenter = notificationRouteCenter
@@ -697,7 +708,7 @@ public final class MainShellViewModel {
     }
 
     public var selectedTimelineMessageGroups: [TimelineMessageGroup] {
-        TimelineMessageGrouping.group(selectedTimelineMessages)
+        cachedSelectedTimelineMessageGroups()
     }
 
     public var selectedChannelMessageState: ChannelMessageState {
@@ -718,6 +729,24 @@ public final class MainShellViewModel {
             embedRenderCount: selectedTimelineMessages.reduce(0) { $0 + ($1.message.embeds?.count ?? 0) },
             pendingDropAttachmentCount: attachments.queuedDraftCount,
             notificationStatus: notificationDiagnostics.permissionStatus.rawValue
+        )
+    }
+
+    public var phase28DogfoodDiagnostics: Phase28DogfoodDiagnostics {
+        let missingUserIDs = missingVisibleUserIDs()
+        let memberDiagnostics = memberListPerformanceDiagnostics
+        let timelineDiagnostics = timelinePerformanceDiagnostics
+        return Phase28DogfoodDiagnostics(
+            dmSelectionState: selection.dmChannelID.map { "selected \($0.rawValue)" } ?? "not selected",
+            dmLoadState: selection.dmChannelID.map { String(describing: messageController.state(for: $0)) } ?? "idle",
+            missingUserCount: missingUserIDs.count,
+            userHydrationQueueCount: 0,
+            notificationAuthorizationStatus: notificationPermissionStatus.rawValue,
+            notificationAuthorizerKind: notificationAuthorizerKind,
+            lastNotificationPermissionRequest: lastNotificationPermissionRequest,
+            serverSettingsButtonState: lastServerSettingsButtonAction ?? (selectedServer == nil ? "no selected server" : "ready"),
+            memberListDiagnostics: "members \(memberDiagnostics.totalMembers) groups \(memberDiagnostics.groupCount) queue \(memberDiagnostics.avatarLoadQueueCount)",
+            timelinePerformanceDiagnostics: "loaded \(timelineDiagnostics.loadedMessageCount) grouped \(timelineDiagnostics.groupedMessageCount) queue \(timelineDiagnostics.avatarLoadQueueCount)"
         )
     }
 
@@ -780,11 +809,108 @@ public final class MainShellViewModel {
         return users.sorted { ($0.displayName ?? $0.username) < ($1.displayName ?? $1.username) }
     }
 
+    public func memberListGroups(for serverID: ServerID?, query: String = "") -> [MemberListGroup] {
+        guard let serverID, let server = snapshot.serversByID[serverID] else {
+            memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(avatarLoadQueueCount: imageResourceLoadTasks.count)
+            return []
+        }
+        let key = memberListCacheKey(serverID: serverID, query: query)
+        if key == memberListGroupCacheKey {
+            memberListPerformanceDiagnostics.avatarLoadQueueCount = imageResourceLoadTasks.count
+            return memberListGroupCache
+        }
+        let started = Date()
+        let groups = MemberListDeriver.groups(server: server, snapshot: snapshot, query: query)
+        memberListGroupCacheKey = key
+        memberListGroupCache = groups
+        let total = groups.reduce(0) { $0 + $1.items.count }
+        memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(
+            totalMembers: total,
+            visibleMemberEstimate: min(total, 80),
+            groupCount: groups.count,
+            avatarLoadQueueCount: imageResourceLoadTasks.count,
+            lastGroupingDurationDescription: "\(Int(Date().timeIntervalSince(started) * 1000))ms"
+        )
+        return groups
+    }
+
     public func serverMembers(for serverID: ServerID?) -> [ServerMember] {
         guard let serverID else { return [] }
         return snapshot.membersByServerAndUserID.values
             .filter { $0.id.serverID == serverID }
             .sorted { $0.id.userID.rawValue < $1.id.userID.rawValue }
+    }
+
+    private func cachedSelectedTimelineMessageGroups() -> [TimelineMessageGroup] {
+        let messages = selectedTimelineMessages
+        let key = timelineGroupCacheKey(messages: messages)
+        if key == selectedTimelineGroupCacheKey {
+            updateTimelinePerformanceDiagnostics(messages: messages, groups: selectedTimelineGroupCache)
+            return selectedTimelineGroupCache
+        }
+        let started = Date()
+        let groups = TimelineMessageGrouping.group(messages)
+        selectedTimelineGroupCacheKey = key
+        selectedTimelineGroupCache = groups
+        updateTimelinePerformanceDiagnostics(messages: messages, groups: groups, elapsed: Date().timeIntervalSince(started))
+        return groups
+    }
+
+    private func timelineGroupCacheKey(messages: [TimelineMessage]) -> String {
+        guard let channelID = selection.channelID ?? selection.dmChannelID else { return "none" }
+        let newest = messages.last?.message.id.rawValue ?? "-"
+        let oldest = messages.first?.message.id.rawValue ?? "-"
+        let pending = messages.filter { $0.status != .confirmed }.map { $0.id.rawValue }.joined(separator: ",")
+        return "\(channelID.rawValue)|\(messages.count)|\(oldest)|\(newest)|\(pending)"
+    }
+
+    private func memberListCacheKey(serverID: ServerID, query: String) -> String {
+        let memberVersion = snapshot.membersByServerAndUserID.values
+            .filter { $0.id.serverID == serverID }
+            .map { member in
+                "\(member.id.userID.rawValue):\(member.nickname ?? ""):\(member.roles.map(\.rawValue).joined(separator: ",")):\(member.avatar?.id.rawValue ?? "-")"
+            }
+            .sorted()
+            .joined(separator: "|")
+        let userVersion = snapshot.usersByID.values
+            .map { "\($0.id.rawValue):\($0.displayName ?? ""):\($0.username):\($0.online):\($0.avatar?.id.rawValue ?? "-")" }
+            .sorted()
+            .joined(separator: "|")
+        return "\(serverID.rawValue)|\(query)|\(memberVersion)|\(userVersion)"
+    }
+
+    private func updateTimelinePerformanceDiagnostics(messages: [TimelineMessage], groups: [TimelineMessageGroup], elapsed: TimeInterval? = nil) {
+        let visibleCount = visibleMessageIDsByChannelID[selection.channelID ?? selection.dmChannelID ?? ""]?.count ?? 0
+        timelinePerformanceDiagnostics = TimelinePerformanceDiagnostics(
+            loadedMessageCount: messages.count,
+            renderedMessageEstimate: visibleCount == 0 ? min(messages.count, 80) : visibleCount,
+            groupedMessageCount: groups.count,
+            markdownCacheCount: 0,
+            embedCacheCount: 0,
+            avatarLoadQueueCount: imageResourceLoadTasks.count,
+            visibleRangeUpdateCount: timelineVisibleRangeUpdateCount,
+            lastSlowOperation: elapsed.map { $0 > 0.05 ? "timeline grouping \(Int($0 * 1000))ms" : nil } ?? timelinePerformanceDiagnostics.lastSlowOperation
+        )
+    }
+
+    private func missingVisibleUserIDs() -> Set<UserID> {
+        var ids = Set<UserID>()
+        for message in selectedTimelineMessages {
+            if snapshot.usersByID[message.message.authorID] == nil {
+                ids.insert(message.message.authorID)
+            }
+        }
+        if let channel = selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
+            for id in channel.recipients where snapshot.usersByID[id] == nil {
+                ids.insert(id)
+            }
+        }
+        if let serverID = selection.serverID {
+            for member in snapshot.membersByServerAndUserID.values where member.id.serverID == serverID && snapshot.usersByID[member.id.userID] == nil {
+                ids.insert(member.id.userID)
+            }
+        }
+        return ids
     }
 
     public var selectedServerMember: ServerMember? {
@@ -1328,6 +1454,7 @@ public final class MainShellViewModel {
     }
 
     public func openServerOverview() {
+        lastServerSettingsButtonAction = selectedServer.map { "opened \($0.id.rawValue)" } ?? "blocked: no selected server"
         isServerOverviewPresented = true
         selectedServerSettingsTab = .overview
         if let details = serverSettingsDetails() {
@@ -2166,7 +2293,7 @@ public final class MainShellViewModel {
         selection.space = .directMessages
         selection.serverID = nil
         selection.channelID = nil
-        selection.dmChannelID = snapshot.channelsByID.values.first { $0.kind == .directMessage }?.id
+        selection.dmChannelID = snapshot.channelsByID.values.first(where: DMChannelClassifier.isDirectMessageLike)?.id
         clearTimelineSelection()
         reconcileSearchHighlightsForSelectedChannel()
         placeholderStatus = nil
@@ -2349,7 +2476,7 @@ public final class MainShellViewModel {
             if selection.space == .directMessages,
                let dmChannelID = selection.dmChannelID,
                snapshot.channelsByID[dmChannelID] == nil {
-                selection.dmChannelID = snapshot.channelsByID.values.first { $0.kind == .directMessage }?.id
+                selection.dmChannelID = snapshot.channelsByID.values.first(where: DMChannelClassifier.isDirectMessageLike)?.id
             }
         case let .server(serverID):
             if snapshot.serversByID[serverID] == nil {
@@ -2462,7 +2589,7 @@ public final class MainShellViewModel {
             restoredLiveConnectionGeneration = nil
         }
         if sessionCoordinator.mode == .liveManual, sessionCoordinator.sessionState == .connected {
-            loadIdentityImagesForCurrentSnapshot()
+            loadVisibleIdentityImagesForCurrentSelection()
         }
     }
 
@@ -2829,7 +2956,7 @@ public final class MainShellViewModel {
             loadInlineImagePreviews(for: message)
             loadImageResource(for: avatarFile(for: message), kind: .userAvatar)
         }
-        loadIdentityImagesForCurrentSnapshot()
+        loadVisibleIdentityImagesForCurrentSelection()
         lastImageResourceAction = "Reloaded visible images"
     }
 
@@ -2870,16 +2997,24 @@ public final class MainShellViewModel {
         }
     }
 
-    private func loadIdentityImagesForCurrentSnapshot() {
-        for user in snapshot.usersByID.values {
-            loadImageResource(for: user.avatar, kind: .userAvatar)
-        }
-        for member in snapshot.membersByServerAndUserID.values {
-            loadImageResource(for: member.avatar, kind: .userAvatar)
-        }
-        for server in snapshot.serversByID.values {
+    private func loadVisibleIdentityImagesForCurrentSelection() {
+        if let server = selectedServer {
             loadImageResource(for: server.icon, kind: .serverIcon)
             loadImageResource(for: server.banner, kind: .serverBanner)
+        }
+        for message in selectedTimelineMessages.prefix(80).map(\.message) {
+            loadImageResource(for: avatarFile(for: message), kind: .userAvatar)
+        }
+        if let channel = selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
+            for userID in channel.recipients.prefix(12) {
+                loadImageResource(for: snapshot.usersByID[userID]?.avatar, kind: .userAvatar)
+            }
+        } else if let serverID = selection.serverID {
+            for group in memberListGroups(for: serverID).prefix(4) {
+                for item in group.items.prefix(24) {
+                    loadImageResource(for: item.avatar, kind: .userAvatar)
+                }
+            }
         }
     }
 
@@ -2921,7 +3056,7 @@ public final class MainShellViewModel {
     }
 
     public func displayName(for user: User?, member: ServerMember? = nil, fallbackID: UserID? = nil) -> String {
-        member?.nickname ?? user?.displayName ?? user?.username ?? fallbackID?.rawValue ?? "Unknown"
+        UserDisplayResolver.displayName(user: user, member: member, fallbackID: fallbackID)
     }
 
     public func avatarFile(for message: Message) -> File? {
@@ -3778,11 +3913,14 @@ public final class MainShellViewModel {
     public func updateTimelineVisibility(messageID: MessageID, channelID: ChannelID, isVisible: Bool) {
         guard channelID == (selection.channelID ?? selection.dmChannelID) else { return }
         var visible = visibleMessageIDsByChannelID[channelID] ?? []
+        let wasVisible = visible.contains(messageID)
+        guard wasVisible != isVisible else { return }
         if isVisible {
             visible.insert(messageID)
         } else {
             visible.remove(messageID)
         }
+        timelineVisibleRangeUpdateCount += 1
         visibleMessageIDsByChannelID[channelID] = visible
         let loadedIDs = selectedTimelineMessages.map(\.message.id)
         timelineViewport = viewportReducer.visibleRangeChanged(
@@ -3962,10 +4100,13 @@ public final class MainShellViewModel {
     }
 
     public func requestNotificationPermission() {
+        lastNotificationPermissionRequest = "requesting"
+        updateNotificationDiagnostics()
         Task { [weak self, manager = notificationPermissionManager] in
             let status = await manager.requestAuthorization()
             await MainActor.run {
                 self?.notificationPermissionStatus = status
+                self?.lastNotificationPermissionRequest = "result \(status.rawValue)"
                 self?.placeholderStatus = "Notification permission: \(status.rawValue)"
                 self?.updateNotificationDiagnostics()
             }
@@ -4014,8 +4155,8 @@ public final class MainShellViewModel {
         let event = NotificationEvent(
             id: "demo-\(UUID().uuidString)",
             route: NotificationRoute(serverID: channel.serverID, channelID: channel.id, messageID: nil),
-            title: "Liquid Bagel notification demo",
-            body: "This is an explicit mock notification preview.",
+            title: "Liquid Bagel test notification",
+            body: "This notification was sent from the explicit settings test action.",
             kind: .mention
         )
         if notificationPreferences.inAppBannersEnabled {
@@ -4028,7 +4169,11 @@ public final class MainShellViewModel {
     }
 
     public func copyRedactedNotificationDiagnostics() {
-        let text = Phase17MessageActions.redactedDiagnosticText(notificationDiagnostics.redactedText)
+        let extra = """
+        authorizer: \(notificationAuthorizerKind)
+        lastPermissionRequest: \(lastNotificationPermissionRequest ?? "-")
+        """
+        let text = Phase17MessageActions.redactedDiagnosticText(NotificationContentFormatter.sanitize(notificationDiagnostics.redactedText + "\n" + extra))
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -4670,7 +4815,7 @@ public final class MainShellViewModel {
     }
 
     private func firstVisibleTextChannel(in serverID: ServerID) -> Channel? {
-        channels(for: serverID).first { $0.kind == .textChannel || $0.kind == .group || $0.kind == .savedMessages }
+        channels(for: serverID).first { $0.kind == .textChannel }
     }
 
     private var isRuntimeSendCapable: Bool {
@@ -4709,7 +4854,7 @@ public final class MainShellViewModel {
         updateNotificationDiagnostics()
         replayQueuedNotificationRoutesIfReady()
         if effectiveRuntimeMode == .liveManual, effectiveSessionState == .connected {
-            loadIdentityImagesForCurrentSnapshot()
+            loadVisibleIdentityImagesForCurrentSelection()
         }
     }
 
@@ -6590,6 +6735,9 @@ public struct ChannelListView: View {
                     GlassIconButton("Server overview", systemImage: "gearshape") {
                         viewModel.openServerOverview()
                     }
+                    .frame(minWidth: 32, minHeight: 32)
+                    .contentShape(Rectangle())
+                    .zIndex(2)
                     .accessibilityLabel("Server overview")
                     .accessibilityHint("Open selected server overview and management actions")
                 }
@@ -6633,6 +6781,7 @@ public struct ChannelListView: View {
             }
             .frame(height: 72)
             .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+            .allowsHitTesting(false)
             .accessibilityLabel("Server banner for \(server.name)")
         }
         #endif
@@ -7577,41 +7726,121 @@ public struct MemberPanelView: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.large) {
             HStack {
-                Text("Members")
+                Text(title)
                     .font(.headline)
                 Spacer()
-                Text("\(members.count)")
+                Text("\(count)")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
             }
-            if members.isEmpty {
-                EmptyStateView(title: "No members", message: "Select a server to preview members.", systemImage: "person.2")
-                    .frame(maxWidth: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-                        Text("ONLINE")
-                            .font(StoatTypography.section)
-                            .foregroundStyle(.secondary)
-                        ForEach(members.filter(\.online)) { user in
-                            MemberRow(user: user, subtitle: roleSubtitle(for: user), displayName: displayName(for: user), imageData: avatarData(for: user))
-                                .onAppear { loadAvatar(for: user) }
-                        }
-                        Text("OFFLINE")
-                            .font(StoatTypography.section)
-                            .foregroundStyle(.secondary)
-                            .padding(.top, StoatSpacing.medium)
-                        ForEach(members.filter { !$0.online }) { user in
-                            MemberRow(user: user, subtitle: roleSubtitle(for: user), displayName: displayName(for: user), imageData: avatarData(for: user))
-                                .onAppear { loadAvatar(for: user) }
-                        }
-                    }
-                }
-            }
+            content
             Spacer()
         }
         .padding(StoatSpacing.large)
         .background(.thinMaterial)
+    }
+
+    @ViewBuilder private var content: some View {
+        if let channel = viewModel.selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
+            dmParticipants(channel)
+        } else if viewModel.selection.serverID != nil {
+            serverMembers
+        } else {
+            EmptyStateView(title: "No member list", message: "Open a server channel or DM to show people here.", systemImage: "person.2")
+                .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var title: String {
+        if let channel = viewModel.selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
+            return channel.kind == .savedMessages ? "Saved Notes" : "Participants"
+        }
+        return "Members"
+    }
+
+    private var count: Int {
+        if let channel = viewModel.selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
+            return channel.recipients.count
+        }
+        return groups.reduce(0) { $0 + $1.items.count }
+    }
+
+    private var groups: [MemberListGroup] {
+        viewModel.memberListGroups(for: viewModel.selection.serverID)
+    }
+
+    @ViewBuilder private var serverMembers: some View {
+        if groups.isEmpty {
+            EmptyStateView(title: "No members", message: "Member data is not present in the current snapshot.", systemImage: "person.2")
+                .frame(maxWidth: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    ForEach(groups) { group in
+                        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                            Text(group.title.uppercased())
+                                .font(StoatTypography.section)
+                                .foregroundStyle(.secondary)
+                            ForEach(group.items) { item in
+                                memberListRow(item)
+                                    .onAppear { viewModel.loadImageResource(for: item.avatar, kind: .userAvatar) }
+                            }
+                        }
+                    }
+                    if viewModel.isDeveloperControlsEnabled {
+                        Text("Members \(viewModel.memberListPerformanceDiagnostics.totalMembers) · groups \(viewModel.memberListPerformanceDiagnostics.groupCount) · image queue \(viewModel.memberListPerformanceDiagnostics.avatarLoadQueueCount)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func dmParticipants(_ channel: Channel) -> some View {
+        let ids = channel.kind == .savedMessages ? [viewModel.currentUserID].compactMap { $0 } : channel.recipients
+        if ids.isEmpty {
+            EmptyStateView(title: "No participants", message: "Participant data is not present in the current snapshot.", systemImage: "person")
+                .frame(maxWidth: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                    ForEach(ids, id: \.self) { userID in
+                        let user = viewModel.snapshot.usersByID[userID]
+                        let item = MemberListItem(userID: userID, user: user, member: nil)
+                        memberListRow(item)
+                            .onAppear { viewModel.loadImageResource(for: item.avatar, kind: .userAvatar) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func memberListRow(_ item: MemberListItem) -> some View {
+        HStack(spacing: StoatSpacing.medium) {
+            AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.isOnline, imageData: viewModel.imageData(for: item.avatar, kind: .userAvatar))
+            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                HStack(spacing: StoatSpacing.xSmall) {
+                    Text(item.displayName)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    if item.isBot {
+                        Text("BOT")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 4)
+                            .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                    }
+                }
+                Text(item.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(.vertical, StoatSpacing.xxSmall)
+        .contentShape(Rectangle())
     }
 
     private var members: [User] {
@@ -8955,24 +9184,37 @@ public struct ServerOverviewView: View {
                         Text("Member management is available when member data is present in the current snapshot.")
                             .foregroundStyle(.secondary)
                     }
-                    ForEach(viewModel.memberManagementItems(for: details)) { item in
-                        HStack {
-                            AvatarView(title: item.displayName, size: 32, isOnline: item.user?.online == true, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
-                            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
-                                Text(item.displayName)
-                                Text("\(item.username) · \(item.roles.map(\.name).joined(separator: ", ").isEmpty ? "No roles" : item.roles.map(\.name).joined(separator: ", "))")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                if let timeoutSummary = item.timeoutSummary {
-                                    Text(timeoutSummary)
-                                        .font(.caption)
-                                        .foregroundStyle(.orange)
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
+                            ForEach(viewModel.memberManagementItems(for: details)) { item in
+                                HStack {
+                                    AvatarView(title: item.displayName, size: 32, isOnline: item.user?.online == true, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
+                                    VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                                        Text(item.displayName)
+                                        Text("\(item.username) · \(item.roles.map(\.name).joined(separator: ", ").isEmpty ? "No roles" : item.roles.map(\.name).joined(separator: ", "))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        if let timeoutSummary = item.timeoutSummary {
+                                            Text(timeoutSummary)
+                                                .font(.caption)
+                                                .foregroundStyle(.orange)
+                                        }
+                                    }
+                                    Spacer()
+                                    Button { viewModel.openMemberDetail(item.member) } label: { Label("Details", systemImage: "person.text.rectangle") }
+                                }
+                                .onAppear {
+                                    viewModel.loadImageResource(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar)
                                 }
                             }
-                            Spacer()
-                            Button { viewModel.openMemberDetail(item.member) } label: { Label("Details", systemImage: "person.text.rectangle") }
+                            if viewModel.isDeveloperControlsEnabled {
+                                Text("Member list \(viewModel.memberListPerformanceDiagnostics.totalMembers) · image queue \(viewModel.memberListPerformanceDiagnostics.avatarLoadQueueCount)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
+                    .frame(minHeight: 160, maxHeight: 420)
                 }
             }
 

@@ -619,11 +619,18 @@ private struct NotificationSettingsTab: View {
         Form {
             Section("Permission") {
                 LabeledContent("System status", value: viewModel.notificationPermissionStatus.rawValue)
+                LabeledContent("Authorizer", value: viewModel.notificationAuthorizerKind)
+                LabeledContent("Last request", value: viewModel.lastNotificationPermissionRequest ?? "-")
                 Button("Request Notification Permission") {
                     viewModel.requestNotificationPermission()
                 }
                 Button("Refresh Status") {
                     viewModel.refreshNotificationPermissionStatus()
+                }
+                if viewModel.notificationPermissionStatus == .denied {
+                    Text("Notifications are denied in macOS System Settings. Open System Settings > Notifications and allow Liquid Bagel, then refresh this status.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
                 Text("Permission prompts happen only here. Status refreshes here and when Liquid Bagel becomes active.")
                     .font(.caption)
@@ -680,7 +687,8 @@ private struct NotificationSettingsTab: View {
                 LabeledContent("Last event", value: viewModel.notificationDiagnostics.lastEventKind?.rawValue ?? "-")
                 HStack {
                     Button("Copy Diagnostics") { viewModel.copyRedactedNotificationDiagnostics() }
-                    Button("Demo Notification") { viewModel.deliverMockNotificationDemo() }
+                    Button("Test Notification") { viewModel.deliverMockNotificationDemo() }
+                        .disabled(!viewModel.notificationPermissionStatus.allowsDelivery)
                 }
             }
         }
