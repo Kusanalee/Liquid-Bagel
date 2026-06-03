@@ -47,6 +47,10 @@ public enum UserDisplayResolver {
         return "\(raw.prefix(4))...\(raw.suffix(4))"
     }
 
+    public static func systemFallbackName(_ id: UserID) -> String {
+        "User \(shortenedID(id))"
+    }
+
     private static func trimmed(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed?.isEmpty == false ? trimmed : nil
@@ -96,19 +100,92 @@ public struct MemberListPerformanceDiagnostics: Hashable, Sendable {
     public var groupCount: Int
     public var avatarLoadQueueCount: Int
     public var lastGroupingDurationDescription: String?
+    public var knownMemberCount: Int
+    public var knownUserCount: Int
+    public var renderedMemberCount: Int
+    public var droppedMemberCount: Int
+    public var droppedReasonSummary: String?
 
     public init(
         totalMembers: Int = 0,
         visibleMemberEstimate: Int = 0,
         groupCount: Int = 0,
         avatarLoadQueueCount: Int = 0,
-        lastGroupingDurationDescription: String? = nil
+        lastGroupingDurationDescription: String? = nil,
+        knownMemberCount: Int = 0,
+        knownUserCount: Int = 0,
+        renderedMemberCount: Int = 0,
+        droppedMemberCount: Int = 0,
+        droppedReasonSummary: String? = nil
     ) {
         self.totalMembers = totalMembers
         self.visibleMemberEstimate = visibleMemberEstimate
         self.groupCount = groupCount
         self.avatarLoadQueueCount = avatarLoadQueueCount
         self.lastGroupingDurationDescription = lastGroupingDurationDescription
+        self.knownMemberCount = knownMemberCount
+        self.knownUserCount = knownUserCount
+        self.renderedMemberCount = renderedMemberCount
+        self.droppedMemberCount = droppedMemberCount
+        self.droppedReasonSummary = droppedReasonSummary
+    }
+}
+
+public struct DMRouteDiagnostics: Hashable, Sendable {
+    public var clickedChannelID: ChannelID?
+    public var selectedConversationChannelID: ChannelID?
+    public var selectedServerID: ServerID?
+    public var messageLoadRequested: Bool
+    public var lastLoadResult: String?
+    public var composerTargetDescription: String?
+
+    public init(
+        clickedChannelID: ChannelID? = nil,
+        selectedConversationChannelID: ChannelID? = nil,
+        selectedServerID: ServerID? = nil,
+        messageLoadRequested: Bool = false,
+        lastLoadResult: String? = nil,
+        composerTargetDescription: String? = nil
+    ) {
+        self.clickedChannelID = clickedChannelID
+        self.selectedConversationChannelID = selectedConversationChannelID
+        self.selectedServerID = selectedServerID
+        self.messageLoadRequested = messageLoadRequested
+        self.lastLoadResult = lastLoadResult
+        self.composerTargetDescription = composerTargetDescription
+    }
+}
+
+public enum ChannelContextMenuActionKind: String, Hashable, Sendable {
+    case settings
+    case createChannel
+    case copyChannelID
+    case deleteChannel
+}
+
+public struct ChannelContextMenuItem: Hashable, Sendable, Identifiable {
+    public var id: ChannelContextMenuActionKind { kind }
+    public var kind: ChannelContextMenuActionKind
+    public var title: String
+    public var systemImage: String
+    public var disabledReason: String?
+    public var isDestructive: Bool
+    public var isDeveloperOnly: Bool
+
+    public init(
+        kind: ChannelContextMenuActionKind,
+        title: String,
+        systemImage: String,
+        disabledReason: String? = nil,
+        isDestructive: Bool = false,
+        isDeveloperOnly: Bool = false
+    ) {
+        self.kind = kind
+        self.title = title
+        self.systemImage = systemImage
+        self.disabledReason = disabledReason
+        self.isDestructive = isDestructive
+        self.isDeveloperOnly = isDeveloperOnly
     }
 }
 

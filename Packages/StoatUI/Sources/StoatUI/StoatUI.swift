@@ -24,6 +24,28 @@ public struct StoatUISnapshot: Equatable, Sendable {
     }
 }
 
+public enum ComposerTextSizing {
+    public static let compactHeight: CGFloat = 34
+    public static let maximumHeight: CGFloat = 92
+    public static let lineHeight: CGFloat = 18
+
+    public static func height(for text: String, approximateCharactersPerLine: Int = 72) -> CGFloat {
+        let normalizedLimit = max(12, approximateCharactersPerLine)
+        let lineCount = visualLineEstimate(for: text, approximateCharactersPerLine: normalizedLimit)
+        let height = compactHeight + CGFloat(max(0, lineCount - 1)) * lineHeight
+        return min(maximumHeight, max(compactHeight, height))
+    }
+
+    private static func visualLineEstimate(for text: String, approximateCharactersPerLine: Int) -> Int {
+        guard !text.isEmpty else { return 1 }
+        return text
+            .components(separatedBy: .newlines)
+            .reduce(0) { partial, line in
+                partial + max(1, Int(ceil(Double(line.count) / Double(approximateCharactersPerLine))))
+            }
+    }
+}
+
 public struct GlassPanel<Content: View>: View {
     private let material: StoatGlassMaterial
     private let padding: CGFloat
@@ -547,7 +569,7 @@ public struct GlassComposer: View {
                     }
                     ZStack(alignment: .topLeading) {
                         ComposerTextInput(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSend, onFocus: onFocus, onPasteImageData: onPasteImageData, onPasteFileURLs: onPasteFileURLs)
-                            .frame(minHeight: 34, maxHeight: 92)
+                            .frame(height: ComposerTextSizing.height(for: text))
                         if text.isEmpty {
                             Text(placeholder)
                                 .foregroundStyle(.secondary)
@@ -747,6 +769,8 @@ private struct ComposerTextView: NSViewRepresentable {
         let scrollView = NSTextView.scrollableTextView()
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
         guard let textView = scrollView.documentView as? NSTextView else {
             return scrollView
         }
@@ -758,6 +782,7 @@ private struct ComposerTextView: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.textContainer?.widthTracksTextView = true
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.string = text
         return scrollView
     }
@@ -1900,10 +1925,6 @@ public struct ChannelRow: View {
         .buttonStyle(.plain)
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.48 : 1)
-        .contextMenu {
-            Button("Channel settings unavailable in Phase 3") {}
-                .disabled(true)
-        }
         .accessibilityLabel(StoatAccessibility.channelLabel(name: channel.displayName, unreadCount: unreadCount, mentionCount: mentionCount, isSelected: isSelected, isDisabled: isDisabled))
         .accessibilityHint(isDisabled ? "Voice channels are deferred in this phase" : "Open channel")
     }

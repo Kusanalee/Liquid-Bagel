@@ -383,7 +383,7 @@ public enum Phase13Accessibility {
 
     public static func channelSearchResultLabel(_ result: ChannelSearchResult, isSelected: Bool) -> String {
         var parts = [
-            result.authorDisplayName ?? result.authorID.rawValue,
+            result.authorDisplayName ?? UserDisplayResolver.shortenedID(result.authorID),
             result.snippet,
             result.mode.displayName
         ]

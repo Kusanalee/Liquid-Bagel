@@ -465,6 +465,7 @@ public final class MainShellViewModel {
     public var imageResourceStates: [ImageCacheKey: AttachmentPreviewState] = [:]
     public var lastImageResourceAction: String?
     public var messageSendDiagnostics = MessageSendDiagnostics()
+    public var dmRouteDiagnostics = DMRouteDiagnostics()
     public var notificationPermissionStatus: NotificationPermissionStatus = .unknown
     public var notificationBanners: [NotificationEvent] = []
     public var notificationDiagnostics = NotificationDiagnostics()
@@ -680,13 +681,24 @@ public final class MainShellViewModel {
         return snapshot.channelsByID[id]
     }
 
+    public var selectedConversationChannelID: ChannelID? {
+        switch selection.space {
+        case .server:
+            return selection.channelID
+        case .directMessages:
+            return selection.dmChannelID
+        case .home, .discover:
+            return nil
+        }
+    }
+
     public var selectedConversationChannel: Channel? {
-        guard let id = selection.channelID ?? selection.dmChannelID else { return nil }
+        guard let id = selectedConversationChannelID else { return nil }
         return snapshot.channelsByID[id]
     }
 
     public var selectedMessages: [Message] {
-        guard let channelID = selection.channelID ?? selection.dmChannelID else { return [] }
+        guard let channelID = selectedConversationChannelID else { return [] }
         let timelineMessages = selectedTimelineMessages
         if !timelineMessages.isEmpty {
             return timelineMessages.map(\.message)
@@ -699,7 +711,7 @@ public final class MainShellViewModel {
     }
 
     public var selectedTimelineMessages: [TimelineMessage] {
-        guard let channelID = selection.channelID ?? selection.dmChannelID else { return [] }
+        guard let channelID = selectedConversationChannelID else { return [] }
         let stateMessages = messageController.state(for: channelID).timelineMessages
         if !stateMessages.isEmpty {
             return stateMessages
@@ -712,7 +724,7 @@ public final class MainShellViewModel {
     }
 
     public var selectedChannelMessageState: ChannelMessageState {
-        messageController.state(for: selection.channelID ?? selection.dmChannelID)
+        messageController.state(for: selectedConversationChannelID)
     }
 
     public var phase27Diagnostics: Phase27Diagnostics {
@@ -722,7 +734,7 @@ public final class MainShellViewModel {
             selectedRouteDescription: String(describing: selection.route),
             selectedChannelID: channel?.id,
             selectedChannelKind: channel?.kind.rawAPIValue,
-            dmLoadState: selection.dmChannelID.map { String(describing: messageController.state(for: $0)) },
+            dmLoadState: selection.dmChannelID.map { safeLoadResultDescription(for: $0) },
             lastSystemEventRender: selectedTimelineMessages.last(where: { $0.message.system != nil }).map { systemEventText(for: $0.message) },
             bannerPlacementState: selectedServer?.banner == nil ? "no banner" : "sidebar header",
             lastReadAckDecision: lastAckResult,
@@ -737,8 +749,8 @@ public final class MainShellViewModel {
         let memberDiagnostics = memberListPerformanceDiagnostics
         let timelineDiagnostics = timelinePerformanceDiagnostics
         return Phase28DogfoodDiagnostics(
-            dmSelectionState: selection.dmChannelID.map { "selected \($0.rawValue)" } ?? "not selected",
-            dmLoadState: selection.dmChannelID.map { String(describing: messageController.state(for: $0)) } ?? "idle",
+            dmSelectionState: selection.dmChannelID.map { "selected \(TimelineCopyFormatter.shortID($0.rawValue))" } ?? "not selected",
+            dmLoadState: selection.dmChannelID.map { safeLoadResultDescription(for: $0) } ?? "idle",
             missingUserCount: missingUserIDs.count,
             userHydrationQueueCount: 0,
             notificationAuthorizationStatus: notificationPermissionStatus.rawValue,
@@ -803,9 +815,6 @@ public final class MainShellViewModel {
             .filter { $0.serverID == serverID }
             .map(\.userID)
         let users = ids.compactMap { snapshot.usersByID[$0] }
-        if users.isEmpty {
-            return snapshot.usersByID.values.sorted { $0.username < $1.username }
-        }
         return users.sorted { ($0.displayName ?? $0.username) < ($1.displayName ?? $1.username) }
     }
 
@@ -823,13 +832,21 @@ public final class MainShellViewModel {
         let groups = MemberListDeriver.groups(server: server, snapshot: snapshot, query: query)
         memberListGroupCacheKey = key
         memberListGroupCache = groups
+        let knownMemberCount = snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID }.count
+        let knownUserCount = snapshot.usersByID.count
         let total = groups.reduce(0) { $0 + $1.items.count }
+        let dropped = max(0, knownMemberCount - total)
         memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(
             totalMembers: total,
             visibleMemberEstimate: min(total, 80),
             groupCount: groups.count,
             avatarLoadQueueCount: imageResourceLoadTasks.count,
-            lastGroupingDurationDescription: "\(Int(Date().timeIntervalSince(started) * 1000))ms"
+            lastGroupingDurationDescription: "\(Int(Date().timeIntervalSince(started) * 1000))ms",
+            knownMemberCount: knownMemberCount,
+            knownUserCount: knownUserCount,
+            renderedMemberCount: total,
+            droppedMemberCount: dropped,
+            droppedReasonSummary: dropped == 0 ? nil : "Filtered by query or unavailable role/member data"
         )
         return groups
     }
@@ -857,7 +874,7 @@ public final class MainShellViewModel {
     }
 
     private func timelineGroupCacheKey(messages: [TimelineMessage]) -> String {
-        guard let channelID = selection.channelID ?? selection.dmChannelID else { return "none" }
+        guard let channelID = selectedConversationChannelID else { return "none" }
         let newest = messages.last?.message.id.rawValue ?? "-"
         let oldest = messages.first?.message.id.rawValue ?? "-"
         let pending = messages.filter { $0.status != .confirmed }.map { $0.id.rawValue }.joined(separator: ",")
@@ -880,7 +897,7 @@ public final class MainShellViewModel {
     }
 
     private func updateTimelinePerformanceDiagnostics(messages: [TimelineMessage], groups: [TimelineMessageGroup], elapsed: TimeInterval? = nil) {
-        let visibleCount = visibleMessageIDsByChannelID[selection.channelID ?? selection.dmChannelID ?? ""]?.count ?? 0
+        let visibleCount = selectedConversationChannelID.flatMap { visibleMessageIDsByChannelID[$0]?.count } ?? 0
         timelinePerformanceDiagnostics = TimelinePerformanceDiagnostics(
             loadedMessageCount: messages.count,
             renderedMessageEstimate: visibleCount == 0 ? min(messages.count, 80) : visibleCount,
@@ -1102,7 +1119,9 @@ public final class MainShellViewModel {
     }
 
     public func openDirectMessage(with userID: UserID) async {
-        if let existing = directMessageItems.first(where: { $0.participants.contains { $0.id == userID } }) {
+        if let existing = directMessageItems.first(where: { item in
+            item.participants.contains { $0.id == userID } || item.channel.recipients.contains(userID)
+        }) {
             selectChannel(existing.id)
             return
         }
@@ -1424,6 +1443,66 @@ public final class MainShellViewModel {
         Phase24Management.disabledReasonForChannelManagement(serverManagementCapabilities(), destructive: destructive)
     }
 
+    public func channelContextMenuItems(for channel: Channel) -> [ChannelContextMenuItem] {
+        let baseReason = channelManagementDisabledReason()
+        let settingsReason: String?
+        if channel.kind == .textChannel {
+            settingsReason = baseReason
+        } else {
+            settingsReason = "Only text channels can be edited."
+        }
+        var items: [ChannelContextMenuItem] = [
+            ChannelContextMenuItem(
+                kind: .settings,
+                title: "Channel Settings",
+                systemImage: "slider.horizontal.3",
+                disabledReason: settingsReason
+            ),
+            ChannelContextMenuItem(
+                kind: .createChannel,
+                title: "Create Channel",
+                systemImage: "plus",
+                disabledReason: baseReason
+            )
+        ]
+        if isDeveloperControlsEnabled {
+            items.append(ChannelContextMenuItem(kind: .copyChannelID, title: "Copy Channel ID", systemImage: "doc.on.doc", isDeveloperOnly: true))
+        }
+        let deleteReason: String?
+        if channel.kind == .textChannel {
+            deleteReason = channelManagementDisabledReason(destructive: true)
+        } else {
+            deleteReason = "Only text channels can be deleted."
+        }
+        items.append(ChannelContextMenuItem(kind: .deleteChannel, title: "Delete Channel", systemImage: "trash", disabledReason: deleteReason, isDestructive: true))
+        return items
+    }
+
+    public func performChannelContextMenuAction(_ kind: ChannelContextMenuActionKind, for channel: Channel) {
+        switch kind {
+        case .settings:
+            selectChannel(channel.id)
+            openChannelSettings()
+        case .createChannel:
+            if channel.serverID != nil {
+                selectChannel(channel.id)
+            }
+            openCreateChannel()
+        case .copyChannelID:
+            guard isDeveloperControlsEnabled else {
+                placeholderStatus = "Developer channel ID copy is disabled."
+                return
+            }
+            Task { [messageCopier] in
+                await messageCopier.copy(channel.id.rawValue)
+            }
+            placeholderStatus = "Channel ID copied"
+        case .deleteChannel:
+            selectChannel(channel.id)
+            requestDeleteSelectedChannel()
+        }
+    }
+
     public func inviteManagementDisabledReason() -> String? {
         Phase24Management.disabledReasonForInvites(serverManagementCapabilities())
     }
@@ -1433,7 +1512,7 @@ public final class MainShellViewModel {
         return ServerOverviewDetails(
             server: server,
             channels: channels(for: server.id),
-            memberCount: members(for: server.id).count,
+            memberCount: serverMembers(for: server.id).count,
             runtimeLine: runtimeSubtitleForManagement,
             capabilities: serverManagementCapabilities()
         )
@@ -2294,6 +2373,7 @@ public final class MainShellViewModel {
         selection.serverID = nil
         selection.channelID = nil
         selection.dmChannelID = snapshot.channelsByID.values.first(where: DMChannelClassifier.isDirectMessageLike)?.id
+        recordDMRouteSelection(clickedChannelID: selection.dmChannelID)
         clearTimelineSelection()
         reconcileSearchHighlightsForSelectedChannel()
         placeholderStatus = nil
@@ -2345,6 +2425,7 @@ public final class MainShellViewModel {
             selection.serverID = nil
             selection.channelID = nil
             selection.dmChannelID = id
+            recordDMRouteSelection(clickedChannelID: id)
         }
         clearTimelineSelection()
         updateViewportForSelectedChannel()
@@ -2354,6 +2435,19 @@ public final class MainShellViewModel {
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
         persistLiveSelectionIfNeeded()
+    }
+
+    private func recordDMRouteSelection(clickedChannelID: ChannelID?) {
+        guard let channelID = clickedChannelID,
+              let channel = snapshot.channelsByID[channelID],
+              DMChannelClassifier.isDirectMessageLike(channel)
+        else { return }
+        dmRouteDiagnostics.clickedChannelID = channelID
+        dmRouteDiagnostics.selectedConversationChannelID = channelID
+        dmRouteDiagnostics.selectedServerID = selection.serverID
+        dmRouteDiagnostics.messageLoadRequested = false
+        dmRouteDiagnostics.lastLoadResult = nil
+        dmRouteDiagnostics.composerTargetDescription = channel.displayName
     }
 
     public func toggleMemberPanel() {
@@ -2393,7 +2487,7 @@ public final class MainShellViewModel {
     public func refreshCurrentContext() {
         switch effectiveRuntimeMode {
         case .mock:
-            if let channelID = selection.channelID ?? selection.dmChannelID {
+            if let channelID = selectedConversationChannelID {
                 Task { [weak self] in
                     guard let self else { return }
                     await self.messageController.refreshMessages(channelID: channelID, snapshotMessages: self.snapshot.messagesByChannelID[channelID] ?? [])
@@ -2405,7 +2499,7 @@ public final class MainShellViewModel {
         case .liveManual:
             switch effectiveConnectionState {
             case .ready:
-                if let channelID = selection.channelID ?? selection.dmChannelID {
+                if let channelID = selectedConversationChannelID {
                     Task { [weak self] in
                         guard let self else { return }
                         await self.messageController.refreshMessages(channelID: channelID, snapshotMessages: self.snapshot.messagesByChannelID[channelID] ?? [])
@@ -2424,7 +2518,7 @@ public final class MainShellViewModel {
     }
 
     public func legacyRefreshSelectedChannel() {
-        if let channelID = selection.channelID ?? selection.dmChannelID {
+        if let channelID = selectedConversationChannelID {
             Task { [weak self] in
                 guard let self else { return }
                 await self.messageController.refreshMessages(channelID: channelID, snapshotMessages: self.snapshot.messagesByChannelID[channelID] ?? [])
@@ -2462,12 +2556,13 @@ public final class MainShellViewModel {
     }
 
     public func confirmLiveVerificationSend() async {
-        guard let channelID = selection.channelID ?? selection.dmChannelID else {
+        guard let channelID = selectedConversationChannelID else {
             messageActionStatus = "Select a channel before sending a verification message."
             return
         }
         await sendDraft(for: channelID)
-        sessionCoordinator?.markLastMessageActionResult(messageActionStatus ?? "Send action attempted.")
+        let result = currentMessageSendDiagnostics().lastSendResult == .succeeded ? "Send action succeeded." : (messageActionStatus ?? "Send action attempted.")
+        sessionCoordinator?.markLastMessageActionResult(result)
     }
 
     public func validateSelection() {
@@ -2643,7 +2738,7 @@ public final class MainShellViewModel {
     }
 
     public func addAttachmentURLsToSelectedChannel(_ urls: [URL]) {
-        addAttachmentURLs(urls, to: selection.channelID ?? selection.dmChannelID)
+        addAttachmentURLs(urls, to: selectedConversationChannelID)
     }
 
     public func addPastedImageData(_ data: Data, to channelID: ChannelID?) {
@@ -2705,7 +2800,7 @@ public final class MainShellViewModel {
     }
 
     public func currentMessageSendDiagnostics() -> MessageSendDiagnostics {
-        let channelID = selection.channelID ?? selection.dmChannelID
+        let channelID = selectedConversationChannelID
         let readiness = composerReadiness(for: channelID)
         var diagnostics = messageSendDiagnostics
         diagnostics.selectedChannelID = channelID
@@ -3316,7 +3411,8 @@ public final class MainShellViewModel {
             return
         }
         let author = snapshot.usersByID[timelineMessage.message.authorID]
-        let authorName = timelineMessage.message.masquerade?.name ?? author?.displayName ?? author?.username ?? timelineMessage.message.authorID.rawValue
+        let member = member(for: timelineMessage.message.authorID, serverID: snapshot.channelsByID[timelineMessage.message.channelID]?.serverID)
+        let authorName = timelineMessage.message.masquerade?.name ?? displayName(for: author, member: member, fallbackID: timelineMessage.message.authorID)
         var draftState = composerDraftState(for: timelineMessage.message.channelID)
         draftState.replyContext = ReplyContext(
             channelID: timelineMessage.message.channelID,
@@ -3380,7 +3476,7 @@ public final class MainShellViewModel {
         if didSend {
             recordMessageSendDiagnostics(channelID: channelID, stage: .decodingResponse, result: .pending, error: nil)
             recordMessageSendDiagnostics(channelID: channelID, stage: .reconciled, result: .succeeded, error: nil)
-            messageActionStatus = "Message sent."
+            messageActionStatus = nil
             acknowledgeSelectedChannel()
         } else {
             let error = messageController.lastErrorByChannelID[channelID] ?? "Message send failed."
@@ -3449,7 +3545,7 @@ public final class MainShellViewModel {
     }
 
     public func loadOlderSelectedMessages() async {
-        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        guard let channelID = selectedConversationChannelID else { return }
         let anchor = timelineViewport.visibleRange?.firstVisibleMessageID ?? selectedTimelineMessages.first?.message.id
         let loaded = await messageController.loadOlderMessages(channelID: channelID)
         if loaded {
@@ -3651,7 +3747,12 @@ public final class MainShellViewModel {
     }
 
     public func systemEventText(for message: Message) -> String {
-        Phase27SystemEventPresenter.text(for: message, usersByID: snapshot.usersByID)
+        Phase27SystemEventPresenter.text(
+            for: message,
+            usersByID: snapshot.usersByID,
+            membersByServerAndUserID: snapshot.membersByServerAndUserID,
+            channel: snapshot.channelsByID[message.channelID]
+        )
     }
 
     public func reactionSummaries(for message: Message) -> [ReactionSummary] {
@@ -3854,7 +3955,7 @@ public final class MainShellViewModel {
     }
 
     public func jumpToFirstUnreadMessage() {
-        let activeChannelID = selection.channelID ?? selection.dmChannelID
+        let activeChannelID = selectedConversationChannelID
         guard let activeChannelID else {
             placeholderStatus = "Select a channel before jumping to unread messages."
             return
@@ -3887,7 +3988,7 @@ public final class MainShellViewModel {
     }
 
     public func updateViewportForSelectedChannel() {
-        let channelID = selection.channelID ?? selection.dmChannelID
+        let channelID = selectedConversationChannelID
         timelineViewport = viewportReducer.channelSelected(
             channelID: channelID,
             messages: selectedTimelineMessages,
@@ -3903,7 +4004,7 @@ public final class MainShellViewModel {
         timelineViewport.isAtNewest = isAtNewest
         if isAtNewest {
             timelineViewport.hasNewerMessagesIndicator = false
-            if let channelID = selection.channelID ?? selection.dmChannelID {
+            if let channelID = selectedConversationChannelID {
                 acknowledgeSelectedChannel()
                 scheduleLiveAckIfNeeded(channelID: channelID)
             }
@@ -3911,7 +4012,7 @@ public final class MainShellViewModel {
     }
 
     public func updateTimelineVisibility(messageID: MessageID, channelID: ChannelID, isVisible: Bool) {
-        guard channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        guard channelID == selectedConversationChannelID else { return }
         var visible = visibleMessageIDsByChannelID[channelID] ?? []
         let wasVisible = visible.contains(messageID)
         guard wasVisible != isVisible else { return }
@@ -3938,7 +4039,7 @@ public final class MainShellViewModel {
     }
 
     public func loadToFirstUnreadMessage() async {
-        guard let channelID = selection.channelID ?? selection.dmChannelID,
+        guard let channelID = selectedConversationChannelID,
               let unreadID = firstUnreadMessageID(for: channelID)
         else {
             placeholderStatus = "No unread marker in this channel."
@@ -3969,14 +4070,16 @@ public final class MainShellViewModel {
         guard let replyID = message.replies?.first else { return nil }
         if let referenced = selectedTimelineMessages.first(where: { $0.message.id == replyID })?.message {
             let author = snapshot.usersByID[referenced.authorID]
-            let authorName = referenced.masquerade?.name ?? author?.displayName ?? author?.username ?? referenced.authorID.rawValue
+            let member = member(for: referenced.authorID, serverID: snapshot.channelsByID[referenced.channelID]?.serverID)
+            let authorName = referenced.masquerade?.name ?? displayName(for: author, member: member, fallbackID: referenced.authorID)
             return "\(authorName): \(Self.replyPreviewText(for: referenced))"
         }
         if let resolution = resolvedReferencesByChannelID[message.channelID]?[replyID] {
             switch resolution {
             case let .loaded(referenced):
                 let author = snapshot.usersByID[referenced.authorID]
-                let authorName = referenced.masquerade?.name ?? author?.displayName ?? author?.username ?? referenced.authorID.rawValue
+                let member = member(for: referenced.authorID, serverID: snapshot.channelsByID[referenced.channelID]?.serverID)
+                let authorName = referenced.masquerade?.name ?? displayName(for: author, member: member, fallbackID: referenced.authorID)
                 return "\(authorName): \(Self.replyPreviewText(for: referenced))"
             case .deleted:
                 return "Original message was deleted"
@@ -3997,7 +4100,7 @@ public final class MainShellViewModel {
     }
 
     public func timelineDiagnostics() -> TimelineDiagnostics {
-        let channelID = selection.channelID ?? selection.dmChannelID
+        let channelID = selectedConversationChannelID
         let history = channelID.flatMap { messageController.historiesByChannelID[$0] }
         let messages = selectedTimelineMessages
         return TimelineDiagnostics(
@@ -4026,7 +4129,7 @@ public final class MainShellViewModel {
 
     @discardableResult
     public func validateTimelineState() -> [TimelineValidationWarning] {
-        let channelID = selection.channelID ?? selection.dmChannelID
+        let channelID = selectedConversationChannelID
         timelineValidationWarnings = visibleRangeValidator.warnings(
             channelID: channelID,
             loadedMessageIDs: selectedTimelineMessages.map(\.message.id),
@@ -4043,6 +4146,8 @@ public final class MainShellViewModel {
         let attachments = attachmentDiagnostics()
         let actions = messageActionDiagnostics()
         let send = MessageSendDiagnosticsFormatter.redactedText(currentMessageSendDiagnostics())
+        let dm = dmRouteDiagnostics
+        let members = memberListPerformanceDiagnostics
         let attachmentText = """
         Attachment diagnostics
         queuedDrafts: \(attachments.queuedDraftCount)
@@ -4058,6 +4163,21 @@ public final class MainShellViewModel {
         reactionGroups: \(actions.reactionGroupCount)
         currentUserReactions: \(actions.currentUserReactionCount)
         pendingDeleteConfirmation: \(actions.hasPendingDeleteConfirmation ? "yes" : "no")
+        DM route diagnostics
+        clickedChannel: \(TimelineCopyFormatter.shortID(dm.clickedChannelID?.rawValue))
+        selectedConversation: \(TimelineCopyFormatter.shortID(dm.selectedConversationChannelID?.rawValue))
+        selectedServer: \(TimelineCopyFormatter.shortID(dm.selectedServerID?.rawValue))
+        loadRequested: \(dm.messageLoadRequested ? "yes" : "no")
+        lastLoadResult: \(dm.lastLoadResult ?? "-")
+        composerTarget: \(dm.composerTargetDescription ?? "-")
+        Member list diagnostics
+        knownMembers: \(members.knownMemberCount)
+        knownUsers: \(members.knownUserCount)
+        renderedMembers: \(members.renderedMemberCount)
+        droppedMembers: \(members.droppedMemberCount)
+        droppedReason: \(members.droppedReasonSummary ?? "-")
+        groups: \(members.groupCount)
+        avatarQueue: \(members.avatarLoadQueueCount)
         """
         let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText + "\n" + send)))
         #if canImport(AppKit)
@@ -4130,7 +4250,7 @@ public final class MainShellViewModel {
     }
 
     public func setSelectedChannelMuted(_ isMuted: Bool) {
-        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        guard let channelID = selectedConversationChannelID else { return }
         setNotificationPreference { preferences in
             var channel = preferences.preference(for: channelID)
             channel.isMuted = isMuted
@@ -4148,7 +4268,7 @@ public final class MainShellViewModel {
     }
 
     public func deliverMockNotificationDemo() {
-        guard let channel = selectedChannel ?? selection.dmChannelID.flatMap({ snapshot.channelsByID[$0] }) ?? snapshot.channelsByID.values.first(where: { $0.kind == .directMessage || $0.kind == .textChannel }) else {
+        guard let channel = selectedConversationChannel ?? snapshot.channelsByID.values.first(where: { $0.kind == .directMessage || $0.kind == .textChannel }) else {
             placeholderStatus = "No channel available for notification demo."
             return
         }
@@ -4247,7 +4367,7 @@ public final class MainShellViewModel {
     }
 
     public func startTimelineCalibration() {
-        let channelID = selection.channelID ?? selection.dmChannelID
+        let channelID = selectedConversationChannelID
         activeCalibrationRun = TimelineCalibrationRun(
             environmentID: sessionCoordinator?.preferences.selectedEnvironmentProfile.id ?? "mock",
             channelID: channelID,
@@ -4339,7 +4459,7 @@ public final class MainShellViewModel {
     }
 
     public func jumpToLoadedFindResult(_ result: LoadedMessageFindResult) {
-        guard result.channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        guard result.channelID == selectedConversationChannelID else { return }
         timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
         timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
         lastTimelineActionResult = "Jumped to loaded find result"
@@ -4380,7 +4500,7 @@ public final class MainShellViewModel {
         case .liveChannel, .pinned:
             guard effectiveRuntimeMode == .liveManual,
                   effectiveSessionState == .connected,
-                  let channelID = selection.channelID ?? selection.dmChannelID,
+                  let channelID = selectedConversationChannelID,
                   let apiClient = sessionCoordinator?.apiClient
             else {
                 let message = "Live search requires manual connection."
@@ -4471,7 +4591,7 @@ public final class MainShellViewModel {
     }
 
     public func reconcileSearchHighlightsForSelectedChannel() {
-        let activeChannelID = selection.channelID ?? selection.dmChannelID
+        let activeChannelID = selectedConversationChannelID
         guard searchHighlightState?.channelID == activeChannelID else {
             searchHighlightState = nil
             selectedSearchResultID = nil
@@ -4486,7 +4606,7 @@ public final class MainShellViewModel {
             searchHighlightState = nil
             return
         }
-        let activeChannelID = selection.channelID ?? selection.dmChannelID
+        let activeChannelID = selectedConversationChannelID
         let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
         searchHighlightState = TimelineSearchHighlightState.make(
             channelID: activeChannelID,
@@ -4501,7 +4621,7 @@ public final class MainShellViewModel {
     }
 
     private func scrollToSearchResult(_ result: ChannelSearchResult) {
-        guard result.channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        guard result.channelID == selectedConversationChannelID else { return }
         timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
         timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
     }
@@ -4527,7 +4647,7 @@ public final class MainShellViewModel {
     public func jumpToSelectedSearchResult() {
         guard let result = selectedSearchResult else { return }
         selectSearchResult(result)
-        guard result.channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        guard result.channelID == selectedConversationChannelID else { return }
         if selectedTimelineMessages.contains(where: { $0.message.id == result.messageID }) {
             scrollToSearchResult(result)
             searchNavigationStatus = "Jumped to search result"
@@ -4545,7 +4665,7 @@ public final class MainShellViewModel {
     }
 
     public func loadAroundSearchResult(_ result: ChannelSearchResult) async {
-        guard result.channelID == (selection.channelID ?? selection.dmChannelID) else { return }
+        guard result.channelID == selectedConversationChannelID else { return }
         guard routeVerificationResult.aroundMessageFetch == .supported || lastRouteVerificationResult != nil else {
             searchNavigationStatus = "Around-message route is not verified."
             return
@@ -4569,7 +4689,7 @@ public final class MainShellViewModel {
     }
 
     public func loadAroundMessage(_ messageID: MessageID) async {
-        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        guard let channelID = selectedConversationChannelID else { return }
         let anchor = timelineViewport.visibleRange?.firstVisibleMessageID ?? selectedTimelineMessages.first?.message.id
         let loaded = await messageController.loadMessagesAround(channelID: channelID, targetMessageID: messageID)
         if loaded {
@@ -4586,7 +4706,7 @@ public final class MainShellViewModel {
     public func runSelectedChannelSearch() async {
         guard effectiveRuntimeMode == .liveManual,
               effectiveSessionState == .connected,
-              let channelID = selection.channelID ?? selection.dmChannelID,
+              let channelID = selectedConversationChannelID,
               let apiClient = sessionCoordinator?.apiClient
         else {
             remoteSearchStatus = "Connect Live Manual before searching the selected channel."
@@ -4677,7 +4797,7 @@ public final class MainShellViewModel {
     }
 
     public func reconcileTimelineSelection(deletedHint: MessageID? = nil, replacementHint: MessageID? = nil) {
-        let activeChannelID = selection.channelID ?? selection.dmChannelID
+        let activeChannelID = selectedConversationChannelID
         guard timelineSelection.channelID == activeChannelID,
               let selectedID = timelineSelection.messageID
         else {
@@ -4798,7 +4918,7 @@ public final class MainShellViewModel {
             placeholderStatus = "No message to select."
             return
         }
-        let activeChannelID = selection.channelID ?? selection.dmChannelID
+        let activeChannelID = selectedConversationChannelID
         let nextIndex: Int
         if let selectedID = timelineSelection.messageID,
            let currentIndex = messages.firstIndex(where: { $0.message.id == selectedID }) {
@@ -4876,7 +4996,7 @@ public final class MainShellViewModel {
     }
 
     private var isActiveChannelVisibleForNotifications: Bool {
-        appLifecyclePhase.selectedChannelIsVisible && (selection.channelID != nil || selection.dmChannelID != nil)
+        appLifecyclePhase.selectedChannelIsVisible && selectedConversationChannelID != nil
     }
 
     private func processNotificationDiff(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
@@ -4890,7 +5010,7 @@ public final class MainShellViewModel {
         let context = NotificationClassificationContext(
             runtimeMode: effectiveRuntimeMode,
             currentUserID: currentUserID,
-            activeChannelID: selection.channelID ?? selection.dmChannelID,
+            activeChannelID: selectedConversationChannelID,
             isActiveChannelVisible: isActiveChannelVisibleForNotifications,
             preferences: notificationPreferences,
             snapshot: current
@@ -5070,7 +5190,7 @@ public final class MainShellViewModel {
             return
         }
         let serverID = selection.serverID
-        let channelID = selection.channelID ?? selection.dmChannelID
+        let channelID = selectedConversationChannelID
         guard serverID == nil || snapshot.serversByID[serverID!] != nil else { return }
         guard channelID == nil || snapshot.channelsByID[channelID!] != nil else { return }
         Task { [weak coordinator] in
@@ -5083,19 +5203,46 @@ public final class MainShellViewModel {
 
     private func scheduleSelectedChannelLoad() {
         selectedChannelLoadTask?.cancel()
-        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        guard let channelID = selectedConversationChannelID else { return }
         let snapshotMessages = snapshot.messagesByChannelID[channelID] ?? []
+        let isDMRoute = snapshot.channelsByID[channelID].map(DMChannelClassifier.isDirectMessageLike) == true
+        if isDMRoute {
+            dmRouteDiagnostics.messageLoadRequested = true
+            dmRouteDiagnostics.selectedConversationChannelID = channelID
+            dmRouteDiagnostics.selectedServerID = selection.serverID
+            dmRouteDiagnostics.composerTargetDescription = snapshot.channelsByID[channelID]?.displayName
+        }
         selectedChannelLoadTask = Task { [weak self] in
             guard let self else { return }
             await self.messageController.loadInitialIfNeeded(channelID: channelID, snapshotMessages: snapshotMessages)
+            if isDMRoute {
+                self.dmRouteDiagnostics.lastLoadResult = self.safeLoadResultDescription(for: channelID)
+            }
             if self.timelineViewport.channelID != channelID || self.timelineViewport.pendingScrollIntent == nil {
                 self.updateViewportForSelectedChannel()
             }
         }
     }
 
+    private func safeLoadResultDescription(for channelID: ChannelID) -> String {
+        switch messageController.state(for: channelID) {
+        case .idle:
+            return "idle"
+        case .loading:
+            return "loading"
+        case let .loaded(messages, hasMoreBefore):
+            return "loaded \(messages.count), hasMoreBefore \(hasMoreBefore ? "yes" : "no")"
+        case let .loadingOlder(messages):
+            return "loading older \(messages.count)"
+        case .empty:
+            return "empty"
+        case let .failed(error, cachedMessages):
+            return "failed \(MessageSendDiagnosticsFormatter.redact(error)), cached \(cachedMessages.count)"
+        }
+    }
+
     private func acknowledgeSelectedChannel() {
-        guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        guard let channelID = selectedConversationChannelID else { return }
         guard snapshot.channelsByID[channelID] != nil else {
             lastAckResult = "Skipped: selected channel missing"
             return
@@ -5247,7 +5394,7 @@ public final class MainShellViewModel {
 extension MainShellViewModel: AppCommandHandling {
     public func canPerform(_ command: AppCommand) -> Bool {
         switch command {
-        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .openJoinInvite, .openCreateServer, .openDiscoverInBrowser, .focusTimeline, .copyTimelineDiagnostics, .resetTimelineTuningDefault:
+        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .openJoinInvite, .openCreateServer, .openDiscoverInBrowser, .focusTimeline, .resetTimelineTuningDefault:
             return true
         case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions, .openMembers:
             return selection.serverID != nil
@@ -5270,11 +5417,11 @@ extension MainShellViewModel: AppCommandHandling {
         case .createInviteForCurrentChannel:
             return (selection.channelID != nil || selection.serverID.flatMap { firstVisibleTextChannel(in: $0) } != nil) && inviteManagementDisabledReason() == nil
         case .openChannelSearch, .openLoadedMessageFind:
-            return selectedChannel != nil || selection.dmChannelID != nil
+            return selectedConversationChannelID != nil
         case .openLiveChannelSearch:
-            return (selectedChannel != nil || selection.dmChannelID != nil) && effectiveRuntimeMode == .liveManual && effectiveSessionState == .connected
+            return selectedConversationChannelID != nil && effectiveRuntimeMode == .liveManual && effectiveSessionState == .connected
         case .openPinnedChannelSearch:
-            return selectedChannel != nil || selection.dmChannelID != nil
+            return selectedConversationChannelID != nil
         case .selectNextSearchResult, .selectPreviousSearchResult, .jumpToSelectedSearchResult:
             return !channelSearchState.results.isEmpty
         case .loadAroundSelectedSearchResult:
@@ -5293,8 +5440,10 @@ extension MainShellViewModel: AppCommandHandling {
             return isDeveloperControlsEnabled && !importedCalibrationNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .copyTimelineCalibration:
             return isDeveloperControlsEnabled && activeCalibrationRun != nil
+        case .copyTimelineDiagnostics:
+            return isDeveloperControlsEnabled
         case .focusComposer:
-            return selectedChannel != nil || selection.dmChannelID != nil
+            return selectedConversationChannelID != nil
         case .reconnect:
             return sessionCoordinator?.hasSavedCredential == true && !isConnecting
         case .disconnect:
@@ -5322,12 +5471,12 @@ extension MainShellViewModel: AppCommandHandling {
         case .selectNextMessage, .selectPreviousMessage, .jumpToNewestMessage:
             return !isTextEntryFocused && !selectedTimelineMessages.isEmpty
         case .jumpToFirstUnreadMessage:
-            guard let channelID = selection.channelID ?? selection.dmChannelID else { return false }
+            guard let channelID = selectedConversationChannelID else { return false }
             return !isTextEntryFocused && firstUnreadMessageID(for: channelID) != nil
         case .replyToSelectedMessage:
             return !isTextEntryFocused && selectedTimelineMessage.map { canReply(to: $0) } == true
         case .cancelReply:
-            return replyContext(for: selection.channelID ?? selection.dmChannelID) != nil
+            return replyContext(for: selectedConversationChannelID) != nil
         case .copySelectedMessage:
             return !isTextEntryFocused && selectedTimelineMessage.map { isMessageActionAvailable(.copyText, for: $0) } == true
         case .copySelectedMessageID:
@@ -5397,7 +5546,7 @@ extension MainShellViewModel: AppCommandHandling {
             return routeVerificationResult.aroundMessageFetch == .supported ? "Selected result is already loaded." : "Around-message route is not verified."
         case .clearSearchHighlights:
             return "No search highlights are active."
-        case .startTimelineCalibration, .addTimelineCalibrationCheckpoint, .applyTimelineCalibrationRecommendation, .importCalibrationNotes, .copyTimelineCalibration:
+        case .startTimelineCalibration, .addTimelineCalibrationCheckpoint, .applyTimelineCalibrationRecommendation, .importCalibrationNotes, .copyTimelineCalibration, .copyTimelineDiagnostics:
             return isDeveloperControlsEnabled ? "Start a calibration run first." : "Developer controls are disabled."
         case .copySelectedMessage, .copySelectedMessageID, .editSelectedMessage, .deleteSelectedMessage, .reactToSelectedMessage, .retrySelectedMessage, .discardSelectedFailedMessage, .editAndRetrySelectedFailedMessage, .pinOrUnpinSelectedMessage, .replyToSelectedMessage:
             if isTextEntryFocused { return "Message actions are paused while typing." }
@@ -5564,7 +5713,7 @@ extension MainShellViewModel: AppCommandHandling {
                 beginReply(to: selectedTimelineMessage)
             }
         case .cancelReply:
-            cancelReply(for: selection.channelID ?? selection.dmChannelID)
+            cancelReply(for: selectedConversationChannelID)
         case .copySelectedMessage:
             copySelectedMessage()
         case .copySelectedMessageID:
@@ -5959,7 +6108,6 @@ public struct MainShellView: View {
             }
             ToolbarItemGroup {
                 Button { viewModel.perform(.openQuickSwitcher) } label: { Label("Quick Switcher", systemImage: "magnifyingglass") }
-                Button { viewModel.perform(.toggleMemberPanel) } label: { Label("Toggle Members", systemImage: "sidebar.right") }
                 Button { viewModel.perform(.openAccountSettings) } label: { Label("Settings", systemImage: "gearshape") }
             }
         }
@@ -6465,6 +6613,10 @@ public struct CredentialSetupView: View {
                 Text("Tokens are never shown in this panel.")
                     .foregroundStyle(.secondary)
             }
+
+            if viewModel.isDeveloperControlsEnabled {
+                developerDiagnosticsSection
+            }
         }
         .formStyle(.grouped)
         .padding()
@@ -6522,6 +6674,41 @@ public struct CredentialSetupView: View {
         }
         if let lastMessageActionResult = state.lastMessageActionResult {
             LabeledContent("Last message action", value: lastMessageActionResult)
+        }
+    }
+
+    @ViewBuilder private var developerDiagnosticsSection: some View {
+        let timeline = viewModel.timelineDiagnostics()
+        let dm = viewModel.dmRouteDiagnostics
+        let members = viewModel.memberListPerformanceDiagnostics
+        let send = viewModel.currentMessageSendDiagnostics()
+        Section("Developer Diagnostics") {
+            LabeledContent("Timeline", value: "loaded \(timeline.loadedMessageCount), visible \(TimelineCopyFormatter.shortID(timeline.firstVisibleMessageID?.rawValue)) to \(TimelineCopyFormatter.shortID(timeline.lastVisibleMessageID?.rawValue))")
+            LabeledContent("DM route", value: "clicked \(TimelineCopyFormatter.shortID(dm.clickedChannelID?.rawValue)), selected \(TimelineCopyFormatter.shortID(dm.selectedConversationChannelID?.rawValue)), load \(dm.messageLoadRequested ? "requested" : "idle")")
+            if let result = dm.lastLoadResult {
+                LabeledContent("DM load", value: result)
+            }
+            if let target = dm.composerTargetDescription {
+                LabeledContent("DM composer", value: target)
+            }
+            LabeledContent("Members", value: "known \(members.knownMemberCount), rendered \(members.renderedMemberCount), dropped \(members.droppedMemberCount), groups \(members.groupCount)")
+            LabeledContent("Member images", value: "queue \(members.avatarLoadQueueCount)")
+            LabeledContent("Send", value: "canSend \(send.canSend ? "yes" : "no"), stage \(send.lastSendStage?.rawValue ?? "-"), result \(send.lastSendResult?.rawValue ?? "-")")
+            if let error = send.lastError {
+                LabeledContent("Send error", value: error)
+            }
+            LabeledContent("Notifications", value: "\(viewModel.notificationDiagnostics.permissionStatus.rawValue), queued \(viewModel.notificationDiagnostics.queuedRouteCount)")
+            HStack {
+                Button("Copy Timeline Diagnostics") {
+                    viewModel.copyRedactedTimelineDiagnostics()
+                }
+                Button("Copy Notification Diagnostics") {
+                    viewModel.copyRedactedNotificationDiagnostics()
+                }
+            }
+            Text("Diagnostics are redacted and omit tokens, raw response bodies, message content, and local file paths.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -6854,9 +7041,6 @@ public struct ChannelListView: View {
             ) {
                 viewModel.openFriends(tab: .online)
             }
-            SidebarButton(title: "Add Friend", systemImage: "person.badge.plus", isSelected: viewModel.friendsTab == .addFriend) {
-                viewModel.openFriends(tab: .addFriend)
-            }
             section("Direct Messages") {
                 if viewModel.directMessageItems.isEmpty {
                     Text("No direct messages")
@@ -6942,6 +7126,17 @@ public struct ChannelListView: View {
         return ChannelRow(channel: channel, isSelected: viewModel.selection.channelID == channel.id, unreadCount: unread == nil ? 0 : 1, mentionCount: unread?.mentions.count ?? 0) {
             viewModel.selectChannel(channel.id)
         }
+        .contextMenu {
+            ForEach(viewModel.channelContextMenuItems(for: channel)) { item in
+                Button(role: item.isDestructive ? .destructive : nil) {
+                    viewModel.performChannelContextMenuAction(item.kind, for: channel)
+                } label: {
+                    Label(item.title, systemImage: item.systemImage)
+                }
+                .disabled(item.disabledReason != nil)
+                .help(item.disabledReason ?? item.title)
+            }
+        }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -6987,8 +7182,14 @@ public struct ChatPlaceholderView: View {
                     GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
                         viewModel.openChannelSearch(mode: .loadedOnly)
                     }
-                    GlassIconButton("Toggle member panel", systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
-                    GlassIconButton("Channel settings unavailable in Phase 3", systemImage: "gearshape", isDisabled: true) {}
+                    let memberToggleLabel = viewModel.selection.isMemberPanelVisible ? "Hide Members" : "Show Members"
+                    GlassIconButton(memberToggleLabel, systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
+                        .accessibilityLabel(memberToggleLabel)
+                    let channelSettingsDisabledReason = viewModel.selectedChannel?.kind == .textChannel ? viewModel.channelManagementDisabledReason() : "Select a text channel before opening channel settings."
+                    GlassIconButton(channelSettingsDisabledReason ?? "Channel Settings", systemImage: "gearshape", isDisabled: channelSettingsDisabledReason != nil) {
+                        viewModel.openChannelSettings()
+                    }
+                    .accessibilityLabel("Channel Settings")
                 }
             }
             MessageTimelineView(viewModel: viewModel)
@@ -7228,7 +7429,6 @@ public struct MessageTimelineView: View {
         }
         newestIndicator
         typingIndicator
-        timelineDiagnosticsView
     }
 
     @ViewBuilder private var searchHighlightAffordance: some View {
@@ -7314,37 +7514,6 @@ public struct MessageTimelineView: View {
             case let .failed(_, message):
                 inlineError(message)
             }
-        }
-    }
-
-    @ViewBuilder private var timelineDiagnosticsView: some View {
-        if viewModel.isDeveloperControlsEnabled {
-            let diagnostics = viewModel.timelineDiagnostics()
-            let attachments = viewModel.attachmentDiagnostics()
-            let actions = viewModel.messageActionDiagnostics()
-            let send = viewModel.currentMessageSendDiagnostics()
-            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
-                Text("Timeline Diagnostics")
-                    .font(.caption.weight(.semibold))
-                Text("Loaded \(diagnostics.loadedMessageCount) · visible \(diagnostics.firstVisibleMessageID?.rawValue ?? "-") to \(diagnostics.lastVisibleMessageID?.rawValue ?? "-") · at newest \(diagnostics.atNewest ? "yes" : "no") · pending refs \(diagnostics.pendingReferenceFetchCount) · retries \(diagnostics.pendingRetryCount)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                Text("Attachments displayed \(attachments.displayedAttachmentCount) · loaded previews \(attachments.loadedPreviewCount) · failed previews \(attachments.failedPreviewCount) · drafts queued \(attachments.queuedDraftCount) · failed uploads \(attachments.failedUploadCount)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                Text("Message actions visible \(actions.visibleActionCount) · available \(actions.availableActionCount) · reactions \(actions.reactionGroupCount) · mine \(actions.currentUserReactionCount) · delete confirm \(actions.hasPendingDeleteConfirmation ? "yes" : "no")")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                Text("Send \(send.canSend ? "ready" : "blocked") · stage \(send.lastSendStage?.rawValue ?? "-") · result \(send.lastSendResult?.rawValue ?? "-") · reason \(send.disabledReason ?? "-") · error \(send.lastError ?? "-")")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            .padding(StoatSpacing.small)
-            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
         }
     }
 
@@ -7787,12 +7956,6 @@ public struct MemberPanelView: View {
                             }
                         }
                     }
-                    if viewModel.isDeveloperControlsEnabled {
-                        Text("Members \(viewModel.memberListPerformanceDiagnostics.totalMembers) · groups \(viewModel.memberListPerformanceDiagnostics.groupCount) · image queue \(viewModel.memberListPerformanceDiagnostics.avatarLoadQueueCount)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
                 }
             }
         }
@@ -8143,12 +8306,19 @@ public struct FriendsPlaceholderView: View {
                     .font(.title2.weight(.semibold))
                 Spacer()
                 Picker("Friend filter", selection: $viewModel.friendsTab) {
-                    ForEach(FriendsTab.allCases, id: \.self) { tab in
+                    ForEach(filterTabs, id: \.self) { tab in
                         Text(tab.title).tag(tab)
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 430)
+                .frame(width: 340)
+                Button {
+                    viewModel.openFriends(tab: .addFriend)
+                } label: {
+                    Label("Add Friend", systemImage: "person.badge.plus")
+                }
+                .buttonStyle(GlassButtonStyle())
+                .accessibilityLabel("Add Friend")
             }
 
             if viewModel.friendsTab == .addFriend {
@@ -8192,6 +8362,10 @@ public struct FriendsPlaceholderView: View {
                 }
             }
         }
+    }
+
+    private var filterTabs: [FriendsTab] {
+        FriendsTab.allCases.filter { $0 != .addFriend }
     }
 
     private func pendingSection(title: String, items: [FriendListItem]) -> some View {
@@ -9279,7 +9453,7 @@ public struct ServerOverviewView: View {
                     Divider()
                     Text("Confirm \(pending.action.rawValue)")
                         .font(.headline)
-                    Text("This action affects \(user?.username ?? pending.member.id.userID.rawValue).")
+                    Text("This action affects \(user?.username ?? UserDisplayResolver.shortenedID(pending.member.id.userID)).")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     HStack {
@@ -9345,7 +9519,7 @@ public struct ServerOverviewView: View {
                     }
                     ForEach(result.bans) { ban in
                         HStack {
-                            Text(result.users.first { $0.id == ban.id.userID }?.username ?? ban.id.userID.rawValue)
+                            Text(result.users.first { $0.id == ban.id.userID }?.username ?? UserDisplayResolver.shortenedID(ban.id.userID))
                             Spacer()
                             Button("Unban") { Task { await viewModel.unban(userID: ban.id.userID) } }
                         }
@@ -9654,7 +9828,7 @@ public struct ChannelSearchPanel: View {
                     .foregroundStyle(result.isLoaded ? .primary : .secondary)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack {
-                        Text(result.authorDisplayName ?? result.authorID.rawValue)
+                        Text(result.authorDisplayName ?? UserDisplayResolver.shortenedID(result.authorID))
                             .font(.caption.weight(.semibold))
                         if let createdAt = result.createdAt {
                             Text(createdAt.formatted(date: .abbreviated, time: .shortened))
@@ -9976,7 +10150,7 @@ public typealias PhaseFourStatus = PhaseOneStatus
 }
 
 @available(macOS 15.0, *)
-#Preview("Phase 11 Timeline Diagnostics") {
+#Preview("Phase 29 Timeline Without Diagnostics") {
     let model = MainShellViewModel(snapshot: MockShellData.snapshot)
     model.selectServer(model.servers[0].id)
     if let channelID = model.selection.channelID {
@@ -9986,6 +10160,41 @@ public typealias PhaseFourStatus = PhaseOneStatus
     }
     return MessageTimelineView(viewModel: model)
         .frame(width: 760, height: 520)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 29 DM Loaded") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selectDirectMessages()
+    return MainShellView(viewModel: model)
+        .frame(width: 1180, height: 760)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 29 Developer Diagnostics") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selectServer(model.servers[0].id)
+    model.showCredentialSetup()
+    return CredentialSetupView(viewModel: model)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 29 Compact Composer") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selectServer(model.servers[0].id)
+    return ChatPlaceholderView(viewModel: model)
+        .frame(width: 760, height: 620)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 29 Capped Composer") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selectServer(model.servers[0].id)
+    if let channelID = model.selectedConversationChannelID {
+        model.updateDraft(String(repeating: "Long composer preview line. ", count: 32), for: channelID)
+    }
+    return ChatPlaceholderView(viewModel: model)
+        .frame(width: 760, height: 620)
 }
 
 @available(macOS 15.0, *)

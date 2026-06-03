@@ -1646,7 +1646,7 @@ public final class AppSessionCoordinator {
             sessionState = .validationFailed("Multi-factor authentication is required.")
             lastErrorMessage = nil
         case let .disabled(userID):
-            let message = "This account is disabled or unavailable. User ID: \(userID.rawValue)"
+            let message = "This account is disabled or unavailable. User ID: \(UserDisplayResolver.shortenedID(userID))"
             sessionState = .validationFailed(message)
             lastErrorMessage = message
         }

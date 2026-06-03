@@ -76,4 +76,16 @@ final class StoatUITests: XCTestCase {
         XCTAssertTrue(reactionLabel.contains("2 reactions"))
         XCTAssertTrue(reactionLabel.contains("selected"))
     }
+
+    func testPhase29ComposerTextSizingStartsCompactAndGrows() {
+        XCTAssertEqual(ComposerTextSizing.height(for: ""), ComposerTextSizing.compactHeight)
+        XCTAssertEqual(ComposerTextSizing.height(for: "one line"), ComposerTextSizing.compactHeight)
+
+        let multiline = ComposerTextSizing.height(for: "one\ntwo\nthree")
+        XCTAssertGreaterThan(multiline, ComposerTextSizing.compactHeight)
+        XCTAssertLessThanOrEqual(multiline, ComposerTextSizing.maximumHeight)
+
+        let capped = ComposerTextSizing.height(for: String(repeating: "long message wraps ", count: 80), approximateCharactersPerLine: 24)
+        XCTAssertEqual(capped, ComposerTextSizing.maximumHeight)
+    }
 }

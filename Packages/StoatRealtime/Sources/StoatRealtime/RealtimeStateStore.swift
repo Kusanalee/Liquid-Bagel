@@ -269,22 +269,22 @@ public actor RealtimeStateStore {
 
     private func applyReady(_ payload: ReadyPayload) {
         if let users = payload.users {
-            currentSnapshot.usersByID = Dictionary(uniqueKeysWithValues: users.map { ($0.id, $0) })
+            currentSnapshot.usersByID = keyedByLastValue(users) { $0.id }
         }
         if let servers = payload.servers {
-            currentSnapshot.serversByID = Dictionary(uniqueKeysWithValues: servers.map { ($0.id, $0) })
+            currentSnapshot.serversByID = keyedByLastValue(servers) { $0.id }
         }
         if let channels = payload.channels {
-            currentSnapshot.channelsByID = Dictionary(uniqueKeysWithValues: channels.map { ($0.id, $0) })
+            currentSnapshot.channelsByID = keyedByLastValue(channels) { $0.id }
         }
         if let members = payload.members {
-            currentSnapshot.membersByServerAndUserID = Dictionary(uniqueKeysWithValues: members.map { (ServerMemberKey($0.id), $0) })
+            currentSnapshot.membersByServerAndUserID = keyedByLastValue(members) { ServerMemberKey($0.id) }
         }
         if let emojis = payload.emojis {
-            currentSnapshot.emojisByID = Dictionary(uniqueKeysWithValues: emojis.map { ($0.id, $0) })
+            currentSnapshot.emojisByID = keyedByLastValue(emojis) { $0.id }
         }
         if let unreads = payload.channelUnreads {
-            currentSnapshot.unreadsByChannelID = Dictionary(uniqueKeysWithValues: unreads.map { ($0.id.channelID, $0) })
+            currentSnapshot.unreadsByChannelID = keyedByLastValue(unreads) { $0.id.channelID }
         }
         if let settings = payload.userSettings {
             currentSnapshot.userSettings = settings
@@ -292,6 +292,14 @@ public actor RealtimeStateStore {
         if let policyChanges = payload.policyChanges {
             currentSnapshot.policyChanges = policyChanges
         }
+    }
+
+    private func keyedByLastValue<Element, Key: Hashable>(_ values: [Element], key: (Element) -> Key) -> [Key: Element] {
+        var result: [Key: Element] = [:]
+        for value in values {
+            result[key(value)] = value
+        }
+        return result
     }
 
     private func insert(_ message: Message) {

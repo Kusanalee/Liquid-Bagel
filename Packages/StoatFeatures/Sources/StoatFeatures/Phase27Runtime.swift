@@ -1,5 +1,6 @@
 import Foundation
 import StoatModels
+import StoatRealtime
 
 public struct Phase27Diagnostics: Hashable, Sendable {
     public var selectedRouteDescription: String
@@ -46,11 +47,29 @@ public struct Phase27Diagnostics: Hashable, Sendable {
 
 public enum Phase27SystemEventPresenter {
     public static func text(for message: Message, usersByID: [UserID: User]) -> String {
+        text(for: message, usersByID: usersByID, membersByServerAndUserID: [:], channel: nil)
+    }
+
+    public static func text(
+        for message: Message,
+        usersByID: [UserID: User],
+        membersByServerAndUserID: [ServerMemberKey: ServerMember],
+        channel: Channel?
+    ) -> String {
         guard let system = message.system else { return message.content ?? "Message" }
-        let actor = displayName(system.by ?? system.from, usersByID: usersByID)
-        let target = displayName(system.to, usersByID: usersByID)
+        let serverID = channel?.serverID
+        let actorID = system.by ?? system.from
+        let targetID = system.to
+        let actor = displayName(actorID, usersByID: usersByID, membersByServerAndUserID: membersByServerAndUserID, serverID: serverID)
+        let target = displayName(targetID, usersByID: usersByID, membersByServerAndUserID: membersByServerAndUserID, serverID: serverID)
         let named = system.name?.trimmingCharacters(in: .whitespacesAndNewlines)
         let fallbackActor = actor ?? "Someone"
+        let eventMember = displayName(
+            actorID ?? targetID ?? message.authorID,
+            usersByID: usersByID,
+            membersByServerAndUserID: membersByServerAndUserID,
+            serverID: serverID
+        )
 
         switch system.kind {
         case .text:
@@ -62,9 +81,9 @@ public enum Phase27SystemEventPresenter {
             if let target { return "\(fallbackActor) removed \(target)" }
             return "\(fallbackActor) removed someone"
         case .userJoined:
-            return "\(actor ?? target ?? "Someone") joined"
+            return "\(eventMember ?? "Someone") joined"
         case .userLeft:
-            return "\(actor ?? target ?? "Someone") left"
+            return "\(eventMember ?? "Someone") left"
         case .userKicked:
             if let target { return "\(fallbackActor) kicked \(target)" }
             return "\(fallbackActor) kicked someone"
@@ -92,12 +111,19 @@ public enum Phase27SystemEventPresenter {
         }
     }
 
-    private static func displayName(_ id: UserID?, usersByID: [UserID: User]) -> String? {
+    private static func displayName(
+        _ id: UserID?,
+        usersByID: [UserID: User],
+        membersByServerAndUserID: [ServerMemberKey: ServerMember],
+        serverID: ServerID?
+    ) -> String? {
         guard let id else { return nil }
-        if let user = usersByID[id] {
-            return user.displayName?.isEmpty == false ? user.displayName : user.username
+        let member = serverID.flatMap { membersByServerAndUserID[ServerMemberKey(serverID: $0, userID: id)] }
+        let user = usersByID[id]
+        if member != nil || user != nil {
+            return UserDisplayResolver.displayName(user: user, member: member, fallbackID: id)
         }
-        return nil
+        return UserDisplayResolver.systemFallbackName(id)
     }
 
     private static func nonEmpty(_ value: String?) -> String? {

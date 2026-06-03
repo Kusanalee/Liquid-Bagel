@@ -303,7 +303,7 @@ public final class QuickSwitcherViewModel {
         let serversByID = snapshot.serversByID
         for channel in snapshot.channelsByID.values.sorted(by: channelSort) where navigation.isSelectable(channel) {
             let serverName = channel.serverID.flatMap { serversByID[$0]?.name }
-            let isDM = channel.kind == .directMessage
+            let isDM = DMChannelClassifier.isDirectMessageLike(channel)
             output.append(QuickSwitcherResult(
                 id: "\(isDM ? "dm" : "channel")-\(channel.id.rawValue)",
                 title: isDM ? channel.displayName : "# \(channel.displayName)",

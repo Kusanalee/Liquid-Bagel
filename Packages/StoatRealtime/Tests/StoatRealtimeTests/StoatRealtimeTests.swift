@@ -264,6 +264,21 @@ final class StoatRealtimeTests: XCTestCase {
         XCTAssertEqual(snapshot.messagesByChannelID["channel1"], [])
     }
 
+    func testPhase29ReadyHydrationKeepsLastDuplicateMemberWithoutCrashing() async {
+        let store = RealtimeStateStore()
+        let user = User(id: "phase29-user", username: "first")
+        let updatedUser = User(id: "phase29-user", username: "second", displayName: "Second")
+        let memberID = MemberCompositeKey(serverID: "phase29-server", userID: "phase29-user")
+        let firstMember = ServerMember(id: memberID, joinedAt: Date(), nickname: "First")
+        let lastMember = ServerMember(id: memberID, joinedAt: Date(), nickname: "Last")
+        await store.apply(.ready(ReadyPayload(users: [user, updatedUser], members: [firstMember, lastMember])))
+
+        let snapshot = await store.snapshot()
+
+        XCTAssertEqual(snapshot.usersByID["phase29-user"]?.displayName, "Second")
+        XCTAssertEqual(snapshot.membersByServerAndUserID[ServerMemberKey(memberID)]?.nickname, "Last")
+    }
+
     func testMessageCapIsEnforced() async {
         let store = RealtimeStateStore(messageCapPerChannel: 1)
         await store.apply(.message(Message(id: "msg1", channelID: "channel1", authorID: "user1", content: "1")))

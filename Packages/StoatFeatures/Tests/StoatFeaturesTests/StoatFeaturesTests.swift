@@ -658,6 +658,7 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.draft(for: channelID), "")
         XCTAssertEqual(sent.count, 1)
         XCTAssertEqual(sent.first?.status, .confirmed)
+        XCTAssertNil(model.messageActionStatus)
 
         model.messageController.hydrate(from: RealtimeSnapshot(messagesByChannelID: [channelID: sent.map(\.message)]))
         XCTAssertEqual(model.selectedTimelineMessages.filter { $0.message.content == "hello" }.count, 1)
@@ -2690,6 +2691,139 @@ final class StoatFeaturesTests: XCTestCase {
         _ = model.selectedTimelineMessageGroups
         XCTAssertEqual(model.timelinePerformanceDiagnostics.visibleRangeUpdateCount, firstCount)
         XCTAssertGreaterThanOrEqual(model.timelinePerformanceDiagnostics.loadedMessageCount, 1)
+    }
+
+    @MainActor
+    func testPhase29DirectMessageSelectionLoadsAndSendUsesDMChannel() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase29-me"
+        let otherUserID: UserID = "phase29-other"
+        let dmID: ChannelID = "phase29-dm"
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[otherUserID] = User(id: otherUserID, username: "other", displayName: "Other")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, active: true, recipients: [currentUserID, otherUserID])
+        snapshot.messagesByChannelID[dmID] = [
+            Message(id: "01J00000000000000000290001", channelID: dmID, authorID: otherUserID, content: "hello")
+        ]
+        let handler = MockMessageActionHandler(currentUserID: currentUserID)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: handler)
+
+        model.selectChannel(dmID)
+        try? await Task.sleep(for: .milliseconds(25))
+        model.updateDraft("reply from dm", for: dmID)
+        await model.sendDraft(for: dmID)
+        let sent = await handler.sentMessages
+
+        XCTAssertEqual(model.selection.space, .directMessages)
+        XCTAssertNil(model.selection.serverID)
+        XCTAssertEqual(model.selectedConversationChannelID, dmID)
+        XCTAssertEqual(model.selectedTimelineMessages.first?.message.channelID, dmID)
+        XCTAssertEqual(sent.last?.channelID, dmID)
+        XCTAssertNil(model.messageActionStatus)
+        XCTAssertEqual(model.currentMessageSendDiagnostics().lastSendResult, .succeeded)
+        XCTAssertEqual(model.dmRouteDiagnostics.clickedChannelID, dmID)
+        XCTAssertTrue(model.dmRouteDiagnostics.messageLoadRequested)
+        XCTAssertTrue(model.dmRouteDiagnostics.lastLoadResult?.contains("loaded") == true)
+    }
+
+    @MainActor
+    func testPhase29OpenDirectMessageMatchesRecipientWhenUserIsMissing() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase29-me"
+        let missingUserID: UserID = "phase29-missing-user"
+        let dmID: ChannelID = "phase29-existing-dm"
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, active: true, recipients: [currentUserID, missingUserID])
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID])
+
+        await model.openDirectMessage(with: missingUserID)
+
+        XCTAssertEqual(model.selection.space, .directMessages)
+        XCTAssertEqual(model.selection.dmChannelID, dmID)
+        XCTAssertEqual(model.snapshot.channelsByID.count, 1)
+    }
+
+    @MainActor
+    func testPhase29SelectedConversationPrefersDMInDMSpace() {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase29-server"
+        let serverChannelID: ChannelID = "phase29-server-channel"
+        let dmID: ChannelID = "phase29-dm-channel"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Phase 29")
+        snapshot.channelsByID[serverChannelID] = Channel(id: serverChannelID, kind: .textChannel, serverID: serverID, name: "general")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: ["me", "other"])
+        let selection = ShellSelection(space: .directMessages, serverID: serverID, channelID: serverChannelID, dmChannelID: dmID)
+        let model = MainShellViewModel(selection: selection, snapshot: snapshot)
+
+        XCTAssertEqual(model.selectedConversationChannelID, dmID)
+        XCTAssertEqual(model.selectedConversationChannel?.id, dmID)
+    }
+
+    @MainActor
+    func testPhase29MemberDiagnosticsKeepMissingAndOfflineMembers() {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase29-server"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Phase 29")
+        for index in 0..<12 {
+            let userID = UserID(rawValue: "phase29-user-\(index)")
+            if index % 4 != 0 {
+                snapshot.usersByID[userID] = User(id: userID, username: "user\(index)", displayName: index % 2 == 0 ? "User \(index)" : nil, online: false)
+            }
+            snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(
+                id: MemberCompositeKey(serverID: serverID, userID: userID),
+                joinedAt: Date(),
+                nickname: index == 1 ? "Nickname" : nil
+            )
+        }
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot)
+        let groups = model.memberListGroups(for: serverID)
+        let allItems = groups.flatMap(\.items)
+
+        XCTAssertEqual(allItems.count, 12)
+        XCTAssertTrue(allItems.contains { $0.displayName == "Nickname" })
+        XCTAssertTrue(allItems.contains { $0.user == nil && $0.displayName.contains("...") })
+        XCTAssertEqual(model.memberListPerformanceDiagnostics.knownMemberCount, 12)
+        XCTAssertEqual(model.memberListPerformanceDiagnostics.renderedMemberCount, 12)
+        XCTAssertEqual(model.memberListPerformanceDiagnostics.droppedMemberCount, 0)
+    }
+
+    @MainActor
+    func testPhase29SystemEventsUseMemberNamesAndSafeFallbacks() {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase29-server"
+        let channelID: ChannelID = "phase29-channel"
+        let namedUserID: UserID = "phase29-named-user"
+        let unknownUserID: UserID = "01JPHASE29UNKNOWNUSER00001"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Phase 29")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "joins")
+        snapshot.usersByID[namedUserID] = User(id: namedUserID, username: "named", displayName: "Named User")
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: namedUserID)] = ServerMember(
+            id: MemberCompositeKey(serverID: serverID, userID: namedUserID),
+            joinedAt: Date(),
+            nickname: "Member Nick"
+        )
+        let model = MainShellViewModel(snapshot: snapshot)
+        let joined = Message(id: "01J00000000000000000290002", channelID: channelID, authorID: namedUserID, system: SystemMessage(kind: .userJoined, by: namedUserID))
+        let left = Message(id: "01J00000000000000000290003", channelID: channelID, authorID: unknownUserID, system: SystemMessage(kind: .userLeft, by: unknownUserID))
+
+        XCTAssertEqual(model.systemEventText(for: joined), "Member Nick joined")
+        XCTAssertTrue(model.systemEventText(for: left).hasPrefix("User "))
+        XCTAssertFalse(model.systemEventText(for: left).contains(unknownUserID.rawValue))
+    }
+
+    @MainActor
+    func testPhase29ChannelContextMenuContainsSettingsAndDeveloperActions() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let server = try XCTUnwrap(model.servers.first)
+        model.selectServer(server.id)
+        let channel = try XCTUnwrap(model.selectedChannel)
+
+        let items = model.channelContextMenuItems(for: channel)
+
+        XCTAssertTrue(items.contains { $0.kind == .settings && $0.title == "Channel Settings" })
+        XCTAssertTrue(items.contains { $0.kind == .createChannel })
+        XCTAssertTrue(items.contains { $0.kind == .copyChannelID && $0.isDeveloperOnly })
+        XCTAssertTrue(items.contains { $0.kind == .deleteChannel && $0.isDestructive })
     }
 
     @MainActor
