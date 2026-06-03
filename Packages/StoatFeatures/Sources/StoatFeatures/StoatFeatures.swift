@@ -112,7 +112,7 @@ public struct ShellSelectionRestorer: Sendable {
         }
 
         let base = preferredSelection ?? ShellSelection(isMemberPanelVisible: preferences.memberPanelVisible)
-        if snapshot.serversByID.isEmpty {
+        if snapshot.serversByID.isEmpty, !snapshot.channelsByID.values.contains(where: isVisibleTextChannel) {
             return ShellSelectionRestorationResult(
                 selection: ShellSelection(space: .home, isMemberPanelVisible: preferences.memberPanelVisible),
                 selectedServerAvailable: false,
@@ -142,14 +142,23 @@ public struct ShellSelectionRestorer: Sendable {
 
         if let channelID = preferredChannelID,
            let channel = snapshot.channelsByID[channelID],
-           let serverID = channel.serverID,
-           snapshot.serversByID[serverID] != nil,
            isVisibleTextChannel(channel) {
+            if let serverID = channel.serverID, snapshot.serversByID[serverID] != nil {
+                return ShellSelectionRestorationResult(
+                    selection: ShellSelection(
+                        space: .server(serverID),
+                        serverID: serverID,
+                        channelID: channelID,
+                        isMemberPanelVisible: preferences.memberPanelVisible
+                    ),
+                    selectedServerAvailable: true,
+                    selectedChannelAvailable: true
+                )
+            }
             return ShellSelectionRestorationResult(
                 selection: ShellSelection(
-                    space: .server(serverID),
-                    serverID: serverID,
-                    channelID: channelID,
+                    space: .directMessages,
+                    dmChannelID: channelID,
                     isMemberPanelVisible: preferences.memberPanelVisible
                 ),
                 selectedServerAvailable: true,
@@ -245,7 +254,7 @@ public struct ShellSelectionRestorer: Sendable {
     }
 
     private func isVisibleTextChannel(_ channel: Channel) -> Bool {
-        channel.kind == .textChannel || channel.kind == .group || channel.kind == .savedMessages
+        channel.kind == .textChannel || channel.kind == .directMessage || channel.kind == .group || channel.kind == .savedMessages
     }
 }
 
@@ -660,6 +669,11 @@ public final class MainShellViewModel {
         return snapshot.channelsByID[id]
     }
 
+    public var selectedConversationChannel: Channel? {
+        guard let id = selection.channelID ?? selection.dmChannelID else { return nil }
+        return snapshot.channelsByID[id]
+    }
+
     public var selectedMessages: [Message] {
         guard let channelID = selection.channelID ?? selection.dmChannelID else { return [] }
         let timelineMessages = selectedTimelineMessages
@@ -688,6 +702,23 @@ public final class MainShellViewModel {
 
     public var selectedChannelMessageState: ChannelMessageState {
         messageController.state(for: selection.channelID ?? selection.dmChannelID)
+    }
+
+    public var phase27Diagnostics: Phase27Diagnostics {
+        let channel = selectedConversationChannel
+        let attachments = attachmentDiagnostics()
+        return Phase27Diagnostics(
+            selectedRouteDescription: String(describing: selection.route),
+            selectedChannelID: channel?.id,
+            selectedChannelKind: channel?.kind.rawAPIValue,
+            dmLoadState: selection.dmChannelID.map { String(describing: messageController.state(for: $0)) },
+            lastSystemEventRender: selectedTimelineMessages.last(where: { $0.message.system != nil }).map { systemEventText(for: $0.message) },
+            bannerPlacementState: selectedServer?.banner == nil ? "no banner" : "sidebar header",
+            lastReadAckDecision: lastAckResult,
+            embedRenderCount: selectedTimelineMessages.reduce(0) { $0 + ($1.message.embeds?.count ?? 0) },
+            pendingDropAttachmentCount: attachments.queuedDraftCount,
+            notificationStatus: notificationDiagnostics.permissionStatus.rawValue
+        )
     }
 
     public var effectiveRuntimeMode: AppRuntimeMode {
@@ -2225,7 +2256,7 @@ public final class MainShellViewModel {
         shouldFocusComposer.toggle()
         composerFocusRequestID += 1
         requestFocus(.composer)
-        placeholderStatus = selectedChannel == nil ? "Select a channel before focusing the composer." : nil
+        placeholderStatus = selectedConversationChannel == nil ? "Select a channel before focusing the composer." : nil
     }
 
     public func refreshPlaceholder() {
@@ -2464,7 +2495,12 @@ public final class MainShellViewModel {
     }
 
     public func addAttachmentURLs(_ urls: [URL], to channelID: ChannelID?) {
-        guard let channelID else { return }
+        guard let channelID else {
+            composerError = "Select a channel or DM before dropping files."
+            placeholderStatus = composerError
+            lastAttachmentAction = "Drop rejected without selected channel"
+            return
+        }
         var state = composerDraftState(for: channelID)
         for url in urls {
             do {
@@ -2477,6 +2513,10 @@ public final class MainShellViewModel {
             }
         }
         composerDrafts[channelID] = state
+    }
+
+    public func addAttachmentURLsToSelectedChannel(_ urls: [URL]) {
+        addAttachmentURLs(urls, to: selection.channelID ?? selection.dmChannelID)
     }
 
     public func addPastedImageData(_ data: Data, to channelID: ChannelID?) {
@@ -3080,6 +3120,7 @@ public final class MainShellViewModel {
     }
 
     public func canReact(to message: Message) -> Bool {
+        guard message.system == nil else { return false }
         guard let channel = snapshot.channelsByID[message.channelID] else { return false }
         guard isRuntimeSendCapable else { return false }
         guard let permissions = resolvedPermissions(for: channel) else { return true }
@@ -3087,7 +3128,8 @@ public final class MainShellViewModel {
     }
 
     public func canEdit(_ message: Message) -> Bool {
-        currentUserID == message.authorID && isRuntimeSendCapable
+        guard message.system == nil else { return false }
+        return currentUserID == message.authorID && isRuntimeSendCapable
     }
 
     public func canEdit(_ timelineMessage: TimelineMessage) -> Bool {
@@ -3097,6 +3139,7 @@ public final class MainShellViewModel {
     }
 
     public func canDelete(_ message: Message) -> Bool {
+        guard message.system == nil else { return false }
         guard isRuntimeSendCapable else { return false }
         if currentUserID == message.authorID { return true }
         guard let channel = snapshot.channelsByID[message.channelID],
@@ -3118,6 +3161,7 @@ public final class MainShellViewModel {
 
     public func canPin(_ timelineMessage: TimelineMessage) -> Bool {
         guard timelineMessage.status == .confirmed else { return false }
+        guard timelineMessage.message.system == nil else { return false }
         guard isRuntimeSendCapable else { return false }
         guard let channel = snapshot.channelsByID[timelineMessage.message.channelID] else { return false }
         guard let permissions = resolvedPermissions(for: channel) else { return true }
@@ -3459,7 +3503,20 @@ public final class MainShellViewModel {
     }
 
     public func messageActionItems(for timelineMessage: TimelineMessage) -> [MessageActionItem] {
-        Phase17MessageActions.actionItems(for: messageActionContext(for: timelineMessage))
+        let items = Phase17MessageActions.actionItems(for: messageActionContext(for: timelineMessage))
+        guard timelineMessage.message.system != nil else { return items }
+        return items.filter { item in
+            switch item.kind {
+            case .copyText, .copyMessageID:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    public func systemEventText(for message: Message) -> String {
+        Phase27SystemEventPresenter.text(for: message, usersByID: snapshot.usersByID)
     }
 
     public func reactionSummaries(for message: Message) -> [ReactionSummary] {
@@ -4868,7 +4925,7 @@ public final class MainShellViewModel {
             return
         }
         let serverID = selection.serverID
-        let channelID = selection.channelID
+        let channelID = selection.channelID ?? selection.dmChannelID
         guard serverID == nil || snapshot.serversByID[serverID!] != nil else { return }
         guard channelID == nil || snapshot.channelsByID[channelID!] != nil else { return }
         Task { [weak coordinator] in
@@ -4894,6 +4951,10 @@ public final class MainShellViewModel {
 
     private func acknowledgeSelectedChannel() {
         guard let channelID = selection.channelID ?? selection.dmChannelID else { return }
+        guard snapshot.channelsByID[channelID] != nil else {
+            lastAckResult = "Skipped: selected channel missing"
+            return
+        }
         let unread = snapshot.unreadsByChannelID[channelID]
         let currentMessages = messageController.state(for: channelID).timelineMessages
         let firstUnread = localReadStates[channelID]?.firstUnreadMessageID ?? unread?.lastMessageID
@@ -4916,12 +4977,9 @@ public final class MainShellViewModel {
     }
 
     private func scheduleLiveAckIfNeeded(channelID: ChannelID) {
-        guard effectiveRuntimeMode == .liveManual,
-              effectiveSessionState == .connected,
-              timelineViewport.isAtNewest,
-              let messageID = timelineViewport.visibleRange?.lastVisibleMessageID ?? messageController.state(for: channelID).timelineMessages.last?.message.id ?? snapshot.unreadsByChannelID[channelID]?.lastMessageID,
-              lastAckedMessageByChannelID[channelID] != messageID
-        else {
+        let decision = readAckDecision(channelID: channelID)
+        lastAckResult = decision.diagnostic
+        guard case let .send(messageID) = decision else {
             return
         }
         lastAckTargetMessageID = messageID
@@ -4945,11 +5003,33 @@ public final class MainShellViewModel {
                 }
             } catch {
                 await MainActor.run {
-                    self?.lastAckResult = "Failed"
-                    self?.messageActionStatus = "Read acknowledgement failed: \(error.userFacingMessage)"
+                    self?.lastAckResult = "Failed: \(error.userFacingMessage)"
                 }
             }
         }
+    }
+
+    private func readAckDecision(channelID: ChannelID) -> Phase27ReadAckDecision {
+        guard effectiveRuntimeMode == .liveManual else { return .skip("not live manual") }
+        guard effectiveSessionState == .connected else { return .skip("not connected") }
+        guard snapshot.channelsByID[channelID] != nil else { return .skip("channel missing") }
+        guard timelineViewport.isAtNewest else { return .skip("not at newest") }
+        let hasUnreadState = snapshot.unreadsByChannelID[channelID]?.lastMessageID != nil
+            || (localReadStates[channelID]?.unreadCount ?? 0) > 0
+            || (localReadStates[channelID]?.mentionCount ?? 0) > 0
+        guard hasUnreadState else {
+            return .skip("no unread state")
+        }
+
+        let candidates = messageController.state(for: channelID).timelineMessages
+            .filter { $0.status == .confirmed && $0.message.channelID == channelID && $0.message.system == nil }
+        let visibleID = timelineViewport.visibleRange?.lastVisibleMessageID
+        let visibleMessageID = visibleID.flatMap { id in candidates.last(where: { $0.message.id == id })?.message.id }
+        guard let messageID = visibleMessageID ?? candidates.last?.message.id else {
+            return .skip("no normal message")
+        }
+        guard lastAckedMessageByChannelID[channelID] != messageID else { return .skip("duplicate") }
+        return .send(messageID)
     }
 
     private func resolveReferenceIfNeeded(channelID: ChannelID, messageID: MessageID) {
@@ -6495,25 +6575,67 @@ public struct ChannelListView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .top, spacing: StoatSpacing.small) {
-            VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-                Text(headerTitle)
-                    .font(StoatTypography.sidebarHeader)
-                    .lineLimit(1)
-                Text(runtimeSubtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            if viewModel.selection.serverID != nil {
-                GlassIconButton("Server overview", systemImage: "gearshape") {
-                    viewModel.openServerOverview()
+        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            HStack(alignment: .top, spacing: StoatSpacing.small) {
+                VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                    Text(headerTitle)
+                        .font(StoatTypography.sidebarHeader)
+                        .lineLimit(1)
+                    Text(runtimeSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .accessibilityLabel("Server overview")
-                .accessibilityHint("Open selected server overview and management actions")
+                Spacer()
+                if viewModel.selection.serverID != nil {
+                    GlassIconButton("Server overview", systemImage: "gearshape") {
+                        viewModel.openServerOverview()
+                    }
+                    .accessibilityLabel("Server overview")
+                    .accessibilityHint("Open selected server overview and management actions")
+                }
             }
+            serverHeaderBanner
         }
         .padding(.horizontal, StoatSpacing.large)
+        .onAppear {
+            viewModel.loadImageResource(for: viewModel.selectedServer?.banner, kind: .serverBanner)
+        }
+        .onChange(of: viewModel.selectedServer?.id) { _, _ in
+            viewModel.loadImageResource(for: viewModel.selectedServer?.banner, kind: .serverBanner)
+        }
+    }
+
+    @ViewBuilder private var serverHeaderBanner: some View {
+        #if canImport(AppKit)
+        if let server = viewModel.selectedServer,
+           let banner = server.banner {
+            ZStack(alignment: .bottomLeading) {
+                if let data = viewModel.imageData(for: banner, kind: .serverBanner),
+                   let image = NSImage(data: data) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.06))
+                        .overlay {
+                            if viewModel.imageResourceStates[ImageCacheKey(id: banner.id.rawValue, kind: .serverBanner)] == .loading {
+                                ProgressView().controlSize(.small)
+                            }
+                        }
+                }
+                LinearGradient(colors: [.clear, .black.opacity(0.34)], startPoint: .top, endPoint: .bottom)
+                Text(server.name)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .padding(StoatSpacing.small)
+            }
+            .frame(height: 72)
+            .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+            .accessibilityLabel("Server banner for \(server.name)")
+        }
+        #endif
     }
 
     private var headerTitle: String {
@@ -6671,6 +6793,7 @@ public struct ChannelListView: View {
         return ChannelRow(channel: channel, isSelected: viewModel.selection.channelID == channel.id, unreadCount: unread == nil ? 0 : 1, mentionCount: unread?.mentions.count ?? 0) {
             viewModel.selectChannel(channel.id)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -6702,28 +6825,25 @@ public struct ChatPlaceholderView: View {
     public var body: some View {
         VStack(spacing: 0) {
             GlassToolbar {
-                ZStack {
-                    serverBanner
-                    HStack(spacing: StoatSpacing.medium) {
-                        Label(viewModel.selectedChannel?.displayName ?? "No channel", systemImage: "number")
-                            .font(.headline)
-                        if let topic = viewModel.selectedChannel?.description {
-                            Text(topic).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                        Spacer()
-                        GlassIconButton("Pinned in this channel", systemImage: "pin") {
-                            viewModel.openChannelSearch(mode: .pinned)
-                        }
-                        GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
-                            viewModel.openChannelSearch(mode: .loadedOnly)
-                        }
-                        GlassIconButton("Toggle member panel", systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
-                        GlassIconButton("Channel settings unavailable in Phase 3", systemImage: "gearshape", isDisabled: true) {}
+                HStack(spacing: StoatSpacing.medium) {
+                    Label(viewModel.selectedConversationChannel?.displayName ?? "No channel", systemImage: "number")
+                        .font(.headline)
+                    if let topic = viewModel.selectedConversationChannel?.description {
+                        Text(topic).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
+                    Spacer()
+                    GlassIconButton("Pinned in this channel", systemImage: "pin") {
+                        viewModel.openChannelSearch(mode: .pinned)
+                    }
+                    GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
+                        viewModel.openChannelSearch(mode: .loadedOnly)
+                    }
+                    GlassIconButton("Toggle member panel", systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
+                    GlassIconButton("Channel settings unavailable in Phase 3", systemImage: "gearshape", isDisabled: true) {}
                 }
             }
             MessageTimelineView(viewModel: viewModel)
-            if let channel = viewModel.selectedChannel {
+            if let channel = viewModel.selectedConversationChannel {
                 let sendReadiness = viewModel.composerReadiness(for: channel.id)
                 let inputReadiness = viewModel.composerInputReadiness(for: channel.id)
                 let draftState = viewModel.composerDraftState(for: channel.id)
@@ -6780,27 +6900,28 @@ public struct ChatPlaceholderView: View {
                 .padding([.horizontal, .bottom], StoatSpacing.large)
             }
         }
-        .onAppear {
-            viewModel.loadImageResource(for: viewModel.selectedServer?.banner, kind: .serverBanner)
-        }
-        .onChange(of: viewModel.selectedServer?.id) { _, _ in
-            viewModel.loadImageResource(for: viewModel.selectedServer?.banner, kind: .serverBanner)
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
+            loadDroppedFileURLs(from: providers)
+            return true
         }
     }
 
-    @ViewBuilder private var serverBanner: some View {
-        #if canImport(AppKit)
-        if let data = viewModel.imageData(for: viewModel.selectedServer?.banner, kind: .serverBanner),
-           let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFill()
-                .frame(maxWidth: .infinity, maxHeight: 52)
-                .clipped()
-                .overlay(Color.black.opacity(0.28))
-                .accessibilityHidden(true)
+    private func loadDroppedFileURLs(from providers: [NSItemProvider]) {
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let url: URL?
+                if let data = item as? Data {
+                    url = URL(dataRepresentation: data, relativeTo: nil)
+                } else {
+                    url = item as? URL
+                }
+                if let url {
+                    Task { @MainActor in
+                        viewModel.addAttachmentURLsToSelectedChannel([url])
+                    }
+                }
+            }
         }
-        #endif
     }
 }
 
@@ -6816,7 +6937,7 @@ public struct MessageTimelineView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: viewModel.messageDensity == .compact ? StoatSpacing.small : StoatSpacing.medium) {
-                    if viewModel.selectedChannel == nil {
+                    if viewModel.selectedConversationChannel == nil {
                         EmptyStateView(title: emptyTitle, message: emptyMessage)
                             .frame(maxWidth: .infinity)
                     } else {
@@ -7171,6 +7292,15 @@ public struct TimelineMessageGroupView: View {
                     if viewModel.inlineEditState?.messageID == timelineMessage.message.id {
                         InlineMessageEditor(viewModel: viewModel)
                             .padding(.leading, index == 0 ? 0 : StoatSize.avatar + StoatSpacing.medium)
+                    } else if timelineMessage.message.system != nil {
+                        SystemEventRow(text: viewModel.systemEventText(for: timelineMessage.message))
+                            .id(timelineMessage.message.id)
+                            .onAppear {
+                                viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
+                            }
+                            .onDisappear {
+                                viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
+                            }
                     } else {
                         MessageRow(
                             message: timelineMessage.message,
@@ -7909,6 +8039,8 @@ private struct DirectMessageItemButton: View {
                 }
             }
             .padding(StoatSpacing.small)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
             .background(viewModel.selection.dmChannelID == item.id ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
         }
         .buttonStyle(.plain)

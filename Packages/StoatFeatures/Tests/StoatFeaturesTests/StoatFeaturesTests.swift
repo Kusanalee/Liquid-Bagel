@@ -2497,6 +2497,98 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(snapshot.usersByID[user.id]?.relationship, .incoming)
     }
 
+    func testPhase27RestoresPersistedDMSelection() {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase27-me"
+        let otherUserID: UserID = "phase27-friend"
+        let dmID: ChannelID = "phase27-dm"
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[otherUserID] = User(id: otherUserID, username: "friend", displayName: "Friend")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, active: true, recipients: [currentUserID, otherUserID])
+
+        let result = ShellSelectionRestorer().restore(
+            preferredSelection: nil,
+            preferences: AppPreferences(lastSelectedChannelID: dmID),
+            snapshot: snapshot,
+            mode: .liveManual
+        )
+
+        XCTAssertEqual(result.selection.space, .directMessages)
+        XCTAssertEqual(result.selection.dmChannelID, dmID)
+        XCTAssertTrue(result.selectedChannelAvailable)
+    }
+
+    @MainActor
+    func testPhase27DMSelectionTargetsComposerAndQueuesDropWithoutUpload() async throws {
+        let uploader = MockAttachmentUploadHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, attachmentUploadHandler: uploader)
+        let dmID = try XCTUnwrap(model.directMessageItems.first?.id)
+        let url = try makeTemporaryAttachment(name: "phase27.txt", contents: Data("queued".utf8))
+
+        model.selectChannel(dmID)
+        model.updateDraft("hello", for: model.selection.channelID ?? model.selection.dmChannelID)
+        model.addAttachmentURLsToSelectedChannel([url])
+
+        XCTAssertEqual(model.selection.space, .directMessages)
+        XCTAssertEqual(model.selectedConversationChannel?.id, dmID)
+        XCTAssertEqual(model.draft(for: dmID), "hello")
+        XCTAssertEqual(model.composerDraftState(for: dmID).attachments.count, 1)
+        let uploadCount = await uploader.uploadCount()
+        XCTAssertEqual(uploadCount, 0)
+    }
+
+    func testPhase27SystemEventPresenterUsesNamesAndUnknownFallback() {
+        let userID: UserID = "phase27-user"
+        let users = [userID: User(id: userID, username: "phase27", displayName: "Phase User")]
+        let joined = Message(id: "01J00000000000000000270001", channelID: "phase27-channel", authorID: userID, system: SystemMessage(kind: .userJoined, by: userID))
+        let unknown = Message(id: "01J00000000000000000270002", channelID: "phase27-channel", authorID: userID, system: SystemMessage(kind: .unknown("custom_event")))
+
+        XCTAssertEqual(Phase27SystemEventPresenter.text(for: joined, usersByID: users), "Phase User joined")
+        XCTAssertEqual(Phase27SystemEventPresenter.text(for: unknown, usersByID: users), "Unsupported system event: custom_event")
+    }
+
+    @MainActor
+    func testPhase27SystemOnlyTimelineDoesNotAckOrExposeNormalActions() async throws {
+        let sender = RecordingChannelAckSender()
+        var snapshot = MockShellData.snapshot
+        let channelID = try XCTUnwrap(snapshot.channelsByID.values.first(where: { $0.kind == .textChannel })?.id)
+        let message = Message(id: "01J00000000000000000270003", channelID: channelID, authorID: "phase27-user", system: SystemMessage(kind: .userLeft, by: "phase27-user"))
+        snapshot.messagesByChannelID[channelID] = [message]
+        snapshot.unreadsByChannelID[channelID] = ChannelUnread(id: ChannelCompositeKey(channelID: channelID, userID: MockShellData.currentUserID), lastMessageID: message.id, mentions: [])
+
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .liveManual, sessionState: .connected, channelAckSender: sender)
+        model.timelineTuning.ackDebounceMilliseconds = 0
+        model.selectChannel(channelID)
+        try? await Task.sleep(for: .milliseconds(25))
+
+        let acks = await sender.acks
+        XCTAssertTrue(acks.isEmpty)
+        XCTAssertTrue(model.lastAckResult?.contains("no normal message") == true)
+        let timelineMessage = try XCTUnwrap(model.selectedTimelineMessages.first)
+        XCTAssertFalse(model.messageActionItems(for: timelineMessage).contains { item in
+            item.kind == .delete || item.kind == .reply || item.kind == .pin
+        })
+    }
+
+    @MainActor
+    func testPhase27DMAckUsesNormalMessage() async throws {
+        let sender = RecordingChannelAckSender()
+        var snapshot = MockShellData.snapshot
+        let dmID = try XCTUnwrap(snapshot.channelsByID.values.first(where: { $0.kind == .directMessage })?.id)
+        let message = Message(id: "01J00000000000000000270004", channelID: dmID, authorID: "01HX0000000000000000000003", content: "dm ack")
+        snapshot.messagesByChannelID[dmID] = [message]
+        snapshot.unreadsByChannelID[dmID] = ChannelUnread(id: ChannelCompositeKey(channelID: dmID, userID: MockShellData.currentUserID), lastMessageID: message.id, mentions: [])
+
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .liveManual, sessionState: .connected, channelAckSender: sender)
+        model.timelineTuning.ackDebounceMilliseconds = 0
+        model.selectChannel(dmID)
+        try? await Task.sleep(for: .milliseconds(25))
+
+        let acks = await sender.acks
+        XCTAssertEqual(acks.last?.0, dmID)
+        XCTAssertEqual(acks.last?.1, message.id)
+    }
+
     @MainActor
     func testPhase24ServerOverviewAndPermissionGating() {
         let model = MainShellViewModel(snapshot: MockShellData.snapshot)

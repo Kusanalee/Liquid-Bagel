@@ -1,3 +1,4 @@
+import Foundation
 import StoatDesignSystem
 import StoatModels
 import SwiftUI
@@ -1157,9 +1158,7 @@ public struct MessageRow: View {
                     }
                 }
                 if let system = message.system {
-                    Text(system.content ?? "System event")
-                        .font(.callout.italic())
-                        .foregroundStyle(.secondary)
+                    SystemEventRow(text: system.content ?? "System event")
                 }
                 if let replyPreview {
                     HStack(spacing: StoatSpacing.xSmall) {
@@ -1178,10 +1177,7 @@ public struct MessageRow: View {
                     .accessibilityLabel(StoatAccessibility.replyPreviewLabel(replyPreview))
                 }
                 if let content = message.content, !content.isEmpty {
-                    Text(content)
-                        .font(StoatTypography.messageBody)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                    MarkdownMessageContent(content)
                 }
                 let renderedAttachments = attachmentItems ?? message.attachments?.map { AttachmentDisplayItem(file: $0) } ?? []
                 if !renderedAttachments.isEmpty {
@@ -1198,7 +1194,7 @@ public struct MessageRow: View {
                 }
                 if let embeds = message.embeds, !embeds.isEmpty {
                     ForEach(Array(embeds.enumerated()), id: \.offset) { _, embed in
-                        EmbedPreviewPlaceholder(title: embed.title ?? "Embed", subtitle: embed.description)
+                        EmbedTimelineCard(embed: embed, isCompact: isCompactDensity)
                     }
                 }
                 let renderedReactions = reactionItems.isEmpty ? fallbackReactionItems : reactionItems
@@ -1613,26 +1609,251 @@ private enum ComposerAttachmentDraftSafeName {
     }
 }
 
-public struct EmbedPreviewPlaceholder: View {
-    private let title: String
-    private let subtitle: String?
-    public init(title: String, subtitle: String? = nil) {
-        self.title = title
-        self.subtitle = subtitle
+public struct SystemEventRow: View {
+    private let text: String
+
+    public init(text: String) {
+        self.text = text
     }
+
+    public var body: some View {
+        HStack(spacing: StoatSpacing.small) {
+            Rectangle()
+                .fill(Color.secondary.opacity(0.35))
+                .frame(height: 1)
+            Text(text)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(nil)
+                .multilineTextAlignment(.center)
+                .textSelection(.enabled)
+            Rectangle()
+                .fill(Color.secondary.opacity(0.35))
+                .frame(height: 1)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, StoatSpacing.xSmall)
+        .accessibilityLabel(text)
+    }
+}
+
+public struct MarkdownMessageContent: View {
+    private let source: String
+
+    public init(_ source: String) {
+        self.source = source
+    }
+
     public var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-            Text(title).font(.caption.weight(.semibold))
-            if let subtitle {
-                Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+            ForEach(blocks.indices, id: \.self) { index in
+                switch blocks[index] {
+                case let .code(code):
+                    Text(code)
+                        .font(.system(.body, design: .monospaced))
+                        .padding(StoatSpacing.small)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+                        .textSelection(.enabled)
+                case let .quote(quote):
+                    Text(attributed(quote))
+                        .font(StoatTypography.messageBody)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, StoatSpacing.small)
+                        .overlay(alignment: .leading) {
+                            Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 2)
+                        }
+                        .textSelection(.enabled)
+                case let .text(text):
+                    Text(attributed(text))
+                        .font(StoatTypography.messageBody)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
-        .padding(StoatSpacing.medium)
+    }
+
+    private var blocks: [MarkdownBlock] {
+        MarkdownBlock.parse(source)
+    }
+
+    private func attributed(_ value: String) -> AttributedString {
+        let sanitized = value.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+        return (try? AttributedString(markdown: sanitized, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(sanitized)
+    }
+}
+
+private enum MarkdownBlock: Hashable {
+    case text(String)
+    case code(String)
+    case quote(String)
+
+    static func parse(_ source: String) -> [MarkdownBlock] {
+        var result: [MarkdownBlock] = []
+        var textBuffer: [String] = []
+        var codeBuffer: [String] = []
+        var isInCode = false
+
+        func flushText() {
+            let text = textBuffer.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { result.append(.text(text)) }
+            textBuffer.removeAll()
+        }
+
+        for line in source.components(separatedBy: .newlines) {
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                if isInCode {
+                    result.append(.code(codeBuffer.joined(separator: "\n")))
+                    codeBuffer.removeAll()
+                    isInCode = false
+                } else {
+                    flushText()
+                    isInCode = true
+                }
+                continue
+            }
+            if isInCode {
+                codeBuffer.append(line)
+            } else if line.trimmingCharacters(in: .whitespaces).hasPrefix(">") {
+                flushText()
+                let quote = line.replacingOccurrences(of: #"^\s*>\s?"#, with: "", options: .regularExpression)
+                result.append(.quote(quote))
+            } else {
+                textBuffer.append(line)
+            }
+        }
+        if isInCode {
+            result.append(.code(codeBuffer.joined(separator: "\n")))
+        }
+        flushText()
+        return result.isEmpty ? [.text(source)] : result
+    }
+}
+
+public struct EmbedTimelineCard: View {
+    private let embed: Embed
+    private let isCompact: Bool
+
+    public init(embed: Embed, isCompact: Bool = false) {
+        self.embed = embed
+        self.isCompact = isCompact
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            HStack(spacing: StoatSpacing.small) {
+                Text(label)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                if let provider = safeText(embed.siteName) {
+                    Text(provider)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            if let title = safeText(embed.title) {
+                if let url = SafeEmbedURL.externalURL(embed.url ?? embed.originalURL) {
+                    Link(title, destination: url)
+                        .font(.caption.weight(.semibold))
+                } else {
+                    Text(title).font(.caption.weight(.semibold))
+                }
+            }
+            if let description = safeText(embed.description) {
+                MarkdownMessageContent(description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+            }
+            if embed.image != nil || embed.media != nil {
+                Label(embed.media?.filename ?? "Image preview available", systemImage: "photo")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if embed.video != nil {
+                Label("Video preview", systemImage: "play.rectangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let displayURL = SafeEmbedURL.display(embed.url ?? embed.originalURL) {
+                Text(displayURL)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(isCompact ? StoatSpacing.small : StoatSpacing.medium)
         .frame(maxWidth: 340, alignment: .leading)
         .overlay(alignment: .leading) {
-            Rectangle().fill(Color.accentColor).frame(width: 3)
+            Rectangle().fill(accentColor).frame(width: 3)
         }
         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var label: String {
+        switch embed.kind {
+        case .website: "Link"
+        case .image: "Image"
+        case .video: "Video"
+        case .text: "Embed"
+        case .none: "Embed"
+        case let .unknown(value): value.isEmpty ? "Embed" : "Embed \(value)"
+        }
+    }
+
+    private var accentColor: Color {
+        guard let colour = embed.colour?.trimmingCharacters(in: .whitespacesAndNewlines), !colour.isEmpty else {
+            return Color.accentColor
+        }
+        #if canImport(AppKit)
+        var hex = colour
+        if hex.hasPrefix("#") { hex.removeFirst() }
+        guard hex.count == 6, let value = Int(hex, radix: 16) else { return Color.accentColor }
+        return Color(nsColor: NSColor(
+            calibratedRed: CGFloat((value >> 16) & 0xff) / 255,
+            green: CGFloat((value >> 8) & 0xff) / 255,
+            blue: CGFloat(value & 0xff) / 255,
+            alpha: 1
+        ))
+        #else
+        return Color.accentColor
+        #endif
+    }
+
+    private var accessibilityLabel: String {
+        [label, safeText(embed.title), safeText(embed.siteName), SafeEmbedURL.display(embed.url ?? embed.originalURL)]
+            .compactMap { $0 }
+            .joined(separator: ", ")
+    }
+
+    private func safeText(_ value: String?) -> String? {
+        let trimmed = value?
+            .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+}
+
+private enum SafeEmbedURL {
+    static func externalURL(_ raw: String?) -> URL? {
+        guard let raw,
+              let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              components.host?.isEmpty == false
+        else { return nil }
+        return components.url
+    }
+
+    static func display(_ raw: String?) -> String? {
+        guard var components = raw.flatMap(URLComponents.init(string:)),
+              components.host?.isEmpty == false
+        else { return nil }
+        components.query = nil
+        components.fragment = nil
+        return components.string
     }
 }
 
@@ -1671,7 +1892,9 @@ public struct ChannelRow: View {
                 }
             }
             .padding(.horizontal, StoatSpacing.medium)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .frame(minHeight: StoatSize.minimumRowHeight)
+            .contentShape(Rectangle())
             .background(isSelected ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
         }
         .buttonStyle(.plain)
