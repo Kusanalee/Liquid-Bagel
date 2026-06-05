@@ -2812,6 +2812,164 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase30DMRowTraceAndActiveConversationBeatStaleServerSelection() async throws {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase30-server"
+        let serverChannelID: ChannelID = "phase30-server-channel"
+        let currentUserID: UserID = "phase30-me"
+        let otherUserID: UserID = "phase30-other"
+        let dmID: ChannelID = "phase30-dm"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: currentUserID, name: "Phase 30")
+        snapshot.channelsByID[serverChannelID] = Channel(id: serverChannelID, kind: .textChannel, serverID: serverID, name: "general")
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[otherUserID] = User(id: otherUserID, username: "other", displayName: "Other")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, otherUserID])
+        snapshot.messagesByChannelID[dmID] = [Message(id: "01J00000000000000000300001", channelID: dmID, authorID: otherUserID, content: "hi")]
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: serverChannelID),
+            snapshot: snapshot,
+            currentUser: snapshot.usersByID[currentUserID]
+        )
+        let item = try XCTUnwrap(model.directMessageItems.first { $0.id == dmID })
+
+        model.selectDirectMessageItem(item)
+        try? await Task.sleep(for: .milliseconds(25))
+
+        XCTAssertEqual(model.activeConversation, .directMessage(channelID: dmID))
+        XCTAssertEqual(model.selectedConversationChannelID, dmID)
+        XCTAssertNil(model.selection.serverID)
+        XCTAssertNil(model.selection.channelID)
+        XCTAssertEqual(model.selection.dmChannelID, dmID)
+        XCTAssertEqual(model.dmLiveTrace.clickedRowID, dmID.rawValue)
+        XCTAssertEqual(model.dmLiveTrace.clickedChannelID, dmID)
+        XCTAssertEqual(model.dmLiveTrace.clickedUserID, otherUserID)
+        XCTAssertEqual(model.dmLiveTrace.selectedServerIDBefore, serverID)
+        XCTAssertNil(model.dmLiveTrace.selectedServerIDAfter)
+        XCTAssertEqual(model.dmLiveTrace.messageLoadChannelID, dmID)
+        XCTAssertEqual(model.dmLiveTrace.timelineChannelID, dmID)
+        XCTAssertEqual(model.dmLiveTrace.composerTargetChannelID, dmID)
+        XCTAssertEqual(model.dmLiveTrace.timelineMessageCount, 1)
+    }
+
+    @MainActor
+    func testPhase30DMLiveLoadSendAttachmentParticipantsAndAckUseDMChannel() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase30-me"
+        let missingUserID: UserID = "phase30-missing-user"
+        let dmID: ChannelID = "phase30-live-dm"
+        let liveMessage = Message(id: "01J00000000000000000300002", channelID: dmID, authorID: missingUserID, content: "from live")
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, missingUserID])
+        snapshot.unreadsByChannelID[dmID] = ChannelUnread(id: ChannelCompositeKey(channelID: dmID, userID: currentUserID), lastMessageID: liveMessage.id, mentions: [])
+        let api = RecordingAPIClient(currentUser: User(id: currentUserID, username: "me"), messagesByChannel: [dmID: [liveMessage]])
+        let controller = ChannelMessageController(runtimeMode: .liveManual, apiClient: api, currentUserID: currentUserID)
+        let sender = RecordingChannelAckSender()
+        let handler = MockMessageActionHandler(currentUserID: currentUserID)
+        let uploader = MockAttachmentUploadHandler()
+        let model = MainShellViewModel(
+            snapshot: snapshot,
+            runtimeMode: .liveManual,
+            sessionState: .connected,
+            currentUser: snapshot.usersByID[currentUserID],
+            messageController: controller,
+            messageActionHandler: handler,
+            attachmentUploadHandler: uploader,
+            channelAckSender: sender
+        )
+        model.timelineTuning.ackDebounceMilliseconds = 0
+
+        model.selectChannel(dmID)
+        try? await Task.sleep(for: .milliseconds(40))
+        model.updateDraft("with attachment", for: dmID)
+        let url = try makeTemporaryAttachment(name: "phase30.txt", contents: Data("dm file".utf8))
+        model.addAttachmentURLs([url], to: dmID)
+        await model.sendDraft(for: dmID)
+        model.updateTimelineAtNewest(true)
+        try? await Task.sleep(for: .milliseconds(25))
+
+        let fetchCount = await api.fetchMessagesCallCount
+        let sent = await handler.sentMessages
+        let acks = await sender.acks
+        XCTAssertEqual(fetchCount, 1)
+        XCTAssertEqual(model.selectedTimelineMessages.first?.message.channelID, dmID)
+        XCTAssertEqual(sent.last?.channelID, dmID)
+        XCTAssertEqual(sent.last?.attachments?.count, 1)
+        XCTAssertEqual(model.directMessageParticipantItems(for: snapshot.channelsByID[dmID]!).count, 2)
+        XCTAssertTrue(model.directMessageParticipantItems(for: snapshot.channelsByID[dmID]!).contains { $0.userID == missingUserID && $0.user == nil })
+        XCTAssertEqual(model.dmLiveTrace.messageLoadChannelID, dmID)
+        XCTAssertTrue(model.dmLiveTrace.messageLoadUsedREST)
+        XCTAssertEqual(model.dmLiveTrace.sidebarParticipantCount, 2)
+        XCTAssertEqual(model.currentMessageSendDiagnostics().selectedChannelID, dmID)
+        XCTAssertEqual(acks.last?.0, dmID)
+    }
+
+    @MainActor
+    func testPhase30GroupDMSavedMessagesAndOpenDMKnownChannelStayExplicit() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase30-me"
+        let otherUserID: UserID = "phase30-other"
+        let groupID: ChannelID = "phase30-group"
+        let dmID: ChannelID = "phase30-known-dm"
+        let savedID: ChannelID = "phase30-saved"
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[otherUserID] = User(id: otherUserID, username: "other")
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Group", recipients: [currentUserID, otherUserID])
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, otherUserID])
+        snapshot.channelsByID[savedID] = Channel(id: savedID, kind: .savedMessages, userID: currentUserID, recipients: [])
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID])
+
+        model.selectChannel(groupID)
+        XCTAssertEqual(model.activeConversation, .groupDM(channelID: groupID))
+        model.selectChannel(savedID)
+        XCTAssertEqual(model.activeConversation, .savedMessages(channelID: savedID))
+        await model.openDirectMessage(with: otherUserID)
+
+        XCTAssertEqual(model.selection.dmChannelID, dmID)
+        XCTAssertEqual(model.snapshot.channelsByID.count, 3)
+        XCTAssertEqual(model.dmLiveTrace.clickedUserID, otherUserID)
+    }
+
+    func testPhase30DMTraceAndParityDiagnosticsStayRedacted() {
+        let trace = DirectMessageLiveTrace(
+            clickedRowID: #"https://secret.example/session token=supersecret"#,
+            clickedUserID: "phase30-user",
+            clickedChannelExistsInSnapshot: false,
+            selectedSpaceBefore: "/Users/enka/private/file.png",
+            selectedSpaceAfter: "directMessages",
+            lastError: #"X-Session-Token: secret {"raw":"body"} https://api.stoat.chat/private"#
+        )
+        let text = DirectMessageLiveTraceFormatter.redactedText(trace)
+
+        XCTAssertFalse(text.contains("supersecret"))
+        XCTAssertFalse(text.contains("X-Session-Token: secret"))
+        XCTAssertFalse(text.contains("/Users/enka/private"))
+        XCTAssertFalse(text.contains("https://api.stoat.chat/private"))
+        XCTAssertFalse(text.contains(#"{"raw":"body"}"#))
+    }
+
+    func testPhase30ParityMatrixContainsRequiredSectionsAndKeepsDMsBrokenUntilLiveQA() {
+        let matrix = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: false)
+        let sections = Set(matrix.sections)
+        XCTAssertTrue(sections.isSuperset(of: [
+            "Account and session",
+            "Core chat",
+            "Server/community",
+            "Notifications",
+            "UI/platform",
+            "Deferred / not parity"
+        ]))
+        XCTAssertFalse(matrix.items.contains { $0.status.rawValue.isEmpty })
+        let dm = matrix.items.first { $0.section == "Core chat" && $0.name == "DMs" }
+        XCTAssertEqual(dm?.status, .broken)
+        XCTAssertFalse(matrix.items.contains { item in
+            (item.status == .deferred || item.status == .blockedByUnverifiedAPI) && item.recommendedNextAction.isEmpty
+        })
+
+        let passed = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: true)
+        XCTAssertEqual(passed.items.first { $0.section == "Core chat" && $0.name == "DMs" }?.status, .done)
+    }
+
+    @MainActor
     func testPhase29ChannelContextMenuContainsSettingsAndDeveloperActions() throws {
         let model = MainShellViewModel(snapshot: MockShellData.snapshot)
         let server = try XCTUnwrap(model.servers.first)

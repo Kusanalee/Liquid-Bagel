@@ -612,7 +612,7 @@ private struct NotificationSettingsTab: View {
     }
 
     private var selectedChannelID: ChannelID? {
-        viewModel.selection.channelID ?? viewModel.selection.dmChannelID
+        viewModel.selectedConversationChannelID
     }
 
     var body: some View {

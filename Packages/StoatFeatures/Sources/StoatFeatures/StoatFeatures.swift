@@ -466,6 +466,7 @@ public final class MainShellViewModel {
     public var lastImageResourceAction: String?
     public var messageSendDiagnostics = MessageSendDiagnostics()
     public var dmRouteDiagnostics = DMRouteDiagnostics()
+    public var dmLiveTrace = DirectMessageLiveTrace()
     public var notificationPermissionStatus: NotificationPermissionStatus = .unknown
     public var notificationBanners: [NotificationEvent] = []
     public var notificationDiagnostics = NotificationDiagnostics()
@@ -681,20 +682,34 @@ public final class MainShellViewModel {
         return snapshot.channelsByID[id]
     }
 
+    public var activeConversation: ActiveConversation {
+        ActiveConversation.resolve(selection: selection, snapshot: snapshot)
+    }
+
     public var selectedConversationChannelID: ChannelID? {
-        switch selection.space {
-        case .server:
-            return selection.channelID
-        case .directMessages:
-            return selection.dmChannelID
-        case .home, .discover:
-            return nil
-        }
+        activeConversation.channelID
     }
 
     public var selectedConversationChannel: Channel? {
         guard let id = selectedConversationChannelID else { return nil }
         return snapshot.channelsByID[id]
+    }
+
+    public func directMessageParticipantItems(for channel: Channel) -> [MemberListItem] {
+        guard DMChannelClassifier.isDirectMessageLike(channel) else { return [] }
+        let ids: [UserID]
+        if channel.kind == .savedMessages {
+            ids = [currentUserID ?? channel.userID].compactMap { $0 }
+        } else {
+            var ordered = channel.recipients
+            if let currentUserID, !ordered.contains(currentUserID) {
+                ordered.insert(currentUserID, at: 0)
+            }
+            ids = ordered
+        }
+        return ids.map { userID in
+            MemberListItem(userID: userID, user: snapshot.usersByID[userID] ?? (userID == currentUser?.id ? currentUser : nil), member: nil)
+        }
     }
 
     public var selectedMessages: [Message] {
@@ -760,6 +775,10 @@ public final class MainShellViewModel {
             memberListDiagnostics: "members \(memberDiagnostics.totalMembers) groups \(memberDiagnostics.groupCount) queue \(memberDiagnostics.avatarLoadQueueCount)",
             timelinePerformanceDiagnostics: "loaded \(timelineDiagnostics.loadedMessageCount) grouped \(timelineDiagnostics.groupedMessageCount) queue \(timelineDiagnostics.avatarLoadQueueCount)"
         )
+    }
+
+    public var phase30ParityMatrix: ParityMatrix {
+        Phase30ParityMatrixBuilder.build(dmLiveQAPassed: false)
     }
 
     public var effectiveRuntimeMode: AppRuntimeMode {
@@ -1120,9 +1139,12 @@ public final class MainShellViewModel {
 
     public func openDirectMessage(with userID: UserID) async {
         if let existing = directMessageItems.first(where: { item in
-            item.participants.contains { $0.id == userID } || item.channel.recipients.contains(userID)
+            guard item.channel.kind == .directMessage || item.channel.kind == .savedMessages else { return false }
+            return item.participants.contains { $0.id == userID } || item.channel.recipients.contains(userID)
         }) {
             selectChannel(existing.id)
+            dmLiveTrace.clickedUserID = userID
+            dmLiveTrace.clickedRowID = "user-\(userID.rawValue)"
             return
         }
         if effectiveRuntimeMode == .mock {
@@ -1135,6 +1157,8 @@ public final class MainShellViewModel {
             )
             snapshot.channelsByID[channel.id] = channel
             selectChannel(channel.id)
+            dmLiveTrace.clickedUserID = userID
+            dmLiveTrace.clickedRowID = "user-\(userID.rawValue)"
             relationshipActionStatus = "Direct message opened"
             return
         }
@@ -1143,9 +1167,24 @@ public final class MainShellViewModel {
             let channel = try await apiClient.openDirectMessage(userID: userID)
             snapshot.channelsByID[channel.id] = channel
             selectChannel(channel.id)
+            dmLiveTrace.clickedUserID = userID
+            dmLiveTrace.clickedRowID = "user-\(userID.rawValue)"
             relationshipActionStatus = "Direct message opened"
         } catch {
             relationshipActionStatus = "Could not open direct message."
+            dmLiveTrace = DirectMessageLiveTrace(
+                clickedRowID: "user-\(userID.rawValue)",
+                clickedUserID: userID,
+                clickedChannelExistsInSnapshot: false,
+                selectedSpaceBefore: String(describing: selection.space),
+                selectedSpaceAfter: String(describing: selection.space),
+                selectedServerIDBefore: selection.serverID,
+                selectedServerIDAfter: selection.serverID,
+                selectedChannelIDBefore: selection.channelID ?? selection.dmChannelID,
+                selectedChannelIDAfter: selection.channelID ?? selection.dmChannelID,
+                selectedConversationChannelID: selectedConversationChannelID,
+                lastError: "Could not open direct message."
+            )
         }
     }
 
@@ -2369,11 +2408,12 @@ public final class MainShellViewModel {
 
     public func selectDirectMessages() {
         endTypingForActiveChannel()
+        let before = selection
         selection.space = .directMessages
         selection.serverID = nil
         selection.channelID = nil
         selection.dmChannelID = snapshot.channelsByID.values.first(where: DMChannelClassifier.isDirectMessageLike)?.id
-        recordDMRouteSelection(clickedChannelID: selection.dmChannelID)
+        recordDMRouteSelection(clickedRowID: selection.dmChannelID?.rawValue ?? "direct-messages", clickedChannelID: selection.dmChannelID, before: before)
         clearTimelineSelection()
         reconcileSearchHighlightsForSelectedChannel()
         placeholderStatus = nil
@@ -2415,6 +2455,7 @@ public final class MainShellViewModel {
             validateSelection()
             return
         }
+        let before = selection
         if let serverID = channel.serverID {
             selection.space = .server(serverID)
             selection.serverID = serverID
@@ -2425,7 +2466,7 @@ public final class MainShellViewModel {
             selection.serverID = nil
             selection.channelID = nil
             selection.dmChannelID = id
-            recordDMRouteSelection(clickedChannelID: id)
+            recordDMRouteSelection(clickedRowID: id.rawValue, clickedChannelID: id, before: before)
         }
         clearTimelineSelection()
         updateViewportForSelectedChannel()
@@ -2437,7 +2478,16 @@ public final class MainShellViewModel {
         persistLiveSelectionIfNeeded()
     }
 
-    private func recordDMRouteSelection(clickedChannelID: ChannelID?) {
+    public func selectDirectMessageItem(_ item: DirectMessageListItem) {
+        selectChannel(item.id)
+        dmLiveTrace.clickedRowID = item.id.rawValue
+        dmLiveTrace.clickedUserID = item.participants.first?.id
+        dmLiveTrace.clickedChannelID = item.channel.id
+        dmLiveTrace.clickedChannelKind = item.channel.kind.rawAPIValue
+        dmLiveTrace.clickedChannelExistsInSnapshot = snapshot.channelsByID[item.id] != nil
+    }
+
+    private func recordDMRouteSelection(clickedRowID: String, clickedChannelID: ChannelID?, clickedUserID: UserID? = nil, before: ShellSelection) {
         guard let channelID = clickedChannelID,
               let channel = snapshot.channelsByID[channelID],
               DMChannelClassifier.isDirectMessageLike(channel)
@@ -2448,6 +2498,29 @@ public final class MainShellViewModel {
         dmRouteDiagnostics.messageLoadRequested = false
         dmRouteDiagnostics.lastLoadResult = nil
         dmRouteDiagnostics.composerTargetDescription = channel.displayName
+        dmLiveTrace = DirectMessageLiveTrace(
+            clickedRowID: clickedRowID,
+            clickedChannelID: channelID,
+            clickedUserID: clickedUserID,
+            clickedChannelKind: channel.kind.rawAPIValue,
+            clickedChannelExistsInSnapshot: true,
+            selectedSpaceBefore: String(describing: before.space),
+            selectedSpaceAfter: String(describing: selection.space),
+            selectedServerIDBefore: before.serverID,
+            selectedServerIDAfter: selection.serverID,
+            selectedChannelIDBefore: before.channelID ?? before.dmChannelID,
+            selectedChannelIDAfter: selection.channelID ?? selection.dmChannelID,
+            selectedConversationChannelID: selectedConversationChannelID,
+            messageLoadRequested: false,
+            messageLoadChannelID: nil,
+            messageLoadUsedREST: false,
+            messageLoadResult: nil,
+            timelineChannelID: selectedConversationChannelID,
+            timelineMessageCount: selectedTimelineMessages.count,
+            composerTargetChannelID: selectedConversationChannelID,
+            sidebarParticipantCount: directMessageParticipantItems(for: channel).count,
+            lastError: selectedConversationChannelID == channelID ? nil : "Selected conversation diverged from clicked DM."
+        )
     }
 
     public func toggleMemberPanel() {
@@ -3477,11 +3550,21 @@ public final class MainShellViewModel {
             recordMessageSendDiagnostics(channelID: channelID, stage: .decodingResponse, result: .pending, error: nil)
             recordMessageSendDiagnostics(channelID: channelID, stage: .reconciled, result: .succeeded, error: nil)
             messageActionStatus = nil
+            if snapshot.channelsByID[channelID].map(DMChannelClassifier.isDirectMessageLike) == true {
+                dmLiveTrace.composerTargetChannelID = channelID
+                dmLiveTrace.timelineChannelID = selectedConversationChannelID
+                dmLiveTrace.timelineMessageCount = selectedTimelineMessages.count
+                dmLiveTrace.lastError = nil
+            }
             acknowledgeSelectedChannel()
         } else {
             let error = messageController.lastErrorByChannelID[channelID] ?? "Message send failed."
             recordMessageSendDiagnostics(channelID: channelID, stage: .failed, result: .failed, error: error)
             messageActionStatus = error
+            if snapshot.channelsByID[channelID].map(DMChannelClassifier.isDirectMessageLike) == true {
+                dmLiveTrace.composerTargetChannelID = channelID
+                dmLiveTrace.lastError = MessageSendDiagnosticsFormatter.redact(error)
+            }
         }
     }
 
@@ -4147,6 +4230,7 @@ public final class MainShellViewModel {
         let actions = messageActionDiagnostics()
         let send = MessageSendDiagnosticsFormatter.redactedText(currentMessageSendDiagnostics())
         let dm = dmRouteDiagnostics
+        let dmTrace = DirectMessageLiveTraceFormatter.redactedText(dmLiveTrace)
         let members = memberListPerformanceDiagnostics
         let attachmentText = """
         Attachment diagnostics
@@ -4179,13 +4263,33 @@ public final class MainShellViewModel {
         groups: \(members.groupCount)
         avatarQueue: \(members.avatarLoadQueueCount)
         """
-        let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText + "\n" + send)))
+        let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText + "\n" + send + "\n" + dmTrace)))
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         #endif
         placeholderStatus = "Timeline diagnostics copied"
         lastTimelineActionResult = "Copied redacted diagnostics"
+    }
+
+    public func copyRedactedDMTrace() {
+        let text = DirectMessageLiveTraceFormatter.redactedText(dmLiveTrace)
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+        placeholderStatus = "DM trace copied"
+        lastTimelineActionResult = "Copied redacted DM trace"
+    }
+
+    public func copyRedactedParityDiagnostics() {
+        let text = ParityMatrixFormatter.redactedText(phase30ParityMatrix)
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+        placeholderStatus = "Parity diagnostics copied"
+        lastTimelineActionResult = "Copied redacted parity diagnostics"
     }
 
     public func resetTimelineDiagnostics() {
@@ -5211,12 +5315,30 @@ public final class MainShellViewModel {
             dmRouteDiagnostics.selectedConversationChannelID = channelID
             dmRouteDiagnostics.selectedServerID = selection.serverID
             dmRouteDiagnostics.composerTargetDescription = snapshot.channelsByID[channelID]?.displayName
+            dmLiveTrace.messageLoadRequested = true
+            dmLiveTrace.messageLoadChannelID = channelID
+            dmLiveTrace.messageLoadUsedREST = effectiveRuntimeMode == .liveManual && effectiveSessionState == .connected
+            dmLiveTrace.selectedConversationChannelID = selectedConversationChannelID
+            dmLiveTrace.timelineChannelID = selectedConversationChannelID
+            dmLiveTrace.composerTargetChannelID = selectedConversationChannelID
+            if let channel = snapshot.channelsByID[channelID] {
+                dmLiveTrace.sidebarParticipantCount = directMessageParticipantItems(for: channel).count
+            }
         }
         selectedChannelLoadTask = Task { [weak self] in
             guard let self else { return }
             await self.messageController.loadInitialIfNeeded(channelID: channelID, snapshotMessages: snapshotMessages)
             if isDMRoute {
-                self.dmRouteDiagnostics.lastLoadResult = self.safeLoadResultDescription(for: channelID)
+                let result = self.safeLoadResultDescription(for: channelID)
+                self.dmRouteDiagnostics.lastLoadResult = result
+                self.dmLiveTrace.messageLoadResult = result
+                self.dmLiveTrace.timelineChannelID = self.selectedConversationChannelID
+                self.dmLiveTrace.timelineMessageCount = self.selectedTimelineMessages.count
+                self.dmLiveTrace.composerTargetChannelID = self.selectedConversationChannelID
+                if let channel = self.snapshot.channelsByID[channelID] {
+                    self.dmLiveTrace.sidebarParticipantCount = self.directMessageParticipantItems(for: channel).count
+                }
+                self.dmLiveTrace.lastError = result.hasPrefix("failed") ? result : nil
             }
             if self.timelineViewport.channelID != channelID || self.timelineViewport.pendingScrollIntent == nil {
                 self.updateViewportForSelectedChannel()
@@ -6563,7 +6685,7 @@ public struct CredentialSetupView: View {
                     Button("Send Composer Text") {
                         viewModel.isTestSendConfirmationPresented = true
                     }
-                    .disabled(!viewModel.composerReadiness(for: viewModel.selection.channelID ?? viewModel.selection.dmChannelID).canSend)
+                    .disabled(!viewModel.composerReadiness(for: viewModel.selectedConversationChannelID).canSend)
                 }
                 HStack {
                     Button("Reload Visible Images") {
@@ -6682,6 +6804,7 @@ public struct CredentialSetupView: View {
         let dm = viewModel.dmRouteDiagnostics
         let members = viewModel.memberListPerformanceDiagnostics
         let send = viewModel.currentMessageSendDiagnostics()
+        let parity = viewModel.phase30ParityMatrix
         Section("Developer Diagnostics") {
             LabeledContent("Timeline", value: "loaded \(timeline.loadedMessageCount), visible \(TimelineCopyFormatter.shortID(timeline.firstVisibleMessageID?.rawValue)) to \(TimelineCopyFormatter.shortID(timeline.lastVisibleMessageID?.rawValue))")
             LabeledContent("DM route", value: "clicked \(TimelineCopyFormatter.shortID(dm.clickedChannelID?.rawValue)), selected \(TimelineCopyFormatter.shortID(dm.selectedConversationChannelID?.rawValue)), load \(dm.messageLoadRequested ? "requested" : "idle")")
@@ -6698,9 +6821,24 @@ public struct CredentialSetupView: View {
                 LabeledContent("Send error", value: error)
             }
             LabeledContent("Notifications", value: "\(viewModel.notificationDiagnostics.permissionStatus.rawValue), queued \(viewModel.notificationDiagnostics.queuedRouteCount)")
+            LabeledContent("DM trace channel", value: "clicked \(TimelineCopyFormatter.shortID(viewModel.dmLiveTrace.clickedChannelID?.rawValue)), load \(TimelineCopyFormatter.shortID(viewModel.dmLiveTrace.messageLoadChannelID?.rawValue)), composer \(TimelineCopyFormatter.shortID(viewModel.dmLiveTrace.composerTargetChannelID?.rawValue))")
+            LabeledContent("DM trace state", value: "messages \(viewModel.dmLiveTrace.timelineMessageCount), participants \(viewModel.dmLiveTrace.sidebarParticipantCount), REST \(viewModel.dmLiveTrace.messageLoadUsedREST ? "yes" : "no")")
+            if let error = viewModel.dmLiveTrace.lastError {
+                LabeledContent("DM trace error", value: error)
+            }
+            LabeledContent("Parity Matrix", value: "\(parity.count(.done)) done, \(parity.count(.partial)) partial, \(parity.count(.broken)) broken, \(parity.count(.blockedByUnverifiedAPI)) blocked, \(parity.count(.deferred)) deferred, \(parity.count(.outOfScope)) out of scope")
+            if let dmParity = parity.items.first(where: { $0.section == "Core chat" && $0.name == "DMs" }) {
+                LabeledContent("DM parity", value: "\(dmParity.status.rawValue): \(dmParity.recommendedNextAction)")
+            }
             HStack {
                 Button("Copy Timeline Diagnostics") {
                     viewModel.copyRedactedTimelineDiagnostics()
+                }
+                Button("Copy DM Trace") {
+                    viewModel.copyRedactedDMTrace()
+                }
+                Button("Copy Parity Diagnostics") {
+                    viewModel.copyRedactedParityDiagnostics()
                 }
                 Button("Copy Notification Diagnostics") {
                     viewModel.copyRedactedNotificationDiagnostics()
@@ -7480,7 +7618,7 @@ public struct MessageTimelineView: View {
     }
 
     @ViewBuilder private var unreadRecoveryBanner: some View {
-        if let channelID = viewModel.selection.channelID ?? viewModel.selection.dmChannelID,
+        if let channelID = viewModel.selectedConversationChannelID,
            let history = viewModel.messageController.historiesByChannelID[channelID] {
             switch history.unreadRecoveryState {
             case .none, .targetLoaded:
@@ -7559,7 +7697,7 @@ public struct MessageTimelineView: View {
     }
 
     @ViewBuilder private var typingIndicator: some View {
-        let users = viewModel.typingUsers(for: viewModel.selection.channelID ?? viewModel.selection.dmChannelID)
+        let users = viewModel.typingUsers(for: viewModel.selectedConversationChannelID)
         if !users.isEmpty {
             Text(typingText(users))
                 .font(.caption)
@@ -7577,7 +7715,7 @@ public struct MessageTimelineView: View {
     }
 
     @ViewBuilder private var unreadSeparator: some View {
-        if let channelID = viewModel.selection.channelID ?? viewModel.selection.dmChannelID,
+        if let channelID = viewModel.selectedConversationChannelID,
            viewModel.firstUnreadMessageID(for: channelID) != nil {
             HStack {
                 Rectangle().frame(height: 1).foregroundStyle(Color.red.opacity(0.5))
@@ -7929,7 +8067,7 @@ public struct MemberPanelView: View {
 
     private var count: Int {
         if let channel = viewModel.selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
-            return channel.recipients.count
+            return viewModel.directMessageParticipantItems(for: channel).count
         }
         return groups.reduce(0) { $0 + $1.items.count }
     }
@@ -7962,16 +8100,14 @@ public struct MemberPanelView: View {
     }
 
     @ViewBuilder private func dmParticipants(_ channel: Channel) -> some View {
-        let ids = channel.kind == .savedMessages ? [viewModel.currentUserID].compactMap { $0 } : channel.recipients
-        if ids.isEmpty {
+        let items = viewModel.directMessageParticipantItems(for: channel)
+        if items.isEmpty {
             EmptyStateView(title: "No participants", message: "Participant data is not present in the current snapshot.", systemImage: "person")
                 .frame(maxWidth: .infinity)
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-                    ForEach(ids, id: \.self) { userID in
-                        let user = viewModel.snapshot.usersByID[userID]
-                        let item = MemberListItem(userID: userID, user: user, member: nil)
+                    ForEach(items) { item in
                         memberListRow(item)
                             .onAppear { viewModel.loadImageResource(for: item.avatar, kind: .userAvatar) }
                     }
@@ -8421,7 +8557,7 @@ private struct DirectMessageItemButton: View {
 
     var body: some View {
         Button {
-            viewModel.selectChannel(item.id)
+            viewModel.selectDirectMessageItem(item)
         } label: {
             HStack(spacing: StoatSpacing.medium) {
                 AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.avatarUser?.online == true, imageData: item.avatarUser.flatMap { viewModel.imageData(for: $0.avatar, kind: .userAvatar) })
@@ -10092,6 +10228,16 @@ public typealias PhaseZeroStatus = PhaseOneStatus
 public typealias PhaseThreeStatus = PhaseOneStatus
 public typealias PhaseFourStatus = PhaseOneStatus
 
+@MainActor
+private func phase30DMPreviewModel(reduceGlass: Bool = false) -> MainShellViewModel {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.reduceGlassIntensity = reduceGlass
+    if let item = model.directMessageItems.first {
+        model.selectDirectMessageItem(item)
+    }
+    return model
+}
+
 @available(macOS 15.0, *)
 #Preview("Shell Dark") {
     MainShellView(viewModel: MainShellViewModel(snapshot: MockShellData.snapshot, runtimeMode: .mock))
@@ -10176,6 +10322,56 @@ public typealias PhaseFourStatus = PhaseOneStatus
     model.selectServer(model.servers[0].id)
     model.showCredentialSetup()
     return CredentialSetupView(viewModel: model)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 30 DM Selected Loaded") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    if let item = model.directMessageItems.first {
+        model.selectDirectMessageItem(item)
+    }
+    return MainShellView(viewModel: model)
+        .frame(width: 1180, height: 760)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 30 DM Participants Sidebar") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    if let item = model.directMessageItems.first {
+        model.selectDirectMessageItem(item)
+    }
+    return MemberPanelView(viewModel: model)
+        .frame(width: 300, height: 620)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 30 DM Trace Developer Panel") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    if let item = model.directMessageItems.first {
+        model.selectDirectMessageItem(item)
+    }
+    model.showCredentialSetup()
+    return CredentialSetupView(viewModel: model)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 30 Parity Matrix Summary") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.showCredentialSetup()
+    return CredentialSetupView(viewModel: model)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 30 High Contrast DM") {
+    MainShellView(viewModel: phase30DMPreviewModel())
+        .preferredColorScheme(.dark)
+        .frame(width: 1180, height: 760)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 30 Reduce Transparency DM") {
+    MainShellView(viewModel: phase30DMPreviewModel(reduceGlass: true))
+        .frame(width: 1180, height: 760)
 }
 
 @available(macOS 15.0, *)
