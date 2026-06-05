@@ -780,12 +780,49 @@ final class StoatFeaturesTests: XCTestCase {
         model.addAttachmentURLs([oversized], to: channelID)
 
         XCTAssertTrue(model.composerDraftState(for: channelID).attachments.isEmpty)
-        XCTAssertTrue(model.composerError?.contains("larger") == true)
+        XCTAssertEqual(model.composerError, "File too large. Liquid Bagel currently supports files up to 20 MB.")
 
         var snapshot = MockShellData.snapshot
         snapshot.channelsByID[channelID]?.permissions = [.viewChannel, .readMessageHistory, .sendMessage]
         let permissionModel = MainShellViewModel(snapshot: snapshot)
         XCTAssertFalse(permissionModel.canUploadFiles(in: permissionModel.snapshot.channelsByID[channelID]))
+    }
+
+    @MainActor
+    func testPhase33UploadLimitBoundaryAndPasteReviewDoNotUpload() async throws {
+        let uploader = MockAttachmentUploadHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, attachmentUploadHandler: uploader)
+        let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
+        let exact = try makeTemporaryAttachment(name: "exact-20mb.txt", contents: Data(repeating: 1, count: AttachmentUploadLimits.maxFileBytes))
+        let over = try makeTemporaryAttachment(name: "over-20mb.txt", contents: Data(repeating: 1, count: AttachmentUploadLimits.maxFileBytes + 1))
+
+        model.reviewDroppedAttachmentURLs([exact, over], to: channelID)
+
+        let review = try XCTUnwrap(model.pendingAttachmentDrop)
+        XCTAssertEqual(review.attachableItems.count, 1)
+        XCTAssertEqual(review.items.filter { $0.warning != nil }.first?.warning, "File too large. Liquid Bagel currently supports files up to 20 MB.")
+        let uploadCountBeforeQueue = await uploader.uploadCount()
+        XCTAssertEqual(uploadCountBeforeQueue, 0)
+
+        model.addPendingDroppedAttachmentsToComposer()
+        XCTAssertEqual(model.composerDraftState(for: channelID).attachments.count, 1)
+        let uploadCountAfterQueue = await uploader.uploadCount()
+        XCTAssertEqual(uploadCountAfterQueue, 0)
+    }
+
+    @MainActor
+    func testPhase33PastedImageOpensReviewBeforeQueueing() async throws {
+        let uploader = MockAttachmentUploadHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, attachmentUploadHandler: uploader)
+        let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
+
+        model.reviewPastedImageData(Data(repeating: 2, count: 32), to: channelID)
+
+        let review = try XCTUnwrap(model.pendingAttachmentDrop)
+        XCTAssertEqual(review.attachableItems.first?.filename, "Pasted Image.png")
+        XCTAssertTrue(model.composerDraftState(for: channelID).attachments.isEmpty)
+        let uploadCount = await uploader.uploadCount()
+        XCTAssertEqual(uploadCount, 0)
     }
 
     @MainActor
@@ -2685,6 +2722,17 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(UserDisplayResolver.displayName(user: user, fallbackID: userID), "Display")
         XCTAssertEqual(UserDisplayResolver.displayName(user: User(id: userID, username: "username"), fallbackID: userID), "username")
         XCTAssertEqual(UserDisplayResolver.displayName(user: nil, fallbackID: userID), "01JA...STUV")
+        let botDisplay = UserDisplayResolver.resolved(userID: userID, user: User(id: userID, username: "botty", bot: BotInformation(ownerID: "owner")), member: nil)
+        XCTAssertTrue(botDisplay.isBot)
+        XCTAssertEqual(botDisplay.source, .botName)
+    }
+
+    func testPhase33RoleColorSanitizesInvalidAndHighContrast() {
+        let valid = ResolvedRoleColor(rawValue: "#33AAEE")
+        XCTAssertEqual(valid?.rawValue, "#33AAEE")
+        XCTAssertNil(ResolvedRoleColor(rawValue: "not-a-color"))
+        XCTAssertNil(ResolvedRoleColor(rawValue: "#33AAEE", highContrast: true))
+        XCTAssertTrue(ResolvedRoleColor(rawValue: "#FFFFFF")?.isAdjustedForReadability == true)
     }
 
     @MainActor
@@ -2853,6 +2901,22 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase33CustomEmojiResolverAndPickerUseReadyEmoji() {
+        var snapshot = MockShellData.snapshot
+        let serverID = snapshot.serversByID.values.first!.id
+        let emoji = Emoji(id: "emoji-phase33", parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagel")
+        snapshot.emojisByID[emoji.id] = emoji
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot)
+
+        let itemByID = model.customEmojiDisplayItem(for: "emoji-phase33")
+        let itemByName = model.customEmojiDisplayItem(for: ":bagel:")
+
+        XCTAssertEqual(itemByID?.name, "bagel")
+        XCTAssertEqual(itemByName?.file.tag, "emojis")
+        XCTAssertTrue(model.commonEmojiItems.contains(":bagel:"))
+    }
+
+    @MainActor
     func testPhase29SystemEventsUseMemberNamesAndSafeFallbacks() {
         var snapshot = RealtimeSnapshot()
         let serverID: ServerID = "phase29-server"
@@ -2874,6 +2938,20 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.systemEventText(for: joined), "Member Nick joined")
         XCTAssertTrue(model.systemEventText(for: left).hasPrefix("User "))
         XCTAssertFalse(model.systemEventText(for: left).contains(unknownUserID.rawValue))
+    }
+
+    @MainActor
+    func testPhase33SystemEventZeroActorUsesHumanFallback() {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase33-server"
+        let channelID: ChannelID = "phase33-channel"
+        let zeroUserID: UserID = "00000000000000000000000000"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Phase 33")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "events")
+        let message = Message(id: "01J00000000000000000330001", channelID: channelID, authorID: zeroUserID, system: SystemMessage(kind: .userJoined, by: zeroUserID))
+        let model = MainShellViewModel(snapshot: snapshot)
+
+        XCTAssertEqual(model.systemEventText(for: message), "A member joined")
     }
 
     @MainActor

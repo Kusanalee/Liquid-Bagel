@@ -18,6 +18,7 @@ public enum UserDisplayResolver {
         case memberNickname
         case userDisplayName
         case username
+        case botName
         case shortenedID
         case unknown
     }
@@ -29,13 +30,14 @@ public enum UserDisplayResolver {
     public static func resolved(userID: UserID?, user: User?, member: ServerMember? = nil) -> ResolvedUserDisplay {
         let resolvedUserID = userID ?? user?.id ?? member?.id.userID ?? UserID(rawValue: "unknown")
         if let nickname = trimmed(member?.nickname) {
-            return ResolvedUserDisplay(userID: resolvedUserID, displayName: nickname, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: nickname), isFallback: false, source: .memberNickname)
+            return ResolvedUserDisplay(userID: resolvedUserID, displayName: nickname, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: nickname), isFallback: false, source: .memberNickname, isBot: user?.bot != nil)
         }
         if let displayName = trimmed(user?.displayName) {
-            return ResolvedUserDisplay(userID: resolvedUserID, displayName: displayName, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: displayName), isFallback: false, source: .userDisplayName)
+            return ResolvedUserDisplay(userID: resolvedUserID, displayName: displayName, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: displayName), isFallback: false, source: .userDisplayName, isBot: user?.bot != nil)
         }
         if let username = trimmed(user?.username) {
-            return ResolvedUserDisplay(userID: resolvedUserID, displayName: username, subtitle: "@\(username)", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: username), isFallback: false, source: .username)
+            let source: Source = user?.bot == nil ? .username : .botName
+            return ResolvedUserDisplay(userID: resolvedUserID, displayName: username, subtitle: "@\(username)", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: username), isFallback: false, source: source, isBot: user?.bot != nil)
         }
         if let userID {
             let shortened = shortenedID(userID)
@@ -89,6 +91,7 @@ public struct ResolvedUserDisplay: Hashable, Sendable {
     public var fallbackInitials: String
     public var isFallback: Bool
     public var source: ResolvedUserDisplaySource
+    public var isBot: Bool
 
     public init(
         userID: UserID,
@@ -97,7 +100,8 @@ public struct ResolvedUserDisplay: Hashable, Sendable {
         avatarFile: File? = nil,
         fallbackInitials: String,
         isFallback: Bool,
-        source: ResolvedUserDisplaySource
+        source: ResolvedUserDisplaySource,
+        isBot: Bool = false
     ) {
         self.userID = userID
         self.displayName = displayName
@@ -106,6 +110,42 @@ public struct ResolvedUserDisplay: Hashable, Sendable {
         self.fallbackInitials = fallbackInitials
         self.isFallback = isFallback
         self.source = source
+        self.isBot = isBot
+    }
+}
+
+public struct ResolvedRoleColor: Hashable, Sendable {
+    public var rawValue: String
+    public var red: Double
+    public var green: Double
+    public var blue: Double
+    public var isAdjustedForReadability: Bool
+
+    public init?(rawValue: String?, highContrast: Bool = false) {
+        guard !highContrast,
+              var hex = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !hex.isEmpty
+        else { return nil }
+        if hex.hasPrefix("#") {
+            hex.removeFirst()
+        }
+        guard hex.count == 6, let value = Int(hex, radix: 16) else { return nil }
+        let red = Double((value >> 16) & 0xFF) / 255
+        let green = Double((value >> 8) & 0xFF) / 255
+        let blue = Double(value & 0xFF) / 255
+        let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        if luminance > 0.78 {
+            self.red = red * 0.72
+            self.green = green * 0.72
+            self.blue = blue * 0.72
+            self.isAdjustedForReadability = true
+        } else {
+            self.red = red
+            self.green = green
+            self.blue = blue
+            self.isAdjustedForReadability = false
+        }
+        self.rawValue = "#\(hex.uppercased())"
     }
 }
 
@@ -120,8 +160,11 @@ public struct MemberListItem: Hashable, Sendable, Identifiable {
     public var isBot: Bool
     public var isOnline: Bool
     public var statusText: String?
+    public var roleIDs: [RoleID]
+    public var primaryRole: Role?
+    public var roleColor: ResolvedRoleColor?
 
-    public init(userID: UserID, user: User?, member: ServerMember?) {
+    public init(userID: UserID, user: User?, member: ServerMember?, server: Server? = nil) {
         let display = UserDisplayResolver.resolved(userID: userID, user: user, member: member)
         self.userID = userID
         self.user = user
@@ -132,6 +175,36 @@ public struct MemberListItem: Hashable, Sendable, Identifiable {
         self.isBot = user?.bot != nil
         self.isOnline = user?.online == true
         self.statusText = user?.status?.text
+        self.roleIDs = member?.roles ?? []
+        let roles = roleIDs.compactMap { server?.roles[$0] }
+            .sorted {
+                if $0.rank != $1.rank { return $0.rank > $1.rank }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+        self.primaryRole = roles.first
+        self.roleColor = ResolvedRoleColor(rawValue: roles.first?.colour)
+    }
+}
+
+public struct CustomEmojiDisplayItem: Hashable, Sendable, Identifiable {
+    public var id: EmojiID
+    public var serverID: ServerID?
+    public var name: String
+    public var file: File
+    public var shortcode: String
+    public var animated: Bool
+
+    public init(emoji: Emoji) {
+        self.id = emoji.id
+        if case let .server(serverID) = emoji.parent {
+            self.serverID = serverID
+        } else {
+            self.serverID = nil
+        }
+        self.name = emoji.name
+        self.shortcode = ":\(emoji.name):"
+        self.animated = emoji.animated
+        self.file = File(id: FileID(rawValue: emoji.id.rawValue), tag: "emojis", filename: "\(emoji.name).png", contentType: "image/png", size: 0)
     }
 }
 
@@ -257,7 +330,7 @@ public enum MemberListDeriver {
         let members = snapshot.membersByServerAndUserID.values
             .filter { $0.id.serverID == server.id }
             .map { member in
-                MemberListItem(userID: member.id.userID, user: snapshot.usersByID[member.id.userID], member: member)
+                MemberListItem(userID: member.id.userID, user: snapshot.usersByID[member.id.userID], member: member, server: server)
             }
             .filter { item in
                 guard !normalizedQuery.isEmpty else { return true }

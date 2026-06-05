@@ -159,6 +159,14 @@ struct AppCommands: Commands {
         }
 
         CommandMenu("Message") {
+            Button("Paste Attachment") {
+                commandHandler?.perform(.pasteAttachment)
+            }
+            .keyboardShortcut("v", modifiers: [.command, .shift])
+            .disabled(commandHandler?.canPerform(.pasteAttachment) == false)
+
+            Divider()
+
             Button("Copy Message") {
                 commandHandler?.perform(.copySelectedMessage)
             }

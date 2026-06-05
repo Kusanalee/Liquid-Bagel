@@ -18,6 +18,7 @@ public enum ImageResourceKind: Hashable, Sendable {
     case userAvatar
     case serverIcon
     case serverBanner
+    case customEmoji
 }
 
 public struct ImageCacheKey: Hashable, Sendable, CustomStringConvertible {

@@ -325,13 +325,17 @@ public struct MessageReactionDisplayItem: Identifiable, Hashable, Sendable {
     public var emoji: String
     public var count: Int
     public var hasCurrentUserReacted: Bool
+    public var customEmojiName: String?
+    public var customEmojiImageData: Data?
 
     public var id: String { emoji }
 
-    public init(emoji: String, count: Int, hasCurrentUserReacted: Bool) {
+    public init(emoji: String, count: Int, hasCurrentUserReacted: Bool, customEmojiName: String? = nil, customEmojiImageData: Data? = nil) {
         self.emoji = emoji
         self.count = count
         self.hasCurrentUserReacted = hasCurrentUserReacted
+        self.customEmojiName = customEmojiName
+        self.customEmojiImageData = customEmojiImageData
     }
 }
 
@@ -887,6 +891,9 @@ private struct ComposerTextView: NSViewRepresentable {
 
         private func handlePaste() -> Bool {
             let pasteboard = NSPasteboard.general
+            if pasteboard.string(forType: .string)?.isEmpty == false {
+                return false
+            }
             let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
             if !urls.isEmpty {
                 onPasteFileURLs(urls)
@@ -1124,6 +1131,7 @@ public struct MessageRow: View {
     private let onDownloadAttachment: (AttachmentDisplayItem) -> Void
     private let onOpenAttachment: (AttachmentDisplayItem) -> Void
     private let onRetryAttachment: (AttachmentDisplayItem) -> Void
+    private let onOpenAuthorProfile: () -> Void
 
     public init(
         message: Message,
@@ -1147,7 +1155,8 @@ public struct MessageRow: View {
         onPreviewAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onDownloadAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onOpenAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
-        onRetryAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in }
+        onRetryAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onOpenAuthorProfile: @escaping () -> Void = {}
     ) {
         self.message = message
         self.author = author
@@ -1171,6 +1180,7 @@ public struct MessageRow: View {
         self.onDownloadAttachment = onDownloadAttachment
         self.onOpenAttachment = onOpenAttachment
         self.onRetryAttachment = onRetryAttachment
+        self.onOpenAuthorProfile = onOpenAuthorProfile
     }
 
     public var body: some View {
@@ -1183,7 +1193,11 @@ public struct MessageRow: View {
         )
         HStack(alignment: .top, spacing: StoatSpacing.medium) {
             if showsHeader {
-                AvatarView(title: authorName, size: StoatSize.avatar, isOnline: author?.online, imageData: authorAvatarData)
+                Button(action: onOpenAuthorProfile) {
+                    AvatarView(title: authorName, size: StoatSize.avatar, isOnline: author?.online, imageData: authorAvatarData)
+                }
+                .buttonStyle(.plain)
+                .help("Open Profile")
             } else {
                 Text(timestampText)
                     .font(.caption2)
@@ -1194,8 +1208,12 @@ public struct MessageRow: View {
             VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
                 if showsHeader {
                     HStack(spacing: StoatSpacing.small) {
-                        Text(authorName)
-                            .font(StoatTypography.messageAuthor)
+                        Button(action: onOpenAuthorProfile) {
+                            Text(authorName)
+                                .font(StoatTypography.messageAuthor)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open Profile")
                         Text(timestampText)
                             .font(.caption)
                             .foregroundStyle(.tertiary)
@@ -1260,11 +1278,14 @@ public struct MessageRow: View {
                             Button {
                                 onToggleReaction(reaction.emoji)
                             } label: {
-                                Text("\(reaction.emoji) \(reaction.count)")
-                                    .font(.caption.weight(.medium))
-                                    .padding(.horizontal, StoatSpacing.small)
-                                    .padding(.vertical, StoatSpacing.xSmall)
-                                    .background(reaction.hasCurrentUserReacted ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.07), in: Capsule())
+                                HStack(spacing: StoatSpacing.xxSmall) {
+                                    ReactionEmojiLabel(reaction: reaction)
+                                    Text("\(reaction.count)")
+                                }
+                                .font(.caption.weight(.medium))
+                                .padding(.horizontal, StoatSpacing.small)
+                                .padding(.vertical, StoatSpacing.xSmall)
+                                .background(reaction.hasCurrentUserReacted ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.07), in: Capsule())
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel(StoatAccessibility.reactionLabel(emoji: reaction.emoji, count: reaction.count, hasReacted: reaction.hasCurrentUserReacted))
@@ -1392,6 +1413,26 @@ public struct MessageRow: View {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         return formatter.string(from: date)
+    }
+}
+
+private struct ReactionEmojiLabel: View {
+    let reaction: MessageReactionDisplayItem
+
+    var body: some View {
+        #if canImport(AppKit)
+        if let data = reaction.customEmojiImageData, let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 16, height: 16)
+                .accessibilityLabel(reaction.customEmojiName ?? reaction.emoji)
+        } else {
+            Text(reaction.customEmojiName.map { ":\($0):" } ?? reaction.emoji)
+        }
+        #else
+        Text(reaction.customEmojiName.map { ":\($0):" } ?? reaction.emoji)
+        #endif
     }
 }
 
@@ -1727,6 +1768,20 @@ public struct MarkdownMessageContent: View {
                             Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 2)
                         }
                         .textSelection(.enabled)
+                case let .heading(level, text):
+                    Text(attributed(text))
+                        .font(level <= 1 ? .title3.weight(.semibold) : .headline)
+                        .textSelection(.enabled)
+                case let .listItem(marker, text):
+                    HStack(alignment: .firstTextBaseline, spacing: StoatSpacing.small) {
+                        Text(marker)
+                            .font(StoatTypography.messageBody)
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 18, alignment: .trailing)
+                        Text(attributed(text))
+                            .font(StoatTypography.messageBody)
+                            .textSelection(.enabled)
+                    }
                 case let .text(text):
                     Text(attributed(text))
                         .font(StoatTypography.messageBody)
@@ -1751,6 +1806,8 @@ private enum MarkdownBlock: Hashable {
     case text(String)
     case code(String)
     case quote(String)
+    case heading(Int, String)
+    case listItem(String, String)
 
     static func parse(_ source: String) -> [MarkdownBlock] {
         var result: [MarkdownBlock] = []
@@ -1778,10 +1835,25 @@ private enum MarkdownBlock: Hashable {
             }
             if isInCode {
                 codeBuffer.append(line)
-            } else if line.trimmingCharacters(in: .whitespaces).hasPrefix(">") {
+                continue
+            }
+
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
                 flushText()
-                let quote = line.replacingOccurrences(of: #"^\s*>\s?"#, with: "", options: .regularExpression)
+                continue
+            }
+
+            if let heading = headingBlock(from: trimmed) {
+                flushText()
+                result.append(heading)
+            } else if trimmed.hasPrefix(">") {
+                flushText()
+                let quote = trimmed.replacingOccurrences(of: #"^>\s?"#, with: "", options: .regularExpression)
                 result.append(.quote(quote))
+            } else if let listItem = listItemBlock(from: trimmed) {
+                flushText()
+                result.append(listItem)
             } else {
                 textBuffer.append(line)
             }
@@ -1791,6 +1863,27 @@ private enum MarkdownBlock: Hashable {
         }
         flushText()
         return result.isEmpty ? [.text(source)] : result
+    }
+
+    private static func headingBlock(from line: String) -> MarkdownBlock? {
+        let hashes = line.prefix { $0 == "#" }
+        guard !hashes.isEmpty, hashes.count <= 6 else { return nil }
+        let remainder = line.dropFirst(hashes.count)
+        guard remainder.first?.isWhitespace == true else { return nil }
+        let text = remainder.trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : .heading(hashes.count, text)
+    }
+
+    private static func listItemBlock(from line: String) -> MarkdownBlock? {
+        if line.hasPrefix("- ") || line.hasPrefix("* ") || line.hasPrefix("+ ") {
+            return .listItem("-", String(line.dropFirst(2)))
+        }
+        guard let match = line.range(of: #"^\d+[.)]\s+"#, options: .regularExpression) else {
+            return nil
+        }
+        let marker = String(line[match]).trimmingCharacters(in: .whitespaces)
+        let text = String(line[match.upperBound...])
+        return .listItem(marker, text)
     }
 }
 

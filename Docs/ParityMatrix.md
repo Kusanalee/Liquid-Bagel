@@ -26,34 +26,36 @@ Live-sensitive items remain `partial` or `broken` until real live QA proves them
 | Core chat | send/edit/delete messages | done | Verified message routes | Send/edit/delete with confirmations | No success toast by design | Action tests | Send/edit/delete | Keep stable |
 | Core chat | replies | partial | Message schema | Reply composer context | Deep parity QA pending | Reply tests | Reply manually | Polish |
 | Core chat | pins | partial | Verified pin routes | Pin actions/search | Full pinned UX incomplete | Pin tests | Pinned search | Polish |
-| Core chat | reactions | partial | Verified reaction routes | Expanded common reactions | Custom emoji send not audited | Reaction tests | React | Emoji audit |
-| Core chat | emoji picker | partial | Native Unicode input | Composer picker inserts common Unicode emoji; reaction quick set expanded | Custom emoji autocomplete/rendering still limited to modeled media support | Phase 32 emoji test | Insert/react emoji | Custom emoji QA |
-| Core chat | custom emoji | partial | Ready emojis | Models decode emojis and media helpers can resolve modeled files | Picker/render parity incomplete; no unverified fetch storm | Model tests | Emoji server | Polish |
-| Core chat | markdown | partial | Message content | Markdown rendering | Official rendering parity incomplete | Render tests | Markdown messages | Polish |
+| Core chat | reactions | partial | Verified reaction routes, Ready emojis | Expanded common reactions; known custom emoji reactions resolve names/images with bounded loading | Custom emoji send/live media QA not audited | Reaction + Phase 33 emoji tests | React with custom emoji | Emoji live QA |
+| Core chat | emoji picker | partial | Native Unicode input, Ready emojis | Composer picker inserts common Unicode emoji and known server emoji shortcodes | Full custom autocomplete and exact official syntax deferred | Phase 32/33 emoji tests | Insert/react emoji | Custom emoji QA |
+| Core chat | custom emoji | partial | Ready emojis | Models decode emojis; picker/reaction display resolves known emoji via `emojis` media tag | Message-content image replacement limited until syntax is live-verified | Model/realtime/Phase 33 tests | Emoji server | Live syntax QA |
+| Core chat | markdown | partial | Message content | Safe block/inline Markdown renderer for headings, lists, quotes, code, links, and common inline styles | Exact official rendering parity incomplete | Render/build tests | Markdown messages | Polish |
 | Core chat | embeds | partial | Message schema | Embed rendering | Variant audit incomplete | Render tests | Embed messages | Audit |
 | Core chat | attachments | done | Upload/send/media routes | Explicit upload/preview/download/open | No persistent cache by design | Attachment tests | Send file | Keep explicit |
 | Core chat | image preview | done | Autumn media routes | Larger inline previews/explicit viewer | Memory-only cache | Media tests | Preview image | Keep bounded |
 | Core chat | drag/drop upload | done | Composer flow | Drop targets open attach review modal before queueing | No auto-upload until send | Phase 32 drop tests | Drop file | Keep stable |
+| Core chat | clipboard paste upload | partial | macOS pasteboard, composer flow | Image/file paste opens the attachment review flow; text paste stays normal; Shift-Command-V exposes explicit Paste Attachment | Finder/provider edge QA pending | Phase 33 paste tests | Paste image/file | Live macOS QA |
+| Core chat | upload size limit | done | Local attachment validation | Shared 20 MB limit rejects oversized files before upload with clear copy | None critical | Phase 33 boundary tests | Try >20 MB file | Keep stable |
 | Core chat | read ack/unreads | partial | Ack route/Ready unreads | Channel-ID ack/local clear | Live DM ack QA needed | Ack tests | Read channels | Monitor |
 | Core chat | typing indicators | partial | Realtime typing | Begin/end helpers | Full display parity incomplete | Typing tests | Type | Polish |
 | Core chat | search | partial | Verified search routes | Loaded/live/pinned search | Global search incomplete | Search tests | Search channel | Phase 31 |
 | Core chat | jump to message | partial | Message fetch/search | Loaded/around-message behavior | Cross-context QA needed | Timeline tests | Jump result | Polish |
-| Core chat | system events | done | System message schema | Safe names/fallbacks | Unsupported events generic | System tests | Event channel | Keep stable |
-| Core chat | user/avatar hydration | partial | Ready users/members, message users, relationship/profile data | Central resolver prevents full raw-ID author names, member nicknames win, avatar metadata remains bounded | Live QA must confirm names/avatars in real chat | Phase 31/32 resolver tests | Inspect affected chats | Keep partial until live QA |
+| Core chat | system events | done | System message schema | Safe member/user names; zero/system actors use human fallbacks | Unsupported events generic | System + Phase 33 tests | Event channel | Keep stable |
+| Core chat | user/avatar hydration | partial | Ready users/members, message users, relationship/profile data | Central resolver prevents full raw-ID author names, member nicknames win, bot metadata preserved, avatar metadata remains bounded | Live QA must confirm names/avatars in real chat | Phase 31/32/33 resolver tests | Inspect affected chats | Keep partial until live QA |
 | Server/community | server list | done | Ready servers | Server rail from Ready | No REST list by design | Selection tests | Connect | Keep Ready |
 | Server/community | server icons | done | Ready media | Bounded in-memory loading | No persistent cache | Media tests | Open server | Keep bounded |
 | Server/community | server banners | done | Ready media | Banner rendering/settings | Live QA recommended | Media tests | Settings | Keep bounded |
 | Server/community | create server | partial | Verified route | Explicit create flow | Parity QA pending | Create tests | Test server | Audit |
 | Server/community | join invite | partial | Verified invite route | Preview/join flow | Native deep-link parity incomplete | Invite tests | Join invite | Audit |
-| Server/community | Discover | partial | Web-backed surface | Browser handoff | No native listing route | Discover tests | Open browser | Keep handoff |
+| Server/community | Discover | partial | Web-backed surface | Browser handoff plus invite tools | No verified native listing route/feed | Discover tests | Open browser | Keep handoff until verified feed |
 | Server/community | invite create/list/revoke | partial | Verified invite routes | Manage invites | Full QA pending | Invite tests | Manage invites | Audit |
 | Server/community | channel create/edit/delete | partial | Verified channel routes | Text channel management | Permission/destructive edge QA | Management tests | Test channel | Audit |
 | Server/community | categories | partial | Server edit categories | Category editor | Reorder/move parity incomplete | Category tests | Edit categories | Polish |
-| Server/community | roles | partial | Verified role routes | Role management | Rank/perms incomplete | Role tests | Roles view | Polish |
+| Server/community | roles | partial | Verified role routes | Role management plus sanitized role color presentation in member/profile surfaces | Rank/perms incomplete | Role + Phase 33 color tests | Roles view | Polish |
 | Server/community | role assignment | partial | Verified member edit | Confirmed role assignment | Rank edge QA | Member tests | Assign role | Audit |
 | Server/community | permissions preview | done | Backend model | Read-only resolver | Writes separate | Resolver tests | Preview | Keep stable |
 | Server/community | permission editing | partial | Verified permission routes | Guarded writes | Full official UX incomplete | Permission tests | Edit test permission | Audit |
-| Server/community | member list | partial | Ready members/users | Missing/offline fallbacks, role grouping, missing-user diagnostics | Live large-server completeness needs dogfood proof | Member tests | Large server | Keep partial until live QA |
+| Server/community | member list | partial | Ready members/users | Missing/offline fallbacks, role grouping, role color chips, profile entry, missing-user diagnostics | Live large-server completeness needs dogfood proof | Member + Phase 33 tests | Large server | Keep partial until live QA |
 | Server/community | member moderation | partial | Verified moderation routes | Kick/ban/timeout guarded from settings and member context menus | Dashboard incomplete | Moderation tests | Test server | Audit |
 | Server/community | bans/timeouts | partial | Verified moderation routes | Ban list/timeouts | Full QA pending | Moderation tests | Test server | Audit |
 | Notifications | local notifications | partial | UserNotifications | Explicit opt-in with requestAuthorization diagnostics | Live permission prompt still needs manual QA | Notification tests | Request manually | Keep partial until live prompt works |

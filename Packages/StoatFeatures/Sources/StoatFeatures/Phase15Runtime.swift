@@ -8,6 +8,10 @@ public enum ComposerAttachmentSource: Hashable, Sendable {
     case inMemory(Data)
 }
 
+public enum AttachmentUploadLimits {
+    public static let maxFileBytes = 20 * 1024 * 1024
+}
+
 public enum ComposerAttachmentUploadStatus: Hashable, Sendable {
     case queued
     case reading
@@ -113,6 +117,15 @@ public struct AttachmentDropReviewItem: Identifiable, Hashable, Sendable {
         self.warning = error.userFacingMessage
     }
 
+    public init(filename: String, error: Error) {
+        self.id = UUID()
+        self.draft = nil
+        self.filename = ComposerAttachmentDraft.sanitizedFilename(filename)
+        self.subtitle = "Not attachable"
+        self.systemImage = "exclamationmark.triangle"
+        self.warning = error.userFacingMessage
+    }
+
     public var canAttach: Bool {
         draft != nil
     }
@@ -171,8 +184,8 @@ public enum AttachmentValidationError: Error, Equatable, Sendable, LocalizedErro
             return "Attach up to \(limit) files per message."
         case .unsupportedType:
             return "This file type is not supported for attachments yet."
-        case let .tooLarge(maxBytes):
-            return "Attachment is larger than \(ByteCountFormatter.string(fromByteCount: Int64(maxBytes), countStyle: .file))."
+        case .tooLarge:
+            return "File too large. Liquid Bagel currently supports files up to 20 MB."
         case .unreadable:
             return "Attachment could not be read."
         case .directory:
@@ -190,7 +203,7 @@ public struct AttachmentValidationPolicy: Sendable {
 
     public init(
         maxAttachmentCount: Int = 5,
-        maxFileBytes: Int = 20 * 1024 * 1024,
+        maxFileBytes: Int = AttachmentUploadLimits.maxFileBytes,
         allowedTypes: [UTType] = [
             .png, .jpeg, .gif, .heic, .webP, .pdf, .plainText, .utf8PlainText,
             .text, .rtf, .json, .commaSeparatedText, .init(filenameExtension: "md") ?? .plainText
@@ -233,7 +246,7 @@ public struct AttachmentValidationPolicy: Sendable {
         )
     }
 
-    public func imageDraft(data: Data, filename: String = "pasted-image.png", existingCount: Int) throws -> ComposerAttachmentDraft {
+    public func imageDraft(data: Data, filename: String = "Pasted Image.png", existingCount: Int) throws -> ComposerAttachmentDraft {
         guard existingCount < maxAttachmentCount else {
             throw AttachmentValidationError.tooManyAttachments(maxAttachmentCount)
         }

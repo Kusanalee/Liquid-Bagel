@@ -76,20 +76,20 @@ public enum Phase27SystemEventPresenter {
             return nonEmpty(system.content) ?? "System event"
         case .userAdded:
             if let target { return "\(fallbackActor) added \(target)" }
-            return "\(fallbackActor) added someone"
+            return "\(fallbackActor) added a member"
         case .userRemove:
             if let target { return "\(fallbackActor) removed \(target)" }
-            return "\(fallbackActor) removed someone"
+            return "\(fallbackActor) removed a member"
         case .userJoined:
-            return "\(eventMember ?? "Someone") joined"
+            return "\(eventMember ?? "A member") joined"
         case .userLeft:
-            return "\(eventMember ?? "Someone") left"
+            return "\(eventMember ?? "A member") left"
         case .userKicked:
             if let target { return "\(fallbackActor) kicked \(target)" }
-            return "\(fallbackActor) kicked someone"
+            return "\(fallbackActor) kicked a member"
         case .userBanned:
             if let target { return "\(fallbackActor) banned \(target)" }
-            return "\(fallbackActor) banned someone"
+            return "\(fallbackActor) banned a member"
         case .channelRenamed:
             if let named, !named.isEmpty { return "Channel renamed to \(named)" }
             return "Channel renamed"
@@ -117,7 +117,7 @@ public enum Phase27SystemEventPresenter {
         membersByServerAndUserID: [ServerMemberKey: ServerMember],
         serverID: ServerID?
     ) -> String? {
-        guard let id else { return nil }
+        guard let id, !isSystemActor(id) else { return nil }
         let member = serverID.flatMap { membersByServerAndUserID[ServerMemberKey(serverID: $0, userID: id)] }
         let user = usersByID[id]
         if member != nil || user != nil {
@@ -129,6 +129,11 @@ public enum Phase27SystemEventPresenter {
     private static func nonEmpty(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    private static func isSystemActor(_ id: UserID) -> Bool {
+        let raw = id.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty || raw == "0" || Set(raw).isSubset(of: Set("0"))
     }
 }
 

@@ -7,6 +7,7 @@ import SwiftUI
 public enum AppCommand: Hashable, Sendable {
     case openQuickSwitcher
     case focusComposer
+    case pasteAttachment
     case refresh
     case reconnect
     case disconnect
@@ -320,6 +321,7 @@ public final class QuickSwitcherViewModel {
     private func commandResults() -> [QuickSwitcherResult] {
         [
             commandResult(.focusComposer, title: "Focus Composer", subtitle: "Move keyboard focus to the message composer"),
+            commandResult(.pasteAttachment, title: "Paste Attachment", subtitle: "Review image or file attachments from the clipboard"),
             commandResult(.focusTimeline, title: "Focus Timeline", subtitle: "Move keyboard focus to the message timeline"),
             commandResult(.refresh, title: "Refresh", subtitle: "Refresh the current runtime context"),
             commandResult(.reconnect, title: "Reconnect", subtitle: "Retry the live realtime session"),

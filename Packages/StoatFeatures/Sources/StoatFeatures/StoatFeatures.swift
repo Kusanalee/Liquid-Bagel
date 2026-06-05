@@ -2830,7 +2830,9 @@ public final class MainShellViewModel {
     }
 
     public var commonEmojiItems: [String] {
-        ["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏", "🔥", "✨", "😄", "😅", "😎", "😢", "😮", "🤔", "🚀", "💯", "🫡", "👋", "🙌", "😆", "😋", "😴"]
+        let unicode = ["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏", "🔥", "✨", "😄", "😅", "😎", "😢", "😮", "🤔", "🚀", "💯", "🫡", "👋", "🙌", "😆", "😋", "😴"]
+        let serverEmoji = customEmojiDisplayItemsForCurrentContext().prefix(12).map(\.shortcode)
+        return unicode + serverEmoji
     }
 
     public func insertEmoji(_ emoji: String, in channelID: ChannelID?) {
@@ -2840,6 +2842,36 @@ public final class MainShellViewModel {
         composerDrafts[channelID] = state
         emojiPickerDiagnostics = "Inserted Unicode emoji"
         requestFocus(.composer)
+    }
+
+    public func customEmojiDisplayItemsForCurrentContext() -> [CustomEmojiDisplayItem] {
+        let serverID = selection.serverID ?? selectedConversationChannel?.serverID
+        return snapshot.emojisByID.values
+            .map(CustomEmojiDisplayItem.init(emoji:))
+            .filter { item in
+                guard let serverID else { return true }
+                return item.serverID == nil || item.serverID == serverID
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    public func customEmojiDisplayItem(for raw: String) -> CustomEmojiDisplayItem? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let emoji = snapshot.emojisByID[EmojiID(rawValue: trimmed)] {
+            return CustomEmojiDisplayItem(emoji: emoji)
+        }
+        let normalized = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+        return snapshot.emojisByID.values
+            .map(CustomEmojiDisplayItem.init(emoji:))
+            .first { $0.name.caseInsensitiveCompare(normalized) == .orderedSame || $0.shortcode.caseInsensitiveCompare(trimmed) == .orderedSame }
+    }
+
+    public func loadCustomEmojiImages(for message: Message) {
+        for emojiKey in message.reactions.keys {
+            if let item = customEmojiDisplayItem(for: emojiKey) {
+                loadImageResource(for: item.file, kind: .customEmoji)
+            }
+        }
     }
 
     public func addAttachmentURLs(_ urls: [URL], to channelID: ChannelID?) {
@@ -2937,8 +2969,30 @@ public final class MainShellViewModel {
         addAttachmentURLs(urls, to: selectedConversationChannelID)
     }
 
+    public func reviewPastedImageData(_ data: Data, to channelID: ChannelID?) {
+        do {
+            let existingCount = channelID.map { composerDraftState(for: $0).attachments.count } ?? 0
+            let draft = try attachmentValidationPolicy.imageDraft(data: data, existingCount: existingCount)
+            reviewPastedAttachmentDrafts([draft], to: channelID, action: "Opened clipboard image attachment review")
+        } catch {
+            pendingAttachmentDrop = AttachmentDropReview(
+                channelID: channelID,
+                channelName: channelID.flatMap { snapshot.channelsByID[$0] }.map { composerPlaceholder(for: $0).replacingOccurrences(of: "Message ", with: "") },
+                items: [AttachmentDropReviewItem(filename: "Pasted Image.png", error: error)],
+                blockedReason: nil
+            )
+            composerError = error.userFacingMessage
+            lastAttachmentAction = "Paste image rejected by validation"
+        }
+    }
+
     public func addPastedImageData(_ data: Data, to channelID: ChannelID?) {
-        guard let channelID else { return }
+        guard let channelID else {
+            composerError = "Select a channel or DM before attaching files."
+            placeholderStatus = composerError
+            lastAttachmentAction = "Paste rejected without selected channel"
+            return
+        }
         var state = composerDraftState(for: channelID)
         do {
             let draft = try attachmentValidationPolicy.imageDraft(data: data, existingCount: state.attachments.count)
@@ -2949,6 +3003,49 @@ public final class MainShellViewModel {
             composerError = error.userFacingMessage
         }
         composerDrafts[channelID] = state
+    }
+
+    public func pasteAttachmentFromClipboard() {
+        #if canImport(AppKit)
+        let pasteboard = NSPasteboard.general
+        let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
+        if !urls.isEmpty {
+            reviewDroppedAttachmentURLs(urls, to: selectedConversationChannelID)
+            lastAttachmentAction = "Opened clipboard file attachment review"
+            return
+        }
+        if let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
+            reviewPastedImageData(data, to: selectedConversationChannelID)
+            return
+        }
+        composerError = "Clipboard does not contain an image or file attachment."
+        placeholderStatus = composerError
+        lastAttachmentAction = "Clipboard paste contained no attachment"
+        #else
+        composerError = "Clipboard attachment paste is available on macOS."
+        placeholderStatus = composerError
+        #endif
+    }
+
+    private func reviewPastedAttachmentDrafts(_ drafts: [ComposerAttachmentDraft], to channelID: ChannelID?, action: String) {
+        let target = channelID.flatMap { snapshot.channelsByID[$0] }
+        let blockedReason: String?
+        if channelID == nil || target == nil {
+            blockedReason = "Select a channel or DM before attaching files."
+        } else if !canUploadFiles(in: target) {
+            blockedReason = "You do not have permission to upload files here."
+        } else if !isRuntimeSendCapable {
+            blockedReason = effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Reconnect before attaching files."
+        } else {
+            blockedReason = nil
+        }
+        pendingAttachmentDrop = AttachmentDropReview(
+            channelID: channelID,
+            channelName: target.map { composerPlaceholder(for: $0).replacingOccurrences(of: "Message ", with: "") },
+            items: drafts.map(AttachmentDropReviewItem.init(draft:)),
+            blockedReason: blockedReason
+        )
+        lastAttachmentAction = action
     }
 
     public func openAttachmentPicker(for channelID: ChannelID?) {
@@ -3322,6 +3419,8 @@ public final class MainShellViewModel {
             tag = "icons"
         case .serverBanner:
             tag = "banners"
+        case .customEmoji:
+            tag = "emojis"
         }
         let filename = kind == .attachmentOriginal ? "original" : nil
         guard let url = try? LiveRemoteAttachmentLoader.mediaURL(baseURL: baseURL, tag: tag, fileID: file.id, filename: filename) else {
@@ -3335,7 +3434,7 @@ public final class MainShellViewModel {
             maxBytes = 8 * 1024 * 1024
         case .attachmentOriginal:
             maxBytes = 20 * 1024 * 1024
-        case .userAvatar, .serverIcon:
+        case .userAvatar, .serverIcon, .customEmoji:
             maxBytes = 2 * 1024 * 1024
         }
         return ImageResourceRequest(id: file.id.rawValue, url: url, kind: kind, maxBytes: maxBytes, filename: file.filename)
@@ -5669,6 +5768,8 @@ extension MainShellViewModel: AppCommandHandling {
         switch command {
         case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .openJoinInvite, .openCreateServer, .openDiscoverInBrowser, .focusTimeline, .resetTimelineTuningDefault:
             return true
+        case .pasteAttachment:
+            return selectedConversationChannelID != nil
         case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions, .openMembers:
             return selection.serverID != nil
         case .openPermissionEditor:
@@ -5778,6 +5879,8 @@ extension MainShellViewModel: AppCommandHandling {
         switch command {
         case .focusComposer:
             return "Select a channel before focusing the composer."
+        case .pasteAttachment:
+            return "Select a channel before pasting an attachment."
         case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions, .openMembers:
             return "Select a server before opening server settings."
         case .openPermissionEditor:
@@ -5842,6 +5945,8 @@ extension MainShellViewModel: AppCommandHandling {
             showQuickSwitcher()
         case .focusComposer:
             focusComposer()
+        case .pasteAttachment:
+            pasteAttachmentFromClipboard()
         case .focusTimeline:
             requestFocus(.timeline)
         case .refresh:
@@ -7684,10 +7789,10 @@ public struct ChatPlaceholderView: View {
                         viewModel.insertEmoji(emoji, in: channel.id)
                     },
                     onPasteImageData: { data in
-                        viewModel.addPastedImageData(data, to: channel.id)
+                        viewModel.reviewPastedImageData(data, to: channel.id)
                     },
                     onPasteFileURLs: { urls in
-                        viewModel.addAttachmentURLs(urls, to: channel.id)
+                        viewModel.reviewDroppedAttachmentURLs(urls, to: channel.id)
                     },
                     onSend: {
                         Task { await viewModel.sendDraft(for: channel.id) }
@@ -8104,6 +8209,9 @@ public struct TimelineMessageGroupView: View {
                             },
                             onRetryAttachment: { item in
                                 Task { await viewModel.retryAttachmentPreview(item) }
+                            },
+                            onOpenAuthorProfile: {
+                                viewModel.showUserProfile(viewModel.resolvedUserDisplay(for: timelineMessage.message).userID)
                             }
                         )
                         .id(timelineMessage.message.id)
@@ -8111,6 +8219,7 @@ public struct TimelineMessageGroupView: View {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
                             viewModel.loadInlineImagePreviews(for: timelineMessage.message)
                             viewModel.loadImageResource(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar)
+                            viewModel.loadCustomEmojiImages(for: timelineMessage.message)
                         }
                         .onDisappear {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
@@ -8157,7 +8266,16 @@ public struct TimelineMessageGroupView: View {
 
     private func rowReactionItems(for timelineMessage: TimelineMessage) -> [MessageReactionDisplayItem] {
         viewModel.reactionSummaries(for: timelineMessage.message).map {
-            MessageReactionDisplayItem(emoji: $0.emoji, count: $0.count, hasCurrentUserReacted: $0.hasCurrentUserReacted)
+            if let emoji = viewModel.customEmojiDisplayItem(for: $0.emoji) {
+                return MessageReactionDisplayItem(
+                    emoji: $0.emoji,
+                    count: $0.count,
+                    hasCurrentUserReacted: $0.hasCurrentUserReacted,
+                    customEmojiName: emoji.name,
+                    customEmojiImageData: viewModel.imageData(for: emoji.file, kind: .customEmoji)
+                )
+            }
+            return MessageReactionDisplayItem(emoji: $0.emoji, count: $0.count, hasCurrentUserReacted: $0.hasCurrentUserReacted)
         }
     }
 
@@ -8420,29 +8538,46 @@ public struct MemberPanelView: View {
     }
 
     private func memberListRow(_ item: MemberListItem) -> some View {
-        HStack(spacing: StoatSpacing.medium) {
-            AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.isOnline, imageData: viewModel.imageData(for: item.avatar, kind: .userAvatar))
-            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
-                HStack(spacing: StoatSpacing.xSmall) {
-                    Text(item.displayName)
-                        .font(.callout.weight(.medium))
-                        .lineLimit(1)
-                    if item.isBot {
-                        Text("BOT")
-                            .font(.caption2.weight(.bold))
-                            .padding(.horizontal, 4)
-                            .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        Button {
+            viewModel.showUserProfile(item.userID)
+        } label: {
+            HStack(spacing: StoatSpacing.medium) {
+                AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.isOnline, imageData: viewModel.imageData(for: item.avatar, kind: .userAvatar))
+                VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                    HStack(spacing: StoatSpacing.xSmall) {
+                        Text(item.displayName)
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(roleForeground(item.roleColor))
+                            .lineLimit(1)
+                        if let role = item.primaryRole {
+                            Text(role.name)
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .foregroundStyle(roleForeground(item.roleColor))
+                                .background(roleForeground(item.roleColor).opacity(0.12), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                        }
+                        if item.isBot {
+                            Text("BOT")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 4)
+                                .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                        }
                     }
+                    Text(item.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Text(item.subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                Spacer()
             }
-            Spacer()
         }
+        .buttonStyle(.plain)
         .padding(.vertical, StoatSpacing.xxSmall)
         .contentShape(Rectangle())
+        .popover(isPresented: Binding(get: { viewModel.profileUserID == item.userID }, set: { if !$0 { viewModel.closeUserProfile() } })) {
+            UserProfileCardView(viewModel: viewModel, user: profileUser(for: item))
+        }
         .contextMenu {
             if let member = item.member {
                 Button {
@@ -8478,6 +8613,15 @@ public struct MemberPanelView: View {
                 .disabled(viewModel.memberActionDisabledReason(for: member, action: .ban) != nil)
             }
         }
+    }
+
+    private func profileUser(for item: MemberListItem) -> User {
+        item.user ?? User(id: item.userID, username: item.displayName, displayName: item.displayName)
+    }
+
+    private func roleForeground(_ color: ResolvedRoleColor?) -> Color {
+        guard let color else { return .primary }
+        return Color(red: color.red, green: color.green, blue: color.blue)
     }
 
     private var members: [User] {
@@ -9013,12 +9157,37 @@ private struct UserProfileCardView: View {
                 VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                     Text(displayName)
                         .font(.title3.weight(.semibold))
+                    if user.bot != nil {
+                        Text("BOT")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 5)
+                            .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                    }
                     Text("@\(user.username)#\(user.discriminator)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if let nickname = member?.nickname, nickname != displayName {
+                        Text("Server nickname: \(nickname)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     Text(viewModel.relationshipStatus(for: user).rawAPIValue)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
+                }
+            }
+
+            if !profileRoles.isEmpty {
+                HStack(spacing: StoatSpacing.xSmall) {
+                    ForEach(profileRoles) { role in
+                        let roleColor = ResolvedRoleColor(rawValue: role.colour)
+                        Text(role.name)
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, StoatSpacing.small)
+                            .padding(.vertical, StoatSpacing.xxSmall)
+                            .foregroundStyle(roleForeground(roleColor))
+                            .background(roleForeground(roleColor).opacity(0.12), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                    }
                 }
             }
 
@@ -9094,7 +9263,27 @@ private struct UserProfileCardView: View {
     }
 
     private var displayName: String {
-        user.displayName?.isEmpty == false ? user.displayName! : user.username
+        UserDisplayResolver.displayName(user: user, member: member, fallbackID: user.id)
+    }
+
+    private var member: ServerMember? {
+        guard let serverID = viewModel.selection.serverID else { return nil }
+        return viewModel.snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: user.id)]
+    }
+
+    private var profileRoles: [Role] {
+        guard let server = viewModel.selection.serverID.flatMap({ viewModel.snapshot.serversByID[$0] }),
+              let member
+        else { return [] }
+        return member.roles.compactMap { server.roles[$0] }.sorted {
+            if $0.rank != $1.rank { return $0.rank > $1.rank }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private func roleForeground(_ color: ResolvedRoleColor?) -> Color {
+        guard let color else { return .secondary }
+        return Color(red: color.red, green: color.green, blue: color.blue)
     }
 }
 
