@@ -458,6 +458,8 @@ public struct GlassComposer: View {
     private let onRemoveAttachment: (UUID) -> Void
     private let onPreviewAttachment: (UUID) -> Void
     private let onDropFileURLs: ([URL]) -> Void
+    private let emojiItems: [String]
+    private let onInsertEmoji: (String) -> Void
     private let onPasteImageData: (Data) -> Void
     private let onPasteFileURLs: ([URL]) -> Void
     private let onSend: () -> Void
@@ -483,6 +485,8 @@ public struct GlassComposer: View {
         onRemoveAttachment: @escaping (UUID) -> Void = { _ in },
         onPreviewAttachment: @escaping (UUID) -> Void = { _ in },
         onDropFileURLs: @escaping ([URL]) -> Void = { _ in },
+        emojiItems: [String] = [],
+        onInsertEmoji: @escaping (String) -> Void = { _ in },
         onPasteImageData: @escaping (Data) -> Void = { _ in },
         onPasteFileURLs: @escaping ([URL]) -> Void = { _ in },
         onSend: @escaping () -> Void = {},
@@ -507,6 +511,8 @@ public struct GlassComposer: View {
         self.onRemoveAttachment = onRemoveAttachment
         self.onPreviewAttachment = onPreviewAttachment
         self.onDropFileURLs = onDropFileURLs
+        self.emojiItems = emojiItems
+        self.onInsertEmoji = onInsertEmoji
         self.onPasteImageData = onPasteImageData
         self.onPasteFileURLs = onPasteFileURLs
         self.onSend = onSend
@@ -578,7 +584,32 @@ public struct GlassComposer: View {
                                 .allowsHitTesting(false)
                         }
                     }
-                    GlassIconButton("Emoji unavailable in Phase 4", systemImage: "face.smiling", isDisabled: true) {}
+                    Menu {
+                        if emojiItems.isEmpty {
+                            Text("No emoji available")
+                        } else {
+                            LazyVGrid(columns: Array(repeating: GridItem(.fixed(32), spacing: 4), count: 8), spacing: 4) {
+                                ForEach(emojiItems, id: \.self) { emoji in
+                                    Button {
+                                        onInsertEmoji(emoji)
+                                    } label: {
+                                        Text(emoji)
+                                            .font(.title3)
+                                            .frame(width: 30, height: 30)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("Insert emoji \(emoji)")
+                                }
+                            }
+                            .padding(6)
+                        }
+                    } label: {
+                        Image(systemName: "face.smiling")
+                            .frame(width: 30, height: 30)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .disabled(emojiItems.isEmpty || !isEnabled)
+                    .help("Insert emoji")
                     if isSending {
                         ProgressView()
                             .controlSize(.small)
@@ -1444,7 +1475,7 @@ public struct AttachmentTimelineCard: View {
             controls
         }
         .padding(isCompact ? StoatSpacing.small : StoatSpacing.medium)
-        .frame(maxWidth: isCompact ? 320 : 380, alignment: .leading)
+        .frame(maxWidth: isCompact ? 460 : 620, alignment: .leading)
         .background(backgroundColor, in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
@@ -1463,8 +1494,9 @@ public struct AttachmentTimelineCard: View {
             Button(action: onPreview) {
                 Image(nsImage: image)
                     .resizable()
+                    .interpolation(.high)
                     .scaledToFit()
-                    .frame(maxWidth: isCompact ? 300 : 360, maxHeight: isCompact ? 180 : 240, alignment: .leading)
+                    .frame(maxWidth: isCompact ? 430 : 580, maxHeight: isCompact ? 260 : 380, alignment: .leading)
                     .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
                     .overlay {
                         RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)

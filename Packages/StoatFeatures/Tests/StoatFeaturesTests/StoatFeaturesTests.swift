@@ -329,7 +329,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testStartupSavedCredentialBecomesReadyWithoutConnecting() async throws {
+    func testMockPreviewSavedCredentialBecomesReadyWithoutConnecting() async throws {
         let custom = try EnvironmentProfile.custom(
             name: "Local",
             environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:14702")!, eventsURL: URL(string: "ws://localhost:14703")!)
@@ -695,6 +695,19 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase32EmojiInsertionAppendsToComposerDraft() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
+
+        model.updateDraft("hello", for: channelID)
+        model.insertEmoji("🎉", in: channelID)
+
+        XCTAssertEqual(model.draft(for: channelID), "hello🎉")
+        XCTAssertTrue(model.commonEmojiItems.contains("🎉"))
+        XCTAssertEqual(model.emojiPickerDiagnostics, "Inserted Unicode emoji")
+    }
+
+    @MainActor
     func testPhase15AttachmentQueueDoesNotUploadUntilExplicitAction() async throws {
         let uploader = MockAttachmentUploadHandler()
         let model = MainShellViewModel(snapshot: MockShellData.snapshot, attachmentUploadHandler: uploader)
@@ -713,6 +726,49 @@ final class StoatFeaturesTests: XCTestCase {
         let finalUploadCount = await uploader.uploadCount()
         XCTAssertEqual(finalUploadCount, 1)
         XCTAssertNotNil(model.composerDraftState(for: channelID).attachments.first?.uploadedFileID)
+    }
+
+    @MainActor
+    func testPhase32DroppedFilesOpenReviewBeforeQueueingOrUploading() async throws {
+        let uploader = MockAttachmentUploadHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, attachmentUploadHandler: uploader)
+        let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
+        let url = try makeTemporaryAttachment(name: "phase32 dropped.txt", contents: Data("drop".utf8))
+
+        model.reviewDroppedAttachmentURLs([url], to: channelID)
+
+        let review = try XCTUnwrap(model.pendingAttachmentDrop)
+        XCTAssertEqual(review.channelID, channelID)
+        XCTAssertEqual(review.items.count, 1)
+        XCTAssertTrue(review.items.first?.filename.hasSuffix("phase32 dropped.txt") == true)
+        XCTAssertFalse(review.items.first?.filename.contains(FileManager.default.temporaryDirectory.path) == true)
+        XCTAssertTrue(review.canAddToMessage)
+        XCTAssertTrue(model.composerDraftState(for: channelID).attachments.isEmpty)
+        let uploadCountAfterDrop = await uploader.uploadCount()
+        XCTAssertEqual(uploadCountAfterDrop, 0)
+
+        model.addPendingDroppedAttachmentsToComposer()
+
+        XCTAssertNil(model.pendingAttachmentDrop)
+        XCTAssertEqual(model.composerDraftState(for: channelID).attachments.count, 1)
+        let uploadCountAfterAdd = await uploader.uploadCount()
+        XCTAssertEqual(uploadCountAfterAdd, 0)
+    }
+
+    @MainActor
+    func testPhase32DroppedFilesWithoutSendableTargetShowBlockedReview() async throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let url = try makeTemporaryAttachment(name: "phase32 blocked.txt", contents: Data("blocked".utf8))
+
+        model.reviewDroppedAttachmentURLs([url], to: nil)
+
+        let review = try XCTUnwrap(model.pendingAttachmentDrop)
+        XCTAssertNil(review.channelID)
+        XCTAssertTrue(review.blockedReason?.contains("Select a channel") == true)
+        XCTAssertFalse(review.canAddToMessage)
+        XCTAssertTrue(review.items.first?.filename.hasSuffix("phase32 blocked.txt") == true)
+        model.cancelPendingAttachmentDrop()
+        XCTAssertNil(model.pendingAttachmentDrop)
     }
 
     @MainActor
@@ -1827,7 +1883,7 @@ final class StoatFeaturesTests: XCTestCase {
         guard case let .failed(_, message) = model.channelSearchState else {
             return XCTFail("Expected failed live search state")
         }
-        XCTAssertEqual(message, "Live search requires manual connection.")
+        XCTAssertEqual(message, "Live search requires a connected live session.")
     }
 
     @MainActor
@@ -2272,7 +2328,7 @@ final class StoatFeaturesTests: XCTestCase {
         await model.openNotificationRoute(NotificationRoute(serverID: channel.serverID, channelID: channel.id, messageID: "missing-phase19"))
 
         XCTAssertEqual(model.effectiveSessionState, .readyToConnect)
-        XCTAssertEqual(model.placeholderStatus, "Connect manually to open this message.")
+        XCTAssertEqual(model.placeholderStatus, "Reconnect to open this message.")
         XCTAssertEqual(model.queuedNotificationRoutes.count, 1)
         XCTAssertEqual(model.notificationDiagnostics.lastRouteOutcome, .queuedAwaitingManualConnect)
     }
@@ -2350,7 +2406,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase21SavedCredentialIsUnvalidatedAndDoesNotConnectOnStartup() async {
+    func testPhase32SavedCredentialAutoConnectsOnStartup() async {
         let realtime = RecordingRealtimeClient()
         let api = RecordingAPIClient()
         let session = AppSessionCoordinator(
@@ -2361,13 +2417,15 @@ final class StoatFeaturesTests: XCTestCase {
 
         await session.startLiveFirstSession()
 
-        XCTAssertEqual(session.sessionState, .savedCredentialUnvalidated)
+        XCTAssertEqual(session.sessionState, .connecting)
         XCTAssertTrue(session.hasSavedCredential)
-        XCTAssertNil(session.currentUser)
+        XCTAssertEqual(session.currentUser?.id, MockShellData.currentUserID)
+        XCTAssertTrue(session.verificationState.credentialLoaded)
+        XCTAssertTrue(session.verificationState.currentUserFetched)
         let connectCallCount = await realtime.connectCallCount
         let fetchCurrentUserCallCount = await api.fetchCurrentUserCallCount
-        XCTAssertEqual(connectCallCount, 0)
-        XCTAssertEqual(fetchCurrentUserCallCount, 0)
+        XCTAssertEqual(connectCallCount, 1)
+        XCTAssertEqual(fetchCurrentUserCallCount, 1)
     }
 
     @MainActor
@@ -2790,6 +2848,7 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(allItems.contains { $0.user == nil && $0.displayName.contains("...") })
         XCTAssertEqual(model.memberListPerformanceDiagnostics.knownMemberCount, 12)
         XCTAssertEqual(model.memberListPerformanceDiagnostics.renderedMemberCount, 12)
+        XCTAssertEqual(model.memberListPerformanceDiagnostics.missingUserCount, 3)
         XCTAssertEqual(model.memberListPerformanceDiagnostics.droppedMemberCount, 0)
     }
 

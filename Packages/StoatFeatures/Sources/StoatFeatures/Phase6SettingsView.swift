@@ -186,7 +186,7 @@ private struct AccountSettingsTab: View {
                         }
                     }
                 } else {
-                    ContentUnavailableView("No validated account", systemImage: "person.crop.circle.badge.questionmark", description: Text("Validate a saved session or connect manually to show account details."))
+                    ContentUnavailableView("No validated account", systemImage: "person.crop.circle.badge.questionmark", description: Text("Set up or retry a saved session to show account details."))
                 }
                 LabeledContent("Environment", value: viewModel.sessionCoordinator?.environment.isProduction == true ? "Stoat Production" : "Custom")
                 LabeledContent("Validation", value: validationText)
@@ -206,7 +206,7 @@ private struct AccountSettingsTab: View {
                     }
                     .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true)
 
-                    Button("Connect Manually") {
+                    Button("Retry Connection") {
                         Task { await viewModel.connectLiveManually() }
                     }
                     .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true || isDisconnectable)
@@ -232,11 +232,6 @@ private struct AccountSettingsTab: View {
                     }
                     .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true)
 
-                    if viewModel.isDeveloperControlsEnabled {
-                        Button("Open Preview Data") {
-                            Task { await viewModel.resetToMock() }
-                        }
-                    }
                 }
             }
 
@@ -244,7 +239,7 @@ private struct AccountSettingsTab: View {
                 if let coordinator = viewModel.sessionCoordinator {
                     LabeledContent("Health", value: Phase6UIHelpers.connectionHealthText(state: coordinator.connectionState, diagnostics: coordinator.diagnostics, hydration: coordinator.hydrationStatus))
                     LabeledContent("Hydration", value: Phase6UIHelpers.hydrationLabel(coordinator.hydrationStatus))
-                    LabeledContent("Mode", value: viewModel.effectiveRuntimeMode == .liveManual ? "Live Manual" : "Preview Data")
+                    LabeledContent("Mode", value: viewModel.effectiveRuntimeMode == .liveManual ? "Live" : "Preview Data")
                     LabeledContent("Ready", value: coordinator.hydrationStatus.readyReceived ? "Received" : "Waiting")
                     LabeledContent("Servers", value: "\(coordinator.hydrationStatus.serverCount)")
                     LabeledContent("Channels", value: "\(coordinator.hydrationStatus.channelCount)")
@@ -670,7 +665,7 @@ private struct NotificationSettingsTab: View {
                     Text("Mentions").tag(DockBadgePreference.mentionsOnly)
                     Text("Unread channels and mentions").tag(DockBadgePreference.unreadChannelsAndMentions)
                 }
-                Text("When Liquid Bagel is active, notifications stay in-app. Native macOS notifications are used only while inactive or in the background, and notification clicks never reconnect Live Manual automatically.")
+                Text("When Liquid Bagel is active, notifications stay in-app. Native macOS notifications are used only while inactive or in the background, and notification clicks never connect in the background.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -766,7 +761,7 @@ private struct TimelineValidationHarnessView: View {
         Grid(alignment: .leading, horizontalSpacing: StoatSpacing.large, verticalSpacing: StoatSpacing.xSmall) {
             diagnosticRow("Environment", viewModel.sessionCoordinator.map { Phase6UIHelpers.environmentDisplayName($0.environment, preferences: $0.preferences) } ?? "Preview Data")
             diagnosticRow("Current User", viewModel.currentUser?.displayName ?? viewModel.currentUser?.username ?? "-")
-            diagnosticRow("Connection", "\(viewModel.effectiveRuntimeMode == .liveManual ? "Live Manual" : "Preview Data") · \(viewModel.effectiveSessionState)")
+            diagnosticRow("Connection", "\(viewModel.effectiveRuntimeMode == .liveManual ? "Live" : "Preview Data") · \(viewModel.effectiveSessionState)")
             diagnosticRow("Ready", viewModel.sessionCoordinator?.verificationState.readyReceived == true ? "yes" : "no")
             diagnosticRow("Channel", TimelineCopyFormatter.shortID(diagnostics.channelID?.rawValue))
             diagnosticRow("Loaded", "\(diagnostics.loadedMessageCount)")
@@ -996,8 +991,8 @@ private struct TimelineValidationHarnessView: View {
 
     private func checklist(_ diagnostics: TimelineDiagnostics) -> some View {
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-            Text("Live Manual Checklist").font(.subheadline.weight(.semibold))
-            checklistRow("Connected Live Manual", viewModel.effectiveRuntimeMode == .liveManual && viewModel.effectiveSessionState == .connected)
+            Text("Live Checklist").font(.subheadline.weight(.semibold))
+            checklistRow("Connected Live", viewModel.effectiveRuntimeMode == .liveManual && viewModel.effectiveSessionState == .connected)
             checklistRow("Ready received", viewModel.sessionCoordinator?.verificationState.readyReceived == true)
             checklistRow("Selected channel exists", diagnostics.channelID != nil)
             checklistRow("Initial messages loaded", diagnostics.loadedMessageCount > 0)

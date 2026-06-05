@@ -35,8 +35,9 @@ public struct MemberManagementItem: Hashable, Sendable, Identifiable {
     public init(member: ServerMember, user: User?, server: Server) {
         self.member = member
         self.user = user
-        self.displayName = member.nickname ?? user?.displayName ?? user?.username ?? "Unknown member"
-        self.username = user.map { "@\($0.username)" } ?? "Unknown user"
+        let display = UserDisplayResolver.resolved(userID: member.id.userID, user: user, member: member)
+        self.displayName = display.displayName
+        self.username = display.subtitle ?? UserDisplayResolver.usernameLine(user: user, fallbackID: member.id.userID)
         self.roles = member.roles.compactMap { server.roles[$0] }.sorted { $0.rank < $1.rank }
         self.highestRank = Phase25PermissionResolver.highestRank(for: member, in: server)
         if let timeout = member.timeout, timeout > Date() {

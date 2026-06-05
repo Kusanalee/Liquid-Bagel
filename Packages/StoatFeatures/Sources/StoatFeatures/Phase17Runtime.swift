@@ -167,7 +167,7 @@ public struct MessageActionDiagnostics: Hashable, Sendable {
 }
 
 public enum Phase17MessageActions {
-    public static let quickReactions = ["👍", "❤️", "😂", "👀", "✅"]
+    public static let quickReactions = ["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏"]
 
     public static func actionItems(for context: MessageActionContext) -> [MessageActionItem] {
         let timelineMessage = context.timelineMessage

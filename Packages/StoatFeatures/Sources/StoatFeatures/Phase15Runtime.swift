@@ -87,6 +87,76 @@ public struct ComposerAttachmentDraft: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct AttachmentDropReviewItem: Identifiable, Hashable, Sendable {
+    public var id: UUID
+    public var draft: ComposerAttachmentDraft?
+    public var filename: String
+    public var subtitle: String
+    public var systemImage: String
+    public var warning: String?
+
+    public init(draft: ComposerAttachmentDraft) {
+        self.id = draft.id
+        self.draft = draft
+        self.filename = draft.filename
+        self.subtitle = draft.displaySize
+        self.systemImage = Self.systemImage(for: draft.kind)
+        self.warning = nil
+    }
+
+    public init(url: URL, error: Error) {
+        self.id = UUID()
+        self.draft = nil
+        self.filename = ComposerAttachmentDraft.sanitizedFilename(url.lastPathComponent)
+        self.subtitle = "Not attachable"
+        self.systemImage = "exclamationmark.triangle"
+        self.warning = error.userFacingMessage
+    }
+
+    public var canAttach: Bool {
+        draft != nil
+    }
+
+    private static func systemImage(for kind: ComposerAttachmentKind) -> String {
+        switch kind {
+        case .image: "photo"
+        case .pdf: "doc.richtext"
+        case .text: "doc.text"
+        case .file: "doc"
+        }
+    }
+}
+
+public struct AttachmentDropReview: Identifiable, Hashable, Sendable {
+    public var id: UUID
+    public var channelID: ChannelID?
+    public var channelName: String?
+    public var items: [AttachmentDropReviewItem]
+    public var blockedReason: String?
+
+    public init(
+        id: UUID = UUID(),
+        channelID: ChannelID?,
+        channelName: String?,
+        items: [AttachmentDropReviewItem],
+        blockedReason: String? = nil
+    ) {
+        self.id = id
+        self.channelID = channelID
+        self.channelName = channelName
+        self.items = items
+        self.blockedReason = blockedReason
+    }
+
+    public var attachableItems: [AttachmentDropReviewItem] {
+        items.filter(\.canAttach)
+    }
+
+    public var canAddToMessage: Bool {
+        blockedReason == nil && channelID != nil && !attachableItems.isEmpty
+    }
+}
+
 public enum AttachmentValidationError: Error, Equatable, Sendable, LocalizedError {
     case tooManyAttachments(Int)
     case unsupportedType

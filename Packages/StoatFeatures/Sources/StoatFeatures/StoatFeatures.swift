@@ -415,6 +415,7 @@ public final class MainShellViewModel {
     public var placeholderStatus: String?
     public var shouldFocusComposer = false
     public var composerFocusRequestID = 0
+    public var emojiPickerDiagnostics: String?
     public var focusTarget: ShellFocusTarget?
     public var previousFocusTarget: ShellFocusTarget?
     public var composerDrafts: [ChannelID: ComposerDraftState] = [:]
@@ -455,6 +456,7 @@ public final class MainShellViewModel {
     public var importedCalibrationNotes = ""
     public var selectedTimelineTuningPreset: TimelineTuningPreset = .conservative
     public var attachmentPreview: AttachmentPreviewSheetItem?
+    public var pendingAttachmentDrop: AttachmentDropReview?
     public var attachmentPreviewStates: [String: AttachmentPreviewState] = [:]
     public var loadedAttachmentData: [String: RemoteAttachmentData] = [:]
     public var loadedAttachmentOriginalData: [String: RemoteAttachmentData] = [:]
@@ -817,10 +819,27 @@ public final class MainShellViewModel {
         case .discover:
             return "Discover"
         case .directMessages:
+            if let channel = selectedConversationChannel {
+                return directMessageTitle(for: channel)
+            }
             return "Direct Messages"
         case .server:
             if let channel = selectedChannel { return "# \(channel.displayName)" }
             return selectedServer?.name ?? "Server"
+        }
+    }
+
+    private func directMessageTitle(for channel: Channel) -> String {
+        switch channel.kind {
+        case .savedMessages:
+            return "Saved Messages"
+        case .group:
+            return channel.displayName.isEmpty ? "Group DM" : channel.displayName
+        default:
+            let names = directMessageParticipantItems(for: channel)
+                .filter { $0.userID != currentUserID }
+                .map(\.displayName)
+            return names.first ?? channel.displayName
         }
     }
 
@@ -859,6 +878,7 @@ public final class MainShellViewModel {
         memberListGroupCache = groups
         let knownMemberCount = snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID }.count
         let knownUserCount = snapshot.usersByID.count
+        let missingUserCount = snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID && snapshot.usersByID[$0.id.userID] == nil }.count
         let total = groups.reduce(0) { $0 + $1.items.count }
         let dropped = max(0, knownMemberCount - total)
         memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(
@@ -869,6 +889,7 @@ public final class MainShellViewModel {
             lastGroupingDurationDescription: "\(Int(Date().timeIntervalSince(started) * 1000))ms",
             knownMemberCount: knownMemberCount,
             knownUserCount: knownUserCount,
+            missingUserCount: missingUserCount,
             renderedMemberCount: total,
             droppedMemberCount: dropped,
             droppedReasonSummary: dropped == 0 ? nil : "Filtered by query or unavailable role/member data"
@@ -1053,7 +1074,7 @@ public final class MainShellViewModel {
               effectiveSessionState == .connected,
               let apiClient = sessionCoordinator?.apiClient
         else {
-            relationshipActionStatus = "Connect manually before refreshing friends and DMs."
+            relationshipActionStatus = "Reconnect before refreshing friends and DMs."
             return
         }
         isRelationshipRefreshInProgress = true
@@ -1203,7 +1224,7 @@ public final class MainShellViewModel {
         guard effectiveSessionState == .connected,
               let apiClient = sessionCoordinator?.apiClient
         else {
-            relationshipActionStatus = "Connect manually before using friend and DM actions."
+            relationshipActionStatus = "Reconnect before using friend and DM actions."
             return nil
         }
         return apiClient
@@ -1280,7 +1301,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            invitePreviewState = .failed(code, "Connect manually before previewing invites.")
+            invitePreviewState = .failed(code, "Reconnect before previewing invites.")
             return
         }
         invitePreviewState = .loading(code)
@@ -1306,7 +1327,7 @@ public final class MainShellViewModel {
         guard let pendingInviteJoin else { return }
         self.pendingInviteJoin = nil
         guard let apiClient = apiClientForCommunityAction() else {
-            invitePreviewState = .failed(pendingInviteJoin.code, "Connect manually before joining an invite.")
+            invitePreviewState = .failed(pendingInviteJoin.code, "Reconnect before joining an invite.")
             return
         }
         invitePreviewState = .loading(pendingInviteJoin.code)
@@ -1341,7 +1362,7 @@ public final class MainShellViewModel {
 
     public func createServerFromDraft() async {
         guard let apiClient = apiClientForCommunityAction() else {
-            serverCreateState = .failed("Connect manually before creating a server.")
+            serverCreateState = .failed("Reconnect before creating a server.")
             return
         }
         let draft = ServerCreateDraft(
@@ -1379,7 +1400,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            inviteManagementState = .failed("Connect manually before managing invites.")
+            inviteManagementState = .failed("Reconnect before managing invites.")
             return
         }
         inviteManagementState = .loading
@@ -1397,7 +1418,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            inviteManagementState = .failed("Connect manually before creating invites.")
+            inviteManagementState = .failed("Reconnect before creating invites.")
             return
         }
         do {
@@ -1425,7 +1446,7 @@ public final class MainShellViewModel {
         guard let pendingInviteDeletion else { return }
         self.pendingInviteDeletion = nil
         guard let apiClient = apiClientForCommunityAction() else {
-            inviteManagementState = .failed("Connect manually before revoking invites.")
+            inviteManagementState = .failed("Reconnect before revoking invites.")
             return
         }
         do {
@@ -1614,8 +1635,8 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            serverOverviewState = .failed("Connect manually before refreshing server details.")
-            serverSettingsState = .failed("Connect manually before refreshing server details.")
+            serverOverviewState = .failed("Reconnect before refreshing server details.")
+            serverSettingsState = .failed("Reconnect before refreshing server details.")
             return
         }
         serverOverviewState = .loading
@@ -1640,7 +1661,7 @@ public final class MainShellViewModel {
 
     public func serverSettingsDisabledReason() -> String? {
         let capabilities = serverManagementCapabilities()
-        guard capabilities.isConnectedForLiveActions else { return "Connect manually to edit server settings." }
+        guard capabilities.isConnectedForLiveActions else { return "Reconnect to edit server settings." }
         guard capabilities.canManageServer else {
             return capabilities.permissionResolutionIncomplete ? "Permission resolution is incomplete for this action." : "You do not have permission to manage this server."
         }
@@ -1649,7 +1670,7 @@ public final class MainShellViewModel {
 
     public func roleManagementDisabledReason() -> String? {
         let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
-        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Connect manually to manage roles." }
+        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Reconnect to manage roles." }
         guard resolution.canManageRoles || currentUserID == selectedServer?.ownerID else {
             return resolution.warnings.isEmpty ? "You do not have permission to manage roles." : "Permission resolution is incomplete for role management."
         }
@@ -1670,7 +1691,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            serverSettingsSaveState = .failed("Connect manually before editing server settings.")
+            serverSettingsSaveState = .failed("Reconnect before editing server settings.")
             return
         }
         serverSettingsSaveState = .loading
@@ -1709,7 +1730,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            serverSettingsSaveState = .failed("Connect manually before editing server appearance.")
+            serverSettingsSaveState = .failed("Reconnect before editing server appearance.")
             return
         }
         serverSettingsSaveState = .loading
@@ -1756,7 +1777,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            categoryEditorState = .failed("Connect manually before editing categories.")
+            categoryEditorState = .failed("Reconnect before editing categories.")
             return
         }
         let draft = ServerEditDraft(categories: form.categories)
@@ -1812,7 +1833,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            roleEditorState = .failed("Connect manually before editing roles.")
+            roleEditorState = .failed("Reconnect before editing roles.")
             return
         }
         roleEditorState = .loading
@@ -1859,7 +1880,7 @@ public final class MainShellViewModel {
         }
         pendingRoleDeletion = nil
         guard roleManagementDisabledReason() == nil, let apiClient = apiClientForCommunityAction() else {
-            phase25Status = roleManagementDisabledReason() ?? "Connect manually before deleting roles."
+            phase25Status = roleManagementDisabledReason() ?? "Reconnect before deleting roles."
             return
         }
         do {
@@ -1900,7 +1921,7 @@ public final class MainShellViewModel {
 
     public func memberRoleAssignmentDisabledReason(for member: ServerMember) -> String? {
         let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
-        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Connect manually to assign roles." }
+        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Reconnect to assign roles." }
         guard member.id.userID != currentUserID else { return "You cannot assign roles to yourself from this guarded flow." }
         guard resolution.canAssignRoles || currentUserID == selectedServer?.ownerID else {
             return resolution.warnings.isEmpty ? "You do not have permission to assign roles." : "Permission resolution is incomplete for role assignment."
@@ -1959,7 +1980,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            memberActionState = .failed("Connect manually before assigning roles.")
+            memberActionState = .failed("Reconnect before assigning roles.")
             return
         }
         memberActionState = .loading
@@ -1978,7 +1999,7 @@ public final class MainShellViewModel {
 
     public func memberActionDisabledReason(for member: ServerMember, action: MemberModerationAction) -> String? {
         let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
-        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Connect manually before member moderation." }
+        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Reconnect before member moderation." }
         guard member.id.userID != currentUserID else { return "You cannot moderate yourself from this guarded flow." }
         guard Phase26MemberSafety.canActOn(member: member, currentMember: selectedServerMember, server: selectedServer, currentUserID: currentUserID) || currentUserID == selectedServer?.ownerID else {
             return "Rank data is incomplete or this member is protected."
@@ -2018,7 +2039,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            memberActionState = .failed("Connect manually before member moderation.")
+            memberActionState = .failed("Reconnect before member moderation.")
             return
         }
         pendingMemberModerationAction = nil
@@ -2079,7 +2100,7 @@ public final class MainShellViewModel {
         }
         let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
         guard serverManagementCapabilities().isConnectedForLiveActions else {
-            banListState = .failed("Connect manually before loading bans.")
+            banListState = .failed("Reconnect before loading bans.")
             return
         }
         guard resolution.effectivePermissions.contains(.banMembers) || currentUserID == server.ownerID else {
@@ -2087,7 +2108,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            banListState = .failed("Connect manually before loading bans.")
+            banListState = .failed("Reconnect before loading bans.")
             return
         }
         banListState = .loading
@@ -2100,7 +2121,7 @@ public final class MainShellViewModel {
 
     public func unban(userID: UserID) async {
         guard let server = selectedServer, let apiClient = apiClientForCommunityAction() else {
-            banListState = .failed("Connect manually before removing bans.")
+            banListState = .failed("Reconnect before removing bans.")
             return
         }
         do {
@@ -2113,7 +2134,7 @@ public final class MainShellViewModel {
 
     public func permissionEditingDisabledReason() -> String? {
         let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
-        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Connect manually before editing permissions." }
+        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Reconnect before editing permissions." }
         guard resolution.canManagePermissions || currentUserID == selectedServer?.ownerID else {
             return resolution.warnings.isEmpty ? "You do not have permission to manage permissions." : "Permission resolution is incomplete for permission editing."
         }
@@ -2162,7 +2183,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            permissionEditorState = .failed("Connect manually before editing permissions.")
+            permissionEditorState = .failed("Reconnect before editing permissions.")
             return
         }
         permissionEditorState = .loading
@@ -2280,7 +2301,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            channelCreateState = .failed("Connect manually before creating channels.")
+            channelCreateState = .failed("Reconnect before creating channels.")
             return
         }
         channelCreateState = .loading
@@ -2338,7 +2359,7 @@ public final class MainShellViewModel {
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
-            channelEditState = .failed("Connect manually before editing channels.")
+            channelEditState = .failed("Reconnect before editing channels.")
             return
         }
         channelEditState = .loading
@@ -2370,7 +2391,7 @@ public final class MainShellViewModel {
         guard let pendingChannelDeletion else { return }
         self.pendingChannelDeletion = nil
         guard let apiClient = apiClientForCommunityAction() else {
-            phase24Status = "Connect manually before deleting channels."
+            phase24Status = "Reconnect before deleting channels."
             return
         }
         do {
@@ -2397,7 +2418,7 @@ public final class MainShellViewModel {
         case .mock:
             "Preview Data"
         case .liveManual:
-            effectiveSessionState == .connected ? "Live Manual connected" : "Live Manual disconnected"
+            effectiveSessionState == .connected ? "Live connected" : "Live disconnected"
         }
     }
 
@@ -2808,6 +2829,19 @@ public final class MainShellViewModel {
         scheduleTyping(for: channelID, draft: draft)
     }
 
+    public var commonEmojiItems: [String] {
+        ["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏", "🔥", "✨", "😄", "😅", "😎", "😢", "😮", "🤔", "🚀", "💯", "🫡", "👋", "🙌", "😆", "😋", "😴"]
+    }
+
+    public func insertEmoji(_ emoji: String, in channelID: ChannelID?) {
+        guard let channelID else { return }
+        var state = composerDraftState(for: channelID)
+        state.text += emoji
+        composerDrafts[channelID] = state
+        emojiPickerDiagnostics = "Inserted Unicode emoji"
+        requestFocus(.composer)
+    }
+
     public func addAttachmentURLs(_ urls: [URL], to channelID: ChannelID?) {
         guard let channelID else {
             composerError = "Select a channel or DM before dropping files."
@@ -2827,6 +2861,76 @@ public final class MainShellViewModel {
             }
         }
         composerDrafts[channelID] = state
+    }
+
+    public func reviewDroppedAttachmentURLs(_ urls: [URL], to channelID: ChannelID?) {
+        let target = channelID.flatMap { snapshot.channelsByID[$0] }
+        let existingCount = channelID.map { composerDraftState(for: $0).attachments.count } ?? 0
+        let blockedReason: String?
+        if channelID == nil || target == nil {
+            blockedReason = "Select a channel or DM before attaching files."
+        } else if !canUploadFiles(in: target) {
+            blockedReason = "You do not have permission to upload files here."
+        } else if !isRuntimeSendCapable {
+            blockedReason = effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Reconnect before attaching files."
+        } else {
+            blockedReason = nil
+        }
+
+        var validatedCount = existingCount
+        let items = urls.map { url -> AttachmentDropReviewItem in
+            do {
+                let draft = try attachmentValidationPolicy.draft(for: url, existingCount: validatedCount)
+                validatedCount += 1
+                return AttachmentDropReviewItem(draft: draft)
+            } catch {
+                return AttachmentDropReviewItem(url: url, error: error)
+            }
+        }
+        pendingAttachmentDrop = AttachmentDropReview(
+            channelID: channelID,
+            channelName: target.map { composerPlaceholder(for: $0).replacingOccurrences(of: "Message ", with: "") },
+            items: items,
+            blockedReason: blockedReason
+        )
+        lastAttachmentAction = "Opened drag and drop attachment review"
+    }
+
+    public func reviewDroppedAttachmentURLsForSelectedChannel(_ urls: [URL]) {
+        reviewDroppedAttachmentURLs(urls, to: selectedConversationChannelID)
+    }
+
+    public func removePendingDroppedAttachment(_ itemID: UUID) {
+        pendingAttachmentDrop?.items.removeAll { $0.id == itemID }
+        if pendingAttachmentDrop?.items.isEmpty == true {
+            pendingAttachmentDrop = nil
+        }
+    }
+
+    public func cancelPendingAttachmentDrop() {
+        pendingAttachmentDrop = nil
+        lastAttachmentAction = "Cancelled drag and drop attachment review"
+    }
+
+    public func addPendingDroppedAttachmentsToComposer() {
+        guard let review = pendingAttachmentDrop,
+              review.canAddToMessage,
+              let channelID = review.channelID
+        else {
+            composerError = pendingAttachmentDrop?.blockedReason ?? "No attachable files are available."
+            placeholderStatus = composerError
+            return
+        }
+        var state = composerDraftState(for: channelID)
+        for item in review.attachableItems {
+            if let draft = item.draft {
+                state.attachments.append(draft)
+            }
+        }
+        composerDrafts[channelID] = state
+        pendingAttachmentDrop = nil
+        composerError = nil
+        lastAttachmentAction = "Queued dropped attachments after confirmation"
     }
 
     public func addAttachmentURLsToSelectedChannel(_ urls: [URL]) {
@@ -2959,7 +3063,7 @@ public final class MainShellViewModel {
             return (false, "Type a message or attach a file.")
         }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Connect manually to send live messages.")
+            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Reconnect to send live messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -2987,7 +3091,7 @@ public final class MainShellViewModel {
             return (false, "Select a channel to send a message.")
         }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Connect manually to send live messages.")
+            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Reconnect to send live messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -4301,6 +4405,7 @@ public final class MainShellViewModel {
         Member list diagnostics
         knownMembers: \(members.knownMemberCount)
         knownUsers: \(members.knownUserCount)
+        missingUsers: \(members.missingUserCount)
         renderedMembers: \(members.renderedMemberCount)
         droppedMembers: \(members.droppedMemberCount)
         droppedReason: \(members.droppedReasonSummary ?? "-")
@@ -4471,7 +4576,7 @@ public final class MainShellViewModel {
               sessionCoordinator?.hydrationStatus.readyReceived == true
         else {
             queueNotificationRoute(route)
-            placeholderStatus = "Connect manually to open this message."
+            placeholderStatus = "Reconnect to open this message."
             recordNotificationRouteOutcome(.queuedAwaitingManualConnect)
             return
         }
@@ -4653,7 +4758,7 @@ public final class MainShellViewModel {
                   let channelID = selectedConversationChannelID,
                   let apiClient = sessionCoordinator?.apiClient
             else {
-                let message = "Live search requires manual connection."
+                let message = "Live search requires a connected live session."
                 channelSearchState = .failed(query, message)
                 remoteSearchStatus = message
                 return
@@ -4859,7 +4964,7 @@ public final class MainShellViewModel {
               let channelID = selectedConversationChannelID,
               let apiClient = sessionCoordinator?.apiClient
         else {
-            remoteSearchStatus = "Connect Live Manual before searching the selected channel."
+            remoteSearchStatus = "Reconnect before searching the selected channel."
             remoteSearchResults = []
             return
         }
@@ -5678,7 +5783,7 @@ extension MainShellViewModel: AppCommandHandling {
         case .openPermissionEditor:
             return permissionEditingDisabledReason() ?? "Select a server before editing permissions."
         case .openBanList:
-            return "Connect manually before loading the ban list."
+            return "Reconnect before loading the ban list."
         case .createRole:
             return roleManagementDisabledReason() ?? "Select a server before creating a role."
         case .createCategory:
@@ -5706,7 +5811,7 @@ extension MainShellViewModel: AppCommandHandling {
         case .selectNextChannel, .selectPreviousChannel, .selectNextUnreadChannel, .selectPreviousUnreadChannel, .selectNextMessage, .selectPreviousMessage, .jumpToNewestMessage, .jumpToFirstUnreadMessage:
             return isTextEntryFocused ? "Keyboard navigation is paused while typing." : "No selectable target."
         case .openChannelSearch, .openLoadedMessageFind, .openLiveChannelSearch, .openPinnedChannelSearch:
-            if command == .openLiveChannelSearch { return "Live search requires manual connection." }
+            if command == .openLiveChannelSearch { return "Live search requires a connected live session." }
             return "Select a channel before searching."
         case .selectNextSearchResult, .selectPreviousSearchResult, .jumpToSelectedSearchResult:
             return "No search result is selected."
@@ -6124,6 +6229,14 @@ public struct MainShellView: View {
                 }
             )
         }
+        .sheet(item: $viewModel.pendingAttachmentDrop) { review in
+            AttachmentDropReviewSheet(
+                review: review,
+                onRemove: { itemID in viewModel.removePendingDroppedAttachment(itemID) },
+                onCancel: { viewModel.cancelPendingAttachmentDrop() },
+                onAdd: { viewModel.addPendingDroppedAttachmentsToComposer() }
+            )
+        }
         .confirmationDialog(
             "Send current composer text?",
             isPresented: $viewModel.isTestSendConfirmationPresented
@@ -6217,6 +6330,26 @@ public struct MainShellView: View {
         } message: {
             Text("This removes the channel after the API confirms deletion. Messages in that channel will no longer be visible here.")
         }
+        .confirmationDialog(
+            viewModel.pendingMemberModerationAction.map { "Confirm \($0.action.rawValue)" } ?? "Confirm member action?",
+            isPresented: Binding(
+                get: { viewModel.pendingMemberModerationAction != nil },
+                set: { if !$0 { viewModel.pendingMemberModerationAction = nil } }
+            )
+        ) {
+            if let pending = viewModel.pendingMemberModerationAction {
+                Button("Confirm", role: memberActionRole(pending.action)) {
+                    Task { await viewModel.confirmPendingMemberAction() }
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingMemberModerationAction = nil
+            }
+        } message: {
+            if let pending = viewModel.pendingMemberModerationAction {
+                Text("Liquid Bagel will apply this action to \(viewModel.displayName(for: viewModel.snapshot.usersByID[pending.member.id.userID], member: pending.member, fallbackID: pending.member.id.userID)) only after confirmation.")
+            }
+        }
         .overlay(alignment: .bottom) {
             if let status = viewModel.placeholderStatus ?? viewModel.phase24Status ?? viewModel.phase23Status ?? viewModel.relationshipActionStatus ?? viewModel.messageActionStatus ?? viewModel.composerError ?? viewModel.sessionCoordinator?.lastErrorMessage {
                 Text(status)
@@ -6281,6 +6414,15 @@ public struct MainShellView: View {
         }
     }
 
+    private func memberActionRole(_ action: MemberModerationAction) -> ButtonRole? {
+        switch action {
+        case .kick, .ban:
+            return .destructive
+        case .saveNickname, .resetNickname, .removeAvatar, .timeout, .clearTimeout:
+            return nil
+        }
+    }
+
     @ViewBuilder private var content: some View {
         if viewModel.isTimelineRouteActive {
             ChatPlaceholderView(viewModel: viewModel)
@@ -6341,7 +6483,7 @@ public struct MainShellView: View {
                 }
             }
             if viewModel.sessionCoordinator?.hasSavedCredential == true {
-                Button("Connect Manually") {
+                Button("Retry Connection") {
                     Task { await viewModel.connectLiveManually() }
                 }
                 .disabled(isDisconnectable)
@@ -6357,13 +6499,9 @@ public struct MainShellView: View {
                 Task { await viewModel.disconnectLive() }
             }
             .disabled(!isDisconnectable)
-            if viewModel.isDeveloperControlsEnabled {
-                Button("Open Preview Data") {
-                    Task { await viewModel.resetToMock() }
-                }
-            }
         } label: {
-            Text("\(runtimeModeText) · \(connectionText)")
+            Label(connectionText, systemImage: connectionSystemImage)
+                .labelStyle(.iconOnly)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, StoatSpacing.small)
@@ -6385,7 +6523,7 @@ public struct MainShellView: View {
 
     private var connectionText: String {
         switch viewModel.effectiveConnectionState {
-        case .idle: viewModel.effectiveRuntimeMode == .mock ? "Preview" : "Idle"
+        case .idle: "Idle"
         case .ready: "Ready"
         case .connecting, .authenticating, .authenticated, .connected: "Connecting"
         case .reconnecting: "Reconnecting"
@@ -6394,10 +6532,23 @@ public struct MainShellView: View {
         }
     }
 
+    private var connectionSystemImage: String {
+        switch viewModel.effectiveConnectionState {
+        case .ready:
+            return "checkmark.circle.fill"
+        case .connecting, .authenticating, .authenticated, .connected, .reconnecting:
+            return "arrow.triangle.2.circlepath"
+        case .failed:
+            return "exclamationmark.triangle.fill"
+        case .idle, .disconnected:
+            return "circle"
+        }
+    }
+
     private var runtimeModeText: String {
         switch viewModel.effectiveRuntimeMode {
         case .mock: "Preview Data"
-        case .liveManual: "Live Manual"
+        case .liveManual: "Live"
         }
     }
 
@@ -6569,6 +6720,116 @@ private struct AttachmentPreviewSheet: View {
     }
 }
 
+private struct AttachmentDropReviewSheet: View {
+    let review: AttachmentDropReview
+    let onRemove: (UUID) -> Void
+    let onCancel: () -> Void
+    let onAdd: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            HStack {
+                Label("Attach Files", systemImage: "paperclip")
+                    .font(.headline)
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            if let channelName = review.channelName {
+                Text(channelName)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            if let blocked = review.blockedReason {
+                Label(blocked, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
+                    ForEach(review.items, id: \.id) { item in
+                        HStack(spacing: StoatSpacing.medium) {
+                            itemPreview(item)
+                            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                                Text(item.filename)
+                                    .font(.callout.weight(.medium))
+                                    .lineLimit(1)
+                                Text(statusText(for: item))
+                                    .font(.caption)
+                                    .foregroundStyle(statusColor(for: item))
+                                    .lineLimit(2)
+                            }
+                            Spacer()
+                            Button {
+                                onRemove(item.id)
+                            } label: {
+                                Image(systemName: "xmark")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Remove file")
+                            .accessibilityLabel("Remove \(item.filename)")
+                        }
+                        .padding(StoatSpacing.small)
+                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                    }
+                }
+            }
+            .frame(minHeight: 180, maxHeight: 340)
+
+            HStack {
+                Text("\(review.attachableItems.count) ready to attach")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Add to Message") {
+                    onAdd()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!review.canAddToMessage)
+            }
+        }
+        .padding(StoatSpacing.large)
+        .frame(width: 520)
+    }
+
+    @ViewBuilder private func itemPreview(_ item: AttachmentDropReviewItem) -> some View {
+        #if canImport(AppKit)
+        if let data = item.draft?.previewData, let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 44, height: 44)
+                .clipShape(RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+        } else {
+            genericIcon(item)
+        }
+        #else
+        genericIcon(item)
+        #endif
+    }
+
+    private func genericIcon(_ item: AttachmentDropReviewItem) -> some View {
+        Image(systemName: item.systemImage)
+            .font(.title3)
+            .frame(width: 44, height: 44)
+            .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+            .accessibilityHidden(true)
+    }
+
+    private func statusText(for item: AttachmentDropReviewItem) -> String {
+        item.warning ?? item.subtitle
+    }
+
+    private func statusColor(for item: AttachmentDropReviewItem) -> Color {
+        item.warning == nil ? .secondary : .orange
+    }
+}
+
 public struct CredentialSetupView: View {
     @Bindable private var viewModel: MainShellViewModel
     @Environment(\.dismiss) private var dismiss
@@ -6608,7 +6869,7 @@ public struct CredentialSetupView: View {
                     }
                     .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true)
 
-                    Button("Connect Manually") {
+                    Button("Retry Connection") {
                         Task { await viewModel.connectLiveManually() }
                     }
                     .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true || isDisconnectable)
@@ -6633,11 +6894,6 @@ public struct CredentialSetupView: View {
                     }
                     .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true)
 
-                    if viewModel.isDeveloperControlsEnabled {
-                        Button("Open Preview Data") {
-                            Task { await viewModel.resetToMock() }
-                        }
-                    }
                 }
             }
 
@@ -6864,7 +7120,7 @@ public struct CredentialSetupView: View {
             if let target = dm.composerTargetDescription {
                 LabeledContent("DM composer", value: target)
             }
-            LabeledContent("Members", value: "known \(members.knownMemberCount), rendered \(members.renderedMemberCount), dropped \(members.droppedMemberCount), groups \(members.groupCount)")
+            LabeledContent("Members", value: "known \(members.knownMemberCount), rendered \(members.renderedMemberCount), missing users \(members.missingUserCount), dropped \(members.droppedMemberCount), groups \(members.groupCount)")
             LabeledContent("Member images", value: "queue \(members.avatarLoadQueueCount)")
             LabeledContent("Send", value: "canSend \(send.canSend ? "yes" : "no"), stage \(send.lastSendStage?.rawValue ?? "-"), result \(send.lastSendResult?.rawValue ?? "-")")
             if let error = send.lastError {
@@ -6921,7 +7177,7 @@ public struct CredentialSetupView: View {
     private var runtimeModeText: String {
         switch viewModel.effectiveRuntimeMode {
         case .mock: "Preview Data"
-        case .liveManual: "Live Manual"
+        case .liveManual: "Live"
         }
     }
 
@@ -7178,19 +7434,19 @@ public struct ChannelListView: View {
         case .liveManual:
             switch viewModel.effectiveSessionState {
             case .connected:
-                return "Live Manual · connected"
+                return "Connected"
             case .connecting, .loadingCredential, .validatingCredential:
-                return "Live Manual · connecting"
+                return "Connecting"
             case .signedOut:
-                return "Live Manual · no credential"
+                return "Signed out"
             case .readyToConnect, .validatedReady:
-                return "Live Manual · ready"
+                return "Ready"
             case .savedCredentialUnvalidated:
-                return "Live Manual · saved credential"
+                return "Saved credential"
             case .invalidSession:
-                return "Live Manual · invalid session"
+                return "Invalid session"
             case .validationFailed, .connectionFailed, .keychainFailed, .failed:
-                return "Live Manual · failed"
+                return "Needs attention"
             case .mock:
                 return "Preview Data"
             }
@@ -7421,7 +7677,11 @@ public struct ChatPlaceholderView: View {
                         viewModel.previewComposerAttachment(attachmentID, in: channel.id)
                     },
                     onDropFileURLs: { urls in
-                        viewModel.addAttachmentURLs(urls, to: channel.id)
+                        viewModel.reviewDroppedAttachmentURLs(urls, to: channel.id)
+                    },
+                    emojiItems: viewModel.commonEmojiItems,
+                    onInsertEmoji: { emoji in
+                        viewModel.insertEmoji(emoji, in: channel.id)
                     },
                     onPasteImageData: { data in
                         viewModel.addPastedImageData(data, to: channel.id)
@@ -7455,7 +7715,7 @@ public struct ChatPlaceholderView: View {
                 }
                 if let url {
                     Task { @MainActor in
-                        viewModel.addAttachmentURLsToSelectedChannel([url])
+                        viewModel.reviewDroppedAttachmentURLsForSelectedChannel([url])
                     }
                 }
             }
@@ -8183,6 +8443,41 @@ public struct MemberPanelView: View {
         }
         .padding(.vertical, StoatSpacing.xxSmall)
         .contentShape(Rectangle())
+        .contextMenu {
+            if let member = item.member {
+                Button {
+                    viewModel.openMemberDetail(member)
+                    viewModel.openServerOverview()
+                } label: {
+                    Label("Member Details", systemImage: "person.text.rectangle")
+                }
+                Divider()
+                Button {
+                    viewModel.requestMemberAction(.timeout, for: member)
+                } label: {
+                    Label("Timeout", systemImage: "clock.badge.exclamationmark")
+                }
+                .disabled(viewModel.memberActionDisabledReason(for: member, action: .timeout) != nil)
+                Button {
+                    viewModel.requestMemberAction(.clearTimeout, for: member)
+                } label: {
+                    Label("Clear Timeout", systemImage: "clock.arrow.circlepath")
+                }
+                .disabled(viewModel.memberActionDisabledReason(for: member, action: .clearTimeout) != nil)
+                Button(role: .destructive) {
+                    viewModel.requestMemberAction(.kick, for: member)
+                } label: {
+                    Label("Kick", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+                .disabled(viewModel.memberActionDisabledReason(for: member, action: .kick) != nil)
+                Button(role: .destructive) {
+                    viewModel.requestMemberAction(.ban, for: member)
+                } label: {
+                    Label("Ban", systemImage: "hand.raised.fill")
+                }
+                .disabled(viewModel.memberActionDisabledReason(for: member, action: .ban) != nil)
+            }
+        }
     }
 
     private var members: [User] {
@@ -8412,7 +8707,7 @@ public struct LiveStartupView: View {
         case .signedOut:
             "Set up a live session"
         case .savedCredentialUnvalidated, .readyToConnect, .validatedReady:
-            "Ready to connect manually"
+            "Ready to connect"
         case .connecting, .loadingCredential, .validatingCredential:
             "Preparing live session"
         case .connected:
@@ -8429,13 +8724,13 @@ public struct LiveStartupView: View {
         case .signedOut:
             "No saved credential is available for this environment. Set up a session before connecting."
         case .savedCredentialUnvalidated:
-            "A credential exists, but Liquid Bagel will not validate or connect until you ask."
+            "A credential exists for this environment. Liquid Bagel will connect automatically on launch and you can retry here if needed."
         case .readyToConnect, .validatedReady:
-            "Connect manually when you are ready to dogfood against live Stoat."
+            "Use retry if the live connection is not already ready."
         case .connected:
             viewModel.snapshot.serversByID.isEmpty ? "Ready arrived, but no servers are available in the live snapshot." : "Live data is ready."
         case .connecting, .loadingCredential, .validatingCredential:
-            "Live setup is running because you requested it."
+            "Liquid Bagel is connecting to live Stoat."
         case .invalidSession, .validationFailed, .connectionFailed, .keychainFailed, .failed:
             viewModel.sessionCoordinator?.lastErrorMessage ?? "Open Account & Connection to repair the session."
         case .mock:
@@ -8444,7 +8739,7 @@ public struct LiveStartupView: View {
     }
 
     private var primaryActionTitle: String {
-        viewModel.sessionCoordinator?.hasSavedCredential == true ? "Connect Manually" : "Set Up Session"
+        viewModel.sessionCoordinator?.hasSavedCredential == true ? "Retry Connection" : "Set Up Session"
     }
 
     private func primaryAction() {
@@ -9961,7 +10256,7 @@ public struct ChannelSearchPanel: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         case .liveChannel:
-            Text(viewModel.effectiveRuntimeMode == .liveManual && viewModel.effectiveSessionState == .connected ? "Live channel search runs only when you press Search." : "Live search requires manual connection.")
+            Text(viewModel.effectiveRuntimeMode == .liveManual && viewModel.effectiveSessionState == .connected ? "Live channel search runs only when you press Search." : "Live search requires a connected live session.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         case .pinned:
@@ -10471,19 +10766,19 @@ private func phase30DMPreviewModel(reduceGlass: Bool = false) -> MainShellViewMo
 }
 
 @available(macOS 15.0, *)
-#Preview("Live Manual - Ready To Connect") {
+#Preview("Live - Ready To Connect") {
     MainShellView(viewModel: MainShellViewModel(snapshot: RealtimeSnapshot(), runtimeMode: .liveManual, sessionState: .readyToConnect, currentUser: nil))
         .frame(width: 1180, height: 760)
 }
 
 @available(macOS 15.0, *)
-#Preview("Live Manual - Connecting") {
+#Preview("Live - Connecting") {
     MainShellView(viewModel: MainShellViewModel(snapshot: RealtimeSnapshot(), connectionState: .authenticating, runtimeMode: .liveManual, sessionState: .connecting, currentUser: nil))
         .frame(width: 1180, height: 760)
 }
 
 @available(macOS 15.0, *)
-#Preview("Live Manual - Ready Snapshot") {
+#Preview("Live - Ready Snapshot") {
     MainShellView(viewModel: MainShellViewModel(
         selection: ShellSelection(space: .server("01HX0000000000000000000201"), serverID: "01HX0000000000000000000201", channelID: "01HX0000000000000000000101"),
         snapshot: MockShellData.snapshot,
@@ -10496,13 +10791,13 @@ private func phase30DMPreviewModel(reduceGlass: Bool = false) -> MainShellViewMo
 }
 
 @available(macOS 15.0, *)
-#Preview("Live Manual - No Servers") {
+#Preview("Live - No Servers") {
     MainShellView(viewModel: MainShellViewModel(snapshot: RealtimeSnapshot(), connectionState: .ready, runtimeMode: .liveManual, sessionState: .connected, currentUser: nil))
         .frame(width: 1180, height: 760)
 }
 
 @available(macOS 15.0, *)
-#Preview("Live Manual - Reconnecting") {
+#Preview("Live - Reconnecting") {
     MainShellView(viewModel: MainShellViewModel(snapshot: MockShellData.snapshot, connectionState: .reconnecting(attempt: 2, nextDelay: .seconds(4)), runtimeMode: .liveManual, sessionState: .connecting, currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID]))
         .frame(width: 1180, height: 760)
 }

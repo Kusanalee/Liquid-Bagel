@@ -1333,7 +1333,11 @@ public final class AppSessionCoordinator {
         if case .keychainFailed = sessionState {
             return
         }
-        sessionState = hasSavedCredential ? .savedCredentialUnvalidated : .signedOut
+        guard hasSavedCredential else {
+            sessionState = .signedOut
+            return
+        }
+        await connectLive(source: .startupAuto)
     }
 
     private func startMockSession(loadStoredPreferences: Bool) async {
@@ -1653,6 +1657,29 @@ public final class AppSessionCoordinator {
     }
 
     public func connectLiveManually() async {
+        await connectLive(source: .userInitiated)
+    }
+
+    public func reconnectLiveManually() async {
+        await connectLive(source: .retry)
+    }
+
+    private enum LiveConnectSource: Hashable, Sendable {
+        case startupAuto
+        case userInitiated
+        case retry
+
+        var failurePrefix: String {
+            switch self {
+            case .startupAuto:
+                return "Automatic connection failed"
+            case .userInitiated, .retry:
+                return "Live connection failed"
+            }
+        }
+    }
+
+    private func connectLive(source: LiveConnectSource) async {
         await disconnectActiveRealtime()
         mode = .liveManual
         sessionState = .loadingCredential
@@ -1703,14 +1730,10 @@ public final class AppSessionCoordinator {
             try await realtimeClient.connect(credential: credential, environment: environment, readyFields: readyFields)
         } catch {
             await disconnectActiveRealtime()
-            let message = "Live connection failed: \(error.userFacingMessage)"
+            let message = "\(source.failurePrefix): \(error.userFacingMessage)"
             sessionState = .connectionFailed(message)
             failLiveSession(message, replaceConnectionState: true)
         }
-    }
-
-    public func reconnectLiveManually() async {
-        await connectLiveManually()
     }
 
     public func disconnectLive() async {
@@ -1720,7 +1743,7 @@ public final class AppSessionCoordinator {
         diagnostics = nil
         currentUser = nil
         apiClient = nil
-        messageActionHandler = UnavailableMessageActionHandler(message: "Connect Live Manual before sending messages.")
+        messageActionHandler = UnavailableMessageActionHandler(message: "Reconnect before sending messages.")
         installLiveSafeSnapshot()
         await refreshCredentialAvailability()
         sessionState = hasSavedCredential ? .readyToConnect : .signedOut

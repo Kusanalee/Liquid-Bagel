@@ -155,6 +155,7 @@ public struct MemberListPerformanceDiagnostics: Hashable, Sendable {
     public var lastGroupingDurationDescription: String?
     public var knownMemberCount: Int
     public var knownUserCount: Int
+    public var missingUserCount: Int
     public var renderedMemberCount: Int
     public var droppedMemberCount: Int
     public var droppedReasonSummary: String?
@@ -167,6 +168,7 @@ public struct MemberListPerformanceDiagnostics: Hashable, Sendable {
         lastGroupingDurationDescription: String? = nil,
         knownMemberCount: Int = 0,
         knownUserCount: Int = 0,
+        missingUserCount: Int = 0,
         renderedMemberCount: Int = 0,
         droppedMemberCount: Int = 0,
         droppedReasonSummary: String? = nil
@@ -178,6 +180,7 @@ public struct MemberListPerformanceDiagnostics: Hashable, Sendable {
         self.lastGroupingDurationDescription = lastGroupingDurationDescription
         self.knownMemberCount = knownMemberCount
         self.knownUserCount = knownUserCount
+        self.missingUserCount = missingUserCount
         self.renderedMemberCount = renderedMemberCount
         self.droppedMemberCount = droppedMemberCount
         self.droppedReasonSummary = droppedReasonSummary

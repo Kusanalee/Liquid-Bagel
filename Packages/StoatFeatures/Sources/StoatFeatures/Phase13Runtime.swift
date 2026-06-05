@@ -351,7 +351,7 @@ public enum TimelineDefaultTuningAdvisor {
             .map(TimelineCopyFormatter.redactTokenLikeStrings)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !redactedNotes.isEmpty || recommendation != nil else {
-            return .remainConservative(reason: "No real Live Manual calibration notes are recorded, so Phase 14 keeps the conservative default.")
+            return .remainConservative(reason: "No real live calibration notes are recorded, so Phase 14 keeps the conservative default.")
         }
 
         let joined = redactedNotes.joined(separator: "\n").lowercased()
