@@ -584,6 +584,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var memberListGroupCacheKey: String?
     @ObservationIgnored private var memberListGroupCache: [MemberListGroup] = []
     @ObservationIgnored private var timelineVisibleRangeUpdateCount = 0
+    @ObservationIgnored private var transientStatusTask: Task<Void, Never>?
 
     public init(
         selection: ShellSelection = ShellSelection(),
@@ -663,6 +664,7 @@ public final class MainShellViewModel {
         selectedChannelLoadTask?.cancel()
         typingEndTask?.cancel()
         ackTask?.cancel()
+        transientStatusTask?.cancel()
         referenceFetchTasks.values.forEach { $0.cancel() }
         attachmentLoadTasks.values.forEach { $0.cancel() }
         imageResourceLoadTasks.values.forEach { $0.cancel() }
@@ -693,6 +695,10 @@ public final class MainShellViewModel {
     public var selectedConversationChannel: Channel? {
         guard let id = selectedConversationChannelID else { return nil }
         return snapshot.channelsByID[id]
+    }
+
+    public var isTimelineRouteActive: Bool {
+        activeConversation != .none
     }
 
     public func directMessageParticipantItems(for channel: Channel) -> [MemberListItem] {
@@ -1059,7 +1065,8 @@ public final class MainShellViewModel {
             for channel in dms {
                 snapshot.channelsByID[channel.id] = channel
             }
-            relationshipActionStatus = "Friends and DMs refreshed"
+            relationshipActionStatus = nil
+            lastTimelineActionResult = "Friends and DMs refreshed"
         } catch {
             relationshipActionStatus = "Refresh failed."
         }
@@ -1229,6 +1236,18 @@ public final class MainShellViewModel {
         snapshot.usersByID[user.id] = user
         if currentUserID == user.id {
             currentUser = user
+        }
+    }
+
+    private func showTransientStatus(_ message: String, keyPath: ReferenceWritableKeyPath<MainShellViewModel, String?> = \.placeholderStatus, duration: Duration = .seconds(2)) {
+        self[keyPath: keyPath] = message
+        transientStatusTask?.cancel()
+        transientStatusTask = Task { [weak self] in
+            try? await Task.sleep(for: duration)
+            await MainActor.run {
+                guard self?[keyPath: keyPath] == message else { return }
+                self?[keyPath: keyPath] = nil
+            }
         }
     }
 
@@ -2412,13 +2431,11 @@ public final class MainShellViewModel {
         selection.space = .directMessages
         selection.serverID = nil
         selection.channelID = nil
-        selection.dmChannelID = snapshot.channelsByID.values.first(where: DMChannelClassifier.isDirectMessageLike)?.id
+        selection.dmChannelID = nil
         recordDMRouteSelection(clickedRowID: selection.dmChannelID?.rawValue ?? "direct-messages", clickedChannelID: selection.dmChannelID, before: before)
         clearTimelineSelection()
         reconcileSearchHighlightsForSelectedChannel()
         placeholderStatus = nil
-        acknowledgeSelectedChannel()
-        scheduleSelectedChannelLoad()
         persistLiveSelectionIfNeeded()
     }
 
@@ -2564,10 +2581,10 @@ public final class MainShellViewModel {
                 Task { [weak self] in
                     guard let self else { return }
                     await self.messageController.refreshMessages(channelID: channelID, snapshotMessages: self.snapshot.messagesByChannelID[channelID] ?? [])
-                    self.placeholderStatus = "Mock data refreshed"
+                    self.showTransientStatus("Mock data refreshed")
                 }
             } else {
-                placeholderStatus = "Mock data refreshed"
+                showTransientStatus("Mock data refreshed")
             }
         case .liveManual:
             switch effectiveConnectionState {
@@ -2577,10 +2594,12 @@ public final class MainShellViewModel {
                         guard let self else { return }
                         await self.messageController.refreshMessages(channelID: channelID, snapshotMessages: self.snapshot.messagesByChannelID[channelID] ?? [])
                         self.sessionCoordinator?.markSelectedChannelMessageFetchSucceeded(channelID: channelID, isAvailable: self.snapshot.channelsByID[channelID] != nil)
-                        self.placeholderStatus = self.messageController.lastErrorByChannelID[channelID] == nil ? "Channel messages refreshed" : nil
+                        if self.messageController.lastErrorByChannelID[channelID] == nil {
+                            self.showTransientStatus("Channel messages refreshed")
+                        }
                     }
                 } else {
-                    placeholderStatus = "Live status refreshed"
+                    showTransientStatus("Live status refreshed")
                 }
             case .disconnected, .failed, .idle:
                 placeholderStatus = "Reconnect to refresh live state"
@@ -3224,14 +3243,39 @@ public final class MainShellViewModel {
     }
 
     public func displayName(for user: User?, member: ServerMember? = nil, fallbackID: UserID? = nil) -> String {
-        UserDisplayResolver.displayName(user: user, member: member, fallbackID: fallbackID)
+        resolvedUserDisplay(for: user, member: member, fallbackID: fallbackID).displayName
+    }
+
+    public func resolvedUserDisplay(for user: User?, member: ServerMember? = nil, fallbackID: UserID? = nil) -> ResolvedUserDisplay {
+        UserDisplayResolver.resolved(userID: fallbackID ?? user?.id ?? member?.id.userID, user: user, member: member)
+    }
+
+    public func resolvedUserDisplay(for message: Message) -> ResolvedUserDisplay {
+        let serverID = snapshot.channelsByID[message.channelID]?.serverID
+        let member = message.member ?? member(for: message.authorID, serverID: serverID)
+        let user = message.user ?? snapshot.usersByID[message.authorID]
+        return resolvedUserDisplay(for: user, member: member, fallbackID: message.authorID)
     }
 
     public func avatarFile(for message: Message) -> File? {
-        if let memberAvatar = message.member?.avatar { return memberAvatar }
-        if let userAvatar = message.user?.avatar { return userAvatar }
-        let member = member(for: message.authorID, serverID: snapshot.channelsByID[message.channelID]?.serverID)
-        return member?.avatar ?? snapshot.usersByID[message.authorID]?.avatar
+        resolvedUserDisplay(for: message).avatarFile
+    }
+
+    public func composerPlaceholder(for channel: Channel) -> String {
+        guard DMChannelClassifier.isDirectMessageLike(channel) else {
+            return "Message #\(channel.displayName)"
+        }
+        switch channel.kind {
+        case .savedMessages:
+            return "Message Saved Notes"
+        case .group:
+            return "Message \(channel.displayName.isEmpty ? "group DM" : channel.displayName)"
+        default:
+            let names = directMessageParticipantItems(for: channel)
+                .filter { $0.userID != currentUserID }
+                .map(\.displayName)
+            return "Message \(names.first ?? channel.displayName)"
+        }
     }
 
     public func previewComposerAttachment(_ attachmentID: UUID, in channelID: ChannelID?) {
@@ -4327,11 +4371,12 @@ public final class MainShellViewModel {
         lastNotificationPermissionRequest = "requesting"
         updateNotificationDiagnostics()
         Task { [weak self, manager = notificationPermissionManager] in
-            let status = await manager.requestAuthorization()
+            let result = await manager.requestAuthorization()
             await MainActor.run {
-                self?.notificationPermissionStatus = status
-                self?.lastNotificationPermissionRequest = "result \(status.rawValue)"
-                self?.placeholderStatus = "Notification permission: \(status.rawValue)"
+                self?.notificationPermissionStatus = result.statusAfter
+                self?.notificationDiagnostics.lastPermissionRequest = result
+                self?.lastNotificationPermissionRequest = result.summary
+                self?.placeholderStatus = "Notification permission: \(result.statusAfter.rawValue)"
                 self?.updateNotificationDiagnostics()
             }
         }
@@ -4396,6 +4441,7 @@ public final class MainShellViewModel {
         let extra = """
         authorizer: \(notificationAuthorizerKind)
         lastPermissionRequest: \(lastNotificationPermissionRequest ?? "-")
+        requestDetails: \(notificationDiagnostics.lastPermissionRequest?.summary ?? "-")
         """
         let text = Phase17MessageActions.redactedDiagnosticText(NotificationContentFormatter.sanitize(notificationDiagnostics.redactedText + "\n" + extra))
         #if canImport(AppKit)
@@ -6236,15 +6282,19 @@ public struct MainShellView: View {
     }
 
     @ViewBuilder private var content: some View {
-        switch viewModel.selection.space {
-        case .home:
-            HomeView(viewModel: viewModel)
-        case .discover:
-            DiscoverView(viewModel: viewModel)
-        case .directMessages:
-            FriendsPlaceholderView(viewModel: viewModel)
-        case .server:
+        if viewModel.isTimelineRouteActive {
             ChatPlaceholderView(viewModel: viewModel)
+        } else {
+            switch viewModel.selection.space {
+            case .home:
+            HomeView(viewModel: viewModel)
+            case .discover:
+            DiscoverView(viewModel: viewModel)
+            case .directMessages:
+            FriendsPlaceholderView(viewModel: viewModel)
+            case .server:
+            ChatPlaceholderView(viewModel: viewModel)
+            }
         }
     }
 
@@ -7344,7 +7394,7 @@ public struct ChatPlaceholderView: View {
                         get: { viewModel.composerDraftState(for: channel.id).shouldMentionReplyAuthor },
                         set: { viewModel.updateReplyMentionPreference($0, for: channel.id) }
                     ),
-                    placeholder: inputReadiness.isEnabled ? "Message #\(channel.displayName)" : inputReadiness.reason,
+                    placeholder: inputReadiness.isEnabled ? viewModel.composerPlaceholder(for: channel) : inputReadiness.reason,
                     isEnabled: inputReadiness.isEnabled,
                     canSend: sendReadiness.canSend,
                     disabledReason: sendReadiness.canSend ? nil : sendReadiness.reason,
@@ -7761,14 +7811,7 @@ public struct TimelineMessageGroupView: View {
                         MessageRow(
                             message: timelineMessage.message,
                             author: author,
-                            authorDisplayNameOverride: viewModel.displayName(
-                                for: timelineMessage.message.user ?? author,
-                                member: timelineMessage.message.member ?? viewModel.member(
-                                    for: timelineMessage.message.authorID,
-                                    serverID: viewModel.snapshot.channelsByID[timelineMessage.message.channelID]?.serverID
-                                ),
-                                fallbackID: timelineMessage.message.authorID
-                            ),
+                            authorDisplayNameOverride: viewModel.resolvedUserDisplay(for: timelineMessage.message).displayName,
                             showsHeader: index == 0,
                             statusText: accessibilityStatus(for: timelineMessage),
                             isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id,
@@ -7779,7 +7822,7 @@ public struct TimelineMessageGroupView: View {
                             searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
                             replyPreview: viewModel.resolvedReplyPreview(for: timelineMessage.message),
                             attachmentItems: viewModel.attachmentDisplayItems(for: timelineMessage.message),
-                            authorAvatarData: viewModel.imageData(for: viewModel.avatarFile(for: timelineMessage.message), kind: .userAvatar),
+                            authorAvatarData: viewModel.imageData(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
                             actionItems: rowActionItems(for: timelineMessage),
                             reactionItems: rowReactionItems(for: timelineMessage),
                             onMessageAction: { actionID in
@@ -7807,7 +7850,7 @@ public struct TimelineMessageGroupView: View {
                         .onAppear {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
                             viewModel.loadInlineImagePreviews(for: timelineMessage.message)
-                            viewModel.loadImageResource(for: viewModel.avatarFile(for: timelineMessage.message), kind: .userAvatar)
+                            viewModel.loadImageResource(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar)
                         }
                         .onDisappear {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
@@ -10181,28 +10224,6 @@ private struct QuickSwitcherResultRow: View {
         case .route:
             return "arrow.turn.down.right"
         }
-    }
-}
-
-public struct LiquidBagelSettingsView: View {
-    public init() {}
-
-    public var body: some View {
-        Form {
-            Section("Instance") {
-                LabeledContent("API", value: PhaseOneStatus.current.environment.apiBaseURL.absoluteString)
-                LabeledContent("Events", value: PhaseOneStatus.current.environment.eventsURL.absoluteString)
-                LabeledContent("Media", value: PhaseOneStatus.current.environment.mediaBaseURL?.absoluteString ?? "Not configured")
-            }
-            Section("Status") {
-                LabeledContent("App phase", value: "Phase 5")
-                LabeledContent("Runtime", value: "Live-first, manual connect only")
-                LabeledContent("Credentials", value: "Keychain scoped by environment")
-                LabeledContent("Custom environment", value: "Memory-only")
-            }
-        }
-        .formStyle(.grouped)
-        .padding()
     }
 }
 

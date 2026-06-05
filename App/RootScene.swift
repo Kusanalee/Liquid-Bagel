@@ -1,4 +1,5 @@
 import StoatFeatures
+import StoatRealtime
 import SwiftUI
 
 struct RootScene: Scene {
@@ -10,8 +11,26 @@ struct RootScene: Scene {
         .defaultSize(width: 1280, height: 820)
 
         Settings {
-            LiquidBagelSettingsView()
-                .frame(width: 560, height: 420)
+            CurrentSettingsSceneView()
         }
+    }
+}
+
+private struct CurrentSettingsSceneView: View {
+    @State private var sessionCoordinator = AppSessionCoordinator()
+    @State private var viewModel = MainShellViewModel(
+        snapshot: RealtimeSnapshot(),
+        runtimeMode: .liveManual,
+        sessionState: .signedOut,
+        currentUser: nil
+    )
+
+    var body: some View {
+        AccountConnectionSettingsView(viewModel: viewModel)
+            .task {
+                viewModel.attachSessionCoordinator(sessionCoordinator)
+                await sessionCoordinator.startLiveFirstSession()
+                viewModel.syncFromSessionCoordinator()
+            }
     }
 }

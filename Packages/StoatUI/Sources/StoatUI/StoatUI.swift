@@ -1347,7 +1347,13 @@ public struct MessageRow: View {
     }
 
     private var authorName: String {
-        message.masquerade?.name ?? authorDisplayNameOverride ?? author?.displayName ?? author?.username ?? message.authorID.rawValue
+        message.masquerade?.name ?? authorDisplayNameOverride ?? author?.displayName ?? author?.username ?? shortenedAuthorID
+    }
+
+    private var shortenedAuthorID: String {
+        let raw = message.authorID.rawValue
+        guard raw.count > 10 else { return raw }
+        return "\(raw.prefix(4))...\(raw.suffix(4))"
     }
 
     private var timestampText: String {

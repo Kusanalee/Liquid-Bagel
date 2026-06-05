@@ -290,7 +290,7 @@ public enum Phase30ParityMatrixBuilder {
             ("Account and session", "user settings sync", .partial, "Ready user_settings", "Preferences are local plus decoded settings", "Full cloud sync parity incomplete", "Persistence tests", "Open settings", "Phase 31"),
 
             ("Core chat", "server text channels", .done, "Ready channels and channel messages", "Server channel selection, load, send", "Critical path covered", "Message load/send tests", "Open server channel", "Keep stable"),
-            ("Core chat", "DMs", dmLiveQAPassed ? .done : .broken, "Ready channels, users/dms, users/{target}/dm", "Phase 30 trace and repair path", dmLiveQAPassed ? "No critical live QA gaps recorded" : "Live QA has not proven DMs fixed", "Phase 30 DM regression tests", "Run Phase 30 DM checklist", dmLiveQAPassed ? "Keep monitoring" : "Do not claim parity"),
+            ("Core chat", "DMs", dmLiveQAPassed ? .done : .broken, "Ready channels, users/dms, users/{target}/dm", "Phase 31 active-conversation timeline routing", dmLiveQAPassed ? "No critical live QA gaps recorded" : "Live QA has not proven DMs fixed", "Phase 31 DM regression tests", "Run Phase 31 DM checklist", dmLiveQAPassed ? "Keep monitoring" : "Do not claim parity"),
             ("Core chat", "group DMs", .partial, "Ready channel kind Group", "Selection/load/sidebar supported", "Create/open group route not verified", "Group DM tests", "Click group DM", "Verify creation route later"),
             ("Core chat", "saved messages", .partial, "Ready channel kind SavedMessages", "Selection/load supported when modeled", "Live availability needs QA", "Saved selection tests", "Click Saved Messages if present", "Live QA"),
             ("Core chat", "send/edit/delete messages", .done, "Verified channel message routes", "Send/edit/delete wired with confirmations", "No persistent success toast by design", "Message action tests", "Send/edit/delete manually", "Keep stable"),
@@ -308,6 +308,7 @@ public enum Phase30ParityMatrixBuilder {
             ("Core chat", "search", .partial, "Verified search routes", "Loaded/live/pinned search exists", "Global search parity incomplete", "Search tests", "Search selected channel", "Phase 31"),
             ("Core chat", "jump to message", .partial, "Message fetch/search routes", "Loaded and around-message behavior exists", "Cross-context route QA needed", "Timeline tests", "Jump from search", "Polish later"),
             ("Core chat", "system events", .done, "Message system schema", "Safe names and fallbacks", "Unsupported events shown generically", "System event tests", "Open event channel", "Keep stable"),
+            ("Core chat", "user/avatar hydration", .partial, "Ready users/members and message/profile data", "Central resolver avoids full raw ID author names", "Live QA must confirm affected chats", "Phase 31 resolver tests", "Inspect real chats", "Keep partial until live QA"),
 
             ("Server/community", "server list", .done, "Ready servers", "Server rail from Ready", "No REST list by design", "Selection tests", "Connect manually", "Keep Ready source"),
             ("Server/community", "server icons", .done, "Ready media files", "Bounded in-memory loading", "No persistent cache by design", "Media tests", "Open server", "Keep bounded"),
@@ -326,7 +327,7 @@ public enum Phase30ParityMatrixBuilder {
             ("Server/community", "member moderation", .partial, "Verified moderation routes", "Kick/ban/timeout guarded", "Full dashboard parity incomplete", "Moderation tests", "Use test server only", "Audit later"),
             ("Server/community", "bans/timeouts", .partial, "Verified moderation routes", "Ban list/timeouts exist", "Full parity QA pending", "Moderation tests", "Use test server only", "Audit later"),
 
-            ("Notifications", "local notifications", .partial, "UserNotifications", "Explicit opt-in only", "No launch prompt by design", "Notification tests", "Request manually", "Keep explicit"),
+            ("Notifications", "local notifications", .partial, "UserNotifications", "Explicit opt-in with request diagnostics", "Live prompt still needs QA", "Notification tests", "Request manually", "Keep partial until live prompt works"),
             ("Notifications", "in-app banners", .done, "Local classifier", "In-app delivery exists", "None critical", "Notification tests", "Receive message", "Keep stable"),
             ("Notifications", "privacy mode", .done, "Notification preferences", "Private content supported", "None critical", "Preference tests", "Toggle privacy", "Keep stable"),
             ("Notifications", "dock badge", .done, "Local unread counts", "Badge manager wired", "None critical", "Badge tests", "Observe dock badge", "Keep stable"),
@@ -342,7 +343,7 @@ public enum Phase30ParityMatrixBuilder {
             ("UI/platform", "performance with large channels", .partial, "Lazy timeline", "Diagnostics and caps exist", "More live QA needed", "Timeline perf tests", "Open large channel", "Monitor"),
             ("UI/platform", "performance with large servers", .partial, "Lazy member list", "Member diagnostics exist", "More live QA needed", "Member perf tests", "Open large server", "Monitor"),
             ("UI/platform", "native macOS window/menu behavior", .partial, "SwiftUI app commands", "Native app shell exists", "Official desktop parity incomplete", "App construction tests", "Use menus", "Audit later"),
-            ("UI/platform", "settings organization", .partial, "Settings tabs", "Account/connection/notifications/developer", "Official settings parity incomplete", "Settings tests", "Open settings", "Polish later"),
+            ("UI/platform", "settings organization", .partial, "Settings tabs", "Settings scene opens Account/connection/notifications/developer", "Official settings parity incomplete", "Settings tests", "Command-comma", "Polish later"),
             ("UI/platform", "diagnostics", .done, "Developer Verification", "Redacted diagnostics and Phase 30 trace", "Developer-only by design", "Redaction tests", "Copy diagnostics", "Keep safe"),
 
             ("Deferred / not parity", "voice", .outOfScope, "Deferred scope", "Not implemented", "Out of Phase 30 scope", "Matrix test", "N/A", "Future verified phase"),

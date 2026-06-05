@@ -2,7 +2,7 @@
 
 Statuses: `done`, `partial`, `broken`, `blockedByUnverifiedAPI`, `deferred`, `outOfScope`.
 
-DMs intentionally remain `broken` until the Phase 30 live QA checklist proves the trace, load, send, attachment, participants, and active-notification behavior in a real live session.
+DMs intentionally remain `broken` until the Phase 31 live QA checklist proves the trace, load, send, attachment, participants, and active-notification behavior in a real live session. Mock tests are not enough to mark DMs, notification permission, or user/avatar hydration done.
 
 | Section | Item | Status | Source of truth | Current implementation | Known gaps | Tests | Manual QA | Next action |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -19,7 +19,7 @@ DMs intentionally remain `broken` until the Phase 30 live QA checklist proves th
 | Account and session | status/custom status | partial | Ready/user settings | Status renders where present | Editing incomplete | Display tests | Inspect status | Audit route |
 | Account and session | user settings sync | partial | Ready user_settings | Local preferences plus decoded settings | Cloud sync incomplete | Persistence tests | Open settings | Phase 31 |
 | Core chat | server text channels | done | Ready/channels messages | Select/load/send server channels | None critical | Message tests | Open channel | Keep stable |
-| Core chat | DMs | broken | Ready, `GET /users/dms`, `GET /users/{target}/dm` | Phase 30 trace and active conversation repair | Needs live QA proof | Phase 30 DM tests | Run checklist | Do not claim parity |
+| Core chat | DMs | broken | Ready, `GET /users/dms`, `GET /users/{target}/dm` | Phase 31 routes clicked DM rows to the timeline via active conversation | Needs live QA proof for load/send/attachments/participants | Phase 31 DM tests | Run Phase 31 checklist | Do not claim parity |
 | Core chat | group DMs | partial | Ready channel kind Group | Select/load/sidebar supported | Create/open route not verified | Group DM tests | Click group DM | Verify later |
 | Core chat | saved messages | partial | Ready channel kind SavedMessages | Select/load supported | Live availability needs QA | Saved tests | Click Saved Messages | Live QA |
 | Core chat | send/edit/delete messages | done | Verified message routes | Send/edit/delete with confirmations | No success toast by design | Action tests | Send/edit/delete | Keep stable |
@@ -37,6 +37,7 @@ DMs intentionally remain `broken` until the Phase 30 live QA checklist proves th
 | Core chat | search | partial | Verified search routes | Loaded/live/pinned search | Global search incomplete | Search tests | Search channel | Phase 31 |
 | Core chat | jump to message | partial | Message fetch/search | Loaded/around-message behavior | Cross-context QA needed | Timeline tests | Jump result | Polish |
 | Core chat | system events | done | System message schema | Safe names/fallbacks | Unsupported events generic | System tests | Event channel | Keep stable |
+| Core chat | user/avatar hydration | partial | Ready users/members, message users, relationship/profile data | Central resolver prevents full raw-ID author names and resolves avatar metadata | Live QA must confirm names/avatars in real chat | Phase 31 resolver tests | Inspect affected chats | Keep partial until live QA |
 | Server/community | server list | done | Ready servers | Server rail from Ready | No REST list by design | Selection tests | Connect | Keep Ready |
 | Server/community | server icons | done | Ready media | Bounded in-memory loading | No persistent cache | Media tests | Open server | Keep bounded |
 | Server/community | server banners | done | Ready media | Banner rendering/settings | Live QA recommended | Media tests | Settings | Keep bounded |
@@ -53,7 +54,7 @@ DMs intentionally remain `broken` until the Phase 30 live QA checklist proves th
 | Server/community | member list | done | Ready members/users | Missing/offline fallbacks | No hidden member fetch | Member tests | Large server | Keep stable |
 | Server/community | member moderation | partial | Verified moderation routes | Kick/ban/timeout guarded | Dashboard incomplete | Moderation tests | Test server | Audit |
 | Server/community | bans/timeouts | partial | Verified moderation routes | Ban list/timeouts | Full QA pending | Moderation tests | Test server | Audit |
-| Notifications | local notifications | partial | UserNotifications | Explicit opt-in | No launch prompt by design | Notification tests | Request manually | Keep explicit |
+| Notifications | local notifications | partial | UserNotifications | Explicit opt-in with requestAuthorization diagnostics | Live permission prompt still needs manual QA | Notification tests | Request manually | Keep partial until live prompt works |
 | Notifications | in-app banners | done | Local classifier | In-app delivery | None critical | Notification tests | Receive message | Keep stable |
 | Notifications | privacy mode | done | Preferences | Private content supported | None critical | Preference tests | Toggle | Keep stable |
 | Notifications | dock badge | done | Local unread counts | Badge manager wired | None critical | Badge tests | Observe badge | Keep stable |
@@ -68,7 +69,7 @@ DMs intentionally remain `broken` until the Phase 30 live QA checklist proves th
 | UI/platform | performance with large channels | partial | Lazy timeline | Diagnostics/caps | More live QA needed | Timeline perf tests | Large channel | Monitor |
 | UI/platform | performance with large servers | partial | Lazy member list | Member diagnostics | More live QA needed | Member perf tests | Large server | Monitor |
 | UI/platform | native macOS window/menu behavior | partial | SwiftUI commands | Native shell exists | Desktop parity incomplete | App tests | Menus | Audit |
-| UI/platform | settings organization | partial | Settings tabs | Account/connection/notifications/developer | Official settings parity incomplete | Settings tests | Open settings | Polish |
+| UI/platform | settings organization | partial | Settings tabs | App Settings routes to current Account/Connection/Notifications/Developer surface | Official settings parity incomplete | Settings tests | Command-comma | Polish |
 | UI/platform | diagnostics | done | Developer Verification | Redacted diagnostics and DM trace | Developer-only by design | Redaction tests | Copy diagnostics | Keep safe |
 | Deferred / not parity | voice | outOfScope | Deferred scope | Not implemented | Out of Phase 30 | Matrix test | N/A | Future phase |
 | Deferred / not parity | video | outOfScope | Deferred scope | Not implemented | Out of Phase 30 | Matrix test | N/A | Future phase |

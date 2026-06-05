@@ -2606,6 +2606,10 @@ final class StoatFeaturesTests: XCTestCase {
         model.selectDirectMessages()
 
         XCTAssertEqual(model.selection.space, .directMessages)
+        XCTAssertNil(model.selection.dmChannelID)
+        XCTAssertNil(model.selectedConversationChannel)
+        XCTAssertEqual(model.selectedTimelineMessages.count, 0)
+        model.selectChannel(groupID)
         XCTAssertEqual(model.selection.dmChannelID, groupID)
         XCTAssertEqual(model.selectedConversationChannel?.id, groupID)
         XCTAssertEqual(model.selectedTimelineMessages.count, 1)
@@ -2664,14 +2668,16 @@ final class StoatFeaturesTests: XCTestCase {
         )
 
         model.requestNotificationPermission()
-        for _ in 0..<10 where model.lastNotificationPermissionRequest != "result authorized" {
+        for _ in 0..<10 where model.notificationPermissionStatus != .authorized {
             try await Task.sleep(for: .milliseconds(30))
         }
 
         let requestCount = await manager.requestCount
         XCTAssertEqual(requestCount, 1)
         XCTAssertEqual(model.notificationPermissionStatus, .authorized)
-        XCTAssertEqual(model.lastNotificationPermissionRequest, "result authorized")
+        XCTAssertTrue(model.notificationDiagnostics.lastPermissionRequest?.requestAuthorizationCalled == true)
+        XCTAssertEqual(model.notificationDiagnostics.lastPermissionRequest?.statusAfter, .authorized)
+        XCTAssertTrue(model.lastNotificationPermissionRequest?.contains("MockNotificationPermissionManager") == true)
         XCTAssertTrue(model.phase28DogfoodDiagnostics.notificationAuthorizerKind.contains("MockNotificationPermissionManager"))
     }
 
@@ -2967,6 +2973,77 @@ final class StoatFeaturesTests: XCTestCase {
 
         let passed = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: true)
         XCTAssertEqual(passed.items.first { $0.section == "Core chat" && $0.name == "DMs" }?.status, .done)
+    }
+
+    @MainActor
+    func testPhase31DirectMessageRowActivatesTimelineWithoutFriendsRouteOverride() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase31-me"
+        let otherUserID: UserID = "phase31-other"
+        let dmID: ChannelID = "phase31-dm"
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[otherUserID] = User(id: otherUserID, username: "other", displayName: "Other Person")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, otherUserID])
+        snapshot.messagesByChannelID[dmID] = [
+            Message(id: "01J00000000000000000310001", channelID: dmID, authorID: otherUserID, content: "hello")
+        ]
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID])
+
+        model.openFriends(tab: .online)
+        XCTAssertEqual(model.selection.space, .directMessages)
+        XCTAssertNil(model.selectedConversationChannelID)
+        XCTAssertFalse(model.isTimelineRouteActive)
+
+        let item = try XCTUnwrap(model.directMessageItems.first { $0.id == dmID })
+        model.selectDirectMessageItem(item)
+        try? await Task.sleep(for: .milliseconds(25))
+
+        XCTAssertEqual(model.activeConversation, .directMessage(channelID: dmID))
+        XCTAssertEqual(model.selectedConversationChannelID, dmID)
+        XCTAssertTrue(model.isTimelineRouteActive)
+        XCTAssertEqual(model.selectedTimelineMessages.first?.message.channelID, dmID)
+        XCTAssertEqual(model.composerPlaceholder(for: snapshot.channelsByID[dmID]!), "Message Other Person")
+        XCTAssertEqual(model.dmLiveTrace.clickedChannelID, dmID)
+        XCTAssertEqual(model.dmLiveTrace.messageLoadChannelID, dmID)
+        XCTAssertEqual(model.dmLiveTrace.timelineChannelID, dmID)
+        XCTAssertEqual(model.dmLiveTrace.composerTargetChannelID, dmID)
+    }
+
+    @MainActor
+    func testPhase31ResolvedDisplayUsesMemberNicknameAvatarAndShortFallback() {
+        let userID: UserID = "01JPHASE31AUTHOR0000000001"
+        let avatar = File(id: "phase31-avatar", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: 10)
+        let memberAvatar = File(id: "phase31-member-avatar", tag: "avatars", filename: "member.png", contentType: "image/png", size: 10)
+        let user = User(id: userID, username: "phaseauthor", displayName: "Phase Author", avatar: avatar)
+        let member = ServerMember(id: MemberCompositeKey(serverID: "phase31-server", userID: userID), joinedAt: Date(), nickname: "Server Nick", avatar: memberAvatar)
+
+        let display = UserDisplayResolver.resolved(userID: userID, user: user, member: member)
+        XCTAssertEqual(display.displayName, "Server Nick")
+        XCTAssertEqual(display.avatarFile?.id, memberAvatar.id)
+        XCTAssertEqual(display.source, ResolvedUserDisplaySource.memberNickname)
+
+        let fallback = UserDisplayResolver.resolved(userID: userID, user: nil, member: nil)
+        XCTAssertNotEqual(fallback.displayName, userID.rawValue)
+        XCTAssertTrue(fallback.displayName.contains("..."))
+        XCTAssertTrue(fallback.isFallback)
+    }
+
+    @MainActor
+    func testPhase31NotificationRequestRecordsOptionsAndAuthorizerMode() async throws {
+        let manager = MockNotificationPermissionManager(status: .notDetermined)
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, notificationPermissionManager: manager)
+
+        model.requestNotificationPermission()
+        for _ in 0..<10 where model.notificationDiagnostics.lastPermissionRequest == nil {
+            try await Task.sleep(for: .milliseconds(30))
+        }
+
+        let result = try XCTUnwrap(model.notificationDiagnostics.lastPermissionRequest)
+        XCTAssertTrue(result.requestAuthorizationCalled)
+        XCTAssertEqual(result.requestedOptions, ["alert", "sound", "badge"])
+        XCTAssertTrue(result.usedMockAuthorizer)
+        XCTAssertEqual(result.statusAfter, .authorized)
+        XCTAssertTrue(model.notificationDiagnostics.redactedText.contains("called yes"))
     }
 
     @MainActor

@@ -319,6 +319,7 @@ public struct NotificationDiagnostics: Hashable, Sendable {
     public var queuedRouteCount: Int
     public var expiredRouteCount: Int
     public var lastRouteOutcome: NotificationRouteOutcome
+    public var lastPermissionRequest: NotificationPermissionRequestResult?
 
     public init(
         permissionStatus: NotificationPermissionStatus = .unknown,
@@ -333,7 +334,8 @@ public struct NotificationDiagnostics: Hashable, Sendable {
         activeChannelVisible: Bool = true,
         queuedRouteCount: Int = 0,
         expiredRouteCount: Int = 0,
-        lastRouteOutcome: NotificationRouteOutcome = .none
+        lastRouteOutcome: NotificationRouteOutcome = .none,
+        lastPermissionRequest: NotificationPermissionRequestResult? = nil
     ) {
         self.permissionStatus = permissionStatus
         self.nativeEnabled = nativeEnabled
@@ -348,6 +350,7 @@ public struct NotificationDiagnostics: Hashable, Sendable {
         self.queuedRouteCount = queuedRouteCount
         self.expiredRouteCount = expiredRouteCount
         self.lastRouteOutcome = lastRouteOutcome
+        self.lastPermissionRequest = lastPermissionRequest
     }
 
     public var redactedText: String {
@@ -366,8 +369,47 @@ public struct NotificationDiagnostics: Hashable, Sendable {
         queuedRoutes: \(queuedRouteCount)
         expiredRoutes: \(expiredRouteCount)
         lastRouteOutcome: \(lastRouteOutcome.rawValue)
+        permissionRequest: \(lastPermissionRequest?.summary ?? "-")
         """
         return NotificationContentFormatter.sanitize(text)
+    }
+}
+
+public struct NotificationPermissionRequestResult: Hashable, Sendable {
+    public var authorizerKind: String
+    public var statusBefore: NotificationPermissionStatus
+    public var requestedOptions: [String]
+    public var requestAuthorizationCalled: Bool
+    public var granted: Bool?
+    public var errorDescription: String?
+    public var statusAfter: NotificationPermissionStatus
+    public var usedMockAuthorizer: Bool
+
+    public init(
+        authorizerKind: String,
+        statusBefore: NotificationPermissionStatus,
+        requestedOptions: [String] = ["alert", "sound", "badge"],
+        requestAuthorizationCalled: Bool,
+        granted: Bool? = nil,
+        errorDescription: String? = nil,
+        statusAfter: NotificationPermissionStatus,
+        usedMockAuthorizer: Bool = false
+    ) {
+        self.authorizerKind = authorizerKind
+        self.statusBefore = statusBefore
+        self.requestedOptions = requestedOptions
+        self.requestAuthorizationCalled = requestAuthorizationCalled
+        self.granted = granted
+        self.errorDescription = errorDescription
+        self.statusAfter = statusAfter
+        self.usedMockAuthorizer = usedMockAuthorizer
+    }
+
+    public var summary: String {
+        let mode = usedMockAuthorizer ? "mock" : "live"
+        let grantedText = granted.map { $0 ? "granted" : "not granted" } ?? "no completion result"
+        let errorText = errorDescription.map { ", error \($0)" } ?? ""
+        return "\(mode) \(authorizerKind), called \(requestAuthorizationCalled ? "yes" : "no"), options \(requestedOptions.joined(separator: "+")), before \(statusBefore.rawValue), \(grantedText), after \(statusAfter.rawValue)\(errorText)"
     }
 }
 
@@ -408,7 +450,7 @@ public struct UserNotificationsNotificationService: NotificationDelivering {
 
 public protocol NotificationPermissionManaging: Sendable {
     func status() async -> NotificationPermissionStatus
-    func requestAuthorization() async -> NotificationPermissionStatus
+    func requestAuthorization() async -> NotificationPermissionRequestResult
 }
 
 public struct UserNotificationsPermissionManager: NotificationPermissionManaging {
@@ -424,13 +466,47 @@ public struct UserNotificationsPermissionManager: NotificationPermissionManaging
         #endif
     }
 
-    public func requestAuthorization() async -> NotificationPermissionStatus {
+    public func requestAuthorization() async -> NotificationPermissionRequestResult {
+        let before = await status()
         #if canImport(UserNotifications)
-        guard UserNotificationsAvailability.canUseCurrentCenter else { return .unknown }
-        _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
-        return await status()
+        guard UserNotificationsAvailability.canUseCurrentCenter else {
+            return NotificationPermissionRequestResult(
+                authorizerKind: "UserNotificationsPermissionManager",
+                statusBefore: before,
+                requestAuthorizationCalled: false,
+                errorDescription: "UNUserNotificationCenter unavailable for this bundle context.",
+                statusAfter: .unknown
+            )
+        }
+        do {
+            let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
+            let after = await status()
+            return NotificationPermissionRequestResult(
+                authorizerKind: "UserNotificationsPermissionManager",
+                statusBefore: before,
+                requestAuthorizationCalled: true,
+                granted: granted,
+                statusAfter: after
+            )
+        } catch {
+            let after = await status()
+            return NotificationPermissionRequestResult(
+                authorizerKind: "UserNotificationsPermissionManager",
+                statusBefore: before,
+                requestAuthorizationCalled: true,
+                granted: false,
+                errorDescription: error.localizedDescription,
+                statusAfter: after
+            )
+        }
         #else
-        return .unknown
+        return NotificationPermissionRequestResult(
+            authorizerKind: "UserNotificationsPermissionManager",
+            statusBefore: before,
+            requestAuthorizationCalled: false,
+            errorDescription: "UserNotifications is unavailable on this platform.",
+            statusAfter: .unknown
+        )
         #endif
     }
 }
@@ -457,12 +533,20 @@ public actor MockNotificationPermissionManager: NotificationPermissionManaging {
         currentStatus
     }
 
-    public func requestAuthorization() async -> NotificationPermissionStatus {
+    public func requestAuthorization() async -> NotificationPermissionRequestResult {
+        let before = currentStatus
         requestCount += 1
         if currentStatus == .notDetermined {
             currentStatus = .authorized
         }
-        return currentStatus
+        return NotificationPermissionRequestResult(
+            authorizerKind: "MockNotificationPermissionManager",
+            statusBefore: before,
+            requestAuthorizationCalled: true,
+            granted: currentStatus == .authorized,
+            statusAfter: currentStatus,
+            usedMockAuthorizer: true
+        )
     }
 }
 

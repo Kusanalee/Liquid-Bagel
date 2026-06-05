@@ -621,6 +621,16 @@ private struct NotificationSettingsTab: View {
                 LabeledContent("System status", value: viewModel.notificationPermissionStatus.rawValue)
                 LabeledContent("Authorizer", value: viewModel.notificationAuthorizerKind)
                 LabeledContent("Last request", value: viewModel.lastNotificationPermissionRequest ?? "-")
+                if let request = viewModel.notificationDiagnostics.lastPermissionRequest {
+                    LabeledContent("Request called", value: request.requestAuthorizationCalled ? "Yes" : "No")
+                    LabeledContent("Options", value: request.requestedOptions.joined(separator: ", "))
+                    LabeledContent("Completion", value: request.granted.map { $0 ? "Granted" : "Not granted" } ?? "No completion result")
+                    if let error = request.errorDescription {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
                 Button("Request Notification Permission") {
                     viewModel.requestNotificationPermission()
                 }
@@ -629,6 +639,12 @@ private struct NotificationSettingsTab: View {
                 }
                 if viewModel.notificationPermissionStatus == .denied {
                     Text("Notifications are denied in macOS System Settings. Open System Settings > Notifications and allow Liquid Bagel, then refresh this status.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if viewModel.notificationPermissionStatus == .notDetermined,
+                          let request = viewModel.notificationDiagnostics.lastPermissionRequest,
+                          request.requestAuthorizationCalled {
+                    Text("The authorization request ran but macOS still reports notDetermined. Check System Settings > Notifications > Liquid Bagel, confirm this is a signed app with a stable bundle identifier, and verify the authorizer is not the mock.")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }

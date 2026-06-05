@@ -14,12 +14,34 @@ public enum DMChannelClassifier {
 }
 
 public enum UserDisplayResolver {
+    public enum Source: String, Hashable, Sendable {
+        case memberNickname
+        case userDisplayName
+        case username
+        case shortenedID
+        case unknown
+    }
+
     public static func displayName(user: User?, member: ServerMember? = nil, fallbackID: UserID? = nil) -> String {
-        if let nickname = trimmed(member?.nickname) { return nickname }
-        if let displayName = trimmed(user?.displayName) { return displayName }
-        if let username = trimmed(user?.username) { return username }
-        if let fallbackID { return shortenedID(fallbackID) }
-        return "Unknown"
+        resolved(userID: fallbackID ?? user?.id ?? member?.id.userID, user: user, member: member).displayName
+    }
+
+    public static func resolved(userID: UserID?, user: User?, member: ServerMember? = nil) -> ResolvedUserDisplay {
+        let resolvedUserID = userID ?? user?.id ?? member?.id.userID ?? UserID(rawValue: "unknown")
+        if let nickname = trimmed(member?.nickname) {
+            return ResolvedUserDisplay(userID: resolvedUserID, displayName: nickname, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: nickname), isFallback: false, source: .memberNickname)
+        }
+        if let displayName = trimmed(user?.displayName) {
+            return ResolvedUserDisplay(userID: resolvedUserID, displayName: displayName, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: displayName), isFallback: false, source: .userDisplayName)
+        }
+        if let username = trimmed(user?.username) {
+            return ResolvedUserDisplay(userID: resolvedUserID, displayName: username, subtitle: "@\(username)", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: username), isFallback: false, source: .username)
+        }
+        if let userID {
+            let shortened = shortenedID(userID)
+            return ResolvedUserDisplay(userID: userID, displayName: shortened, subtitle: "Unknown user \(shortened)", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: shortened), isFallback: true, source: .shortenedID)
+        }
+        return ResolvedUserDisplay(userID: resolvedUserID, displayName: "Unknown", subtitle: "Unknown user", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: "?", isFallback: true, source: .unknown)
     }
 
     public static func usernameLine(user: User?, fallbackID: UserID? = nil) -> String {
@@ -57,6 +79,36 @@ public enum UserDisplayResolver {
     }
 }
 
+public typealias ResolvedUserDisplaySource = UserDisplayResolver.Source
+
+public struct ResolvedUserDisplay: Hashable, Sendable {
+    public var userID: UserID
+    public var displayName: String
+    public var subtitle: String?
+    public var avatarFile: File?
+    public var fallbackInitials: String
+    public var isFallback: Bool
+    public var source: ResolvedUserDisplaySource
+
+    public init(
+        userID: UserID,
+        displayName: String,
+        subtitle: String? = nil,
+        avatarFile: File? = nil,
+        fallbackInitials: String,
+        isFallback: Bool,
+        source: ResolvedUserDisplaySource
+    ) {
+        self.userID = userID
+        self.displayName = displayName
+        self.subtitle = subtitle
+        self.avatarFile = avatarFile
+        self.fallbackInitials = fallbackInitials
+        self.isFallback = isFallback
+        self.source = source
+    }
+}
+
 public struct MemberListItem: Hashable, Sendable, Identifiable {
     public var id: UserID { userID }
     public var userID: UserID
@@ -70,12 +122,13 @@ public struct MemberListItem: Hashable, Sendable, Identifiable {
     public var statusText: String?
 
     public init(userID: UserID, user: User?, member: ServerMember?) {
+        let display = UserDisplayResolver.resolved(userID: userID, user: user, member: member)
         self.userID = userID
         self.user = user
         self.member = member
-        self.displayName = UserDisplayResolver.displayName(user: user, member: member, fallbackID: userID)
-        self.subtitle = user?.status?.text ?? UserDisplayResolver.usernameLine(user: user, fallbackID: userID)
-        self.avatar = member?.avatar ?? user?.avatar
+        self.displayName = display.displayName
+        self.subtitle = user?.status?.text ?? display.subtitle ?? UserDisplayResolver.usernameLine(user: user, fallbackID: userID)
+        self.avatar = display.avatarFile
         self.isBot = user?.bot != nil
         self.isOnline = user?.online == true
         self.statusText = user?.status?.text
