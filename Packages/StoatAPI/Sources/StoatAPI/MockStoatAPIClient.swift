@@ -566,6 +566,15 @@ public actor MockStoatAPIClient: StoatAPIClient {
         servers[serverIndex].roles.removeValue(forKey: roleID)
     }
 
+    public func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember] {
+        guard servers.contains(where: { $0.id == serverID }) else {
+            throw StoatAPIError.notFound
+        }
+        return members.values
+            .filter { $0.id.serverID == serverID }
+            .sorted { $0.id.userID.rawValue < $1.id.userID.rawValue }
+    }
+
     public func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember {
         guard servers.contains(where: { $0.id == serverID }) else {
             throw StoatAPIError.notFound

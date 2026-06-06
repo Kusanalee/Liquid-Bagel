@@ -339,6 +339,19 @@ public struct MessageReactionDisplayItem: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct MessageInlineCustomEmojiItem: Identifiable, Hashable, Sendable {
+    public var id: String { shortcode }
+    public var shortcode: String
+    public var name: String
+    public var imageData: Data?
+
+    public init(shortcode: String, name: String, imageData: Data? = nil) {
+        self.shortcode = shortcode
+        self.name = name
+        self.imageData = imageData
+    }
+}
+
 public enum AttachmentDisplayFormatting {
     public static func safeFilename(_ filename: String) -> String {
         let last = URL(fileURLWithPath: filename).lastPathComponent
@@ -443,6 +456,7 @@ public struct GlassSearchField: View {
 }
 
 public struct GlassComposer: View {
+    @State private var isEmojiPopoverPresented = false
     @Binding private var text: String
     private let placeholder: String
     private let isEnabled: Bool
@@ -588,31 +602,23 @@ public struct GlassComposer: View {
                                 .allowsHitTesting(false)
                         }
                     }
-                    Menu {
-                        if emojiItems.isEmpty {
-                            Text("No emoji available")
-                        } else {
-                            LazyVGrid(columns: Array(repeating: GridItem(.fixed(32), spacing: 4), count: 8), spacing: 4) {
-                                ForEach(emojiItems, id: \.self) { emoji in
-                                    Button {
-                                        onInsertEmoji(emoji)
-                                    } label: {
-                                        Text(emoji)
-                                            .font(.title3)
-                                            .frame(width: 30, height: 30)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .accessibilityLabel("Insert emoji \(emoji)")
-                                }
-                            }
-                            .padding(6)
-                        }
+                    Button {
+                        isEmojiPopoverPresented.toggle()
                     } label: {
                         Image(systemName: "face.smiling")
                             .frame(width: 30, height: 30)
                     }
-                    .menuStyle(.borderlessButton)
-                    .disabled(emojiItems.isEmpty || !isEnabled)
+                    .buttonStyle(.borderless)
+                    .popover(isPresented: $isEmojiPopoverPresented, arrowEdge: .top) {
+                        EmojiPickerPopover(
+                            emojiItems: emojiItems,
+                            disabledReason: isEnabled ? nil : disabledReason,
+                            onInsertEmoji: { emoji in
+                                onInsertEmoji(emoji)
+                                isEmojiPopoverPresented = false
+                            }
+                        )
+                    }
                     .help("Insert emoji")
                     if isSending {
                         ProgressView()
@@ -652,6 +658,40 @@ public struct GlassComposer: View {
                 }
             }
         }
+    }
+}
+
+private struct EmojiPickerPopover: View {
+    let emojiItems: [String]
+    let disabledReason: String?
+    let onInsertEmoji: (String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            Text("Emoji")
+                .font(.headline)
+            if let disabledReason {
+                EmptyStateView(title: "Emoji unavailable", message: disabledReason, systemImage: "face.smiling")
+            } else if emojiItems.isEmpty {
+                EmptyStateView(title: "No emoji available", message: "Unicode emoji will appear here when the composer is ready.", systemImage: "face.smiling")
+            } else {
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(34), spacing: 4), count: 8), spacing: 4) {
+                    ForEach(emojiItems, id: \.self) { emoji in
+                        Button {
+                            onInsertEmoji(emoji)
+                        } label: {
+                            Text(emoji)
+                                .font(.title3)
+                                .frame(width: 32, height: 32)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Insert emoji \(emoji)")
+                    }
+                }
+            }
+        }
+        .padding(StoatSpacing.medium)
+        .frame(width: 330, alignment: .leading)
     }
 }
 
@@ -1112,6 +1152,7 @@ public struct MessageRow: View {
     private let message: Message
     private let author: User?
     private let authorDisplayNameOverride: String?
+    private let authorDisplayColor: Color?
     private let showsHeader: Bool
     private let statusText: String?
     private let isSelected: Bool
@@ -1122,6 +1163,7 @@ public struct MessageRow: View {
     private let searchAccessibilityStatus: String?
     private let replyPreview: String?
     private let attachmentItems: [AttachmentDisplayItem]?
+    private let customEmojiItems: [MessageInlineCustomEmojiItem]
     private let authorAvatarData: Data?
     private let actionItems: [MessageRowActionItem]
     private let reactionItems: [MessageReactionDisplayItem]
@@ -1137,6 +1179,7 @@ public struct MessageRow: View {
         message: Message,
         author: User?,
         authorDisplayNameOverride: String? = nil,
+        authorDisplayColor: Color? = nil,
         showsHeader: Bool = true,
         statusText: String? = nil,
         isSelected: Bool = false,
@@ -1147,6 +1190,7 @@ public struct MessageRow: View {
         searchAccessibilityStatus: String? = nil,
         replyPreview: String? = nil,
         attachmentItems: [AttachmentDisplayItem]? = nil,
+        customEmojiItems: [MessageInlineCustomEmojiItem] = [],
         authorAvatarData: Data? = nil,
         actionItems: [MessageRowActionItem] = [],
         reactionItems: [MessageReactionDisplayItem] = [],
@@ -1161,6 +1205,7 @@ public struct MessageRow: View {
         self.message = message
         self.author = author
         self.authorDisplayNameOverride = authorDisplayNameOverride
+        self.authorDisplayColor = authorDisplayColor
         self.showsHeader = showsHeader
         self.statusText = statusText
         self.isSelected = isSelected
@@ -1171,6 +1216,7 @@ public struct MessageRow: View {
         self.searchAccessibilityStatus = searchAccessibilityStatus
         self.replyPreview = replyPreview
         self.attachmentItems = attachmentItems
+        self.customEmojiItems = customEmojiItems
         self.authorAvatarData = authorAvatarData
         self.actionItems = actionItems
         self.reactionItems = reactionItems
@@ -1211,6 +1257,7 @@ public struct MessageRow: View {
                         Button(action: onOpenAuthorProfile) {
                             Text(authorName)
                                 .font(StoatTypography.messageAuthor)
+                                .foregroundStyle(authorDisplayColor ?? .primary)
                         }
                         .buttonStyle(.plain)
                         .help("Open Profile")
@@ -1251,7 +1298,11 @@ public struct MessageRow: View {
                     .accessibilityLabel(StoatAccessibility.replyPreviewLabel(replyPreview))
                 }
                 if let content = message.content, !content.isEmpty {
-                    MarkdownMessageContent(content)
+                    if customEmojiItems.isEmpty {
+                        MarkdownMessageContent(content)
+                    } else {
+                        InlineCustomEmojiMessageContent(source: content, customEmojiItems: customEmojiItems)
+                    }
                 }
                 let renderedAttachments = attachmentItems ?? message.attachments?.map { AttachmentDisplayItem(file: $0) } ?? []
                 if !renderedAttachments.isEmpty {
@@ -1799,6 +1850,77 @@ public struct MarkdownMessageContent: View {
     private func attributed(_ value: String) -> AttributedString {
         let sanitized = value.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
         return (try? AttributedString(markdown: sanitized, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(sanitized)
+    }
+}
+
+private struct InlineCustomEmojiMessageContent: View {
+    let source: String
+    let customEmojiItems: [MessageInlineCustomEmojiItem]
+
+    var body: some View {
+        HStack(alignment: .center, spacing: StoatSpacing.xxSmall) {
+            ForEach(tokens.indices, id: \.self) { index in
+                switch tokens[index] {
+                case let .text(value):
+                    Text(value)
+                        .font(StoatTypography.messageBody)
+                        .textSelection(.enabled)
+                case let .emoji(item):
+                    inlineEmoji(item)
+                }
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityLabel(source)
+    }
+
+    @ViewBuilder private func inlineEmoji(_ item: MessageInlineCustomEmojiItem) -> some View {
+        #if canImport(AppKit)
+        if let data = item.imageData, let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 22, height: 22)
+                .accessibilityLabel(item.name)
+        } else {
+            Text(item.shortcode)
+                .font(StoatTypography.messageBody)
+        }
+        #else
+        Text(item.shortcode)
+            .font(StoatTypography.messageBody)
+        #endif
+    }
+
+    private var tokens: [InlineCustomEmojiToken] {
+        InlineCustomEmojiToken.tokenize(source: source, items: customEmojiItems)
+    }
+}
+
+private enum InlineCustomEmojiToken: Hashable {
+    case text(String)
+    case emoji(MessageInlineCustomEmojiItem)
+
+    static func tokenize(source: String, items: [MessageInlineCustomEmojiItem]) -> [InlineCustomEmojiToken] {
+        var remaining = source[...]
+        var result: [InlineCustomEmojiToken] = []
+        let byShortcode = Dictionary(uniqueKeysWithValues: items.map { ($0.shortcode, $0) })
+
+        while let start = remaining.firstIndex(of: ":"),
+              let end = remaining[remaining.index(after: start)...].firstIndex(of: ":") {
+            let before = String(remaining[..<start])
+            if !before.isEmpty { result.append(.text(before)) }
+            let shortcode = String(remaining[start...end])
+            if let item = byShortcode[shortcode] {
+                result.append(.emoji(item))
+            } else {
+                result.append(.text(shortcode))
+            }
+            remaining = remaining[remaining.index(after: end)...]
+        }
+        let tail = String(remaining)
+        if !tail.isEmpty { result.append(.text(tail)) }
+        return result.isEmpty ? [.text(source)] : result
     }
 }
 

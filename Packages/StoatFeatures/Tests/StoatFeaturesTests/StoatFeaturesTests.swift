@@ -2917,6 +2917,101 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase34RightSidebarContextTracksRouteWithoutStaleMembers() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+
+        XCTAssertEqual(model.rightSidebarContext, .hidden)
+
+        model.selectServer(model.servers[0].id)
+        XCTAssertEqual(model.rightSidebarContext, .serverMembers(serverID: model.selectedServer!.id, channelID: model.selectedConversationChannelID))
+
+        model.selectHome()
+        XCTAssertEqual(model.rightSidebarContext, .hidden)
+
+        model.selectDiscover()
+        XCTAssertEqual(model.rightSidebarContext, .hidden)
+
+        model.selectDirectMessages()
+        XCTAssertEqual(model.rightSidebarContext, .hidden)
+        let dm = model.directMessageItems.first!
+        model.selectDirectMessageItem(dm)
+        XCTAssertTrue([
+            RightSidebarContext.directMessageParticipants(channelID: dm.id),
+            RightSidebarContext.groupDMParticipants(channelID: dm.id)
+        ].contains(model.rightSidebarContext))
+    }
+
+    @MainActor
+    func testPhase34MemberDiagnosticsReportMissingAvatarsWithoutDroppingMembers() {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase34-server"
+        let userID: UserID = "phase34-user"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Phase 34")
+        snapshot.usersByID[userID] = User(id: userID, username: "avatarless")
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(
+            id: MemberCompositeKey(serverID: serverID, userID: userID),
+            joinedAt: Date()
+        )
+
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot)
+        let groups = model.memberListGroups(for: serverID)
+
+        XCTAssertEqual(groups.flatMap(\.items).count, 1)
+        XCTAssertEqual(model.memberListPerformanceDiagnostics.missingAvatarCount, 1)
+        XCTAssertEqual(model.memberListPerformanceDiagnostics.droppedMemberCount, 0)
+    }
+
+    @MainActor
+    func testPhase34HighestRoleColorAppliesToServerMessageButNotDM() {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase34-color-server"
+        let channelID: ChannelID = "phase34-color-channel"
+        let userID: UserID = "phase34-color-user"
+        let lowRoleID: RoleID = "phase34-low"
+        let highRoleID: RoleID = "phase34-high"
+        let low = Role(id: lowRoleID, name: "Low", permissions: PermissionOverride(), colour: "#111111", rank: 1)
+        let high = Role(id: highRoleID, name: "High", permissions: PermissionOverride(), colour: "#33AAEE", rank: 50)
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Phase 34", roles: [lowRoleID: low, highRoleID: high])
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(
+            id: MemberCompositeKey(serverID: serverID, userID: userID),
+            joinedAt: Date(),
+            roles: [lowRoleID, highRoleID]
+        )
+        let model = MainShellViewModel(snapshot: snapshot)
+        let serverMessage = Message(id: "01J00000000000000000340001", channelID: channelID, authorID: userID, content: "hi")
+        let dmID: ChannelID = "phase34-dm"
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, active: true, recipients: [userID])
+        model.snapshot = snapshot
+        let dmMessage = Message(id: "01J00000000000000000340002", channelID: dmID, authorID: userID, content: "hi")
+
+        XCTAssertEqual(model.roleColor(for: serverMessage)?.sourceRoleID, highRoleID)
+        XCTAssertEqual(model.roleColor(for: serverMessage)?.rawValue, "#33AAEE")
+        XCTAssertNil(model.roleColor(for: dmMessage))
+        XCTAssertNil(RoleColorResolver.resolve(member: snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)], server: snapshot.serversByID[serverID], highContrast: true))
+    }
+
+    @MainActor
+    func testPhase34CustomEmojiInsertionAndInlineResolverUseReadyEmoji() {
+        var snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { !$0.channelIDs.isEmpty }!
+        let serverID = server.id
+        let channelID = server.channelIDs[0]
+        let emoji = Emoji(id: "emoji-phase34", parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagelparty")
+        snapshot.emojisByID[emoji.id] = emoji
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot)
+
+        model.insertEmoji(":bagelparty:", in: channelID)
+        XCTAssertEqual(model.draft(for: channelID), ":bagelparty:")
+        XCTAssertEqual(model.emojiPickerDiagnostics, "Inserted custom emoji shortcode")
+
+        let message = Message(id: "01J00000000000000000340003", channelID: channelID, authorID: MockShellData.currentUserID, content: "hello :bagelparty:")
+        let inline = model.inlineCustomEmojiItems(for: message)
+        XCTAssertEqual(inline.map(\.shortcode), [":bagelparty:"])
+        XCTAssertEqual(inline.first?.name, "bagelparty")
+    }
+
+    @MainActor
     func testPhase29SystemEventsUseMemberNamesAndSafeFallbacks() {
         var snapshot = RealtimeSnapshot()
         let serverID: ServerID = "phase29-server"

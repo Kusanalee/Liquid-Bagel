@@ -663,6 +663,16 @@ final class StoatAPITests: XCTestCase {
         XCTAssertTrue(memberBody?.contains(#""nickname":"Ops""#) == true)
         XCTAssertTrue(memberBody?.contains(#""remove":["Avatar"]"#) == true)
 
+        let memberListJSON = Data(#"[{"_id":{"server":"server-1","user":"user-2"},"joined_at":"2026-06-02T00:00:00.000Z","roles":["role-1"]}]"#.utf8)
+        let memberListTransport = RecordingHTTPTransport(data: memberListJSON)
+        let memberListClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: memberListTransport)
+        let fetchedMembers = try await memberListClient.fetchServerMembers(serverID: "server-1")
+        let capturedMemberListRequest = await memberListTransport.lastRequest()
+        let memberListRequest = try XCTUnwrap(capturedMemberListRequest)
+        XCTAssertEqual(fetchedMembers.count, 1)
+        XCTAssertEqual(memberListRequest.httpMethod, "GET")
+        XCTAssertEqual(memberListRequest.url?.path, "/servers/server-1/members")
+
         let kickTransport = RecordingHTTPTransport(statusCode: 204)
         let kickClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: kickTransport)
         try await kickClient.kickMember(serverID: "server-1", userID: "user-2")

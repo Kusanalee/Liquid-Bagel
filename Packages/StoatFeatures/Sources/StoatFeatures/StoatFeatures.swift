@@ -703,6 +703,35 @@ public final class MainShellViewModel {
         activeConversation != .none
     }
 
+    public var rightSidebarContext: RightSidebarContext {
+        switch activeConversation {
+        case let .serverChannel(serverID, channelID):
+            return .serverMembers(serverID: serverID, channelID: channelID)
+        case let .directMessage(channelID), let .savedMessages(channelID):
+            return .directMessageParticipants(channelID: channelID)
+        case let .groupDM(channelID):
+            return .groupDMParticipants(channelID: channelID)
+        case .none:
+            switch selection.space {
+            case .home:
+                return .hidden
+            case .directMessages:
+                return .hidden
+            case .discover:
+                return .hidden
+            case .server:
+                return .hidden
+            }
+        }
+    }
+
+    public var canRefreshSelectedServerMembers: Bool {
+        if case .serverMembers = rightSidebarContext {
+            return sessionCoordinator?.apiClient != nil
+        }
+        return false
+    }
+
     public func directMessageParticipantItems(for channel: Channel) -> [MemberListItem] {
         guard DMChannelClassifier.isDirectMessageLike(channel) else { return [] }
         let ids: [UserID]
@@ -879,6 +908,7 @@ public final class MainShellViewModel {
         let knownMemberCount = snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID }.count
         let knownUserCount = snapshot.usersByID.count
         let missingUserCount = snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID && snapshot.usersByID[$0.id.userID] == nil }.count
+        let missingAvatarCount = groups.flatMap(\.items).filter { $0.avatar == nil }.count
         let total = groups.reduce(0) { $0 + $1.items.count }
         let dropped = max(0, knownMemberCount - total)
         memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(
@@ -890,9 +920,10 @@ public final class MainShellViewModel {
             knownMemberCount: knownMemberCount,
             knownUserCount: knownUserCount,
             missingUserCount: missingUserCount,
+            missingAvatarCount: missingAvatarCount,
             renderedMemberCount: total,
             droppedMemberCount: dropped,
-            droppedReasonSummary: dropped == 0 ? nil : "Filtered by query or unavailable role/member data"
+            droppedReasonSummary: dropped == 0 ? "missing avatars \(missingAvatarCount)" : "Filtered by query; missing avatars \(missingAvatarCount)"
         )
         return groups
     }
@@ -902,6 +933,28 @@ public final class MainShellViewModel {
         return snapshot.membersByServerAndUserID.values
             .filter { $0.id.serverID == serverID }
             .sorted { $0.id.userID.rawValue < $1.id.userID.rawValue }
+    }
+
+    public func refreshSelectedServerMembers() async {
+        guard case let .serverMembers(serverID, _) = rightSidebarContext else {
+            placeholderStatus = "Open a server channel before refreshing members."
+            return
+        }
+        guard let apiClient = sessionCoordinator?.apiClient else {
+            placeholderStatus = "Member refresh requires a live session."
+            return
+        }
+        do {
+            let members = try await apiClient.fetchServerMembers(serverID: serverID)
+            snapshot.membersByServerAndUserID = snapshot.membersByServerAndUserID.filter { $0.key.serverID != serverID }
+            for member in members {
+                snapshot.membersByServerAndUserID[ServerMemberKey(member.id)] = member
+            }
+            memberListGroupCacheKey = nil
+            placeholderStatus = "Refreshed \(members.count) members."
+        } catch {
+            placeholderStatus = "Member refresh failed: \(error.userFacingMessage)"
+        }
     }
 
     private func cachedSelectedTimelineMessageGroups() -> [TimelineMessageGroup] {
@@ -2840,19 +2893,29 @@ public final class MainShellViewModel {
         var state = composerDraftState(for: channelID)
         state.text += emoji
         composerDrafts[channelID] = state
-        emojiPickerDiagnostics = "Inserted Unicode emoji"
+        emojiPickerDiagnostics = emoji.hasPrefix(":") && emoji.hasSuffix(":") ? "Inserted custom emoji shortcode" : "Inserted Unicode emoji"
         requestFocus(.composer)
     }
 
     public func customEmojiDisplayItemsForCurrentContext() -> [CustomEmojiDisplayItem] {
-        let serverID = selection.serverID ?? selectedConversationChannel?.serverID
-        return snapshot.emojisByID.values
-            .map(CustomEmojiDisplayItem.init(emoji:))
-            .filter { item in
-                guard let serverID else { return true }
-                return item.serverID == nil || item.serverID == serverID
-            }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        customEmojiDisplayItemsForContext(channelID: selectedConversationChannelID)
+    }
+
+    public func roleColor(for message: Message, highContrast: Bool = false) -> ResolvedRoleColor? {
+        guard let channel = snapshot.channelsByID[message.channelID],
+              let serverID = channel.serverID,
+              let server = snapshot.serversByID[serverID]
+        else { return nil }
+        let member = snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: message.authorID)]
+        return RoleColorResolver.resolve(member: member, server: server, highContrast: highContrast)
+    }
+
+    public func roleColor(for userID: UserID, serverID: ServerID?, highContrast: Bool = false) -> ResolvedRoleColor? {
+        guard let serverID,
+              let server = snapshot.serversByID[serverID]
+        else { return nil }
+        let member = snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)]
+        return RoleColorResolver.resolve(member: member, server: server, highContrast: highContrast)
     }
 
     public func customEmojiDisplayItem(for raw: String) -> CustomEmojiDisplayItem? {
@@ -2866,12 +2929,41 @@ public final class MainShellViewModel {
             .first { $0.name.caseInsensitiveCompare(normalized) == .orderedSame || $0.shortcode.caseInsensitiveCompare(trimmed) == .orderedSame }
     }
 
+    public func inlineCustomEmojiItems(for message: Message) -> [MessageInlineCustomEmojiItem] {
+        guard let content = message.content, content.contains(":") else { return [] }
+        return customEmojiDisplayItemsForContext(channelID: message.channelID)
+            .filter { content.localizedCaseInsensitiveContains($0.shortcode) }
+            .map { item in
+                MessageInlineCustomEmojiItem(
+                    shortcode: item.shortcode,
+                    name: item.name,
+                    imageData: imageData(for: item.file, kind: .customEmoji)
+                )
+            }
+    }
+
     public func loadCustomEmojiImages(for message: Message) {
         for emojiKey in message.reactions.keys {
             if let item = customEmojiDisplayItem(for: emojiKey) {
                 loadImageResource(for: item.file, kind: .customEmoji)
             }
         }
+        for item in customEmojiDisplayItemsForContext(channelID: message.channelID) {
+            if message.content?.localizedCaseInsensitiveContains(item.shortcode) == true {
+                loadImageResource(for: item.file, kind: .customEmoji)
+            }
+        }
+    }
+
+    private func customEmojiDisplayItemsForContext(channelID: ChannelID?) -> [CustomEmojiDisplayItem] {
+        let serverID = channelID.flatMap { snapshot.channelsByID[$0]?.serverID } ?? selection.serverID ?? selectedConversationChannel?.serverID
+        return snapshot.emojisByID.values
+            .map(CustomEmojiDisplayItem.init(emoji:))
+            .filter { item in
+                guard let serverID else { return true }
+                return item.serverID == nil || item.serverID == serverID
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     public func addAttachmentURLs(_ urls: [URL], to channelID: ChannelID?) {
@@ -6283,9 +6375,9 @@ public struct MainShellView: View {
                 .frame(width: StoatSize.channelSidebarWidth)
             Divider()
             content
-            if viewModel.selection.isMemberPanelVisible {
+            if viewModel.selection.isMemberPanelVisible, viewModel.rightSidebarContext.isPeopleContext {
                 Divider()
-                MemberPanelView(viewModel: viewModel)
+                MemberPanelView(viewModel: viewModel, context: viewModel.rightSidebarContext)
                     .frame(width: StoatSize.memberPanelWidth)
             }
         }
@@ -7225,8 +7317,16 @@ public struct CredentialSetupView: View {
             if let target = dm.composerTargetDescription {
                 LabeledContent("DM composer", value: target)
             }
-            LabeledContent("Members", value: "known \(members.knownMemberCount), rendered \(members.renderedMemberCount), missing users \(members.missingUserCount), dropped \(members.droppedMemberCount), groups \(members.groupCount)")
+            LabeledContent("Sidebar", value: "\(viewModel.rightSidebarContext)")
+            LabeledContent("Members", value: "known \(members.knownMemberCount), rendered \(members.renderedMemberCount), missing users \(members.missingUserCount), missing avatars \(members.missingAvatarCount), dropped \(members.droppedMemberCount), groups \(members.groupCount)")
+            if let dropSummary = members.droppedReasonSummary {
+                LabeledContent("Member notes", value: dropSummary)
+            }
             LabeledContent("Member images", value: "queue \(members.avatarLoadQueueCount)")
+            LabeledContent("Emoji", value: "known \(viewModel.snapshot.emojisByID.count), picker \(viewModel.commonEmojiItems.count)")
+            if let emojiDiagnostics = viewModel.emojiPickerDiagnostics {
+                LabeledContent("Emoji picker", value: emojiDiagnostics)
+            }
             LabeledContent("Send", value: "canSend \(send.canSend ? "yes" : "no"), stage \(send.lastSendStage?.rawValue ?? "-"), result \(send.lastSendResult?.rawValue ?? "-")")
             if let error = send.lastError {
                 LabeledContent("Send error", value: error)
@@ -7254,6 +7354,10 @@ public struct CredentialSetupView: View {
                 Button("Copy Notification Diagnostics") {
                     viewModel.copyRedactedNotificationDiagnostics()
                 }
+                Button("Refresh Members") {
+                    Task { await viewModel.refreshSelectedServerMembers() }
+                }
+                .disabled(!viewModel.canRefreshSelectedServerMembers)
             }
             Text("Diagnostics are redacted and omit tokens, raw response bodies, message content, and local file paths.")
                 .font(.caption)
@@ -7731,9 +7835,11 @@ public struct ChatPlaceholderView: View {
                     GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
                         viewModel.openChannelSearch(mode: .loadedOnly)
                     }
-                    let memberToggleLabel = viewModel.selection.isMemberPanelVisible ? "Hide Members" : "Show Members"
-                    GlassIconButton(memberToggleLabel, systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
-                        .accessibilityLabel(memberToggleLabel)
+                    if viewModel.rightSidebarContext.isPeopleContext {
+                        let memberToggleLabel = viewModel.selection.isMemberPanelVisible ? "Hide Members" : "Show Members"
+                        GlassIconButton(memberToggleLabel, systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
+                            .accessibilityLabel(memberToggleLabel)
+                    }
                     let channelSettingsDisabledReason = viewModel.selectedChannel?.kind == .textChannel ? viewModel.channelManagementDisabledReason() : "Select a text channel before opening channel settings."
                     GlassIconButton(channelSettingsDisabledReason ?? "Channel Settings", systemImage: "gearshape", isDisabled: channelSettingsDisabledReason != nil) {
                         viewModel.openChannelSettings()
@@ -8146,6 +8252,7 @@ public struct MessageTimelineView: View {
 }
 
 public struct TimelineMessageGroupView: View {
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     private let group: TimelineMessageGroup
     private let author: User?
     private let viewModel: MainShellViewModel
@@ -8177,6 +8284,7 @@ public struct TimelineMessageGroupView: View {
                             message: timelineMessage.message,
                             author: author,
                             authorDisplayNameOverride: viewModel.resolvedUserDisplay(for: timelineMessage.message).displayName,
+                            authorDisplayColor: roleColor(for: timelineMessage.message),
                             showsHeader: index == 0,
                             statusText: accessibilityStatus(for: timelineMessage),
                             isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id,
@@ -8187,6 +8295,7 @@ public struct TimelineMessageGroupView: View {
                             searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
                             replyPreview: viewModel.resolvedReplyPreview(for: timelineMessage.message),
                             attachmentItems: viewModel.attachmentDisplayItems(for: timelineMessage.message),
+                            customEmojiItems: viewModel.inlineCustomEmojiItems(for: timelineMessage.message),
                             authorAvatarData: viewModel.imageData(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
                             actionItems: rowActionItems(for: timelineMessage),
                             reactionItems: rowReactionItems(for: timelineMessage),
@@ -8281,6 +8390,13 @@ public struct TimelineMessageGroupView: View {
 
     private func buttonRole(for item: MessageActionItem) -> ButtonRole? {
         item.role == .destructive ? .destructive : nil
+    }
+
+    private func roleColor(for message: Message) -> Color? {
+        guard colorSchemeContrast != .increased,
+              let roleColor = viewModel.roleColor(for: message)
+        else { return nil }
+        return Color(red: roleColor.red, green: roleColor.green, blue: roleColor.blue)
     }
 
     @ViewBuilder private func statusView(for timelineMessage: TimelineMessage) -> some View {
@@ -8445,10 +8561,13 @@ public struct EditMessageSheet: View {
 }
 
 public struct MemberPanelView: View {
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     private let viewModel: MainShellViewModel
+    private let context: RightSidebarContext
 
-    public init(viewModel: MainShellViewModel) {
+    public init(viewModel: MainShellViewModel, context: RightSidebarContext? = nil) {
         self.viewModel = viewModel
+        self.context = context ?? viewModel.rightSidebarContext
     }
 
     public var body: some View {
@@ -8469,6 +8588,53 @@ public struct MemberPanelView: View {
     }
 
     @ViewBuilder private var content: some View {
+        switch context {
+        case let .directMessageParticipants(channelID), let .groupDMParticipants(channelID):
+            if let channel = viewModel.snapshot.channelsByID[channelID] {
+                dmParticipants(channel)
+            } else {
+                EmptyStateView(title: "No participants", message: "Participant data is not present in the current snapshot.", systemImage: "person")
+                    .frame(maxWidth: .infinity)
+            }
+        case .serverMembers:
+            serverMembers
+        case .hidden, .homeSummary, .friendsSummary, .discoverSummary:
+            EmptyView()
+        }
+    }
+
+    private var title: String {
+        switch context {
+        case let .directMessageParticipants(channelID), let .groupDMParticipants(channelID):
+            if viewModel.snapshot.channelsByID[channelID]?.kind == .savedMessages {
+                return "Saved Notes"
+            }
+            return "Participants"
+        case .serverMembers:
+            return "Members"
+        case .hidden, .homeSummary, .friendsSummary, .discoverSummary:
+            return ""
+        }
+    }
+
+    private var count: Int {
+        switch context {
+        case let .directMessageParticipants(channelID), let .groupDMParticipants(channelID):
+            guard let channel = viewModel.snapshot.channelsByID[channelID] else { return 0 }
+            return viewModel.directMessageParticipantItems(for: channel).count
+        case .serverMembers:
+            return groups.reduce(0) { $0 + $1.items.count }
+        case .hidden, .homeSummary, .friendsSummary, .discoverSummary:
+            return 0
+        }
+    }
+
+    private var groups: [MemberListGroup] {
+        guard case let .serverMembers(serverID, _) = context else { return [] }
+        return viewModel.memberListGroups(for: serverID)
+    }
+
+    @ViewBuilder private var legacyContent: some View {
         if let channel = viewModel.selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
             dmParticipants(channel)
         } else if viewModel.selection.serverID != nil {
@@ -8477,24 +8643,6 @@ public struct MemberPanelView: View {
             EmptyStateView(title: "No member list", message: "Open a server channel or DM to show people here.", systemImage: "person.2")
                 .frame(maxWidth: .infinity)
         }
-    }
-
-    private var title: String {
-        if let channel = viewModel.selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
-            return channel.kind == .savedMessages ? "Saved Notes" : "Participants"
-        }
-        return "Members"
-    }
-
-    private var count: Int {
-        if let channel = viewModel.selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
-            return viewModel.directMessageParticipantItems(for: channel).count
-        }
-        return groups.reduce(0) { $0 + $1.items.count }
-    }
-
-    private var groups: [MemberListGroup] {
-        viewModel.memberListGroups(for: viewModel.selection.serverID)
     }
 
     @ViewBuilder private var serverMembers: some View {
@@ -8549,14 +8697,6 @@ public struct MemberPanelView: View {
                             .font(.callout.weight(.medium))
                             .foregroundStyle(roleForeground(item.roleColor))
                             .lineLimit(1)
-                        if let role = item.primaryRole {
-                            Text(role.name)
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .foregroundStyle(roleForeground(item.roleColor))
-                                .background(roleForeground(item.roleColor).opacity(0.12), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
-                        }
                         if item.isBot {
                             Text("BOT")
                                 .font(.caption2.weight(.bold))
@@ -8620,7 +8760,7 @@ public struct MemberPanelView: View {
     }
 
     private func roleForeground(_ color: ResolvedRoleColor?) -> Color {
-        guard let color else { return .primary }
+        guard colorSchemeContrast != .increased, let color else { return .primary }
         return Color(red: color.red, green: color.green, blue: color.blue)
     }
 
@@ -8670,27 +8810,29 @@ public struct HomeView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: StoatSpacing.xLarge) {
+            VStack(alignment: .leading, spacing: StoatSpacing.large) {
                 HStack {
                     Text("Home")
-                        .font(.largeTitle.weight(.semibold))
+                        .font(.title.weight(.semibold))
                     Spacer()
-                    Button("Refresh Friends & DMs") {
+                    Button {
                         Task { await viewModel.refreshRelationshipsAndDirectMessages() }
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(GlassButtonStyle())
                     .disabled(!canRefreshRelationships || viewModel.isRelationshipRefreshInProgress)
                 }
 
-                HStack(alignment: .top, spacing: StoatSpacing.large) {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                     currentUserPanel
-                    statusPanel
-                    recentDMsPanel
+                    quickActions
                 }
 
-                quickActions
-
-                FriendsPlaceholderView(viewModel: viewModel, compact: true)
+                HStack(alignment: .top, spacing: StoatSpacing.large) {
+                    recentDMsPanel
+                    friendRequestsPanel
+                }
             }
             .padding(StoatSpacing.xxLarge)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -8699,8 +8841,7 @@ public struct HomeView: View {
 
     private var currentUserPanel: some View {
         GlassPanel {
-            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                Text("Current User").font(.headline)
+            HStack(spacing: StoatSpacing.medium) {
                 if let user = viewModel.currentUserID.flatMap({ viewModel.snapshot.usersByID[$0] }) ?? viewModel.currentUser {
                     Button {
                         viewModel.showUserProfile(user.id)
@@ -8712,12 +8853,16 @@ public struct HomeView: View {
                         UserProfileCardView(viewModel: viewModel, user: user)
                     }
                     .onAppear { viewModel.loadImageResource(for: user.avatar, kind: .userAvatar) }
+                    Spacer()
+                    Label(sessionStateText, systemImage: viewModel.effectiveSessionState == .connected ? "checkmark.circle.fill" : "circle")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
                 } else {
                     EmptyStateView(title: "Signed out", message: "Set up a session before connecting.", systemImage: "person.crop.circle.badge.exclamationmark")
                 }
             }
         }
-        .frame(maxWidth: 320, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     private var statusPanel: some View {
@@ -8754,12 +8899,29 @@ public struct HomeView: View {
         .frame(maxWidth: 360, alignment: .topLeading)
     }
 
+    private var friendRequestsPanel: some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                Text("Friends").font(.headline)
+                LabeledContent("Online", value: "\(viewModel.allFriendItems.filter { $0.relationshipStatus == .friend && $0.user.online }.count)")
+                LabeledContent("Requests", value: "\(viewModel.incomingFriendRequestCount)")
+                Button {
+                    viewModel.openFriends(tab: viewModel.incomingFriendRequestCount > 0 ? .pending : .online)
+                } label: {
+                    Label("Open Friends", systemImage: "person.2")
+                }
+                .buttonStyle(GlassButtonStyle())
+            }
+        }
+        .frame(maxWidth: 280, alignment: .topLeading)
+    }
+
     private var quickActions: some View {
         HStack(spacing: StoatSpacing.medium) {
             Button("Friends") { viewModel.openFriends(tab: .online) }
-            Button("Pending Requests") { viewModel.openFriends(tab: .pending) }
             Button("Add Friend") { viewModel.openFriends(tab: .addFriend) }
-            Button("Account & Connection") { viewModel.showAccountSessions() }
+            Button("Discover") { viewModel.selectDiscover() }
+            Button("Account & Settings") { viewModel.showAccountSessions() }
         }
         .buttonStyle(GlassButtonStyle())
     }
@@ -9147,6 +9309,7 @@ private struct FriendItemRow: View {
 }
 
 private struct UserProfileCardView: View {
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @Bindable var viewModel: MainShellViewModel
     let user: User
 
@@ -9157,6 +9320,7 @@ private struct UserProfileCardView: View {
                 VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                     Text(displayName)
                         .font(.title3.weight(.semibold))
+                        .foregroundStyle(displayNameForeground)
                     if user.bot != nil {
                         Text("BOT")
                             .font(.caption2.weight(.bold))
@@ -9282,7 +9446,14 @@ private struct UserProfileCardView: View {
     }
 
     private func roleForeground(_ color: ResolvedRoleColor?) -> Color {
-        guard let color else { return .secondary }
+        guard colorSchemeContrast != .increased, let color else { return .secondary }
+        return Color(red: color.red, green: color.green, blue: color.blue)
+    }
+
+    private var displayNameForeground: Color {
+        guard colorSchemeContrast != .increased,
+              let color = RoleColorResolver.resolve(member: member, server: viewModel.selection.serverID.flatMap { viewModel.snapshot.serversByID[$0] })
+        else { return .primary }
         return Color(red: color.red, green: color.green, blue: color.blue)
     }
 }
@@ -10877,6 +11048,28 @@ private func phase30DMPreviewModel(reduceGlass: Bool = false) -> MainShellViewMo
 #Preview("Phase 30 Reduce Transparency DM") {
     MainShellView(viewModel: phase30DMPreviewModel(reduceGlass: true))
         .frame(width: 1180, height: 760)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 34 Compact Home") {
+    MainShellView(viewModel: MainShellViewModel(snapshot: MockShellData.snapshot))
+        .frame(width: 1180, height: 760)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 34 Server Members Role Colors") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selectServer(model.servers[0].id)
+    return MemberPanelView(viewModel: model, context: model.rightSidebarContext)
+        .frame(width: 300, height: 620)
+}
+
+@available(macOS 15.0, *)
+#Preview("Phase 34 Home No Member Sidebar") {
+    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+    model.selection.isMemberPanelVisible = true
+    return MainShellView(viewModel: model)
+        .frame(width: 980, height: 640)
 }
 
 @available(macOS 15.0, *)

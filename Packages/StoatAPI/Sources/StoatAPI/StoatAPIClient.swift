@@ -47,6 +47,7 @@ public protocol StoatAPIClient: Sendable {
     func createRole(serverID: ServerID, draft: RoleCreateDraft) async throws -> RoleCreateResponse
     func editRole(serverID: ServerID, roleID: RoleID, draft: RoleEditDraft) async throws -> Role
     func deleteRole(serverID: ServerID, roleID: RoleID) async throws
+    func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember]
     func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember
     func kickMember(serverID: ServerID, userID: UserID) async throws
     func banMember(serverID: ServerID, userID: UserID, draft: BanCreateDraft) async throws -> ServerBan
@@ -184,6 +185,10 @@ public extension StoatAPIClient {
 
     func deleteRole(serverID: ServerID, roleID: RoleID) async throws {
         throw StoatAPIError.unimplementedEndpoint("Role deletion is not implemented by this API client.")
+    }
+
+    func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember] {
+        throw StoatAPIError.unimplementedEndpoint("Server member refresh is not implemented by this API client.")
     }
 
     func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember {
@@ -600,6 +605,15 @@ public actor LiveStoatAPIClient: StoatAPIClient {
             StoatRequest<EmptyResponse>(
                 method: .delete,
                 path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/roles/\(roleID.rawValue.stoatPathComponentEscaped)"
+            )
+        )
+    }
+
+    public func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember] {
+        try await perform(
+            StoatRequest<[ServerMember]>(
+                method: .get,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/members"
             )
         )
     }

@@ -115,17 +115,22 @@ public struct ResolvedUserDisplay: Hashable, Sendable {
 }
 
 public struct ResolvedRoleColor: Hashable, Sendable {
+    public var sourceRoleID: RoleID?
+    public var rawHex: String?
+    public var displayColorToken: String?
+    public var isReadable: Bool
+    public var fallbackReason: String?
     public var rawValue: String
     public var red: Double
     public var green: Double
     public var blue: Double
     public var isAdjustedForReadability: Bool
 
-    public init?(rawValue: String?, highContrast: Bool = false) {
-        guard !highContrast,
-              var hex = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+    public init?(rawValue: String?, highContrast: Bool = false, sourceRoleID: RoleID? = nil) {
+        guard var hex = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
               !hex.isEmpty
         else { return nil }
+        if highContrast { return nil }
         if hex.hasPrefix("#") {
             hex.removeFirst()
         }
@@ -145,7 +150,55 @@ public struct ResolvedRoleColor: Hashable, Sendable {
             self.blue = blue
             self.isAdjustedForReadability = false
         }
-        self.rawValue = "#\(hex.uppercased())"
+        let normalized = "#\(hex.uppercased())"
+        self.sourceRoleID = sourceRoleID
+        self.rawHex = normalized
+        self.displayColorToken = normalized
+        self.isReadable = true
+        self.fallbackReason = nil
+        self.rawValue = normalized
+    }
+}
+
+public enum RoleColorResolver {
+    public static func resolve(member: ServerMember?, server: Server?, highContrast: Bool = false) -> ResolvedRoleColor? {
+        guard let member, let server else { return nil }
+        return member.roles
+            .compactMap { server.roles[$0] }
+            .sorted(by: rolePriority)
+            .compactMap { role in
+                ResolvedRoleColor(rawValue: role.colour, highContrast: highContrast, sourceRoleID: role.id)
+            }
+            .first
+    }
+
+    public static func sortedRoles(member: ServerMember?, server: Server?) -> [Role] {
+        guard let member, let server else { return [] }
+        return member.roles.compactMap { server.roles[$0] }.sorted(by: rolePriority)
+    }
+
+    private static func rolePriority(_ lhs: Role, _ rhs: Role) -> Bool {
+        if lhs.rank != rhs.rank { return lhs.rank > rhs.rank }
+        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+    }
+}
+
+public enum RightSidebarContext: Hashable, Sendable {
+    case hidden
+    case serverMembers(serverID: ServerID, channelID: ChannelID?)
+    case directMessageParticipants(channelID: ChannelID)
+    case groupDMParticipants(channelID: ChannelID)
+    case homeSummary
+    case friendsSummary
+    case discoverSummary
+
+    public var isPeopleContext: Bool {
+        switch self {
+        case .serverMembers, .directMessageParticipants, .groupDMParticipants:
+            true
+        case .hidden, .homeSummary, .friendsSummary, .discoverSummary:
+            false
+        }
     }
 }
 
@@ -176,13 +229,9 @@ public struct MemberListItem: Hashable, Sendable, Identifiable {
         self.isOnline = user?.online == true
         self.statusText = user?.status?.text
         self.roleIDs = member?.roles ?? []
-        let roles = roleIDs.compactMap { server?.roles[$0] }
-            .sorted {
-                if $0.rank != $1.rank { return $0.rank > $1.rank }
-                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-            }
+        let roles = RoleColorResolver.sortedRoles(member: member, server: server)
         self.primaryRole = roles.first
-        self.roleColor = ResolvedRoleColor(rawValue: roles.first?.colour)
+        self.roleColor = RoleColorResolver.resolve(member: member, server: server)
     }
 }
 
@@ -229,6 +278,7 @@ public struct MemberListPerformanceDiagnostics: Hashable, Sendable {
     public var knownMemberCount: Int
     public var knownUserCount: Int
     public var missingUserCount: Int
+    public var missingAvatarCount: Int
     public var renderedMemberCount: Int
     public var droppedMemberCount: Int
     public var droppedReasonSummary: String?
@@ -242,6 +292,7 @@ public struct MemberListPerformanceDiagnostics: Hashable, Sendable {
         knownMemberCount: Int = 0,
         knownUserCount: Int = 0,
         missingUserCount: Int = 0,
+        missingAvatarCount: Int = 0,
         renderedMemberCount: Int = 0,
         droppedMemberCount: Int = 0,
         droppedReasonSummary: String? = nil
@@ -254,6 +305,7 @@ public struct MemberListPerformanceDiagnostics: Hashable, Sendable {
         self.knownMemberCount = knownMemberCount
         self.knownUserCount = knownUserCount
         self.missingUserCount = missingUserCount
+        self.missingAvatarCount = missingAvatarCount
         self.renderedMemberCount = renderedMemberCount
         self.droppedMemberCount = droppedMemberCount
         self.droppedReasonSummary = droppedReasonSummary
