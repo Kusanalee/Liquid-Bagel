@@ -46,6 +46,13 @@ public struct Phase27Diagnostics: Hashable, Sendable {
 }
 
 public enum Phase27SystemEventPresenter {
+    public static func profileTarget(for message: Message) -> UserID? {
+        guard let system = message.system else { return nil }
+        let candidate = system.by ?? system.from ?? system.to ?? message.authorID
+        guard !isSystemActor(candidate) else { return nil }
+        return candidate
+    }
+
     public static func text(for message: Message, usersByID: [UserID: User]) -> String {
         text(for: message, usersByID: usersByID, membersByServerAndUserID: [:], channel: nil)
     }
@@ -123,7 +130,7 @@ public enum Phase27SystemEventPresenter {
         if member != nil || user != nil {
             return UserDisplayResolver.displayName(user: user, member: member, fallbackID: id)
         }
-        return UserDisplayResolver.systemFallbackName(id)
+        return nil
     }
 
     private static func nonEmpty(_ value: String?) -> String? {

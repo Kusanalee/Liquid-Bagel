@@ -312,6 +312,55 @@ public struct MemberListPerformanceDiagnostics: Hashable, Sendable {
     }
 }
 
+public enum MemberHydrationSource: String, Hashable, Sendable {
+    case readyOnly = "Ready only"
+    case restHydrated = "REST hydrated"
+    case realtimeUpdate = "Realtime update"
+}
+
+public struct MemberHydrationDiagnostics: Hashable, Sendable {
+    public var source: MemberHydrationSource
+    public var lastMemberFetchServerID: ServerID?
+    public var requestedCount: Int
+    public var returnedCount: Int
+    public var mergedMemberCount: Int
+    public var mergedUserCount: Int
+    public var missingUserCount: Int
+    public var droppedCount: Int
+    public var staleFetchDiscarded: Bool
+    public var isLoading: Bool
+    public var error: String?
+    public var lastUpdatedAt: Date?
+
+    public init(
+        source: MemberHydrationSource = .readyOnly,
+        lastMemberFetchServerID: ServerID? = nil,
+        requestedCount: Int = 0,
+        returnedCount: Int = 0,
+        mergedMemberCount: Int = 0,
+        mergedUserCount: Int = 0,
+        missingUserCount: Int = 0,
+        droppedCount: Int = 0,
+        staleFetchDiscarded: Bool = false,
+        isLoading: Bool = false,
+        error: String? = nil,
+        lastUpdatedAt: Date? = nil
+    ) {
+        self.source = source
+        self.lastMemberFetchServerID = lastMemberFetchServerID
+        self.requestedCount = requestedCount
+        self.returnedCount = returnedCount
+        self.mergedMemberCount = mergedMemberCount
+        self.mergedUserCount = mergedUserCount
+        self.missingUserCount = missingUserCount
+        self.droppedCount = droppedCount
+        self.staleFetchDiscarded = staleFetchDiscarded
+        self.isLoading = isLoading
+        self.error = error
+        self.lastUpdatedAt = lastUpdatedAt
+    }
+}
+
 public struct DMRouteDiagnostics: Hashable, Sendable {
     public var clickedChannelID: ChannelID?
     public var selectedConversationChannelID: ChannelID?

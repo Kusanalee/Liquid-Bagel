@@ -352,6 +352,18 @@ public struct MessageInlineCustomEmojiItem: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct EmojiPickerSection: Identifiable, Hashable, Sendable {
+    public var id: String
+    public var title: String
+    public var items: [String]
+
+    public init(id: String, title: String, items: [String]) {
+        self.id = id
+        self.title = title
+        self.items = items
+    }
+}
+
 public enum AttachmentDisplayFormatting {
     public static func safeFilename(_ filename: String) -> String {
         let last = URL(fileURLWithPath: filename).lastPathComponent
@@ -477,6 +489,7 @@ public struct GlassComposer: View {
     private let onPreviewAttachment: (UUID) -> Void
     private let onDropFileURLs: ([URL]) -> Void
     private let emojiItems: [String]
+    private let emojiSections: [EmojiPickerSection]
     private let onInsertEmoji: (String) -> Void
     private let onPasteImageData: (Data) -> Void
     private let onPasteFileURLs: ([URL]) -> Void
@@ -504,6 +517,7 @@ public struct GlassComposer: View {
         onPreviewAttachment: @escaping (UUID) -> Void = { _ in },
         onDropFileURLs: @escaping ([URL]) -> Void = { _ in },
         emojiItems: [String] = [],
+        emojiSections: [EmojiPickerSection] = [],
         onInsertEmoji: @escaping (String) -> Void = { _ in },
         onPasteImageData: @escaping (Data) -> Void = { _ in },
         onPasteFileURLs: @escaping ([URL]) -> Void = { _ in },
@@ -530,6 +544,7 @@ public struct GlassComposer: View {
         self.onPreviewAttachment = onPreviewAttachment
         self.onDropFileURLs = onDropFileURLs
         self.emojiItems = emojiItems
+        self.emojiSections = emojiSections
         self.onInsertEmoji = onInsertEmoji
         self.onPasteImageData = onPasteImageData
         self.onPasteFileURLs = onPasteFileURLs
@@ -611,7 +626,7 @@ public struct GlassComposer: View {
                     .buttonStyle(.borderless)
                     .popover(isPresented: $isEmojiPopoverPresented, arrowEdge: .top) {
                         EmojiPickerPopover(
-                            emojiItems: emojiItems,
+                            sections: emojiSections.isEmpty ? [EmojiPickerSection(id: "emoji", title: "Emoji", items: emojiItems)] : emojiSections,
                             disabledReason: isEnabled ? nil : disabledReason,
                             onInsertEmoji: { emoji in
                                 onInsertEmoji(emoji)
@@ -662,9 +677,10 @@ public struct GlassComposer: View {
 }
 
 private struct EmojiPickerPopover: View {
-    let emojiItems: [String]
+    let sections: [EmojiPickerSection]
     let disabledReason: String?
     let onInsertEmoji: (String) -> Void
+    @State private var searchText = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.small) {
@@ -672,26 +688,89 @@ private struct EmojiPickerPopover: View {
                 .font(.headline)
             if let disabledReason {
                 EmptyStateView(title: "Emoji unavailable", message: disabledReason, systemImage: "face.smiling")
-            } else if emojiItems.isEmpty {
-                EmptyStateView(title: "No emoji available", message: "Unicode emoji will appear here when the composer is ready.", systemImage: "face.smiling")
+            } else if sections.flatMap(\.items).isEmpty {
+                EmptyStateView(title: "No emoji available", message: "Emoji will appear here when the composer is ready.", systemImage: "face.smiling")
+            } else if filteredSections.isEmpty {
+                TextField("Search emoji", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                EmptyStateView(title: "No matches", message: "Try another emoji name or shortcode.", systemImage: "magnifyingglass")
             } else {
-                LazyVGrid(columns: Array(repeating: GridItem(.fixed(34), spacing: 4), count: 8), spacing: 4) {
-                    ForEach(emojiItems, id: \.self) { emoji in
-                        Button {
-                            onInsertEmoji(emoji)
-                        } label: {
-                            Text(emoji)
-                                .font(.title3)
-                                .frame(width: 32, height: 32)
+                TextField("Search emoji", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                        ForEach(filteredSections) { section in
+                            VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                                Text(section.title.uppercased())
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                LazyVGrid(columns: Array(repeating: GridItem(.fixed(34), spacing: 4), count: 8), spacing: 4) {
+                                    ForEach(section.items, id: \.self) { emoji in
+                                        Button {
+                                            onInsertEmoji(emoji)
+                                        } label: {
+                                            Text(emoji)
+                                                .font(emoji.hasPrefix(":") ? .caption.weight(.semibold) : .title3)
+                                                .lineLimit(1)
+                                                .minimumScaleFactor(0.6)
+                                                .frame(width: 32, height: 32)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .accessibilityLabel("Insert emoji \(emoji)")
+                                    }
+                                }
+                            }
                         }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Insert emoji \(emoji)")
                     }
                 }
+                .frame(maxHeight: 320)
             }
         }
         .padding(StoatSpacing.medium)
         .frame(width: 330, alignment: .leading)
+    }
+
+    private var filteredSections: [EmojiPickerSection] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return sections.filter { !$0.items.isEmpty } }
+        return sections.compactMap { section in
+            let matches = section.items.filter { item in
+                item.localizedCaseInsensitiveContains(query)
+                    || item.trimmingCharacters(in: CharacterSet(charactersIn: ":")).localizedCaseInsensitiveContains(query)
+                    || Self.aliases(for: item).contains { $0.localizedCaseInsensitiveContains(query) }
+            }
+            return matches.isEmpty ? nil : EmojiPickerSection(id: section.id, title: section.title, items: matches)
+        }
+    }
+
+    private static func aliases(for emoji: String) -> [String] {
+        switch emoji {
+        case "👍": return ["thumbs up", "like", "yes"]
+        case "❤️": return ["heart", "love"]
+        case "😂": return ["laugh", "joy", "tears"]
+        case "🥯": return ["bagel"]
+        case "✅": return ["check", "done", "success"]
+        case "👀": return ["eyes", "look"]
+        case "🎉": return ["party", "celebrate", "tada"]
+        case "🙏": return ["pray", "thanks", "please"]
+        case "🔥": return ["fire", "hot"]
+        case "✨": return ["sparkles", "magic"]
+        case "😄": return ["smile", "happy"]
+        case "😅": return ["sweat", "relief"]
+        case "😎": return ["cool", "sunglasses"]
+        case "😢": return ["sad", "cry"]
+        case "😮": return ["surprise", "wow"]
+        case "🤔": return ["thinking", "hmm"]
+        case "🚀": return ["rocket", "ship"]
+        case "💯": return ["hundred", "perfect"]
+        case "🫡": return ["salute"]
+        case "👋": return ["wave", "hello"]
+        case "🙌": return ["raise hands", "hooray"]
+        case "😆": return ["laugh", "grin"]
+        case "😋": return ["yum", "tasty"]
+        case "😴": return ["sleep", "tired"]
+        default: return []
+        }
     }
 }
 
@@ -1794,15 +1873,17 @@ public struct SystemEventRow: View {
 
 public struct MarkdownMessageContent: View {
     private let source: String
+    private let parsedBlocks: [MarkdownBlock]
 
     public init(_ source: String) {
         self.source = source
+        self.parsedBlocks = MarkdownBlock.parse(source)
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-            ForEach(blocks.indices, id: \.self) { index in
-                switch blocks[index] {
+            ForEach(parsedBlocks.indices, id: \.self) { index in
+                switch parsedBlocks[index] {
                 case let .code(code):
                     Text(code)
                         .font(.system(.body, design: .monospaced))
@@ -1841,10 +1922,6 @@ public struct MarkdownMessageContent: View {
                 }
             }
         }
-    }
-
-    private var blocks: [MarkdownBlock] {
-        MarkdownBlock.parse(source)
     }
 
     private func attributed(_ value: String) -> AttributedString {

@@ -3012,6 +3012,157 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase35SelectedServerMemberHydrationMergesRestMembersAndDiagnostics() async {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase35-server"
+        let channelID: ChannelID = "phase35-channel"
+        let currentUserID: UserID = "phase35-current"
+        let botID: UserID = "phase35-bot"
+        let missingID: UserID = "phase35-missing-user-000000"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: currentUserID, name: "Phase 35")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "current", displayName: "Current")
+        snapshot.usersByID[botID] = User(id: botID, username: "phasebot", bot: BotInformation(ownerID: currentUserID))
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: currentUserID)] = ServerMember(
+            id: MemberCompositeKey(serverID: serverID, userID: currentUserID),
+            joinedAt: Date(),
+            nickname: "Ready Current"
+        )
+        let restMembers = [
+            ServerMember(id: MemberCompositeKey(serverID: serverID, userID: currentUserID), joinedAt: Date(), nickname: "REST Current"),
+            ServerMember(id: MemberCompositeKey(serverID: serverID, userID: botID), joinedAt: Date()),
+            ServerMember(id: MemberCompositeKey(serverID: serverID, userID: missingID), joinedAt: Date())
+        ]
+        let api = RecordingAPIClient(membersByServer: [serverID: restMembers])
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            communityAPIClient: api
+        )
+
+        await model.hydrateServerMembers(serverID: serverID, force: true, reason: "test")
+        let callCount = await api.fetchServerMembersCallCount
+        let groups = model.memberListGroups(for: serverID)
+        let items = groups.flatMap(\.items)
+
+        XCTAssertEqual(callCount, 1)
+        XCTAssertEqual(items.count, 3)
+        XCTAssertTrue(items.contains { $0.userID == botID && $0.isBot })
+        XCTAssertTrue(items.contains { $0.userID == missingID && $0.user == nil })
+        XCTAssertEqual(model.snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: currentUserID)]?.nickname, "REST Current")
+        XCTAssertEqual(model.memberHydrationDiagnostics.source, .restHydrated)
+        XCTAssertEqual(model.memberHydrationDiagnostics.returnedCount, 3)
+        XCTAssertEqual(model.memberHydrationDiagnostics.missingUserCount, 1)
+    }
+
+    @MainActor
+    func testPhase35StaleMemberHydrationIsDiscardedAfterServerSwitch() async throws {
+        var snapshot = RealtimeSnapshot()
+        let serverA: ServerID = "phase35-a"
+        let serverB: ServerID = "phase35-b"
+        let channelA: ChannelID = "phase35-a-channel"
+        let channelB: ChannelID = "phase35-b-channel"
+        let userA: UserID = "phase35-a-user"
+        snapshot.serversByID[serverA] = Server(id: serverA, ownerID: userA, name: "A")
+        snapshot.serversByID[serverB] = Server(id: serverB, ownerID: userA, name: "B")
+        snapshot.channelsByID[channelA] = Channel(id: channelA, kind: .textChannel, serverID: serverA, name: "a")
+        snapshot.channelsByID[channelB] = Channel(id: channelB, kind: .textChannel, serverID: serverB, name: "b")
+        let api = RecordingAPIClient(
+            membersByServer: [serverA: [ServerMember(id: MemberCompositeKey(serverID: serverA, userID: userA), joinedAt: Date())]],
+            memberFetchDelayNanoseconds: 50_000_000
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverA), serverID: serverA, channelID: channelA),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            communityAPIClient: api
+        )
+
+        let task = Task { await model.hydrateServerMembers(serverID: serverA, force: true, reason: "test") }
+        try await Task.sleep(nanoseconds: 5_000_000)
+        model.selectChannel(channelB)
+        await task.value
+
+        XCTAssertNil(model.snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverA, userID: userA)])
+        XCTAssertTrue(model.memberHydrationDiagnostics.staleFetchDiscarded)
+    }
+
+    @MainActor
+    func testPhase35ImageResourceQueueCapsConcurrentLoads() async throws {
+        let loader = SlowImageResourceLoader(delayNanoseconds: 500_000_000)
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        for index in 0..<10 {
+            let file = File(id: FileID(rawValue: "phase35-avatar-\(index)"), tag: "avatars", filename: "avatar\(index).png", contentType: "image/png", size: 100)
+            model.loadImageResource(for: file, kind: .userAvatar)
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        let diagnostics = await model.imageResourceDiagnostics()
+
+        XCTAssertLessThanOrEqual(diagnostics.activeTaskCount, 6)
+        XCTAssertGreaterThanOrEqual(diagnostics.queuedTaskCount, 4)
+    }
+
+    @MainActor
+    func testPhase35ProfileFetchRunsOnlyWhenOpenedAndKeepsBackground() async throws {
+        var snapshot = RealtimeSnapshot()
+        let userID: UserID = "phase35-profile-user"
+        let background = File(id: "phase35-background", tag: "backgrounds", filename: "banner.png", contentType: "image/png", size: 100)
+        snapshot.usersByID[userID] = User(id: userID, username: "profile", displayName: "Profile User")
+        let api = RecordingAPIClient(profilesByUserID: [userID: UserProfile(content: "# Bio\n- one", background: background)])
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: api)
+
+        let before = await api.fetchUserProfileCallCount
+        model.showUserProfile(userID)
+        for _ in 0..<20 where model.userProfilesByID[userID] == nil {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let after = await api.fetchUserProfileCallCount
+
+        XCTAssertEqual(before, 0)
+        XCTAssertEqual(after, 1)
+        XCTAssertEqual(model.userProfilesByID[userID]?.background?.tag, "backgrounds")
+    }
+
+    @MainActor
+    func testPhase35SystemEventUnknownActorUsesHumanFallbackAndKnownTargetOpensProfile() {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase35-events"
+        let channelID: ChannelID = "phase35-events-channel"
+        let knownID: UserID = "phase35-known"
+        let unknownID: UserID = "phase35-unknown-000000"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: knownID, name: "Events")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "events")
+        snapshot.usersByID[knownID] = User(id: knownID, username: "known", displayName: "Known")
+        let model = MainShellViewModel(snapshot: snapshot)
+        let unknown = Message(id: "01J00000000000000000350001", channelID: channelID, authorID: unknownID, system: SystemMessage(kind: .userJoined, by: unknownID))
+        let pinned = Message(id: "01J00000000000000000350002", channelID: channelID, authorID: knownID, system: SystemMessage(kind: .messagePinned, by: knownID))
+
+        XCTAssertEqual(model.systemEventText(for: unknown), "A member joined")
+        XCTAssertEqual(model.systemEventProfileTarget(for: pinned), knownID)
+        XCTAssertNil(model.systemEventProfileTarget(for: unknown))
+    }
+
+    @MainActor
+    func testPhase35EmojiSectionsGroupCurrentAndOtherServers() {
+        var snapshot = MockShellData.snapshot
+        let currentServerID: ServerID = "phase35-emoji-current"
+        let otherServerID: ServerID = "phase35-emoji-other"
+        let channelID: ChannelID = "phase35-emoji-channel"
+        snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: MockShellData.currentUserID, name: "Current")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: currentServerID, name: "general")
+        snapshot.emojisByID["phase35-current"] = Emoji(id: "phase35-current", parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "currentparty")
+        snapshot.emojisByID["phase35-other"] = Emoji(id: "phase35-other", parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "otherparty")
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID), snapshot: snapshot)
+        let sections = model.composerEmojiSections
+        let current = sections.first { $0.id == "current-server" }?.items ?? []
+        let other = sections.first { $0.id == "other-servers" }?.items ?? []
+
+        XCTAssertTrue(current.contains(":currentparty:"))
+        XCTAssertTrue(other.contains(":otherparty:"))
+    }
+
+    @MainActor
     func testPhase29SystemEventsUseMemberNamesAndSafeFallbacks() {
         var snapshot = RealtimeSnapshot()
         let serverID: ServerID = "phase29-server"
@@ -3031,7 +3182,7 @@ final class StoatFeaturesTests: XCTestCase {
         let left = Message(id: "01J00000000000000000290003", channelID: channelID, authorID: unknownUserID, system: SystemMessage(kind: .userLeft, by: unknownUserID))
 
         XCTAssertEqual(model.systemEventText(for: joined), "Member Nick joined")
-        XCTAssertTrue(model.systemEventText(for: left).hasPrefix("User "))
+        XCTAssertEqual(model.systemEventText(for: left), "A member left")
         XCTAssertFalse(model.systemEventText(for: left).contains(unknownUserID.rawValue))
     }
 
@@ -3612,6 +3763,21 @@ private final class MutableSnapshotSource: ShellSnapshotSource, @unchecked Senda
     }
 }
 
+private actor SlowImageResourceLoader: ImageResourceLoading {
+    private let delayNanoseconds: UInt64
+    private(set) var calls: [ImageResourceRequest] = []
+
+    init(delayNanoseconds: UInt64) {
+        self.delayNanoseconds = delayNanoseconds
+    }
+
+    func loadImage(_ request: ImageResourceRequest) async throws -> ImageResourceResult {
+        calls.append(request)
+        try await Task.sleep(nanoseconds: delayNanoseconds)
+        return ImageResourceResult(request: request, contentType: "image/png", data: Data("image".utf8))
+    }
+}
+
 private actor RecordingRealtimeClient: StoatRealtimeClient {
     nonisolated var connectionState: AsyncStream<RealtimeConnectionState> { stateHub.stream() }
     nonisolated var events: AsyncStream<StoatGatewayEvent> { eventHub.stream() }
@@ -3659,6 +3825,9 @@ private actor RecordingRealtimeClient: StoatRealtimeClient {
 private actor RecordingAPIClient: StoatAPIClient {
     private(set) var fetchCurrentUserCallCount = 0
     private(set) var fetchMessagesCallCount = 0
+    private(set) var fetchServerMembersCallCount = 0
+    private(set) var fetchedServerMemberIDs: [ServerID] = []
+    private(set) var fetchUserProfileCallCount = 0
     private(set) var sentDrafts: [(ChannelID, MessageDraft)] = []
     private(set) var editedMessages: [(ChannelID, MessageID, MessageEditDraft)] = []
     private(set) var deletedMessages: [(ChannelID, MessageID)] = []
@@ -3667,16 +3836,25 @@ private actor RecordingAPIClient: StoatAPIClient {
 
     private let currentUser: User
     private var messagesByChannel: [ChannelID: [Message]]
+    private var membersByServer: [ServerID: [ServerMember]]
+    private var profilesByUserID: [UserID: UserProfile]
     private let fetchError: (any Error & Sendable)?
+    private let memberFetchDelayNanoseconds: UInt64
 
     init(
         currentUser: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
         messagesByChannel: [ChannelID: [Message]] = [:],
-        fetchError: (any Error & Sendable)? = nil
+        membersByServer: [ServerID: [ServerMember]] = [:],
+        profilesByUserID: [UserID: UserProfile] = [:],
+        fetchError: (any Error & Sendable)? = nil,
+        memberFetchDelayNanoseconds: UInt64 = 0
     ) {
         self.currentUser = currentUser
         self.messagesByChannel = messagesByChannel
+        self.membersByServer = membersByServer
+        self.profilesByUserID = profilesByUserID
         self.fetchError = fetchError
+        self.memberFetchDelayNanoseconds = memberFetchDelayNanoseconds
     }
 
     func fetchRootConfiguration() async throws -> StoatConfig {
@@ -3686,6 +3864,11 @@ private actor RecordingAPIClient: StoatAPIClient {
     func fetchCurrentUser() async throws -> User {
         fetchCurrentUserCallCount += 1
         return currentUser
+    }
+
+    func fetchUserProfile(userID: UserID) async throws -> UserProfile {
+        fetchUserProfileCallCount += 1
+        return profilesByUserID[userID] ?? UserProfile(content: "Profile for \(userID.rawValue)")
     }
 
     func fetchServers() async throws -> [Server] {
@@ -3717,6 +3900,15 @@ private actor RecordingAPIClient: StoatAPIClient {
             messages = Array(messages.prefix(limit))
         }
         return messages
+    }
+
+    func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember] {
+        fetchServerMembersCallCount += 1
+        fetchedServerMemberIDs.append(serverID)
+        if memberFetchDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: memberFetchDelayNanoseconds)
+        }
+        return membersByServer[serverID] ?? []
     }
 
     func sendMessage(channelID: ChannelID, draft: MessageDraft) async throws -> Message {

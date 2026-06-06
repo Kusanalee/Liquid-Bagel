@@ -476,6 +476,9 @@ public final class MainShellViewModel {
     public var notificationAuthorizerKind: String = "unknown"
     public var lastServerSettingsButtonAction: String?
     public var memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics()
+    public var memberHydrationDiagnostics = MemberHydrationDiagnostics()
+    public var memberHydrationLoadingServerIDs: Set<ServerID> = []
+    public var memberHydrationErrorsByServerID: [ServerID: String] = [:]
     public var timelinePerformanceDiagnostics = TimelinePerformanceDiagnostics()
     public var appLifecyclePhase: AppLifecyclePhase = .active
     public var queuedNotificationRoutes: [QueuedNotificationRoute] = []
@@ -561,6 +564,14 @@ public final class MainShellViewModel {
     @ObservationIgnored private var referenceFetchTasks: [MessageID: Task<Void, Never>] = [:]
     @ObservationIgnored private var attachmentLoadTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var imageResourceLoadTasks: [ImageCacheKey: Task<Void, Never>] = [:]
+    @ObservationIgnored private var queuedImageResourceRequests: [ImageCacheKey: ImageResourceRequest] = [:]
+    @ObservationIgnored private let maxConcurrentImageResourceLoads = 6
+    @ObservationIgnored private let maxConcurrentInlinePreviewLoads = 4
+    @ObservationIgnored private var memberHydrationTasks: [ServerID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var memberHydrationGenerations: [ServerID: Int] = [:]
+    @ObservationIgnored private var hydratedMemberServerIDs: Set<ServerID> = []
+    @ObservationIgnored private var restHydratedMembersByServerID: [ServerID: [ServerMemberKey: ServerMember]] = [:]
+    @ObservationIgnored private var lastMemberHydrationRequestedAt: [ServerID: Date] = [:]
     @ObservationIgnored private var activeTypingChannelID: ChannelID?
     @ObservationIgnored private var lastTypingBeginAt: [ChannelID: Date] = [:]
     @ObservationIgnored private var lastAckedMessageByChannelID: [ChannelID: MessageID] = [:]
@@ -670,6 +681,8 @@ public final class MainShellViewModel {
         referenceFetchTasks.values.forEach { $0.cancel() }
         attachmentLoadTasks.values.forEach { $0.cancel() }
         imageResourceLoadTasks.values.forEach { $0.cancel() }
+        queuedImageResourceRequests.removeAll()
+        memberHydrationTasks.values.forEach { $0.cancel() }
     }
 
     public var servers: [Server] {
@@ -727,7 +740,7 @@ public final class MainShellViewModel {
 
     public var canRefreshSelectedServerMembers: Bool {
         if case .serverMembers = rightSidebarContext {
-            return sessionCoordinator?.apiClient != nil
+            return apiClientForMemberHydration() != nil
         }
         return false
     }
@@ -809,7 +822,7 @@ public final class MainShellViewModel {
             notificationAuthorizerKind: notificationAuthorizerKind,
             lastNotificationPermissionRequest: lastNotificationPermissionRequest,
             serverSettingsButtonState: lastServerSettingsButtonAction ?? (selectedServer == nil ? "no selected server" : "ready"),
-            memberListDiagnostics: "members \(memberDiagnostics.totalMembers) groups \(memberDiagnostics.groupCount) queue \(memberDiagnostics.avatarLoadQueueCount)",
+            memberListDiagnostics: "members \(memberDiagnostics.totalMembers) groups \(memberDiagnostics.groupCount) queue \(memberDiagnostics.avatarLoadQueueCount) source \(memberHydrationDiagnostics.source.rawValue)",
             timelinePerformanceDiagnostics: "loaded \(timelineDiagnostics.loadedMessageCount) grouped \(timelineDiagnostics.groupedMessageCount) queue \(timelineDiagnostics.avatarLoadQueueCount)"
         )
     }
@@ -893,12 +906,12 @@ public final class MainShellViewModel {
 
     public func memberListGroups(for serverID: ServerID?, query: String = "") -> [MemberListGroup] {
         guard let serverID, let server = snapshot.serversByID[serverID] else {
-            memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(avatarLoadQueueCount: imageResourceLoadTasks.count)
+            memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(avatarLoadQueueCount: imageResourceQueueCount)
             return []
         }
         let key = memberListCacheKey(serverID: serverID, query: query)
         if key == memberListGroupCacheKey {
-            memberListPerformanceDiagnostics.avatarLoadQueueCount = imageResourceLoadTasks.count
+            memberListPerformanceDiagnostics.avatarLoadQueueCount = imageResourceQueueCount
             return memberListGroupCache
         }
         let started = Date()
@@ -915,7 +928,7 @@ public final class MainShellViewModel {
             totalMembers: total,
             visibleMemberEstimate: min(total, 80),
             groupCount: groups.count,
-            avatarLoadQueueCount: imageResourceLoadTasks.count,
+            avatarLoadQueueCount: imageResourceQueueCount,
             lastGroupingDurationDescription: "\(Int(Date().timeIntervalSince(started) * 1000))ms",
             knownMemberCount: knownMemberCount,
             knownUserCount: knownUserCount,
@@ -935,26 +948,247 @@ public final class MainShellViewModel {
             .sorted { $0.id.userID.rawValue < $1.id.userID.rawValue }
     }
 
+    private var imageResourceQueueCount: Int {
+        imageResourceLoadTasks.count + queuedImageResourceRequests.count
+    }
+
+    public func isMemberHydrationLoading(serverID: ServerID) -> Bool {
+        memberHydrationLoadingServerIDs.contains(serverID)
+    }
+
+    public func memberHydrationStatusMessage(for serverID: ServerID) -> String? {
+        if memberHydrationLoadingServerIDs.contains(serverID) {
+            return "Refreshing members..."
+        }
+        if let error = memberHydrationErrorsByServerID[serverID] {
+            return "Member refresh failed: \(error)"
+        }
+        if hydratedMemberServerIDs.contains(serverID) {
+            return "REST hydrated"
+        }
+        if knownMemberCount(serverID: serverID) > 0 {
+            return "Ready members"
+        }
+        return nil
+    }
+
+    public func hydrateMembersForVisibleContextIfNeeded() {
+        guard case let .serverMembers(serverID, _) = rightSidebarContext else {
+            cancelMemberHydrationTasks(except: nil)
+            return
+        }
+        Task { [weak self] in
+            await self?.hydrateServerMembers(serverID: serverID, force: false, reason: "visible member panel")
+        }
+    }
+
     public func refreshSelectedServerMembers() async {
         guard case let .serverMembers(serverID, _) = rightSidebarContext else {
             placeholderStatus = "Open a server channel before refreshing members."
             return
         }
-        guard let apiClient = sessionCoordinator?.apiClient else {
-            placeholderStatus = "Member refresh requires a live session."
+        await hydrateServerMembers(serverID: serverID, force: true, reason: "manual refresh")
+    }
+
+    public func hydrateServerMembers(serverID: ServerID, force: Bool = false, reason: String = "foreground") async {
+        cancelMemberHydrationTasks(except: serverID)
+        if !force, hydratedMemberServerIDs.contains(serverID) {
+            memberHydrationDiagnostics.source = .restHydrated
+            memberHydrationDiagnostics.lastMemberFetchServerID = serverID
             return
         }
-        do {
-            let members = try await apiClient.fetchServerMembers(serverID: serverID)
-            snapshot.membersByServerAndUserID = snapshot.membersByServerAndUserID.filter { $0.key.serverID != serverID }
-            for member in members {
-                snapshot.membersByServerAndUserID[ServerMemberKey(member.id)] = member
-            }
-            memberListGroupCacheKey = nil
-            placeholderStatus = "Refreshed \(members.count) members."
-        } catch {
-            placeholderStatus = "Member refresh failed: \(error.userFacingMessage)"
+        if !force,
+           let requestedAt = lastMemberHydrationRequestedAt[serverID],
+           Date().timeIntervalSince(requestedAt) < 2 {
+            return
         }
+        if let existing = memberHydrationTasks[serverID] {
+            if force {
+                existing.cancel()
+            } else {
+                return
+            }
+        }
+        guard let apiClient = apiClientForMemberHydration() else {
+            let message = "Member refresh requires a live session."
+            memberHydrationErrorsByServerID[serverID] = message
+            memberHydrationDiagnostics = MemberHydrationDiagnostics(
+                source: .readyOnly,
+                lastMemberFetchServerID: serverID,
+                requestedCount: knownMemberCount(serverID: serverID),
+                missingUserCount: missingUserCount(serverID: serverID),
+                error: message,
+                lastUpdatedAt: Date()
+            )
+            if force { placeholderStatus = message }
+            return
+        }
+
+        let requestedCount = knownMemberCount(serverID: serverID)
+        let generation = (memberHydrationGenerations[serverID] ?? 0) + 1
+        memberHydrationGenerations[serverID] = generation
+        lastMemberHydrationRequestedAt[serverID] = Date()
+        memberHydrationLoadingServerIDs.insert(serverID)
+        memberHydrationErrorsByServerID[serverID] = nil
+        memberHydrationDiagnostics = MemberHydrationDiagnostics(
+            source: .readyOnly,
+            lastMemberFetchServerID: serverID,
+            requestedCount: requestedCount,
+            missingUserCount: missingUserCount(serverID: serverID),
+            isLoading: true,
+            lastUpdatedAt: Date()
+        )
+
+        let task = Task { [weak self] in
+            do {
+                let members = try await apiClient.fetchServerMembers(serverID: serverID)
+                await MainActor.run {
+                    self?.finishMemberHydration(
+                        serverID: serverID,
+                        generation: generation,
+                        requestedCount: requestedCount,
+                        returnedMembers: members,
+                        reason: reason
+                    )
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self?.discardStaleMemberHydration(serverID: serverID, generation: generation)
+                }
+            } catch {
+                await MainActor.run {
+                    self?.failMemberHydration(
+                        serverID: serverID,
+                        generation: generation,
+                        requestedCount: requestedCount,
+                        error: error,
+                        forced: force
+                    )
+                }
+            }
+        }
+        memberHydrationTasks[serverID] = task
+        await task.value
+    }
+
+    private func finishMemberHydration(
+        serverID: ServerID,
+        generation: Int,
+        requestedCount: Int,
+        returnedMembers: [ServerMember],
+        reason: String
+    ) {
+        guard memberHydrationGenerations[serverID] == generation,
+              isMemberHydrationContextCurrent(serverID: serverID)
+        else {
+            discardStaleMemberHydration(serverID: serverID, generation: generation)
+            return
+        }
+
+        var returnedByKey: [ServerMemberKey: ServerMember] = [:]
+        for member in returnedMembers {
+            returnedByKey[ServerMemberKey(member.id)] = member
+        }
+        let previousCount = knownMemberCount(serverID: serverID)
+        snapshot.membersByServerAndUserID = snapshot.membersByServerAndUserID.filter { $0.key.serverID != serverID }
+        for (key, member) in returnedByKey {
+            snapshot.membersByServerAndUserID[key] = member
+        }
+        restHydratedMembersByServerID[serverID] = returnedByKey
+        hydratedMemberServerIDs.insert(serverID)
+        memberHydrationTasks[serverID] = nil
+        memberHydrationLoadingServerIDs.remove(serverID)
+        memberHydrationErrorsByServerID[serverID] = nil
+        memberListGroupCacheKey = nil
+
+        let missingUsers = missingUserCount(serverID: serverID)
+        let dropped = max(0, previousCount - returnedByKey.count)
+        memberHydrationDiagnostics = MemberHydrationDiagnostics(
+            source: .restHydrated,
+            lastMemberFetchServerID: serverID,
+            requestedCount: requestedCount,
+            returnedCount: returnedMembers.count,
+            mergedMemberCount: returnedByKey.count,
+            mergedUserCount: 0,
+            missingUserCount: missingUsers,
+            droppedCount: dropped,
+            staleFetchDiscarded: false,
+            isLoading: false,
+            error: nil,
+            lastUpdatedAt: Date()
+        )
+        placeholderStatus = "Refreshed \(returnedByKey.count) members."
+        quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+        loadVisibleIdentityImagesForCurrentSelection()
+        if reason == "manual refresh" {
+            lastServerSettingsButtonAction = "Member refresh completed"
+        }
+    }
+
+    private func failMemberHydration(serverID: ServerID, generation: Int, requestedCount: Int, error: Error, forced: Bool) {
+        guard memberHydrationGenerations[serverID] == generation else {
+            discardStaleMemberHydration(serverID: serverID, generation: generation)
+            return
+        }
+        let message = error.userFacingMessage
+        memberHydrationTasks[serverID] = nil
+        memberHydrationLoadingServerIDs.remove(serverID)
+        memberHydrationErrorsByServerID[serverID] = message
+        memberHydrationDiagnostics = MemberHydrationDiagnostics(
+            source: hydratedMemberServerIDs.contains(serverID) ? .restHydrated : .readyOnly,
+            lastMemberFetchServerID: serverID,
+            requestedCount: requestedCount,
+            missingUserCount: missingUserCount(serverID: serverID),
+            isLoading: false,
+            error: message,
+            lastUpdatedAt: Date()
+        )
+        if forced {
+            placeholderStatus = "Member refresh failed: \(message)"
+        }
+    }
+
+    private func discardStaleMemberHydration(serverID: ServerID, generation: Int) {
+        if memberHydrationGenerations[serverID] == generation {
+            memberHydrationTasks[serverID] = nil
+            memberHydrationLoadingServerIDs.remove(serverID)
+        }
+        memberHydrationDiagnostics.staleFetchDiscarded = true
+        memberHydrationDiagnostics.isLoading = false
+        memberHydrationDiagnostics.lastMemberFetchServerID = serverID
+        memberHydrationDiagnostics.lastUpdatedAt = Date()
+    }
+
+    private func cancelMemberHydrationTasks(except keptServerID: ServerID?) {
+        let staleServers = memberHydrationTasks.keys.filter { $0 != keptServerID }
+        guard !staleServers.isEmpty else { return }
+        for serverID in staleServers {
+            memberHydrationTasks[serverID]?.cancel()
+            memberHydrationTasks[serverID] = nil
+            memberHydrationLoadingServerIDs.remove(serverID)
+        }
+        memberHydrationDiagnostics.staleFetchDiscarded = true
+        memberHydrationDiagnostics.isLoading = !memberHydrationLoadingServerIDs.isEmpty
+        memberHydrationDiagnostics.lastUpdatedAt = Date()
+    }
+
+    private func isMemberHydrationContextCurrent(serverID: ServerID) -> Bool {
+        guard case let .serverMembers(currentServerID, _) = rightSidebarContext else { return false }
+        return currentServerID == serverID
+    }
+
+    private func apiClientForMemberHydration() -> (any StoatAPIClient)? {
+        sessionCoordinator?.apiClient ?? (effectiveRuntimeMode == .mock ? communityAPIClient : nil)
+    }
+
+    private func knownMemberCount(serverID: ServerID) -> Int {
+        snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID }.count
+    }
+
+    private func missingUserCount(serverID: ServerID) -> Int {
+        snapshot.membersByServerAndUserID.values.filter { member in
+            member.id.serverID == serverID && snapshot.usersByID[member.id.userID] == nil
+        }.count
     }
 
     private func cachedSelectedTimelineMessageGroups() -> [TimelineMessageGroup] {
@@ -1003,7 +1237,7 @@ public final class MainShellViewModel {
             groupedMessageCount: groups.count,
             markdownCacheCount: 0,
             embedCacheCount: 0,
-            avatarLoadQueueCount: imageResourceLoadTasks.count,
+            avatarLoadQueueCount: imageResourceQueueCount,
             visibleRangeUpdateCount: timelineVisibleRangeUpdateCount,
             lastSlowOperation: elapsed.map { $0 > 0.05 ? "timeline grouping \(Int($0 * 1000))ms" : nil } ?? timelinePerformanceDiagnostics.lastSlowOperation
         )
@@ -1107,9 +1341,7 @@ public final class MainShellViewModel {
         guard userProfilesByID[userID] == nil,
               !profileLoadingUserIDs.contains(userID)
         else { return }
-        guard effectiveRuntimeMode == .liveManual,
-              effectiveSessionState == .connected,
-              let apiClient = sessionCoordinator?.apiClient
+        guard let apiClient = sessionCoordinator?.apiClient ?? (effectiveRuntimeMode == .mock ? communityAPIClient : nil)
         else { return }
         profileLoadingUserIDs.insert(userID)
         profileErrorsByID[userID] = nil
@@ -2802,7 +3034,7 @@ public final class MainShellViewModel {
         reduceGlassIntensity = sessionCoordinator.preferences.reduceGlassIntensity
         inlineImagePreviewPolicy = sessionCoordinator.preferences.inlineImagePreviewPolicy
         timelineTuning = sessionCoordinator.preferences.timelineTuning.validated()
-        snapshot = sessionCoordinator.snapshot
+        snapshot = snapshotWithHydratedMemberOverlay(sessionCoordinator.snapshot)
         if sessionCoordinator.mode == .liveManual,
            previousNotificationGeneration != sessionCoordinator.liveConnectionGeneration {
             seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
@@ -2883,9 +3115,30 @@ public final class MainShellViewModel {
     }
 
     public var commonEmojiItems: [String] {
-        let unicode = ["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏", "🔥", "✨", "😄", "😅", "😎", "😢", "😮", "🤔", "🚀", "💯", "🫡", "👋", "🙌", "😆", "😋", "😴"]
-        let serverEmoji = customEmojiDisplayItemsForCurrentContext().prefix(12).map(\.shortcode)
-        return unicode + serverEmoji
+        composerEmojiSections.flatMap(\.items)
+    }
+
+    public var composerEmojiSections: [EmojiPickerSection] {
+        let common = ["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏", "🔥", "✨"]
+        let smileys = ["😄", "😅", "😎", "😢", "😮", "🤔", "🫡", "👋", "🙌", "😆", "😋", "😴"]
+        let serverID = selectedConversationChannelID.flatMap { snapshot.channelsByID[$0]?.serverID } ?? selection.serverID
+        let custom = snapshot.emojisByID.values.map(CustomEmojiDisplayItem.init(emoji:)).sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+        let currentServer = custom.filter { item in
+            guard let serverID else { return false }
+            return item.serverID == serverID
+        }.prefix(48).map(\.shortcode)
+        let otherServers = custom.filter { item in
+            guard let serverID else { return item.serverID != nil }
+            return item.serverID != nil && item.serverID != serverID
+        }.prefix(48).map(\.shortcode)
+        return [
+            EmojiPickerSection(id: "common", title: "Common", items: common),
+            EmojiPickerSection(id: "smileys", title: "Unicode", items: smileys),
+            EmojiPickerSection(id: "current-server", title: "Current Server", items: Array(currentServer)),
+            EmojiPickerSection(id: "other-servers", title: "Other Servers", items: Array(otherServers))
+        ].filter { !$0.items.isEmpty }
     }
 
     public func insertEmoji(_ emoji: String, in channelID: ChannelID?) {
@@ -3365,6 +3618,10 @@ public final class MainShellViewModel {
         guard effectiveRuntimeMode == .liveManual || effectiveRuntimeMode == .mock else { return }
         for item in attachmentDisplayItems(for: message) where shouldAutoLoadInlineImage(item) {
             guard attachmentLoadTasks[item.id] == nil else { continue }
+            guard attachmentLoadTasks.count < maxConcurrentInlinePreviewLoads else {
+                lastAttachmentAction = "Media-heavy safe mode: preview queue saturated"
+                break
+            }
             attachmentLoadTasks[item.id] = Task { [weak self] in
                 await self?.loadInlineImagePreview(item)
             }
@@ -3400,11 +3657,29 @@ public final class MainShellViewModel {
                 self.attachmentPreviewStates[item.id] = .readyRemote
                 self.lastAttachmentAction = "Loaded inline image preview"
             }
+        } catch is CancellationError {
+            await MainActor.run {
+                if case .loading = self.attachmentPreviewStates[item.id] {
+                    self.attachmentPreviewStates[item.id] = .notLoaded
+                }
+                self.lastAttachmentAction = "Cancelled offscreen inline image preview"
+            }
         } catch {
             let message = AttachmentSafety.safeErrorMessage(error)
             await MainActor.run {
                 self.attachmentPreviewStates[item.id] = .failed(message)
                 self.lastAttachmentAction = "Inline image preview failed"
+            }
+        }
+    }
+
+    private func cancelInlineImagePreviews(for message: Message) {
+        for item in attachmentDisplayItems(for: message) {
+            guard let task = attachmentLoadTasks[item.id] else { continue }
+            task.cancel()
+            attachmentLoadTasks[item.id] = nil
+            if case .loading = attachmentPreviewStates[item.id] {
+                attachmentPreviewStates[item.id] = .notLoaded
             }
         }
     }
@@ -3417,17 +3692,23 @@ public final class MainShellViewModel {
     public func loadImageResource(for file: File?, kind: ImageResourceKind) {
         guard let request = imageResourceRequest(for: file, kind: kind) else { return }
         let key = request.cacheKey
-        guard loadedImageResources[key] == nil, imageResourceLoadTasks[key] == nil else { return }
-        imageResourceStates[key] = .loading
-        imageResourceLoadTasks[key] = Task { [weak self] in
-            await self?.loadImageResource(request)
+        guard loadedImageResources[key] == nil,
+              imageResourceLoadTasks[key] == nil,
+              queuedImageResourceRequests[key] == nil
+        else { return }
+        if case .failed = imageResourceStates[key] {
+            return
         }
+        imageResourceStates[key] = .loading
+        queuedImageResourceRequests[key] = request
+        drainImageResourceQueue()
     }
 
     public func clearImageMemoryCache() async {
         await imageMemoryCache.removeAll()
         loadedImageResources.removeAll()
         imageResourceStates.removeAll()
+        queuedImageResourceRequests.removeAll()
         lastImageResourceAction = "Cleared image memory cache"
     }
 
@@ -3449,6 +3730,8 @@ public final class MainShellViewModel {
         return ImageResourceDiagnostics(
             loadedCount: loadedImageResources.count,
             failedCount: failed,
+            activeTaskCount: imageResourceLoadTasks.count,
+            queuedTaskCount: queuedImageResourceRequests.count,
             cacheEntryCount: snapshot.count,
             cacheByteCount: snapshot.byteCount,
             lastAction: lastImageResourceAction
@@ -3459,6 +3742,7 @@ public final class MainShellViewModel {
         defer {
             Task { @MainActor [weak self] in
                 self?.imageResourceLoadTasks[request.cacheKey] = nil
+                self?.drainImageResourceQueue()
             }
         }
         do {
@@ -3468,12 +3752,32 @@ public final class MainShellViewModel {
                 self.imageResourceStates[request.cacheKey] = .readyRemote
                 self.lastImageResourceAction = loaded.fromCache ? "Loaded image from memory cache" : "Loaded image"
             }
+        } catch is CancellationError {
+            await MainActor.run {
+                if case .loading = self.imageResourceStates[request.cacheKey] {
+                    self.imageResourceStates[request.cacheKey] = .notLoaded
+                }
+                self.lastImageResourceAction = "Cancelled image load"
+            }
         } catch {
             let message = AttachmentSafety.safeErrorMessage(error)
             await MainActor.run {
                 self.imageResourceStates[request.cacheKey] = .failed(message)
                 self.lastImageResourceAction = "Image load failed"
             }
+        }
+    }
+
+    private func drainImageResourceQueue() {
+        while imageResourceLoadTasks.count < maxConcurrentImageResourceLoads,
+              let next = queuedImageResourceRequests.first {
+            queuedImageResourceRequests.removeValue(forKey: next.key)
+            imageResourceLoadTasks[next.key] = Task { [weak self] in
+                await self?.loadImageResource(next.value)
+            }
+        }
+        if queuedImageResourceRequests.count > maxConcurrentImageResourceLoads * 2 {
+            lastImageResourceAction = "Media-heavy safe mode: image queue saturated"
         }
     }
 
@@ -3511,6 +3815,8 @@ public final class MainShellViewModel {
             tag = "icons"
         case .serverBanner:
             tag = "banners"
+        case .profileBackground:
+            tag = file.tag.isEmpty ? "backgrounds" : file.tag
         case .customEmoji:
             tag = "emojis"
         }
@@ -3520,7 +3826,7 @@ public final class MainShellViewModel {
         }
         let maxBytes: Int
         switch kind {
-        case .serverBanner:
+        case .serverBanner, .profileBackground:
             maxBytes = 4 * 1024 * 1024
         case .attachmentPreview:
             maxBytes = 8 * 1024 * 1024
@@ -4177,6 +4483,13 @@ public final class MainShellViewModel {
         )
     }
 
+    public func systemEventProfileTarget(for message: Message) -> UserID? {
+        guard let target = Phase27SystemEventPresenter.profileTarget(for: message),
+              snapshot.usersByID[target] != nil || member(for: target, serverID: snapshot.channelsByID[message.channelID]?.serverID) != nil
+        else { return nil }
+        return target
+    }
+
     public func reactionSummaries(for message: Message) -> [ReactionSummary] {
         Phase17MessageActions.reactionSummaries(for: message, currentUserID: currentUserID)
     }
@@ -4442,6 +4755,9 @@ public final class MainShellViewModel {
             visible.insert(messageID)
         } else {
             visible.remove(messageID)
+            if let message = selectedTimelineMessages.first(where: { $0.message.id == messageID })?.message {
+                cancelInlineImagePreviews(for: message)
+            }
         }
         timelineVisibleRangeUpdateCount += 1
         visibleMessageIDsByChannelID[channelID] = visible
@@ -4571,6 +4887,7 @@ public final class MainShellViewModel {
         let dm = dmRouteDiagnostics
         let dmTrace = DirectMessageLiveTraceFormatter.redactedText(dmLiveTrace)
         let members = memberListPerformanceDiagnostics
+        let memberHydration = memberHydrationDiagnostics
         let attachmentText = """
         Attachment diagnostics
         queuedDrafts: \(attachments.queuedDraftCount)
@@ -4602,6 +4919,18 @@ public final class MainShellViewModel {
         droppedReason: \(members.droppedReasonSummary ?? "-")
         groups: \(members.groupCount)
         avatarQueue: \(members.avatarLoadQueueCount)
+        Member hydration diagnostics
+        source: \(memberHydration.source.rawValue)
+        lastFetchServer: \(TimelineCopyFormatter.shortID(memberHydration.lastMemberFetchServerID?.rawValue))
+        requested: \(memberHydration.requestedCount)
+        returned: \(memberHydration.returnedCount)
+        mergedMembers: \(memberHydration.mergedMemberCount)
+        mergedUsers: \(memberHydration.mergedUserCount)
+        missingUsersAfterMerge: \(memberHydration.missingUserCount)
+        dropped: \(memberHydration.droppedCount)
+        staleDiscarded: \(memberHydration.staleFetchDiscarded ? "yes" : "no")
+        loading: \(memberHydration.isLoading ? "yes" : "no")
+        error: \(memberHydration.error ?? "-")
         """
         let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText + "\n" + send + "\n" + dmTrace)))
         #if canImport(AppKit)
@@ -5205,7 +5534,7 @@ public final class MainShellViewModel {
             messageID: result.messageID,
             channelID: result.channelID,
             authorID: result.authorID,
-            authorDisplayName: snapshot.usersByID[result.authorID]?.displayName ?? snapshot.usersByID[result.authorID]?.username,
+            authorDisplayName: resolvedDisplayName(userID: result.authorID, channelID: result.channelID),
             createdAt: result.createdAt,
             snippet: result.snippet,
             mode: mode,
@@ -5221,7 +5550,7 @@ public final class MainShellViewModel {
             messageID: message.id,
             channelID: message.channelID,
             authorID: message.authorID,
-            authorDisplayName: snapshot.usersByID[message.authorID]?.displayName ?? snapshot.usersByID[message.authorID]?.username,
+            authorDisplayName: resolvedDisplayName(userID: message.authorID, channelID: message.channelID),
             createdAt: message.createdAt,
             snippet: snippet,
             mode: mode,
@@ -5229,6 +5558,13 @@ public final class MainShellViewModel {
             isLoaded: isLoaded,
             safeStatus: isLoaded ? nil : "Result outside loaded range"
         )
+    }
+
+    private func resolvedDisplayName(userID: UserID, channelID: ChannelID) -> String {
+        let serverID = snapshot.channelsByID[channelID]?.serverID
+        let user = snapshot.usersByID[userID]
+        let member = serverID.flatMap { snapshot.membersByServerAndUserID[ServerMemberKey(serverID: $0, userID: userID)] }
+        return UserDisplayResolver.displayName(user: user, member: member, fallbackID: userID)
     }
 
     private func markSearchResultLoaded(_ messageID: MessageID) {
@@ -5406,22 +5742,49 @@ public final class MainShellViewModel {
 
     private func applySnapshot(_ snapshot: RealtimeSnapshot) {
         let oldSnapshot = self.snapshot
-        self.snapshot = snapshot
-        messageController.hydrate(from: snapshot)
-        applyRealtimeDeleteDiff(previous: oldSnapshot, current: snapshot)
-        processNotificationDiff(previous: oldSnapshot, current: snapshot)
-        previousSnapshot = snapshot
+        let mergedSnapshot = snapshotWithHydratedMemberOverlay(snapshot)
+        updateMemberSourceDiagnostics(previous: oldSnapshot, current: mergedSnapshot)
+        self.snapshot = mergedSnapshot
+        messageController.hydrate(from: mergedSnapshot)
+        applyRealtimeDeleteDiff(previous: oldSnapshot, current: mergedSnapshot)
+        processNotificationDiff(previous: oldSnapshot, current: mergedSnapshot)
+        previousSnapshot = mergedSnapshot
         restoreOrValidateSelection()
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
         reconcileTimelineSelection()
-        quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+        quickSwitcherViewModel.update(snapshot: mergedSnapshot, selection: selection)
         updateDockBadge()
         updateNotificationDiagnostics()
         replayQueuedNotificationRoutesIfReady()
         if effectiveRuntimeMode == .liveManual, effectiveSessionState == .connected {
             loadVisibleIdentityImagesForCurrentSelection()
         }
+    }
+
+    private func snapshotWithHydratedMemberOverlay(_ incoming: RealtimeSnapshot) -> RealtimeSnapshot {
+        guard !restHydratedMembersByServerID.isEmpty else { return incoming }
+        var copy = incoming
+        for (serverID, hydratedMembers) in restHydratedMembersByServerID {
+            copy.membersByServerAndUserID = copy.membersByServerAndUserID.filter { $0.key.serverID != serverID }
+            for (key, member) in hydratedMembers {
+                copy.membersByServerAndUserID[key] = member
+            }
+        }
+        return copy
+    }
+
+    private func updateMemberSourceDiagnostics(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
+        let previousKeys = Set(previous.membersByServerAndUserID.keys)
+        let currentKeys = Set(current.membersByServerAndUserID.keys)
+        guard previousKeys != currentKeys else { return }
+        if let selectedServerID = selection.serverID {
+            memberHydrationDiagnostics.missingUserCount = missingUserCount(serverID: selectedServerID)
+        }
+        if memberHydrationDiagnostics.source != .restHydrated {
+            memberHydrationDiagnostics.source = previousKeys.isEmpty ? .readyOnly : .realtimeUpdate
+        }
+        memberHydrationDiagnostics.lastUpdatedAt = Date()
     }
 
     private func applyRealtimeDeleteDiff(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
@@ -7306,6 +7669,7 @@ public struct CredentialSetupView: View {
         let timeline = viewModel.timelineDiagnostics()
         let dm = viewModel.dmRouteDiagnostics
         let members = viewModel.memberListPerformanceDiagnostics
+        let memberHydration = viewModel.memberHydrationDiagnostics
         let send = viewModel.currentMessageSendDiagnostics()
         let parity = viewModel.phase30ParityMatrix
         Section("Developer Diagnostics") {
@@ -7322,6 +7686,9 @@ public struct CredentialSetupView: View {
             if let dropSummary = members.droppedReasonSummary {
                 LabeledContent("Member notes", value: dropSummary)
             }
+            LabeledContent("Member source", value: "\(memberHydration.source.rawValue), server \(TimelineCopyFormatter.shortID(memberHydration.lastMemberFetchServerID?.rawValue))")
+            LabeledContent("Member REST", value: "requested \(memberHydration.requestedCount), returned \(memberHydration.returnedCount), merged \(memberHydration.mergedMemberCount), users \(memberHydration.mergedUserCount)")
+            LabeledContent("Member stale/error", value: "stale \(memberHydration.staleFetchDiscarded ? "yes" : "no"), loading \(memberHydration.isLoading ? "yes" : "no"), error \(memberHydration.error ?? "-")")
             LabeledContent("Member images", value: "queue \(members.avatarLoadQueueCount)")
             LabeledContent("Emoji", value: "known \(viewModel.snapshot.emojisByID.count), picker \(viewModel.commonEmojiItems.count)")
             if let emojiDiagnostics = viewModel.emojiPickerDiagnostics {
@@ -7891,6 +8258,7 @@ public struct ChatPlaceholderView: View {
                         viewModel.reviewDroppedAttachmentURLs(urls, to: channel.id)
                     },
                     emojiItems: viewModel.commonEmojiItems,
+                    emojiSections: viewModel.composerEmojiSections,
                     onInsertEmoji: { emoji in
                         viewModel.insertEmoji(emoji, in: channel.id)
                     },
@@ -8271,14 +8639,7 @@ public struct TimelineMessageGroupView: View {
                         InlineMessageEditor(viewModel: viewModel)
                             .padding(.leading, index == 0 ? 0 : StoatSize.avatar + StoatSpacing.medium)
                     } else if timelineMessage.message.system != nil {
-                        SystemEventRow(text: viewModel.systemEventText(for: timelineMessage.message))
-                            .id(timelineMessage.message.id)
-                            .onAppear {
-                                viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
-                            }
-                            .onDisappear {
-                                viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
-                            }
+                        systemEventRow(timelineMessage)
                     } else {
                         MessageRow(
                             message: timelineMessage.message,
@@ -8358,6 +8719,35 @@ public struct TimelineMessageGroupView: View {
     private func select(_ timelineMessage: TimelineMessage, source: MessageFocusSource = .mouse) {
         viewModel.timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: source)
         viewModel.requestFocus(.timeline)
+    }
+
+    @ViewBuilder private func systemEventRow(_ timelineMessage: TimelineMessage) -> some View {
+        let row = SystemEventRow(text: viewModel.systemEventText(for: timelineMessage.message))
+        if let target = viewModel.systemEventProfileTarget(for: timelineMessage.message) {
+            Button {
+                viewModel.showUserProfile(target)
+            } label: {
+                row
+            }
+            .buttonStyle(.plain)
+            .help("Open Profile")
+            .id(timelineMessage.message.id)
+            .onAppear {
+                viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
+            }
+            .onDisappear {
+                viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
+            }
+        } else {
+            row
+                .id(timelineMessage.message.id)
+                .onAppear {
+                    viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
+                }
+                .onDisappear {
+                    viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
+                }
+        }
     }
 
     private func rowActionItems(for timelineMessage: TimelineMessage) -> [MessageRowActionItem] {
@@ -8576,6 +8966,17 @@ public struct MemberPanelView: View {
                 Text(title)
                     .font(.headline)
                 Spacer()
+                if case let .serverMembers(serverID, _) = context {
+                    Button {
+                        Task { await viewModel.hydrateServerMembers(serverID: serverID, force: true, reason: "panel refresh") }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(viewModel.isMemberHydrationLoading(serverID: serverID) || !viewModel.canRefreshSelectedServerMembers)
+                    .help("Refresh Members")
+                    .accessibilityLabel("Refresh members")
+                }
                 Text("\(count)")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -8585,6 +8986,9 @@ public struct MemberPanelView: View {
         }
         .padding(StoatSpacing.large)
         .background(.thinMaterial)
+        .task(id: context) {
+            viewModel.hydrateMembersForVisibleContextIfNeeded()
+        }
     }
 
     @ViewBuilder private var content: some View {
@@ -8646,8 +9050,21 @@ public struct MemberPanelView: View {
     }
 
     @ViewBuilder private var serverMembers: some View {
+        if case let .serverMembers(serverID, _) = context,
+           let status = viewModel.memberHydrationStatusMessage(for: serverID) {
+            HStack(spacing: StoatSpacing.small) {
+                if viewModel.isMemberHydrationLoading(serverID: serverID) {
+                    ProgressView().controlSize(.small)
+                }
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer()
+            }
+        }
         if groups.isEmpty {
-            EmptyStateView(title: "No members", message: "Member data is not present in the current snapshot.", systemImage: "person.2")
+            EmptyStateView(title: "No members", message: emptyMemberMessage, systemImage: "person.2")
                 .frame(maxWidth: .infinity)
         } else {
             ScrollView {
@@ -8666,6 +9083,22 @@ public struct MemberPanelView: View {
                 }
             }
         }
+    }
+
+    private var emptyMemberMessage: String {
+        guard case let .serverMembers(serverID, _) = context else {
+            return "Member data is not present in the current snapshot."
+        }
+        if viewModel.isMemberHydrationLoading(serverID: serverID) {
+            return "Loading selected-server members."
+        }
+        if let error = viewModel.memberHydrationErrorsByServerID[serverID] {
+            return "Refresh failed: \(error)"
+        }
+        if viewModel.canRefreshSelectedServerMembers {
+            return "Ready has no members yet. Use refresh or wait for selected-server hydration."
+        }
+        return "Member data is not present in the current snapshot."
     }
 
     @ViewBuilder private func dmParticipants(_ channel: Channel) -> some View {
@@ -9315,8 +9748,9 @@ private struct UserProfileCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            profileBackground
             HStack(alignment: .center, spacing: StoatSpacing.medium) {
-                AvatarView(title: displayName, size: StoatSize.avatar, isOnline: user.online, imageData: viewModel.imageData(for: user.avatar, kind: .userAvatar))
+                AvatarView(title: displayName, size: StoatSize.avatar, isOnline: user.online, imageData: viewModel.imageData(for: avatarFile, kind: .userAvatar))
                 VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                     Text(displayName)
                         .font(.title3.weight(.semibold))
@@ -9362,9 +9796,8 @@ private struct UserProfileCardView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-            } else if let profile = viewModel.userProfilesByID[user.id], let content = profile.content, !content.isEmpty {
-                Text(content)
-                    .font(.callout)
+            } else if let content = profileBio {
+                MarkdownMessageContent(content)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if let error = viewModel.profileErrorsByID[user.id] {
                 Text(error)
@@ -9386,8 +9819,14 @@ private struct UserProfileCardView: View {
         .padding(StoatSpacing.large)
         .frame(width: 360, alignment: .leading)
         .onAppear {
-            viewModel.loadImageResource(for: user.avatar, kind: .userAvatar)
+            viewModel.loadImageResource(for: avatarFile, kind: .userAvatar)
+            if let background = viewModel.userProfilesByID[user.id]?.background {
+                viewModel.loadImageResource(for: background, kind: .profileBackground)
+            }
             Task { await viewModel.fetchUserProfileIfNeeded(user.id) }
+        }
+        .onChange(of: viewModel.userProfilesByID[user.id]?.background) { _, background in
+            viewModel.loadImageResource(for: background, kind: .profileBackground)
         }
     }
 
@@ -9428,6 +9867,32 @@ private struct UserProfileCardView: View {
 
     private var displayName: String {
         UserDisplayResolver.displayName(user: user, member: member, fallbackID: user.id)
+    }
+
+    private var avatarFile: File? {
+        UserDisplayResolver.resolved(userID: user.id, user: user, member: member).avatarFile
+    }
+
+    @ViewBuilder private var profileBackground: some View {
+        if let background = viewModel.userProfilesByID[user.id]?.background,
+           let data = viewModel.imageData(for: background, kind: .profileBackground) {
+            #if canImport(AppKit)
+            if let image = NSImage(data: data) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(height: 96)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
+                    .accessibilityLabel("Profile banner")
+            }
+            #endif
+        }
+    }
+
+    private var profileBio: String? {
+        let content = viewModel.userProfilesByID[user.id]?.content?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return content?.isEmpty == false ? content : nil
     }
 
     private var member: ServerMember? {
@@ -10635,8 +11100,17 @@ public struct ChannelSearchPanel: View {
             LoadingStateView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case let .empty(query):
-            ContentUnavailableView("No results", systemImage: query.mode == .pinned ? "pin.slash" : "magnifyingglass", description: Text(query.mode.displayName))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: StoatSpacing.medium) {
+                ContentUnavailableView("No results", systemImage: query.mode == .pinned ? "pin.slash" : "magnifyingglass", description: Text(query.mode.displayName))
+                if query.mode == .loadedOnly, viewModel.effectiveRuntimeMode == .liveManual, viewModel.effectiveSessionState == .connected {
+                    Button("Search Channel Remotely") {
+                        viewModel.channelSearchQuery.mode = .liveChannel
+                        Task { await viewModel.runChannelSearch() }
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         case let .failed(_, message):
             ErrorStateView(message)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -18,6 +18,7 @@ public enum ImageResourceKind: Hashable, Sendable {
     case userAvatar
     case serverIcon
     case serverBanner
+    case profileBackground
     case customEmoji
 }
 
@@ -581,6 +582,8 @@ public struct AttachmentDiagnostics: Hashable, Sendable {
 public struct ImageResourceDiagnostics: Hashable, Sendable {
     public var loadedCount: Int
     public var failedCount: Int
+    public var activeTaskCount: Int
+    public var queuedTaskCount: Int
     public var cacheEntryCount: Int
     public var cacheByteCount: Int
     public var lastAction: String?
@@ -588,12 +591,16 @@ public struct ImageResourceDiagnostics: Hashable, Sendable {
     public init(
         loadedCount: Int = 0,
         failedCount: Int = 0,
+        activeTaskCount: Int = 0,
+        queuedTaskCount: Int = 0,
         cacheEntryCount: Int = 0,
         cacheByteCount: Int = 0,
         lastAction: String? = nil
     ) {
         self.loadedCount = loadedCount
         self.failedCount = failedCount
+        self.activeTaskCount = activeTaskCount
+        self.queuedTaskCount = queuedTaskCount
         self.cacheEntryCount = cacheEntryCount
         self.cacheByteCount = cacheByteCount
         self.lastAction = lastAction.map(AttachmentDiagnosticsFormatter.redact)
