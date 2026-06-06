@@ -2227,6 +2227,33 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(NotificationClassifier.classify(message: suppressed, context: context), .suppress(.messageSuppressed))
     }
 
+    func testPhase36StatusSuppressesNotificationsForBusyAndFocus() {
+        let currentUserID: UserID = "user-me"
+        let otherUserID: UserID = "user-other"
+        let channelID: ChannelID = "channel-text"
+        let dmChannelID: ChannelID = "channel-dm"
+        let unread = Message(id: "01J00000000000000000036002", channelID: channelID, authorID: otherUserID, content: "ordinary")
+        let mention = Message(id: "01J00000000000000000036003", channelID: channelID, authorID: otherUserID, content: "ping", mentions: [currentUserID])
+        let dm = Message(id: "01J00000000000000000036004", channelID: dmChannelID, authorID: otherUserID, content: "dm")
+        var preferences = NotificationPreferences.defaults
+        preferences.deliveryScope = .allMessages
+
+        var busySnapshot = phase18Snapshot(currentUserID: currentUserID, otherUserID: otherUserID, textChannelID: channelID, dmChannelID: dmChannelID)
+        busySnapshot.usersByID[currentUserID]?.status = UserStatus(presence: .busy)
+        let busyContext = NotificationClassificationContext(runtimeMode: .liveManual, currentUserID: currentUserID, activeChannelID: nil, preferences: preferences, snapshot: busySnapshot)
+        XCTAssertEqual(NotificationClassifier.classify(message: mention, context: busyContext), .suppress(.doNotDisturb))
+        XCTAssertEqual(NotificationClassifier.classify(message: dm, context: busyContext), .suppress(.doNotDisturb))
+
+        var focusSnapshot = phase18Snapshot(currentUserID: currentUserID, otherUserID: otherUserID, textChannelID: channelID, dmChannelID: dmChannelID)
+        focusSnapshot.usersByID[currentUserID]?.status = UserStatus(presence: .focus)
+        let focusContext = NotificationClassificationContext(runtimeMode: .liveManual, currentUserID: currentUserID, activeChannelID: nil, preferences: preferences, snapshot: focusSnapshot)
+        XCTAssertEqual(NotificationClassifier.classify(message: unread, context: focusContext), .suppress(.focusNonMention))
+        XCTAssertEqual(NotificationClassifier.classify(message: dm, context: focusContext), .suppress(.focusNonMention))
+        guard case .deliver = NotificationClassifier.classify(message: mention, context: focusContext) else {
+            return XCTFail("Focus should still allow mentions.")
+        }
+    }
+
     func testPhase18ContentFormattingPrivacyAttachmentSummaryAndRedaction() {
         let file = File(id: "phase18-file", tag: "attachments", filename: "secret.png", contentType: "image/png", size: 12)
         let message = Message(id: "01J00000000000000000018006", channelID: "channel", authorID: "other", content: "see https://example.com/raw token: abc /tmp/private/file.md **bold**", attachments: [file])
@@ -3033,7 +3060,11 @@ final class StoatFeaturesTests: XCTestCase {
             ServerMember(id: MemberCompositeKey(serverID: serverID, userID: botID), joinedAt: Date()),
             ServerMember(id: MemberCompositeKey(serverID: serverID, userID: missingID), joinedAt: Date())
         ]
-        let api = RecordingAPIClient(membersByServer: [serverID: restMembers])
+        let restUsers = [
+            User(id: currentUserID, username: "current", displayName: "REST Current User"),
+            User(id: botID, username: "phasebot", displayName: "Phase Bot", bot: BotInformation(ownerID: currentUserID))
+        ]
+        let api = RecordingAPIClient(membersByServer: [serverID: restMembers], usersByServer: [serverID: restUsers])
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
@@ -3051,9 +3082,57 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(items.contains { $0.userID == botID && $0.isBot })
         XCTAssertTrue(items.contains { $0.userID == missingID && $0.user == nil })
         XCTAssertEqual(model.snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: currentUserID)]?.nickname, "REST Current")
+        XCTAssertEqual(model.snapshot.usersByID[currentUserID]?.displayName, "REST Current User")
+        XCTAssertEqual(model.snapshot.usersByID[botID]?.displayName, "Phase Bot")
         XCTAssertEqual(model.memberHydrationDiagnostics.source, .restHydrated)
         XCTAssertEqual(model.memberHydrationDiagnostics.returnedCount, 3)
+        XCTAssertEqual(model.memberHydrationDiagnostics.mergedUserCount, 2)
         XCTAssertEqual(model.memberHydrationDiagnostics.missingUserCount, 1)
+    }
+
+    @MainActor
+    func testPhase36MemberHydrationFailureKeepsReadyMembersAndRecordsAPIShape() async {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase36-ready-server"
+        let channelID: ChannelID = "phase36-ready-channel"
+        let readyUserID: UserID = "phase36-ready-user"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: readyUserID, name: "Phase 36")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        snapshot.usersByID[readyUserID] = User(id: readyUserID, username: "ready", displayName: "Ready User")
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: readyUserID)] = ServerMember(
+            id: MemberCompositeKey(serverID: serverID, userID: readyUserID),
+            joinedAt: Date(),
+            nickname: "Ready Nick"
+        )
+        let diagnostics = APIRequestDiagnostics(
+            method: "GET",
+            route: "/servers/phase36-ready-server/members",
+            redactedResourceID: "phas...rver",
+            authHeaderPresent: true,
+            httpStatus: 200,
+            contentType: "application/json",
+            topLevelResponseShape: "array[1]",
+            decoderSummary: "Expected members/users wrapper",
+            errorCategory: "decode"
+        )
+        let api = RecordingAPIClient(
+            memberFetchError: StoatAPIDiagnosedError(apiError: .decodingFailed("Expected members/users wrapper"), diagnostics: diagnostics)
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            communityAPIClient: api
+        )
+
+        await model.hydrateServerMembers(serverID: serverID, force: true, reason: "test")
+
+        let displayNames = model.memberListGroups(for: serverID).flatMap { $0.items }.map { $0.displayName }
+        XCTAssertEqual(displayNames, ["Ready Nick"])
+        XCTAssertEqual(model.memberHydrationDiagnostics.source, MemberHydrationSource.readyOnly)
+        XCTAssertEqual(model.memberHydrationDiagnostics.apiDiagnostics?.topLevelResponseShape, "array[1]")
+        XCTAssertEqual(model.memberHydrationDiagnostics.apiDiagnostics?.errorCategory, "decode")
+        XCTAssertTrue(model.memberHydrationStatusMessage(for: serverID)?.contains("decode") == true)
     }
 
     @MainActor
@@ -3160,6 +3239,22 @@ final class StoatFeaturesTests: XCTestCase {
 
         XCTAssertTrue(current.contains(":currentparty:"))
         XCTAssertTrue(other.contains(":otherparty:"))
+    }
+
+    @MainActor
+    func testPhase36CustomEmojiContextHidesOtherServersInMessages() {
+        var snapshot = MockShellData.snapshot
+        let currentServerID: ServerID = "phase36-emoji-current"
+        let otherServerID: ServerID = "phase36-emoji-other"
+        let channelID: ChannelID = "phase36-emoji-channel"
+        snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: MockShellData.currentUserID, name: "Current")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: currentServerID, name: "general")
+        snapshot.emojisByID["phase36-current"] = Emoji(id: "phase36-current", parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "currentparty")
+        snapshot.emojisByID["phase36-other"] = Emoji(id: "phase36-other", parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "otherparty")
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID), snapshot: snapshot)
+        let message = Message(id: "01J00000000000000000360001", channelID: channelID, authorID: MockShellData.currentUserID, content: ":currentparty: :otherparty:")
+
+        XCTAssertEqual(model.inlineCustomEmojiItems(for: message).map(\.shortcode), [":currentparty:"])
     }
 
     @MainActor
@@ -3427,6 +3522,52 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(result.usedMockAuthorizer)
         XCTAssertEqual(result.statusAfter, .authorized)
         XCTAssertTrue(model.notificationDiagnostics.redactedText.contains("called yes"))
+    }
+
+    @MainActor
+    func testPhase36NotificationsDoNotRequestOnLaunchAndSelfTestSchedulesOnlyWhenAuthorized() async throws {
+        let deniedManager = MockNotificationPermissionManager(status: .denied)
+        let deniedService = MockNotificationService()
+        let deniedModel = MainShellViewModel(
+            snapshot: MockShellData.snapshot,
+            notificationDeliverer: deniedService,
+            notificationPermissionManager: deniedManager,
+            dockBadgeManager: MockDockBadgeManager()
+        )
+        let deniedRequestCountBefore = await deniedManager.requestCount
+        XCTAssertEqual(deniedRequestCountBefore, 0)
+
+        deniedModel.runNotificationSelfTest()
+        for _ in 0..<20 where deniedModel.notificationDiagnostics.selfTestReport == "Self-test started" {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        let deniedRequestCountAfter = await deniedManager.requestCount
+        XCTAssertEqual(deniedRequestCountAfter, 1)
+        XCTAssertTrue((deniedModel.notificationDiagnostics.selfTestReport ?? "").contains("local test skipped"))
+        let deniedEvents = await deniedService.events()
+        XCTAssertTrue(deniedEvents.isEmpty)
+
+        let authorizedManager = MockNotificationPermissionManager(status: .authorized)
+        let authorizedService = MockNotificationService()
+        let authorizedModel = MainShellViewModel(
+            snapshot: MockShellData.snapshot,
+            notificationDeliverer: authorizedService,
+            notificationPermissionManager: authorizedManager,
+            dockBadgeManager: MockDockBadgeManager()
+        )
+        authorizedModel.runNotificationSelfTest()
+        for _ in 0..<20 {
+            let events = await authorizedService.events()
+            if !events.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        let authorizedRequestCount = await authorizedManager.requestCount
+        XCTAssertEqual(authorizedRequestCount, 1)
+        let authorizedEvents = await authorizedService.events()
+        XCTAssertEqual(authorizedEvents.count, 1)
+        XCTAssertTrue((authorizedModel.notificationDiagnostics.selfTestReport ?? "").contains("scheduled local test"))
     }
 
     @MainActor
@@ -3837,23 +3978,30 @@ private actor RecordingAPIClient: StoatAPIClient {
     private let currentUser: User
     private var messagesByChannel: [ChannelID: [Message]]
     private var membersByServer: [ServerID: [ServerMember]]
+    private var usersByServer: [ServerID: [User]]
+    private var editedUsersByID: [UserID: User] = [:]
     private var profilesByUserID: [UserID: UserProfile]
     private let fetchError: (any Error & Sendable)?
+    private let memberFetchError: (any Error & Sendable)?
     private let memberFetchDelayNanoseconds: UInt64
 
     init(
         currentUser: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
         messagesByChannel: [ChannelID: [Message]] = [:],
         membersByServer: [ServerID: [ServerMember]] = [:],
+        usersByServer: [ServerID: [User]] = [:],
         profilesByUserID: [UserID: UserProfile] = [:],
         fetchError: (any Error & Sendable)? = nil,
+        memberFetchError: (any Error & Sendable)? = nil,
         memberFetchDelayNanoseconds: UInt64 = 0
     ) {
         self.currentUser = currentUser
         self.messagesByChannel = messagesByChannel
         self.membersByServer = membersByServer
+        self.usersByServer = usersByServer
         self.profilesByUserID = profilesByUserID
         self.fetchError = fetchError
+        self.memberFetchError = memberFetchError
         self.memberFetchDelayNanoseconds = memberFetchDelayNanoseconds
     }
 
@@ -3864,6 +4012,16 @@ private actor RecordingAPIClient: StoatAPIClient {
     func fetchCurrentUser() async throws -> User {
         fetchCurrentUserCallCount += 1
         return currentUser
+    }
+
+    func editUser(userID: UserID, draft: UserEditDraft) async throws -> User {
+        var user = editedUsersByID[userID] ?? (userID == currentUser.id ? currentUser : User(id: userID, username: UserDisplayResolver.shortenedID(userID)))
+        if let status = draft.status {
+            user.status = status
+            user.online = status.presence != .invisible
+        }
+        editedUsersByID[userID] = user
+        return user
     }
 
     func fetchUserProfile(userID: UserID) async throws -> UserProfile {
@@ -3902,13 +4060,16 @@ private actor RecordingAPIClient: StoatAPIClient {
         return messages
     }
 
-    func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember] {
+    func fetchServerMembers(serverID: ServerID) async throws -> ServerMembersResponse {
         fetchServerMembersCallCount += 1
         fetchedServerMemberIDs.append(serverID)
         if memberFetchDelayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: memberFetchDelayNanoseconds)
         }
-        return membersByServer[serverID] ?? []
+        if let memberFetchError {
+            throw memberFetchError
+        }
+        return ServerMembersResponse(members: membersByServer[serverID] ?? [], users: usersByServer[serverID] ?? [])
     }
 
     func sendMessage(channelID: ChannelID, draft: MessageDraft) async throws -> Message {

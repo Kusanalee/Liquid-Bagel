@@ -137,6 +137,8 @@ public enum NotificationSuppressionReason: String, Hashable, Sendable {
     case activeChannel
     case deliveryScope
     case unknownChannel
+    case doNotDisturb
+    case focusNonMention
 }
 
 public enum NotificationClassification: Hashable, Sendable {
@@ -245,6 +247,14 @@ public enum NotificationClassifier {
         guard message.authorID != currentUserID else { return .suppress(.selfMessage) }
         guard !message.isSuppressed else { return .suppress(.messageSuppressed) }
         guard let channel = context.snapshot.channelsByID[message.channelID] else { return .suppress(.unknownChannel) }
+        let isMention = (message.mentions ?? []).contains(currentUserID) || message.mentionsEveryone
+
+        if context.snapshot.usersByID[currentUserID]?.status?.presence == .busy {
+            return .suppress(.doNotDisturb)
+        }
+        if context.snapshot.usersByID[currentUserID]?.status?.presence == .focus, !isMention {
+            return .suppress(.focusNonMention)
+        }
 
         let channelPreference = context.preferences.preference(for: message.channelID)
         guard !channelPreference.isMuted else { return .suppress(.channelMuted) }
@@ -254,7 +264,6 @@ public enum NotificationClassifier {
             return .suppress(.activeChannel)
         }
 
-        let isMention = (message.mentions ?? []).contains(currentUserID) || message.mentionsEveryone
         let isDirect = channel.kind == .directMessage || channel.kind == .group
         let kind: NotificationClassificationKind
         if isMention {
@@ -320,6 +329,7 @@ public struct NotificationDiagnostics: Hashable, Sendable {
     public var expiredRouteCount: Int
     public var lastRouteOutcome: NotificationRouteOutcome
     public var lastPermissionRequest: NotificationPermissionRequestResult?
+    public var selfTestReport: String?
 
     public init(
         permissionStatus: NotificationPermissionStatus = .unknown,
@@ -335,7 +345,8 @@ public struct NotificationDiagnostics: Hashable, Sendable {
         queuedRouteCount: Int = 0,
         expiredRouteCount: Int = 0,
         lastRouteOutcome: NotificationRouteOutcome = .none,
-        lastPermissionRequest: NotificationPermissionRequestResult? = nil
+        lastPermissionRequest: NotificationPermissionRequestResult? = nil,
+        selfTestReport: String? = nil
     ) {
         self.permissionStatus = permissionStatus
         self.nativeEnabled = nativeEnabled
@@ -351,6 +362,7 @@ public struct NotificationDiagnostics: Hashable, Sendable {
         self.expiredRouteCount = expiredRouteCount
         self.lastRouteOutcome = lastRouteOutcome
         self.lastPermissionRequest = lastPermissionRequest
+        self.selfTestReport = selfTestReport
     }
 
     public var redactedText: String {
@@ -370,6 +382,7 @@ public struct NotificationDiagnostics: Hashable, Sendable {
         expiredRoutes: \(expiredRouteCount)
         lastRouteOutcome: \(lastRouteOutcome.rawValue)
         permissionRequest: \(lastPermissionRequest?.summary ?? "-")
+        selfTest: \(selfTestReport ?? "-")
         """
         return NotificationContentFormatter.sanitize(text)
     }
@@ -382,6 +395,7 @@ public struct NotificationPermissionRequestResult: Hashable, Sendable {
     public var requestAuthorizationCalled: Bool
     public var granted: Bool?
     public var errorDescription: String?
+    public var errorCodeName: String?
     public var statusAfter: NotificationPermissionStatus
     public var usedMockAuthorizer: Bool
 
@@ -392,6 +406,7 @@ public struct NotificationPermissionRequestResult: Hashable, Sendable {
         requestAuthorizationCalled: Bool,
         granted: Bool? = nil,
         errorDescription: String? = nil,
+        errorCodeName: String? = nil,
         statusAfter: NotificationPermissionStatus,
         usedMockAuthorizer: Bool = false
     ) {
@@ -401,6 +416,7 @@ public struct NotificationPermissionRequestResult: Hashable, Sendable {
         self.requestAuthorizationCalled = requestAuthorizationCalled
         self.granted = granted
         self.errorDescription = errorDescription
+        self.errorCodeName = errorCodeName
         self.statusAfter = statusAfter
         self.usedMockAuthorizer = usedMockAuthorizer
     }
@@ -408,8 +424,9 @@ public struct NotificationPermissionRequestResult: Hashable, Sendable {
     public var summary: String {
         let mode = usedMockAuthorizer ? "mock" : "live"
         let grantedText = granted.map { $0 ? "granted" : "not granted" } ?? "no completion result"
+        let codeText = errorCodeName.map { ", code \($0)" } ?? ""
         let errorText = errorDescription.map { ", error \($0)" } ?? ""
-        return "\(mode) \(authorizerKind), called \(requestAuthorizationCalled ? "yes" : "no"), options \(requestedOptions.joined(separator: "+")), before \(statusBefore.rawValue), \(grantedText), after \(statusAfter.rawValue)\(errorText)"
+        return "\(mode) \(authorizerKind), called \(requestAuthorizationCalled ? "yes" : "no"), options \(requestedOptions.joined(separator: "+")), before \(statusBefore.rawValue), \(grantedText), after \(statusAfter.rawValue)\(codeText)\(errorText)"
     }
 }
 
@@ -490,12 +507,14 @@ public struct UserNotificationsPermissionManager: NotificationPermissionManaging
             )
         } catch {
             let after = await status()
+            let namedCode = Self.errorCodeName(error)
             return NotificationPermissionRequestResult(
                 authorizerKind: "UserNotificationsPermissionManager",
                 statusBefore: before,
                 requestAuthorizationCalled: true,
                 granted: false,
                 errorDescription: error.localizedDescription,
+                errorCodeName: namedCode,
                 statusAfter: after
             )
         }
@@ -507,6 +526,45 @@ public struct UserNotificationsPermissionManager: NotificationPermissionManaging
             errorDescription: "UserNotifications is unavailable on this platform.",
             statusAfter: .unknown
         )
+        #endif
+    }
+
+    private static func errorCodeName(_ error: Error) -> String? {
+        #if canImport(UserNotifications)
+        let nsError = error as NSError
+        guard nsError.domain == UNErrorDomain,
+              let code = UNError.Code(rawValue: nsError.code)
+        else { return nil }
+        switch code {
+        case .notificationsNotAllowed:
+            return "notificationsNotAllowed"
+        case .attachmentInvalidURL:
+            return "attachmentInvalidURL"
+        case .attachmentUnrecognizedType:
+            return "attachmentUnrecognizedType"
+        case .attachmentInvalidFileSize:
+            return "attachmentInvalidFileSize"
+        case .attachmentNotInDataStore:
+            return "attachmentNotInDataStore"
+        case .attachmentMoveIntoDataStoreFailed:
+            return "attachmentMoveIntoDataStoreFailed"
+        case .attachmentCorrupt:
+            return "attachmentCorrupt"
+        case .notificationInvalidNoDate:
+            return "notificationInvalidNoDate"
+        case .notificationInvalidNoContent:
+            return "notificationInvalidNoContent"
+        case .contentProvidingObjectNotAllowed:
+            return "contentProvidingObjectNotAllowed"
+        case .contentProvidingInvalid:
+            return "contentProvidingInvalid"
+        case .badgeInputInvalid:
+            return "badgeInputInvalid"
+        @unknown default:
+            return "UNError.Code(\(nsError.code))"
+        }
+        #else
+        return nil
         #endif
     }
 }

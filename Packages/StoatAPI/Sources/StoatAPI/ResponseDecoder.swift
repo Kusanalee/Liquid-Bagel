@@ -58,8 +58,31 @@ public struct StoatResponseDecoder: Sendable {
         do {
             return try decoder.decode(type, from: data)
         } catch {
-            throw StoatAPIError.decodingFailed(error.localizedDescription)
+            throw StoatAPIError.decodingFailed(Self.describeDecodingError(error))
         }
+    }
+
+    public static func describeDecodingError(_ error: Error) -> String {
+        if let decodingError = error as? DecodingError {
+            switch decodingError {
+            case let .typeMismatch(type, context):
+                return "type mismatch for \(type) at \(codingPath(context.codingPath)): \(context.debugDescription)"
+            case let .valueNotFound(type, context):
+                return "missing value for \(type) at \(codingPath(context.codingPath)): \(context.debugDescription)"
+            case let .keyNotFound(key, context):
+                return "missing key \(key.stringValue) at \(codingPath(context.codingPath)): \(context.debugDescription)"
+            case let .dataCorrupted(context):
+                return "data corrupted at \(codingPath(context.codingPath)): \(context.debugDescription)"
+            @unknown default:
+                return decodingError.localizedDescription
+            }
+        }
+        return error.localizedDescription
+    }
+
+    private static func codingPath(_ path: [CodingKey]) -> String {
+        let value = path.map(\.stringValue).joined(separator: ".")
+        return value.isEmpty ? "$" : value
     }
 
     private func retryAfter(from data: Data) -> Int? {
@@ -75,4 +98,3 @@ public struct StoatResponseDecoder: Sendable {
         return String(data: data, encoding: .utf8)
     }
 }
-

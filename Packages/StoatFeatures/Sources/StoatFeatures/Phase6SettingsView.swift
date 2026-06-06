@@ -620,6 +620,7 @@ private struct NotificationSettingsTab: View {
                     LabeledContent("Request called", value: request.requestAuthorizationCalled ? "Yes" : "No")
                     LabeledContent("Options", value: request.requestedOptions.joined(separator: ", "))
                     LabeledContent("Completion", value: request.granted.map { $0 ? "Granted" : "Not granted" } ?? "No completion result")
+                    LabeledContent("Named error", value: request.errorCodeName ?? "-")
                     if let error = request.errorDescription {
                         Text(error)
                             .font(.caption)
@@ -631,6 +632,9 @@ private struct NotificationSettingsTab: View {
                 }
                 Button("Refresh Status") {
                     viewModel.refreshNotificationPermissionStatus()
+                }
+                Button("Open macOS Notification Settings") {
+                    viewModel.openMacOSNotificationSettings()
                 }
                 if viewModel.notificationPermissionStatus == .denied {
                     Text("Notifications are denied in macOS System Settings. Open System Settings > Notifications and allow Liquid Bagel, then refresh this status.")
@@ -696,10 +700,14 @@ private struct NotificationSettingsTab: View {
                 LabeledContent("Suppressed", value: "\(viewModel.notificationDiagnostics.suppressedCount)")
                 LabeledContent("Last suppression", value: viewModel.notificationDiagnostics.lastSuppressionReason?.rawValue ?? "-")
                 LabeledContent("Last event", value: viewModel.notificationDiagnostics.lastEventKind?.rawValue ?? "-")
+                LabeledContent("Build/signing", value: viewModel.notificationBuildSigningChecklist)
+                if let report = viewModel.notificationDiagnostics.selfTestReport {
+                    LabeledContent("Self-test", value: report)
+                }
                 HStack {
                     Button("Copy Diagnostics") { viewModel.copyRedactedNotificationDiagnostics() }
-                    Button("Test Notification") { viewModel.deliverMockNotificationDemo() }
-                        .disabled(!viewModel.notificationPermissionStatus.allowsDelivery)
+                    Button("Run Self-Test") { viewModel.runNotificationSelfTest() }
+                    Button("Reset Diagnostics") { viewModel.resetNotificationDiagnostics() }
                 }
             }
         }

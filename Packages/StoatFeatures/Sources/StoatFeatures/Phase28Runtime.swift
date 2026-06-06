@@ -1,4 +1,5 @@
 import Foundation
+import StoatAPI
 import StoatModels
 import StoatRealtime
 
@@ -330,6 +331,7 @@ public struct MemberHydrationDiagnostics: Hashable, Sendable {
     public var staleFetchDiscarded: Bool
     public var isLoading: Bool
     public var error: String?
+    public var apiDiagnostics: APIRequestDiagnostics?
     public var lastUpdatedAt: Date?
 
     public init(
@@ -344,6 +346,7 @@ public struct MemberHydrationDiagnostics: Hashable, Sendable {
         staleFetchDiscarded: Bool = false,
         isLoading: Bool = false,
         error: String? = nil,
+        apiDiagnostics: APIRequestDiagnostics? = nil,
         lastUpdatedAt: Date? = nil
     ) {
         self.source = source
@@ -357,6 +360,7 @@ public struct MemberHydrationDiagnostics: Hashable, Sendable {
         self.staleFetchDiscarded = staleFetchDiscarded
         self.isLoading = isLoading
         self.error = error
+        self.apiDiagnostics = apiDiagnostics
         self.lastUpdatedAt = lastUpdatedAt
     }
 }

@@ -416,3 +416,34 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Live reference fetching may use the verified single-message route only after explicit Live Manual connection and visible/explicit timeline need.
 - Around-message fetch may use verified `nearby` only for explicit recovery actions such as load-to-unread or load-around-target.
 - Remote search remains selected-channel only, explicit, non-persistent, and Live Manual only. Local “Find in loaded messages” remains available in mock and live loaded data without network calls.
+
+## Phase 36 Notes
+
+### Sources inspected
+
+- Generated API/schema source: https://github.com/stoatchat/javascript-client-api
+- Backend member route source: https://github.com/stoatchat/stoatchat
+- Official web status menu behavior: https://github.com/stoatchat/for-web
+
+### Member wrapper finding
+
+- Current `GET /servers/{target}/members` returns an object wrapper with `members` and `users`, not a bare member array.
+- Liquid Bagel decodes that route as `ServerMembersResponse { members: [ServerMember], users: [User] }`.
+- The live client requests `GET /servers/{target}/members?exclude_offline=false` so offline users are not intentionally filtered out by the client.
+- Member refresh diagnostics record method, route, redacted target, auth-present state, status, content type, rate-limit metadata, response byte count, top-level JSON shape, decode summary, and error category.
+- The feature layer merges returned users into the same snapshot store used by message rows, member rows, DMs, Friends, search, notifications, and profile cards.
+- Ready members are preserved on member refresh failure. Successful REST results overlay the selected server only and keep Ready members that are absent from the wrapper until live QA proves a better reconciliation rule.
+
+### Status route finding
+
+- User status editing uses `PATCH /users/{currentUserID}` with a `status` object.
+- `status.presence` values modeled by Liquid Bagel are `Online`, `Idle`, `Focus`, `Busy`, and `Invisible`.
+- UI copy displays `Busy` as `Do Not Disturb`.
+- Phase 36 only patches presence and preserves existing custom status text when present. Rich custom-status editing remains parity work.
+- The local notification classifier suppresses all notifications while Busy and suppresses non-mentions while Focus.
+
+### Notifications and App Intents
+
+- Notification self-test is an explicit settings action. It can request authorization, records before/after state, and schedules a local test only when the resulting status allows delivery.
+- Diagnostics include named `UNError.Code` values when UserNotifications reports them, plus sanitized bundle/signing/sandbox/app-path checklist data.
+- Current project inspection found no app-owned App Intents or Shortcuts implementation. `com.apple.linkd.autoShortcut` should be treated as system/Xcode noise unless future source inspection finds app-owned intent code.

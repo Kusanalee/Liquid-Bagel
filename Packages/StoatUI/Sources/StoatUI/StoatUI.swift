@@ -1033,21 +1033,23 @@ public struct AvatarView: View {
     private let subtitle: String?
     private let size: CGFloat
     private let isOnline: Bool?
+    private let presence: Presence?
     private let imageData: Data?
 
-    public init(title: String, subtitle: String? = nil, size: CGFloat = StoatSize.avatar, isOnline: Bool? = nil, imageData: Data? = nil) {
+    public init(title: String, subtitle: String? = nil, size: CGFloat = StoatSize.avatar, isOnline: Bool? = nil, presence: Presence? = nil, imageData: Data? = nil) {
         self.title = title
         self.subtitle = subtitle
         self.size = size
         self.isOnline = isOnline
+        self.presence = presence
         self.imageData = imageData
     }
 
     public var body: some View {
         ZStack(alignment: .bottomTrailing) {
             avatarContent
-            if let isOnline {
-                PresenceDot(isOnline: isOnline)
+            if presence != nil || isOnline != nil {
+                PresenceDot(presence: presence, isOnline: isOnline)
                     .offset(x: 2, y: 2)
             }
         }
@@ -1165,18 +1167,51 @@ public struct MentionBadge: View {
 }
 
 public struct PresenceDot: View {
-    private let isOnline: Bool
+    private let presence: Presence?
+    private let isOnline: Bool?
 
     public init(isOnline: Bool) {
+        self.presence = nil
+        self.isOnline = isOnline
+    }
+
+    public init(presence: Presence?, isOnline: Bool? = nil) {
+        self.presence = presence
         self.isOnline = isOnline
     }
 
     public var body: some View {
         Circle()
-            .fill(isOnline ? Color.green : Color.secondary)
+            .fill(color)
             .frame(width: 9, height: 9)
             .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 2))
-            .accessibilityLabel(isOnline ? "Online" : "Offline")
+            .accessibilityLabel(label)
+    }
+
+    private var color: Color {
+        switch presence {
+        case .online:
+            return .green
+        case .idle:
+            return .orange
+        case .focus:
+            return .blue
+        case .busy:
+            return .red
+        case .invisible:
+            return .secondary
+        case .unknown:
+            return isOnline == true ? .green : .secondary
+        case nil:
+            return isOnline == true ? .green : .secondary
+        }
+    }
+
+    private var label: String {
+        if let presence {
+            return presence.displayName
+        }
+        return isOnline == true ? "Online" : "Offline"
     }
 }
 
@@ -1319,7 +1354,7 @@ public struct MessageRow: View {
         HStack(alignment: .top, spacing: StoatSpacing.medium) {
             if showsHeader {
                 Button(action: onOpenAuthorProfile) {
-                    AvatarView(title: authorName, size: StoatSize.avatar, isOnline: author?.online, imageData: authorAvatarData)
+                    AvatarView(title: authorName, size: StoatSize.avatar, isOnline: author?.online, presence: author?.status?.presence, imageData: authorAvatarData)
                 }
                 .buttonStyle(.plain)
                 .help("Open Profile")
@@ -2351,7 +2386,7 @@ public struct MemberRow: View {
     public var body: some View {
         let name = displayName ?? user.displayName ?? user.username
         HStack(spacing: StoatSpacing.medium) {
-            AvatarView(title: name, size: StoatSize.compactAvatar, isOnline: user.online, imageData: imageData)
+            AvatarView(title: name, size: StoatSize.compactAvatar, isOnline: user.online, presence: user.status?.presence, imageData: imageData)
             VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                 Text(name)
                     .font(.callout.weight(.medium))

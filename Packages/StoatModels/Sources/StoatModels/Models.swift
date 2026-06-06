@@ -111,6 +111,36 @@ public struct UserProfile: Codable, Hashable, Sendable {
     }
 }
 
+public enum UserEditRemovedField: String, Codable, Hashable, Sendable {
+    case avatar = "Avatar"
+    case statusText = "StatusText"
+    case statusPresence = "StatusPresence"
+    case profileContent = "ProfileContent"
+    case profileBackground = "ProfileBackground"
+    case displayName = "DisplayName"
+}
+
+public struct UserEditDraft: Codable, Hashable, Sendable {
+    public var displayName: String?
+    public var avatar: String?
+    public var status: UserStatus?
+    public var remove: [UserEditRemovedField]
+
+    public init(displayName: String? = nil, avatar: String? = nil, status: UserStatus? = nil, remove: [UserEditRemovedField] = []) {
+        self.displayName = displayName
+        self.avatar = avatar
+        self.status = status
+        self.remove = remove
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case displayName = "display_name"
+        case avatar
+        case status
+        case remove
+    }
+}
+
 public enum Presence: Codable, Hashable, Sendable {
     case online
     case idle
@@ -142,6 +172,17 @@ public enum Presence: Codable, Hashable, Sendable {
         case .idle: "Idle"
         case .focus: "Focus"
         case .busy: "Busy"
+        case .invisible: "Invisible"
+        case let .unknown(value): value
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .online: "Online"
+        case .idle: "Idle"
+        case .focus: "Focus"
+        case .busy: "Do Not Disturb"
         case .invisible: "Invisible"
         case let .unknown(value): value
         }

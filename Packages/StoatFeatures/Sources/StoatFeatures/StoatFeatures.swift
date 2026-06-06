@@ -13,6 +13,10 @@ import UniformTypeIdentifiers
 import AppKit
 #endif
 
+#if canImport(UserNotifications)
+@preconcurrency import UserNotifications
+#endif
+
 public enum AppRuntimeMode: Codable, Hashable, Sendable {
     case mock
     case liveManual
@@ -490,6 +494,7 @@ public final class MainShellViewModel {
     public var userProfilesByID: [UserID: UserProfile] = [:]
     public var profileErrorsByID: [UserID: String] = [:]
     public var profileLoadingUserIDs: Set<UserID> = []
+    public var statusUpdateStatus: String?
     public var pendingRelationshipAction: PendingRelationshipAction?
     public var isJoinInvitePresented = false
     public var inviteInput = ""
@@ -854,6 +859,25 @@ public final class MainShellViewModel {
         return sessionCoordinator?.currentUser?.id ?? currentUser?.id
     }
 
+    public var currentUserForPresentation: User? {
+        if let currentUserID, let user = snapshot.usersByID[currentUserID] {
+            return user
+        }
+        return sessionCoordinator?.currentUser ?? currentUser
+    }
+
+    public var profilePresentationUser: User? {
+        guard let profileUserID else { return nil }
+        if let user = snapshot.usersByID[profileUserID] {
+            return user
+        }
+        if profileUserID == currentUser?.id {
+            return currentUser
+        }
+        let fallback = UserDisplayResolver.shortenedID(profileUserID)
+        return User(id: profileUserID, username: fallback, displayName: fallback)
+    }
+
     public var title: String {
         switch selection.space {
         case .home:
@@ -961,13 +985,13 @@ public final class MainShellViewModel {
             return "Refreshing members..."
         }
         if let error = memberHydrationErrorsByServerID[serverID] {
-            return "Member refresh failed: \(error)"
+            return "Member refresh failed due to \(memberHydrationDiagnostics.apiDiagnostics?.errorCategory ?? "refresh error"): \(error)"
         }
         if hydratedMemberServerIDs.contains(serverID) {
-            return "REST hydrated"
+            return "Members refreshed from Stoat"
         }
         if knownMemberCount(serverID: serverID) > 0 {
-            return "Ready members"
+            return "Showing Ready members"
         }
         return nil
     }
@@ -1041,13 +1065,13 @@ public final class MainShellViewModel {
 
         let task = Task { [weak self] in
             do {
-                let members = try await apiClient.fetchServerMembers(serverID: serverID)
+                let response = try await apiClient.fetchServerMembers(serverID: serverID)
                 await MainActor.run {
                     self?.finishMemberHydration(
                         serverID: serverID,
                         generation: generation,
                         requestedCount: requestedCount,
-                        returnedMembers: members,
+                        response: response,
                         reason: reason
                     )
                 }
@@ -1075,7 +1099,7 @@ public final class MainShellViewModel {
         serverID: ServerID,
         generation: Int,
         requestedCount: Int,
-        returnedMembers: [ServerMember],
+        response: ServerMembersResponse,
         reason: String
     ) {
         guard memberHydrationGenerations[serverID] == generation,
@@ -1086,11 +1110,18 @@ public final class MainShellViewModel {
         }
 
         var returnedByKey: [ServerMemberKey: ServerMember] = [:]
-        for member in returnedMembers {
+        for user in response.users {
+            upsertUser(user)
+        }
+        for member in response.members {
             returnedByKey[ServerMemberKey(member.id)] = member
         }
         let previousCount = knownMemberCount(serverID: serverID)
+        let readyByKey = snapshot.membersByServerAndUserID.filter { $0.key.serverID == serverID }
         snapshot.membersByServerAndUserID = snapshot.membersByServerAndUserID.filter { $0.key.serverID != serverID }
+        for (key, member) in readyByKey where returnedByKey[key] == nil {
+            snapshot.membersByServerAndUserID[key] = member
+        }
         for (key, member) in returnedByKey {
             snapshot.membersByServerAndUserID[key] = member
         }
@@ -1107,17 +1138,18 @@ public final class MainShellViewModel {
             source: .restHydrated,
             lastMemberFetchServerID: serverID,
             requestedCount: requestedCount,
-            returnedCount: returnedMembers.count,
+            returnedCount: response.members.count,
             mergedMemberCount: returnedByKey.count,
-            mergedUserCount: 0,
+            mergedUserCount: response.users.count,
             missingUserCount: missingUsers,
             droppedCount: dropped,
             staleFetchDiscarded: false,
             isLoading: false,
             error: nil,
+            apiDiagnostics: response.diagnostics,
             lastUpdatedAt: Date()
         )
-        placeholderStatus = "Refreshed \(returnedByKey.count) members."
+        placeholderStatus = "Refreshed \(returnedByKey.count) members and \(response.users.count) users."
         quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
         loadVisibleIdentityImagesForCurrentSelection()
         if reason == "manual refresh" {
@@ -1130,7 +1162,8 @@ public final class MainShellViewModel {
             discardStaleMemberHydration(serverID: serverID, generation: generation)
             return
         }
-        let message = error.userFacingMessage
+        let diagnosed = error as? StoatAPIDiagnosedError
+        let message = diagnosed?.apiError.errorDescription ?? error.userFacingMessage
         memberHydrationTasks[serverID] = nil
         memberHydrationLoadingServerIDs.remove(serverID)
         memberHydrationErrorsByServerID[serverID] = message
@@ -1141,6 +1174,7 @@ public final class MainShellViewModel {
             missingUserCount: missingUserCount(serverID: serverID),
             isLoading: false,
             error: message,
+            apiDiagnostics: diagnosed?.diagnostics,
             lastUpdatedAt: Date()
         )
         if forced {
@@ -1335,6 +1369,38 @@ public final class MainShellViewModel {
 
     public func closeUserProfile() {
         profileUserID = nil
+    }
+
+    public func setCurrentUserPresence(_ presence: Presence) async {
+        guard let userID = currentUserID,
+              let apiClient = apiClientForCommunityAction()
+        else {
+            statusUpdateStatus = "Reconnect before changing status."
+            placeholderStatus = statusUpdateStatus
+            return
+        }
+
+        let originalUser = currentUserForPresentation
+        let existingStatus = originalUser?.status ?? UserStatus()
+        var optimistic = originalUser ?? User(id: userID, username: UserDisplayResolver.shortenedID(userID))
+        optimistic.status = UserStatus(text: existingStatus.text, presence: presence)
+        optimistic.online = presence != .invisible
+        upsertUser(optimistic)
+        statusUpdateStatus = "Changing status to \(presence.displayName)..."
+        placeholderStatus = statusUpdateStatus
+
+        do {
+            let updated = try await apiClient.editUser(userID: userID, draft: UserEditDraft(status: UserStatus(text: existingStatus.text, presence: presence)))
+            upsertUser(updated)
+            statusUpdateStatus = "Status changed to \(presence.displayName)."
+            placeholderStatus = statusUpdateStatus
+        } catch {
+            if let originalUser {
+                upsertUser(originalUser)
+            }
+            statusUpdateStatus = "Status change failed: \(error.userFacingMessage)"
+            placeholderStatus = statusUpdateStatus
+        }
     }
 
     public func fetchUserProfileIfNeeded(_ userID: UserID) async {
@@ -4931,6 +4997,15 @@ public final class MainShellViewModel {
         staleDiscarded: \(memberHydration.staleFetchDiscarded ? "yes" : "no")
         loading: \(memberHydration.isLoading ? "yes" : "no")
         error: \(memberHydration.error ?? "-")
+        apiRoute: \(memberHydration.apiDiagnostics?.method ?? "-") \(memberHydration.apiDiagnostics?.route ?? "-")
+        apiResource: \(memberHydration.apiDiagnostics?.redactedResourceID ?? "-")
+        apiAuth: \(memberHydration.apiDiagnostics?.authHeaderPresent == true ? "present" : "missing")
+        apiStatus: \(memberHydration.apiDiagnostics?.httpStatus.map(String.init) ?? "-")
+        apiContentType: \(memberHydration.apiDiagnostics?.contentType ?? "-")
+        apiShape: \(memberHydration.apiDiagnostics?.topLevelResponseShape ?? "-")
+        apiDecoder: \(memberHydration.apiDiagnostics?.decoderSummary ?? "-")
+        apiCategory: \(memberHydration.apiDiagnostics?.errorCategory ?? "-")
+        apiRateRemaining: \(memberHydration.apiDiagnostics?.rateLimitInfo.remaining.map(String.init) ?? "-")
         """
         let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText + "\n" + send + "\n" + dmTrace)))
         #if canImport(AppKit)
@@ -5007,6 +5082,78 @@ public final class MainShellViewModel {
         }
     }
 
+    public func runNotificationSelfTest() {
+        notificationDiagnostics.selfTestReport = "Self-test started"
+        updateNotificationDiagnostics()
+        let routeChannelID = selectedConversationChannelID ?? ChannelID(rawValue: "notification-self-test")
+        Task { [weak self, manager = notificationPermissionManager, deliverer = notificationDeliverer] in
+            let before = await manager.status()
+            let request = await manager.requestAuthorization()
+            let after = await manager.status()
+            var steps = [
+                "before \(before.rawValue)",
+                "request \(request.granted == true ? "granted" : "not granted")",
+                "after \(after.rawValue)"
+            ]
+            if after.allowsDelivery {
+                let event = NotificationEvent(
+                    id: "self-test-\(UUID().uuidString)",
+                    route: NotificationRoute(channelID: routeChannelID),
+                    title: "Liquid Bagel notification self-test",
+                    body: "This local notification was scheduled by an explicit settings action.",
+                    kind: .mention
+                )
+                do {
+                    try await deliverer.deliver(event)
+                    steps.append("scheduled local test")
+                } catch {
+                    steps.append("schedule failed \(error.localizedDescription)")
+                }
+            } else {
+                steps.append("local test skipped")
+            }
+            await MainActor.run {
+                self?.notificationPermissionStatus = after
+                self?.notificationDiagnostics.lastPermissionRequest = request
+                self?.lastNotificationPermissionRequest = request.summary
+                self?.notificationDiagnostics.selfTestReport = steps.joined(separator: " -> ")
+                self?.placeholderStatus = "Notification self-test complete"
+                self?.updateNotificationDiagnostics()
+            }
+        }
+    }
+
+    public func resetNotificationDiagnostics() {
+        notificationDiagnostics = NotificationDiagnostics(permissionStatus: notificationPermissionStatus, nativeEnabled: notificationPreferences.nativeNotificationsEnabled, inAppEnabled: notificationPreferences.inAppBannersEnabled)
+        lastNotificationPermissionRequest = nil
+        notificationBanners.removeAll()
+        deliveredNotificationIDs.removeAll()
+        expiredNotificationRouteCount = 0
+        placeholderStatus = "Notification diagnostics reset"
+        updateNotificationDiagnostics()
+    }
+
+    public func openMacOSNotificationSettings() {
+        #if canImport(AppKit)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") {
+            NSWorkspace.shared.open(url)
+            placeholderStatus = "Opened macOS Notification Settings"
+        }
+        #endif
+    }
+
+    public var notificationBuildSigningChecklist: String {
+        let bundleID = Bundle.main.bundleIdentifier ?? "-"
+        let appPath = NotificationContentFormatter.sanitize(Bundle.main.bundleURL.path)
+        let sandbox = ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] == nil ? "not reported" : "reported"
+        #if canImport(UserNotifications)
+        let delegateConfigured = UNUserNotificationCenter.current().delegate == nil ? "no" : "yes"
+        #else
+        let delegateConfigured = "unavailable"
+        #endif
+        return "bundle \(bundleID), sandbox \(sandbox), app \(appPath), authorizer \(notificationAuthorizerKind), delegate \(delegateConfigured)"
+    }
+
     public func saveNotificationPreferences(_ preferences: NotificationPreferences) {
         Task { [weak self] in
             guard let self else { return }
@@ -5065,8 +5212,10 @@ public final class MainShellViewModel {
     public func copyRedactedNotificationDiagnostics() {
         let extra = """
         authorizer: \(notificationAuthorizerKind)
+        buildChecklist: \(notificationBuildSigningChecklist)
         lastPermissionRequest: \(lastNotificationPermissionRequest ?? "-")
         requestDetails: \(notificationDiagnostics.lastPermissionRequest?.summary ?? "-")
+        selfTest: \(notificationDiagnostics.selfTestReport ?? "-")
         """
         let text = Phase17MessageActions.redactedDiagnosticText(NotificationContentFormatter.sanitize(notificationDiagnostics.redactedText + "\n" + extra))
         #if canImport(AppKit)
@@ -6961,15 +7110,20 @@ public struct MainShellView: View {
         .onAppear { viewModel.validateSelection() }
         .toolbar {
             ToolbarItem(placement: .principal) {
-                HStack(spacing: StoatSpacing.small) {
-                    Text(viewModel.title)
-                        .font(.headline)
-                    connectionChip
-                }
+                Text(viewModel.title)
+                    .font(.headline)
             }
             ToolbarItemGroup {
                 Button { viewModel.perform(.openQuickSwitcher) } label: { Label("Quick Switcher", systemImage: "magnifyingglass") }
                 Button { viewModel.perform(.openAccountSettings) } label: { Label("Settings", systemImage: "gearshape") }
+            }
+        }
+        .popover(isPresented: Binding(get: { viewModel.profileUserID != nil }, set: { if !$0 { viewModel.closeUserProfile() } })) {
+            if let user = viewModel.profilePresentationUser {
+                UserProfileCardView(viewModel: viewModel, user: user)
+            } else {
+                EmptyStateView(title: "Profile unavailable", message: "User data is not present in the current snapshot.", systemImage: "person.crop.circle.badge.questionmark")
+                    .padding(StoatSpacing.large)
             }
         }
     }
@@ -7000,154 +7154,6 @@ public struct MainShellView: View {
         }
     }
 
-    private var connectionChip: some View {
-        Menu {
-            LabeledContent("Mode", value: runtimeModeText)
-            LabeledContent("Session", value: sessionStateText)
-            LabeledContent("Connection", value: connectionText)
-            LabeledContent("Health", value: Phase6UIHelpers.connectionHealthText(state: viewModel.effectiveConnectionState, diagnostics: viewModel.effectiveDiagnostics, hydration: viewModel.sessionCoordinator?.hydrationStatus ?? .empty))
-            if let latency = viewModel.effectiveDiagnostics?.lastLatencyMilliseconds {
-                LabeledContent("Latency", value: "\(latency) ms")
-            }
-            if let ready = viewModel.effectiveDiagnostics?.readyAt {
-                LabeledContent("Last Ready", value: ready.formatted(date: .omitted, time: .standard))
-            }
-            if let lastEvent = viewModel.effectiveDiagnostics?.lastReceivedEventAt {
-                LabeledContent("Last Event", value: lastEvent.formatted(date: .omitted, time: .standard))
-            }
-            if let hydration = viewModel.sessionCoordinator?.hydrationStatus {
-                LabeledContent("Hydration", value: Phase6UIHelpers.hydrationLabel(hydration))
-            }
-            if let session = viewModel.sessionCoordinator {
-                LabeledContent("Credential", value: session.hasSavedCredential ? "Saved" : "Missing")
-                LabeledContent("Environment", value: Phase6UIHelpers.environmentDisplayName(session.environment, preferences: session.preferences))
-                if let user = session.currentUser {
-                    LabeledContent("Current User", value: user.displayName ?? user.username)
-                }
-            }
-            Divider()
-            Button("Account & Sessions…") {
-                viewModel.showAccountSessions()
-            }
-            Button("Connection Settings…") {
-                viewModel.showConnectionSettings()
-            }
-            if viewModel.sessionCoordinator?.preferences.showDeveloperRuntimeControls != false {
-                Button("Developer Verification…") {
-                    viewModel.showCredentialSetup()
-                }
-            }
-            if viewModel.sessionCoordinator?.hasSavedCredential == true {
-                Button("Validate Saved Session") {
-                    Task { await viewModel.sessionCoordinator?.validateSavedSession(); viewModel.syncFromSessionCoordinator() }
-                }
-            }
-            if viewModel.sessionCoordinator?.hasSavedCredential == true {
-                Button("Retry Connection") {
-                    Task { await viewModel.connectLiveManually() }
-                }
-                .disabled(isDisconnectable)
-            }
-            Button("Reconnect") {
-                Task { await viewModel.reconnectLiveManually() }
-            }
-            .disabled(viewModel.sessionCoordinator?.hasSavedCredential != true || isConnecting)
-            Button("Refresh Selected Channel") {
-                viewModel.refreshCurrentContext()
-            }
-            Button("Disconnect") {
-                Task { await viewModel.disconnectLive() }
-            }
-            .disabled(!isDisconnectable)
-        } label: {
-            Label(connectionText, systemImage: connectionSystemImage)
-                .labelStyle(.iconOnly)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, StoatSpacing.small)
-                .padding(.vertical, StoatSpacing.xSmall)
-        .background(Color.primary.opacity(viewModel.reduceGlassIntensity ? 0.10 : 0.06), in: Capsule())
-        }
-        .menuStyle(.borderlessButton)
-        .accessibilityLabel(StoatAccessibility.runtimeLabel(
-            mode: runtimeModeText,
-            connection: connectionText,
-            health: Phase6UIHelpers.connectionHealthText(
-                state: viewModel.effectiveConnectionState,
-                diagnostics: viewModel.effectiveDiagnostics,
-                hydration: viewModel.sessionCoordinator?.hydrationStatus ?? .empty
-            )
-        ))
-        .accessibilityHint("Open runtime and connection actions")
-    }
-
-    private var connectionText: String {
-        switch viewModel.effectiveConnectionState {
-        case .idle: "Idle"
-        case .ready: "Ready"
-        case .connecting, .authenticating, .authenticated, .connected: "Connecting"
-        case .reconnecting: "Reconnecting"
-        case .disconnected: "Offline"
-        case .failed: "Failed"
-        }
-    }
-
-    private var connectionSystemImage: String {
-        switch viewModel.effectiveConnectionState {
-        case .ready:
-            return "checkmark.circle.fill"
-        case .connecting, .authenticating, .authenticated, .connected, .reconnecting:
-            return "arrow.triangle.2.circlepath"
-        case .failed:
-            return "exclamationmark.triangle.fill"
-        case .idle, .disconnected:
-            return "circle"
-        }
-    }
-
-    private var runtimeModeText: String {
-        switch viewModel.effectiveRuntimeMode {
-        case .mock: "Preview Data"
-        case .liveManual: "Live"
-        }
-    }
-
-    private var sessionStateText: String {
-        switch viewModel.effectiveSessionState {
-        case .mock: "Preview Data"
-        case .signedOut: "Signed Out"
-        case .loadingCredential: "Loading Credential"
-        case .savedCredentialUnvalidated: "Saved Credential"
-        case .validatingCredential: "Validating"
-        case .validatedReady: "Validated"
-        case .readyToConnect: "Ready"
-        case .connecting: "Connecting"
-        case .connected: "Connected"
-        case .invalidSession: "Invalid Session"
-        case .validationFailed: "Validation Failed"
-        case .connectionFailed: "Connection Failed"
-        case .keychainFailed: "Keychain Failed"
-        case .failed: "Failed"
-        }
-    }
-
-    private var isDisconnectable: Bool {
-        switch viewModel.effectiveConnectionState {
-        case .connecting, .connected, .authenticating, .authenticated, .ready, .reconnecting:
-            return true
-        case .idle, .disconnected, .failed:
-            return false
-        }
-    }
-
-    private var isConnecting: Bool {
-        switch viewModel.effectiveConnectionState {
-        case .connecting, .connected, .authenticating, .authenticated, .reconnecting:
-            return true
-        case .idle, .ready, .disconnected, .failed:
-            return false
-        }
-    }
 }
 
 private struct AttachmentPreviewSheet: View {
@@ -7689,6 +7695,12 @@ public struct CredentialSetupView: View {
             LabeledContent("Member source", value: "\(memberHydration.source.rawValue), server \(TimelineCopyFormatter.shortID(memberHydration.lastMemberFetchServerID?.rawValue))")
             LabeledContent("Member REST", value: "requested \(memberHydration.requestedCount), returned \(memberHydration.returnedCount), merged \(memberHydration.mergedMemberCount), users \(memberHydration.mergedUserCount)")
             LabeledContent("Member stale/error", value: "stale \(memberHydration.staleFetchDiscarded ? "yes" : "no"), loading \(memberHydration.isLoading ? "yes" : "no"), error \(memberHydration.error ?? "-")")
+            if let api = memberHydration.apiDiagnostics {
+                LabeledContent("Member API route", value: "\(api.method) \(api.route), auth \(api.authHeaderPresent ? "present" : "missing")")
+                LabeledContent("Member API response", value: "status \(api.httpStatus.map(String.init) ?? "-"), type \(api.contentType ?? "-"), shape \(api.topLevelResponseShape ?? "-")")
+                LabeledContent("Member API decode", value: "\(api.errorCategory ?? "ok"): \(api.decoderSummary ?? "-")")
+                LabeledContent("Member API rate limit", value: "remaining \(api.rateLimitInfo.remaining.map(String.init) ?? "-"), reset \(api.rateLimitInfo.resetAfterMilliseconds.map(String.init) ?? "-")")
+            }
             LabeledContent("Member images", value: "queue \(members.avatarLoadQueueCount)")
             LabeledContent("Emoji", value: "known \(viewModel.snapshot.emojisByID.count), picker \(viewModel.commonEmojiItems.count)")
             if let emojiDiagnostics = viewModel.emojiPickerDiagnostics {
@@ -7699,6 +7711,10 @@ public struct CredentialSetupView: View {
                 LabeledContent("Send error", value: error)
             }
             LabeledContent("Notifications", value: "\(viewModel.notificationDiagnostics.permissionStatus.rawValue), queued \(viewModel.notificationDiagnostics.queuedRouteCount)")
+            LabeledContent("Notification build", value: viewModel.notificationBuildSigningChecklist)
+            if let selfTest = viewModel.notificationDiagnostics.selfTestReport {
+                LabeledContent("Notification self-test", value: selfTest)
+            }
             LabeledContent("DM trace channel", value: "clicked \(TimelineCopyFormatter.shortID(viewModel.dmLiveTrace.clickedChannelID?.rawValue)), load \(TimelineCopyFormatter.shortID(viewModel.dmLiveTrace.messageLoadChannelID?.rawValue)), composer \(TimelineCopyFormatter.shortID(viewModel.dmLiveTrace.composerTargetChannelID?.rawValue))")
             LabeledContent("DM trace state", value: "messages \(viewModel.dmLiveTrace.timelineMessageCount), participants \(viewModel.dmLiveTrace.sidebarParticipantCount), REST \(viewModel.dmLiveTrace.messageLoadUsedREST ? "yes" : "no")")
             if let error = viewModel.dmLiveTrace.lastError {
@@ -7845,6 +7861,12 @@ public struct ServerRailView: View {
             ServerRailItem(title: "Home", systemImage: "house.fill", isSelected: viewModel.selection.space == .home) {
                 viewModel.selectHome()
             }
+            if let user = viewModel.currentUserForPresentation {
+                currentUserRailItem(user)
+                    .onAppear {
+                        viewModel.loadImageResource(for: user.avatar, kind: .userAvatar)
+                    }
+            }
             Divider().padding(.horizontal, StoatSpacing.medium)
             ScrollView {
                 LazyVStack(spacing: StoatSpacing.small) {
@@ -7874,6 +7896,66 @@ public struct ServerRailView: View {
         }
         .padding(.vertical, StoatSpacing.medium)
         .background(.regularMaterial)
+    }
+
+    private func currentUserRailItem(_ user: User) -> some View {
+        let display = UserDisplayResolver.resolved(userID: user.id, user: user)
+        return Button {
+            viewModel.showUserProfile(user.id)
+        } label: {
+            ZStack(alignment: .topTrailing) {
+                AvatarView(
+                    title: display.displayName,
+                    size: StoatSize.serverIcon,
+                    isOnline: user.online,
+                    presence: user.status?.presence,
+                    imageData: viewModel.imageData(for: display.avatarFile, kind: .userAvatar)
+                )
+                if user.status?.presence == .busy {
+                    Image(systemName: "bell.slash.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .offset(x: -1, y: -3)
+                }
+            }
+            .frame(width: StoatSize.serverIcon, height: StoatSize.serverIcon)
+        }
+        .buttonStyle(.plain)
+        .help("Profile and status")
+        .contextMenu {
+            statusMenuButton(.online)
+            statusMenuButton(.idle)
+            statusMenuButton(.focus)
+            statusMenuButton(.busy)
+            statusMenuButton(.invisible)
+        }
+        .accessibilityLabel("Profile and status, \(user.status?.presence?.displayName ?? (user.online ? "Online" : "Offline"))")
+        .accessibilityHint("Open your profile, or right click to change status")
+    }
+
+    private func statusMenuButton(_ presence: Presence) -> some View {
+        Button {
+            Task { await viewModel.setCurrentUserPresence(presence) }
+        } label: {
+            Label(presence.displayName, systemImage: statusSystemImage(presence))
+        }
+    }
+
+    private func statusSystemImage(_ presence: Presence) -> String {
+        switch presence {
+        case .online:
+            return "circle.fill"
+        case .idle:
+            return "moon.fill"
+        case .focus:
+            return "scope"
+        case .busy:
+            return "bell.slash.fill"
+        case .invisible:
+            return "circle"
+        case .unknown:
+            return "questionmark.circle"
+        }
     }
 
     private func unreadCount(for server: Server) -> Int {
@@ -9123,7 +9205,7 @@ public struct MemberPanelView: View {
             viewModel.showUserProfile(item.userID)
         } label: {
             HStack(spacing: StoatSpacing.medium) {
-                AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.isOnline, imageData: viewModel.imageData(for: item.avatar, kind: .userAvatar))
+                AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.isOnline, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: item.avatar, kind: .userAvatar))
                 VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                     HStack(spacing: StoatSpacing.xSmall) {
                         Text(item.displayName)
@@ -9148,9 +9230,6 @@ public struct MemberPanelView: View {
         .buttonStyle(.plain)
         .padding(.vertical, StoatSpacing.xxSmall)
         .contentShape(Rectangle())
-        .popover(isPresented: Binding(get: { viewModel.profileUserID == item.userID }, set: { if !$0 { viewModel.closeUserProfile() } })) {
-            UserProfileCardView(viewModel: viewModel, user: profileUser(for: item))
-        }
         .contextMenu {
             if let member = item.member {
                 Button {
@@ -9186,10 +9265,6 @@ public struct MemberPanelView: View {
                 .disabled(viewModel.memberActionDisabledReason(for: member, action: .ban) != nil)
             }
         }
-    }
-
-    private func profileUser(for item: MemberListItem) -> User {
-        item.user ?? User(id: item.userID, username: item.displayName, displayName: item.displayName)
     }
 
     private func roleForeground(_ color: ResolvedRoleColor?) -> Color {
@@ -9279,12 +9354,9 @@ public struct HomeView: View {
                     Button {
                         viewModel.showUserProfile(user.id)
                     } label: {
-                        MemberRow(user: user, subtitle: user.status?.text, imageData: viewModel.imageData(for: user.avatar, kind: .userAvatar))
+                        MemberRow(user: user, subtitle: user.status?.text ?? user.status?.presence?.displayName, imageData: viewModel.imageData(for: user.avatar, kind: .userAvatar))
                     }
                     .buttonStyle(.plain)
-                    .popover(isPresented: Binding(get: { viewModel.profileUserID == user.id }, set: { if !$0 { viewModel.closeUserProfile() } })) {
-                        UserProfileCardView(viewModel: viewModel, user: user)
-                    }
                     .onAppear { viewModel.loadImageResource(for: user.avatar, kind: .userAvatar) }
                     Spacer()
                     Label(sessionStateText, systemImage: viewModel.effectiveSessionState == .connected ? "checkmark.circle.fill" : "circle")
@@ -9637,7 +9709,7 @@ private struct DirectMessageItemButton: View {
             viewModel.selectDirectMessageItem(item)
         } label: {
             HStack(spacing: StoatSpacing.medium) {
-                AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.avatarUser?.online == true, imageData: item.avatarUser.flatMap { viewModel.imageData(for: $0.avatar, kind: .userAvatar) })
+                AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.avatarUser?.online == true, presence: item.avatarUser?.status?.presence, imageData: item.avatarUser.flatMap { viewModel.imageData(for: $0.avatar, kind: .userAvatar) })
                 VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                     Text(item.displayName)
                         .font(.callout.weight(.medium))
@@ -9684,9 +9756,6 @@ private struct FriendItemRow: View {
                 )
             }
             .buttonStyle(.plain)
-            .popover(isPresented: Binding(get: { viewModel.profileUserID == item.user.id }, set: { if !$0 { viewModel.closeUserProfile() } })) {
-                UserProfileCardView(viewModel: viewModel, user: item.user)
-            }
 
             Spacer()
 
@@ -9750,7 +9819,7 @@ private struct UserProfileCardView: View {
         VStack(alignment: .leading, spacing: StoatSpacing.large) {
             profileBackground
             HStack(alignment: .center, spacing: StoatSpacing.medium) {
-                AvatarView(title: displayName, size: StoatSize.avatar, isOnline: user.online, imageData: viewModel.imageData(for: avatarFile, kind: .userAvatar))
+                AvatarView(title: displayName, size: StoatSize.avatar, isOnline: user.online, presence: user.status?.presence, imageData: viewModel.imageData(for: avatarFile, kind: .userAvatar))
                 VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                     Text(displayName)
                         .font(.title3.weight(.semibold))
@@ -10661,7 +10730,7 @@ public struct ServerOverviewView: View {
                         LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
                             ForEach(viewModel.memberManagementItems(for: details)) { item in
                                 HStack {
-                                    AvatarView(title: item.displayName, size: 32, isOnline: item.user?.online == true, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
+                                    AvatarView(title: item.displayName, size: 32, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
                                     VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                                         Text(item.displayName)
                                         Text("\(item.username) · \(item.roles.map(\.name).joined(separator: ", ").isEmpty ? "No roles" : item.roles.map(\.name).joined(separator: ", "))")

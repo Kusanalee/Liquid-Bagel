@@ -162,6 +162,27 @@ public actor MockStoatAPIClient: StoatAPIClient {
         currentUser
     }
 
+    public func editUser(userID: UserID, draft: UserEditDraft) async throws -> User {
+        guard var user = users[userID] else {
+            throw StoatAPIError.notFound
+        }
+        if let status = draft.status {
+            user.status = status
+            user.online = status.presence != .invisible
+        }
+        if draft.remove.contains(.statusText) {
+            user.status?.text = nil
+        }
+        if draft.remove.contains(.statusPresence) {
+            user.status?.presence = nil
+        }
+        users[userID] = user
+        if currentUser.id == userID {
+            currentUser = user
+        }
+        return user
+    }
+
     public func fetchUserProfile(userID: UserID) async throws -> UserProfile {
         guard let user = users[userID] else {
             throw StoatAPIError.notFound
@@ -566,13 +587,15 @@ public actor MockStoatAPIClient: StoatAPIClient {
         servers[serverIndex].roles.removeValue(forKey: roleID)
     }
 
-    public func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember] {
+    public func fetchServerMembers(serverID: ServerID) async throws -> ServerMembersResponse {
         guard servers.contains(where: { $0.id == serverID }) else {
             throw StoatAPIError.notFound
         }
-        return members.values
+        let sortedMembers = members.values
             .filter { $0.id.serverID == serverID }
             .sorted { $0.id.userID.rawValue < $1.id.userID.rawValue }
+        let memberUsers = sortedMembers.compactMap { users[$0.id.userID] }
+        return ServerMembersResponse(members: sortedMembers, users: memberUsers)
     }
 
     public func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember {

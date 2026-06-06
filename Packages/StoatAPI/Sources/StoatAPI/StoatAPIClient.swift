@@ -4,6 +4,7 @@ import StoatModels
 public protocol StoatAPIClient: Sendable {
     func fetchRootConfiguration() async throws -> StoatConfig
     func fetchCurrentUser() async throws -> User
+    func editUser(userID: UserID, draft: UserEditDraft) async throws -> User
     func fetchUserProfile(userID: UserID) async throws -> UserProfile
     func fetchServers() async throws -> [Server]
     func fetchChannels() async throws -> [Channel]
@@ -47,7 +48,7 @@ public protocol StoatAPIClient: Sendable {
     func createRole(serverID: ServerID, draft: RoleCreateDraft) async throws -> RoleCreateResponse
     func editRole(serverID: ServerID, roleID: RoleID, draft: RoleEditDraft) async throws -> Role
     func deleteRole(serverID: ServerID, roleID: RoleID) async throws
-    func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember]
+    func fetchServerMembers(serverID: ServerID) async throws -> ServerMembersResponse
     func editMember(serverID: ServerID, userID: UserID, draft: MemberEditDraft) async throws -> ServerMember
     func kickMember(serverID: ServerID, userID: UserID) async throws
     func banMember(serverID: ServerID, userID: UserID, draft: BanCreateDraft) async throws -> ServerBan
@@ -77,6 +78,10 @@ public extension StoatAPIClient {
 
     func fetchUserProfile(userID: UserID) async throws -> UserProfile {
         throw StoatAPIError.unimplementedEndpoint("User profile fetch is not implemented by this API client.")
+    }
+
+    func editUser(userID: UserID, draft: UserEditDraft) async throws -> User {
+        throw StoatAPIError.unimplementedEndpoint("User editing is not implemented by this API client.")
     }
 
     func fetchDirectMessages() async throws -> [Channel] {
@@ -187,7 +192,7 @@ public extension StoatAPIClient {
         throw StoatAPIError.unimplementedEndpoint("Role deletion is not implemented by this API client.")
     }
 
-    func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember] {
+    func fetchServerMembers(serverID: ServerID) async throws -> ServerMembersResponse {
         throw StoatAPIError.unimplementedEndpoint("Server member refresh is not implemented by this API client.")
     }
 
@@ -269,6 +274,16 @@ public actor LiveStoatAPIClient: StoatAPIClient {
 
     public func fetchCurrentUser() async throws -> User {
         try await perform(StoatRequest<User>(method: .get, path: "/users/@me"))
+    }
+
+    public func editUser(userID: UserID, draft: UserEditDraft) async throws -> User {
+        try await perform(
+            StoatRequest<User>(
+                method: .patch,
+                path: "/users/\(userID.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(draft))
+            )
+        )
     }
 
     public func fetchUserProfile(userID: UserID) async throws -> UserProfile {
@@ -609,12 +624,14 @@ public actor LiveStoatAPIClient: StoatAPIClient {
         )
     }
 
-    public func fetchServerMembers(serverID: ServerID) async throws -> [ServerMember] {
-        try await perform(
-            StoatRequest<[ServerMember]>(
+    public func fetchServerMembers(serverID: ServerID) async throws -> ServerMembersResponse {
+        try await performServerMembersRequest(
+            StoatRequest<ServerMembersResponse>(
                 method: .get,
-                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/members"
-            )
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/members",
+                queryItems: [URLQueryItem(name: "exclude_offline", value: "false")]
+            ),
+            serverID: serverID
         )
     }
 
@@ -737,6 +754,59 @@ public actor LiveStoatAPIClient: StoatAPIClient {
         let urlRequest = try requestBuilder.build(request, credential: credential)
         let httpResponse = try await transport.data(for: urlRequest)
         return try responseDecoder.decode(Response.self, from: httpResponse)
+    }
+
+    private func performServerMembersRequest(_ request: StoatRequest<ServerMembersResponse>, serverID: ServerID) async throws -> ServerMembersResponse {
+        let credential = request.requiresAuthentication ? try await credentialProvider.credential() : nil
+        let urlRequest = try requestBuilder.build(request, credential: credential)
+        var diagnostics = APIRequestDiagnostics(
+            method: request.method.rawValue,
+            route: request.path,
+            redactedResourceID: Self.redactedID(serverID.rawValue),
+            authHeaderPresent: Self.hasStoatAuthHeader(urlRequest)
+        )
+        do {
+            let httpResponse = try await transport.data(for: urlRequest)
+            diagnostics.httpStatus = httpResponse.statusCode
+            diagnostics.contentType = Self.header("Content-Type", in: httpResponse.headers)
+            diagnostics.topLevelResponseShape = APIResponseShapeSummarizer.summarize(httpResponse.data)
+            diagnostics.rateLimitInfo = httpResponse.rateLimitInfo
+            diagnostics.responseByteCount = httpResponse.data.count
+            do {
+                var response = try responseDecoder.decode(ServerMembersResponse.self, from: httpResponse)
+                diagnostics.decoderSummary = "decoded members/users wrapper"
+                diagnostics.errorCategory = nil
+                response.diagnostics = diagnostics
+                return response
+            } catch let error as StoatAPIError {
+                diagnostics.decoderSummary = error.errorDescription
+                diagnostics.errorCategory = error.diagnosticCategory
+                throw StoatAPIDiagnosedError(apiError: error, diagnostics: diagnostics)
+            }
+        } catch let error as StoatAPIDiagnosedError {
+            throw error
+        } catch let error as StoatAPIError {
+            diagnostics.decoderSummary = error.errorDescription
+            diagnostics.errorCategory = error.diagnosticCategory
+            throw StoatAPIDiagnosedError(apiError: error, diagnostics: diagnostics)
+        }
+    }
+
+    private static func header(_ name: String, in headers: [String: String]) -> String? {
+        headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+    }
+
+    private static func hasStoatAuthHeader(_ request: URLRequest) -> Bool {
+        let headers = request.allHTTPHeaderFields ?? [:]
+        return headers.keys.contains { key in
+            key.caseInsensitiveCompare("X-Session-Token") == .orderedSame ||
+            key.caseInsensitiveCompare("X-Bot-Token") == .orderedSame
+        }
+    }
+
+    private static func redactedID(_ id: String) -> String {
+        guard id.count > 10 else { return id }
+        return "\(id.prefix(4))...\(id.suffix(4))"
     }
 }
 
