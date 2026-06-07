@@ -28,23 +28,25 @@ public enum UserDisplayResolver {
         resolved(userID: fallbackID ?? user?.id ?? member?.id.userID, user: user, member: member).displayName
     }
 
-    public static func resolved(userID: UserID?, user: User?, member: ServerMember? = nil) -> ResolvedUserDisplay {
+    public static func resolved(userID: UserID?, user: User?, member: ServerMember? = nil, server: Server? = nil, highContrast: Bool = false) -> ResolvedUserDisplay {
         let resolvedUserID = userID ?? user?.id ?? member?.id.userID ?? UserID(rawValue: "unknown")
+        let roleColor = RoleColorResolver.resolve(member: member, server: server, highContrast: highContrast)
+        let roleColorDiagnostics = RoleColorResolver.diagnostics(member: member, server: server, resolved: roleColor, highContrast: highContrast)
         if let nickname = trimmed(member?.nickname) {
-            return ResolvedUserDisplay(userID: resolvedUserID, displayName: nickname, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: nickname), isFallback: false, source: .memberNickname, isBot: user?.bot != nil)
+            return ResolvedUserDisplay(userID: resolvedUserID, displayName: nickname, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: nickname), isFallback: false, source: .memberNickname, isBot: user?.bot != nil, roleColor: roleColor, roleColorDiagnostics: roleColorDiagnostics, serverContextID: server?.id)
         }
         if let displayName = trimmed(user?.displayName) {
-            return ResolvedUserDisplay(userID: resolvedUserID, displayName: displayName, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: displayName), isFallback: false, source: .userDisplayName, isBot: user?.bot != nil)
+            return ResolvedUserDisplay(userID: resolvedUserID, displayName: displayName, subtitle: usernameLine(user: user, fallbackID: resolvedUserID), avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: displayName), isFallback: false, source: .userDisplayName, isBot: user?.bot != nil, roleColor: roleColor, roleColorDiagnostics: roleColorDiagnostics, serverContextID: server?.id)
         }
         if let username = trimmed(user?.username) {
             let source: Source = user?.bot == nil ? .username : .botName
-            return ResolvedUserDisplay(userID: resolvedUserID, displayName: username, subtitle: "@\(username)", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: username), isFallback: false, source: source, isBot: user?.bot != nil)
+            return ResolvedUserDisplay(userID: resolvedUserID, displayName: username, subtitle: "@\(username)", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: username), isFallback: false, source: source, isBot: user?.bot != nil, roleColor: roleColor, roleColorDiagnostics: roleColorDiagnostics, serverContextID: server?.id)
         }
         if let userID {
             let shortened = shortenedID(userID)
-            return ResolvedUserDisplay(userID: userID, displayName: shortened, subtitle: "Unknown user \(shortened)", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: shortened), isFallback: true, source: .shortenedID)
+            return ResolvedUserDisplay(userID: userID, displayName: shortened, subtitle: "Unknown user \(shortened)", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: initials(for: shortened), isFallback: true, source: .shortenedID, roleColor: roleColor, roleColorDiagnostics: roleColorDiagnostics, serverContextID: server?.id)
         }
-        return ResolvedUserDisplay(userID: resolvedUserID, displayName: "Unknown", subtitle: "Unknown user", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: "?", isFallback: true, source: .unknown)
+        return ResolvedUserDisplay(userID: resolvedUserID, displayName: "Unknown", subtitle: "Unknown user", avatarFile: member?.avatar ?? user?.avatar, fallbackInitials: "?", isFallback: true, source: .unknown, roleColor: roleColor, roleColorDiagnostics: roleColorDiagnostics, serverContextID: server?.id)
     }
 
     public static func usernameLine(user: User?, fallbackID: UserID? = nil) -> String {
@@ -93,6 +95,9 @@ public struct ResolvedUserDisplay: Hashable, Sendable {
     public var isFallback: Bool
     public var source: ResolvedUserDisplaySource
     public var isBot: Bool
+    public var roleColor: ResolvedRoleColor?
+    public var roleColorDiagnostics: RoleColorDiagnostics?
+    public var serverContextID: ServerID?
 
     public init(
         userID: UserID,
@@ -102,7 +107,10 @@ public struct ResolvedUserDisplay: Hashable, Sendable {
         fallbackInitials: String,
         isFallback: Bool,
         source: ResolvedUserDisplaySource,
-        isBot: Bool = false
+        isBot: Bool = false,
+        roleColor: ResolvedRoleColor? = nil,
+        roleColorDiagnostics: RoleColorDiagnostics? = nil,
+        serverContextID: ServerID? = nil
     ) {
         self.userID = userID
         self.displayName = displayName
@@ -112,6 +120,61 @@ public struct ResolvedUserDisplay: Hashable, Sendable {
         self.isFallback = isFallback
         self.source = source
         self.isBot = isBot
+        self.roleColor = roleColor
+        self.roleColorDiagnostics = roleColorDiagnostics
+        self.serverContextID = serverContextID
+    }
+}
+
+public struct RoleColorDiagnostics: Hashable, Sendable {
+    public var serverContextID: ServerID?
+    public var sourceRoleID: RoleID?
+    public var rejectedRoleIDs: [RoleID]
+    public var fallbackReason: String?
+
+    public init(serverContextID: ServerID? = nil, sourceRoleID: RoleID? = nil, rejectedRoleIDs: [RoleID] = [], fallbackReason: String? = nil) {
+        self.serverContextID = serverContextID
+        self.sourceRoleID = sourceRoleID
+        self.rejectedRoleIDs = rejectedRoleIDs
+        self.fallbackReason = fallbackReason
+    }
+}
+
+public struct RoleSortDiagnostics: Hashable, Sendable {
+    public var sortMode: String
+    public var groupOrder: [String]
+    public var memberCountByGroupID: [String: Int]
+    public var duplicateSuppressionCount: Int
+    public var unknownRoleCount: Int
+    public var cacheHit: Bool
+    public var durationMilliseconds: Int
+
+    public init(
+        sortMode: String = "rank-desc",
+        groupOrder: [String] = [],
+        memberCountByGroupID: [String: Int] = [:],
+        duplicateSuppressionCount: Int = 0,
+        unknownRoleCount: Int = 0,
+        cacheHit: Bool = false,
+        durationMilliseconds: Int = 0
+    ) {
+        self.sortMode = sortMode
+        self.groupOrder = groupOrder
+        self.memberCountByGroupID = memberCountByGroupID
+        self.duplicateSuppressionCount = duplicateSuppressionCount
+        self.unknownRoleCount = unknownRoleCount
+        self.cacheHit = cacheHit
+        self.durationMilliseconds = durationMilliseconds
+    }
+}
+
+public struct MemberListDerivationResult: Hashable, Sendable {
+    public var groups: [MemberListGroup]
+    public var diagnostics: RoleSortDiagnostics
+
+    public init(groups: [MemberListGroup], diagnostics: RoleSortDiagnostics) {
+        self.groups = groups
+        self.diagnostics = diagnostics
     }
 }
 
@@ -166,21 +229,54 @@ public enum RoleColorResolver {
         guard let member, let server else { return nil }
         return member.roles
             .compactMap { server.roles[$0] }
-            .sorted(by: rolePriority)
+            .sorted(by: nativeRolePriority)
             .compactMap { role in
                 ResolvedRoleColor(rawValue: role.colour, highContrast: highContrast, sourceRoleID: role.id)
             }
             .first
     }
 
-    public static func sortedRoles(member: ServerMember?, server: Server?) -> [Role] {
-        guard let member, let server else { return [] }
-        return member.roles.compactMap { server.roles[$0] }.sorted(by: rolePriority)
+    public static func diagnostics(member: ServerMember?, server: Server?, resolved: ResolvedRoleColor?, highContrast: Bool = false) -> RoleColorDiagnostics? {
+        guard let member else {
+            return RoleColorDiagnostics(fallbackReason: "missing member")
+        }
+        guard let server else {
+            return RoleColorDiagnostics(fallbackReason: "missing server context")
+        }
+        if highContrast {
+            return RoleColorDiagnostics(serverContextID: server.id, fallbackReason: "high contrast")
+        }
+        let rejected = member.roles.compactMap { roleID -> RoleID? in
+            guard let role = server.roles[roleID] else { return roleID }
+            return ResolvedRoleColor(rawValue: role.colour, sourceRoleID: role.id) == nil && role.colour != nil ? role.id : nil
+        }
+        return RoleColorDiagnostics(serverContextID: server.id, sourceRoleID: resolved?.sourceRoleID, rejectedRoleIDs: rejected, fallbackReason: resolved == nil ? "no colored role" : nil)
     }
 
-    private static func rolePriority(_ lhs: Role, _ rhs: Role) -> Bool {
+    public static func sortedRoles(member: ServerMember?, server: Server?) -> [Role] {
+        guard let member, let server else { return [] }
+        return member.roles.compactMap { server.roles[$0] }.sorted(by: nativeRolePriority)
+    }
+
+    public static func nativeRolePriority(_ lhs: Role, _ rhs: Role) -> Bool {
         if lhs.rank != rhs.rank { return lhs.rank > rhs.rank }
+        let lhsAdmin = isAdministrative(role: lhs)
+        let rhsAdmin = isAdministrative(role: rhs)
+        if lhsAdmin != rhsAdmin { return lhsAdmin && !rhsAdmin }
         return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+    }
+
+    public static func isAdministrative(role: Role) -> Bool {
+        let lowered = role.name.lowercased()
+        if lowered.contains("admin") || lowered.contains("manager") || lowered.contains("moderator") || lowered.contains("mod") {
+            return true
+        }
+        return role.permissions.allow.contains(.manageServer)
+            || role.permissions.allow.contains(.manageRole)
+            || role.permissions.allow.contains(.managePermissions)
+            || role.permissions.allow.contains(.kickMembers)
+            || role.permissions.allow.contains(.banMembers)
+            || role.permissions.allow.contains(.timeoutMembers)
     }
 }
 
@@ -217,9 +313,10 @@ public struct MemberListItem: Hashable, Sendable, Identifiable {
     public var roleIDs: [RoleID]
     public var primaryRole: Role?
     public var roleColor: ResolvedRoleColor?
+    public var roleColorDiagnostics: RoleColorDiagnostics?
 
     public init(userID: UserID, user: User?, member: ServerMember?, server: Server? = nil) {
-        let display = UserDisplayResolver.resolved(userID: userID, user: user, member: member)
+        let display = UserDisplayResolver.resolved(userID: userID, user: user, member: member, server: server)
         self.userID = userID
         self.user = user
         self.member = member
@@ -232,7 +329,8 @@ public struct MemberListItem: Hashable, Sendable, Identifiable {
         self.roleIDs = member?.roles ?? []
         let roles = RoleColorResolver.sortedRoles(member: member, server: server)
         self.primaryRole = roles.first
-        self.roleColor = RoleColorResolver.resolve(member: member, server: server)
+        self.roleColor = display.roleColor
+        self.roleColorDiagnostics = display.roleColorDiagnostics
     }
 }
 
@@ -430,7 +528,19 @@ public enum MemberListDeriver {
         query: String = "",
         includeRoleGroups: Bool = true
     ) -> [MemberListGroup] {
-        guard let server else { return [] }
+        result(server: server, snapshot: snapshot, query: query, includeRoleGroups: includeRoleGroups).groups
+    }
+
+    public static func result(
+        server: Server?,
+        snapshot: RealtimeSnapshot,
+        query: String = "",
+        includeRoleGroups: Bool = true
+    ) -> MemberListDerivationResult {
+        let started = Date()
+        guard let server else {
+            return MemberListDerivationResult(groups: [], diagnostics: RoleSortDiagnostics(sortMode: "no-server", durationMilliseconds: Int(Date().timeIntervalSince(started) * 1000)))
+        }
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let members = snapshot.membersByServerAndUserID.values
             .filter { $0.id.serverID == server.id }
@@ -446,23 +556,33 @@ public enum MemberListDeriver {
 
         let sorted = members.sorted(by: memberSort)
         guard includeRoleGroups else {
-            return fallbackGroups(items: sorted)
+            let groups = fallbackGroups(items: sorted)
+            return MemberListDerivationResult(groups: groups, diagnostics: diagnostics(for: groups, started: started))
         }
 
         let orderedRoles = server.roles.values
-            .sorted { lhs, rhs in
-                if lhs.rank != rhs.rank { return lhs.rank > rhs.rank }
-                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-            }
+            .sorted(by: RoleColorResolver.nativeRolePriority)
         var used: Set<UserID> = []
         var groups: [MemberListGroup] = []
+        var duplicateSuppressionCount = 0
+        var unknownRoleIDs = Set<RoleID>()
+        let ownerItems = sorted.filter { item in
+            item.userID == server.ownerID
+        }
+        if !ownerItems.isEmpty {
+            used.formUnion(ownerItems.map(\.userID))
+            groups.append(MemberListGroup(id: "owner", title: "Owner - \(ownerItems.count)", items: ownerItems))
+        }
 
-        for role in orderedRoles where role.hoist {
+        for role in orderedRoles {
             let items = sorted.filter { item in
                 guard let member = item.member else { return false }
-                return member.roles.contains(role.id)
+                guard !used.contains(item.userID), member.roles.contains(role.id) else { return false }
+                let highestRole = RoleColorResolver.sortedRoles(member: member, server: server).first
+                return highestRole?.id == role.id
             }
             guard !items.isEmpty else { continue }
+            duplicateSuppressionCount += items.filter { used.contains($0.userID) }.count
             used.formUnion(items.map(\.userID))
             groups.append(MemberListGroup(id: "role-\(role.id.rawValue)", title: "\(role.name) - \(items.count)", items: items))
         }
@@ -474,8 +594,13 @@ public enum MemberListDeriver {
         }
 
         let remaining = sorted.filter { !used.contains($0.userID) }
+        for item in sorted {
+            for roleID in item.roleIDs where server.roles[roleID] == nil {
+                unknownRoleIDs.insert(roleID)
+            }
+        }
         groups.append(contentsOf: fallbackGroups(items: remaining))
-        return groups
+        return MemberListDerivationResult(groups: groups, diagnostics: diagnostics(for: groups, started: started, duplicateSuppressionCount: duplicateSuppressionCount, unknownRoleCount: unknownRoleIDs.count))
     }
 
     private static func fallbackGroups(items: [MemberListItem]) -> [MemberListGroup] {
@@ -500,6 +625,21 @@ public enum MemberListDeriver {
         let compared = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
         if compared != .orderedSame { return compared == .orderedAscending }
         return lhs.userID.rawValue < rhs.userID.rawValue
+    }
+
+    private static func diagnostics(
+        for groups: [MemberListGroup],
+        started: Date,
+        duplicateSuppressionCount: Int = 0,
+        unknownRoleCount: Int = 0
+    ) -> RoleSortDiagnostics {
+        RoleSortDiagnostics(
+            groupOrder: groups.map(\.id),
+            memberCountByGroupID: Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0.items.count) }),
+            duplicateSuppressionCount: duplicateSuppressionCount,
+            unknownRoleCount: unknownRoleCount,
+            durationMilliseconds: Int(Date().timeIntervalSince(started) * 1000)
+        )
     }
 }
 
@@ -531,6 +671,179 @@ public struct TimelinePerformanceDiagnostics: Hashable, Sendable {
         self.avatarLoadQueueCount = avatarLoadQueueCount
         self.visibleRangeUpdateCount = visibleRangeUpdateCount
         self.lastSlowOperation = lastSlowOperation
+    }
+}
+
+public struct VisibleIdentityDiagnostics: Hashable, Sendable {
+    public var unresolvedVisibleUserCount: Int
+    public var shortenedVisibleIDCount: Int
+    public var avatarFailureCacheCount: Int
+    public var profileFetchMergeCount: Int
+    public var memberWrapperUserMergeCount: Int
+
+    public init(
+        unresolvedVisibleUserCount: Int = 0,
+        shortenedVisibleIDCount: Int = 0,
+        avatarFailureCacheCount: Int = 0,
+        profileFetchMergeCount: Int = 0,
+        memberWrapperUserMergeCount: Int = 0
+    ) {
+        self.unresolvedVisibleUserCount = unresolvedVisibleUserCount
+        self.shortenedVisibleIDCount = shortenedVisibleIDCount
+        self.avatarFailureCacheCount = avatarFailureCacheCount
+        self.profileFetchMergeCount = profileFetchMergeCount
+        self.memberWrapperUserMergeCount = memberWrapperUserMergeCount
+    }
+}
+
+public struct FreezePerformanceDiagnostics: Hashable, Sendable {
+    public var lastMainThreadMarker: String?
+    public var timelineRenderPassCount: Int
+    public var memberGroupingCount: Int
+    public var memberGroupingCacheHitCount: Int
+    public var markdownParseCount: Int
+    public var markdownCacheHitCount: Int
+    public var imageActiveCount: Int
+    public var imageQueuedCount: Int
+    public var imageCompletedCount: Int
+    public var imageFailedCount: Int
+    public var avatarActiveQueuedFailed: String
+    public var customEmojiActiveQueued: String
+    public var profileMediaActiveQueued: String
+    public var visibleRangeUpdateCount: Int
+    public var diagnosticsPublishCount: Int
+    public var lastStateLoopSuspicion: String?
+    public var mediaSafeModeEnabled: Bool
+
+    public init(
+        lastMainThreadMarker: String? = nil,
+        timelineRenderPassCount: Int = 0,
+        memberGroupingCount: Int = 0,
+        memberGroupingCacheHitCount: Int = 0,
+        markdownParseCount: Int = 0,
+        markdownCacheHitCount: Int = 0,
+        imageActiveCount: Int = 0,
+        imageQueuedCount: Int = 0,
+        imageCompletedCount: Int = 0,
+        imageFailedCount: Int = 0,
+        avatarActiveQueuedFailed: String = "0/0/0",
+        customEmojiActiveQueued: String = "0/0",
+        profileMediaActiveQueued: String = "0/0",
+        visibleRangeUpdateCount: Int = 0,
+        diagnosticsPublishCount: Int = 0,
+        lastStateLoopSuspicion: String? = nil,
+        mediaSafeModeEnabled: Bool = false
+    ) {
+        self.lastMainThreadMarker = lastMainThreadMarker
+        self.timelineRenderPassCount = timelineRenderPassCount
+        self.memberGroupingCount = memberGroupingCount
+        self.memberGroupingCacheHitCount = memberGroupingCacheHitCount
+        self.markdownParseCount = markdownParseCount
+        self.markdownCacheHitCount = markdownCacheHitCount
+        self.imageActiveCount = imageActiveCount
+        self.imageQueuedCount = imageQueuedCount
+        self.imageCompletedCount = imageCompletedCount
+        self.imageFailedCount = imageFailedCount
+        self.avatarActiveQueuedFailed = avatarActiveQueuedFailed
+        self.customEmojiActiveQueued = customEmojiActiveQueued
+        self.profileMediaActiveQueued = profileMediaActiveQueued
+        self.visibleRangeUpdateCount = visibleRangeUpdateCount
+        self.diagnosticsPublishCount = diagnosticsPublishCount
+        self.lastStateLoopSuspicion = lastStateLoopSuspicion
+        self.mediaSafeModeEnabled = mediaSafeModeEnabled
+    }
+}
+
+public struct NotificationBuildReadinessDiagnostics: Hashable, Sendable {
+    public var bundleIdentifier: String
+    public var bundleDisplayName: String
+    public var appPath: String
+    public var codeSigningAllowed: String
+    public var detectedSignatureStatus: String
+    public var sandboxStatus: String
+    public var delegateConfigured: Bool
+    public var lastUNErrorName: String?
+    public var lastBeforeStatus: String?
+    public var lastAfterStatus: String?
+    public var systemSettingsCheck: String
+    public var testingSignedBuild: Bool
+
+    public init(
+        bundleIdentifier: String = "-",
+        bundleDisplayName: String = "-",
+        appPath: String = "-",
+        codeSigningAllowed: String = "unknown",
+        detectedSignatureStatus: String = "unknown",
+        sandboxStatus: String = "unknown",
+        delegateConfigured: Bool = false,
+        lastUNErrorName: String? = nil,
+        lastBeforeStatus: String? = nil,
+        lastAfterStatus: String? = nil,
+        systemSettingsCheck: String = "Check System Settings > Notifications manually.",
+        testingSignedBuild: Bool = false
+    ) {
+        self.bundleIdentifier = bundleIdentifier
+        self.bundleDisplayName = bundleDisplayName
+        self.appPath = appPath
+        self.codeSigningAllowed = codeSigningAllowed
+        self.detectedSignatureStatus = detectedSignatureStatus
+        self.sandboxStatus = sandboxStatus
+        self.delegateConfigured = delegateConfigured
+        self.lastUNErrorName = lastUNErrorName
+        self.lastBeforeStatus = lastBeforeStatus
+        self.lastAfterStatus = lastAfterStatus
+        self.systemSettingsCheck = systemSettingsCheck
+        self.testingSignedBuild = testingSignedBuild
+    }
+
+    public var summary: String {
+        "bundle \(bundleIdentifier), signed \(detectedSignatureStatus), signingAllowed \(codeSigningAllowed), sandbox \(sandboxStatus), delegate \(delegateConfigured ? "yes" : "no")"
+    }
+}
+
+public enum ProfileOpenSource: String, Hashable, Sendable {
+    case messageAvatar
+    case messageName
+    case memberRow
+    case directMessageParticipant
+    case friendRow
+    case currentUser
+    case systemEventActor
+    case mention
+    case unknown
+}
+
+public struct ProfilePresentationContext: Hashable, Sendable {
+    public var userID: UserID
+    public var serverID: ServerID?
+    public var openSource: ProfileOpenSource
+    public var display: ResolvedUserDisplay
+    public var relationship: RelationshipStatus
+    public var roles: [Role]
+    public var mutualGroups: [String]
+    public var mutualServers: [String]
+    public var botOwnerID: UserID?
+
+    public init(
+        userID: UserID,
+        serverID: ServerID? = nil,
+        openSource: ProfileOpenSource = .unknown,
+        display: ResolvedUserDisplay,
+        relationship: RelationshipStatus = .none,
+        roles: [Role] = [],
+        mutualGroups: [String] = [],
+        mutualServers: [String] = [],
+        botOwnerID: UserID? = nil
+    ) {
+        self.userID = userID
+        self.serverID = serverID
+        self.openSource = openSource
+        self.display = display
+        self.relationship = relationship
+        self.roles = roles
+        self.mutualGroups = mutualGroups
+        self.mutualServers = mutualServers
+        self.botOwnerID = botOwnerID
     }
 }
 

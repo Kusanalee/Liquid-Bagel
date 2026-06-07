@@ -35,10 +35,10 @@ public struct MemberManagementItem: Hashable, Sendable, Identifiable {
     public init(member: ServerMember, user: User?, server: Server) {
         self.member = member
         self.user = user
-        let display = UserDisplayResolver.resolved(userID: member.id.userID, user: user, member: member)
+        let display = UserDisplayResolver.resolved(userID: member.id.userID, user: user, member: member, server: server)
         self.displayName = display.displayName
         self.username = display.subtitle ?? UserDisplayResolver.usernameLine(user: user, fallbackID: member.id.userID)
-        self.roles = member.roles.compactMap { server.roles[$0] }.sorted { $0.rank < $1.rank }
+        self.roles = member.roles.compactMap { server.roles[$0] }.sorted(by: RoleColorResolver.nativeRolePriority)
         self.highestRank = Phase25PermissionResolver.highestRank(for: member, in: server)
         if let timeout = member.timeout, timeout > Date() {
             self.timeoutSummary = "Timed out until \(timeout.formatted(date: .abbreviated, time: .shortened))"

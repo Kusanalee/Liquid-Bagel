@@ -1912,7 +1912,7 @@ public struct MarkdownMessageContent: View {
 
     public init(_ source: String) {
         self.source = source
-        self.parsedBlocks = MarkdownBlock.parse(source)
+        self.parsedBlocks = MarkdownBlockCache.shared.blocks(for: source)
     }
 
     public var body: some View {
@@ -1962,6 +1962,57 @@ public struct MarkdownMessageContent: View {
     private func attributed(_ value: String) -> AttributedString {
         let sanitized = value.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
         return (try? AttributedString(markdown: sanitized, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(sanitized)
+    }
+}
+
+public struct MarkdownCacheDiagnostics: Hashable, Sendable {
+    public var cacheCount: Int
+    public var parseCount: Int
+    public var cacheHitCount: Int
+}
+
+private final class MarkdownBlockCache: @unchecked Sendable {
+    static let shared = MarkdownBlockCache()
+    private let lock = NSLock()
+    private var blocksBySource: [String: [MarkdownBlock]] = [:]
+    private var order: [String] = []
+    private(set) var parseCount = 0
+    private(set) var cacheHitCount = 0
+    private let maxEntries = 400
+
+    func blocks(for source: String) -> [MarkdownBlock] {
+        lock.lock()
+        if let cached = blocksBySource[source] {
+            cacheHitCount += 1
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let parsed = MarkdownBlock.parse(source)
+
+        lock.lock()
+        parseCount += 1
+        blocksBySource[source] = parsed
+        order.append(source)
+        while order.count > maxEntries, let oldest = order.first {
+            order.removeFirst()
+            blocksBySource.removeValue(forKey: oldest)
+        }
+        lock.unlock()
+        return parsed
+    }
+
+    func diagnostics() -> MarkdownCacheDiagnostics {
+        lock.lock()
+        defer { lock.unlock() }
+        return MarkdownCacheDiagnostics(cacheCount: blocksBySource.count, parseCount: parseCount, cacheHitCount: cacheHitCount)
+    }
+}
+
+extension MarkdownMessageContent {
+    public static func cacheDiagnostics() -> MarkdownCacheDiagnostics {
+        MarkdownBlockCache.shared.diagnostics()
     }
 }
 

@@ -690,6 +690,7 @@ private struct NotificationSettingsTab: View {
             }
 
             Section("Diagnostics") {
+                let readiness = viewModel.notificationBuildReadinessDiagnostics
                 LabeledContent("Lifecycle", value: viewModel.notificationDiagnostics.lifecyclePhase.rawValue)
                 LabeledContent("Active channel visible", value: viewModel.notificationDiagnostics.activeChannelVisible ? "Yes" : "No")
                 LabeledContent("Dock badge", value: "\(viewModel.notificationDiagnostics.dockBadgeValue)")
@@ -700,7 +701,19 @@ private struct NotificationSettingsTab: View {
                 LabeledContent("Suppressed", value: "\(viewModel.notificationDiagnostics.suppressedCount)")
                 LabeledContent("Last suppression", value: viewModel.notificationDiagnostics.lastSuppressionReason?.rawValue ?? "-")
                 LabeledContent("Last event", value: viewModel.notificationDiagnostics.lastEventKind?.rawValue ?? "-")
-                LabeledContent("Build/signing", value: viewModel.notificationBuildSigningChecklist)
+                LabeledContent("Bundle ID", value: readiness.bundleIdentifier)
+                LabeledContent("Bundle name", value: readiness.bundleDisplayName)
+                LabeledContent("App path", value: readiness.appPath)
+                LabeledContent("Signing allowed", value: readiness.codeSigningAllowed)
+                LabeledContent("Signature", value: readiness.detectedSignatureStatus)
+                LabeledContent("Sandbox", value: readiness.sandboxStatus)
+                LabeledContent("Delegate", value: readiness.delegateConfigured ? "Configured" : "Missing")
+                LabeledContent("Last UNError", value: readiness.lastUNErrorName ?? "-")
+                LabeledContent("Before/after", value: "\(readiness.lastBeforeStatus ?? "-") -> \(readiness.lastAfterStatus ?? "-")")
+                Toggle("I am testing a signed build", isOn: $viewModel.testingSignedNotificationBuild)
+                Text(readiness.systemSettingsCheck)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 if let report = viewModel.notificationDiagnostics.selfTestReport {
                     LabeledContent("Self-test", value: report)
                 }

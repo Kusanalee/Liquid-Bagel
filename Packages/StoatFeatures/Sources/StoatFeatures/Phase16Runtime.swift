@@ -587,6 +587,10 @@ public struct ImageResourceDiagnostics: Hashable, Sendable {
     public var cacheEntryCount: Int
     public var cacheByteCount: Int
     public var lastAction: String?
+    public var activeCountByKind: [ImageResourceKind: Int]
+    public var queuedCountByKind: [ImageResourceKind: Int]
+    public var failedCountByKind: [ImageResourceKind: Int]
+    public var mediaSafeModeEnabled: Bool
 
     public init(
         loadedCount: Int = 0,
@@ -595,7 +599,11 @@ public struct ImageResourceDiagnostics: Hashable, Sendable {
         queuedTaskCount: Int = 0,
         cacheEntryCount: Int = 0,
         cacheByteCount: Int = 0,
-        lastAction: String? = nil
+        lastAction: String? = nil,
+        activeCountByKind: [ImageResourceKind: Int] = [:],
+        queuedCountByKind: [ImageResourceKind: Int] = [:],
+        failedCountByKind: [ImageResourceKind: Int] = [:],
+        mediaSafeModeEnabled: Bool = false
     ) {
         self.loadedCount = loadedCount
         self.failedCount = failedCount
@@ -604,6 +612,10 @@ public struct ImageResourceDiagnostics: Hashable, Sendable {
         self.cacheEntryCount = cacheEntryCount
         self.cacheByteCount = cacheByteCount
         self.lastAction = lastAction.map(AttachmentDiagnosticsFormatter.redact)
+        self.activeCountByKind = activeCountByKind
+        self.queuedCountByKind = queuedCountByKind
+        self.failedCountByKind = failedCountByKind
+        self.mediaSafeModeEnabled = mediaSafeModeEnabled
     }
 }
 

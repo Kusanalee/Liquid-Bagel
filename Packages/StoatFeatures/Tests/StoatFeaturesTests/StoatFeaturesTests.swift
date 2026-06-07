@@ -3841,6 +3841,117 @@ final class StoatFeaturesTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testPhase37MemberOrderingHighestRoleColorAndDMIsolation() throws {
+        let serverID: ServerID = "phase37-server"
+        let channelID: ChannelID = "phase37-channel"
+        let adminID: RoleID = "phase37-admin"
+        let managerID: RoleID = "phase37-manager"
+        let ordinaryID: RoleID = "phase37-ordinary"
+        let userAdmin: UserID = "phase37-user-admin"
+        let userManager: UserID = "phase37-user-manager"
+        let userOrdinary: UserID = "phase37-user-ordinary"
+        let userBot: UserID = "phase37-user-bot"
+        let userUnknown: UserID = "phase37-user-unknown"
+        var server = Server(id: serverID, ownerID: "phase37-owner", name: "Phase 37")
+        server.roles = [
+            adminID: Role(id: adminID, name: "Admins", permissions: PermissionOverride(allow: [.manageServer]), colour: "#FF3366", rank: 0),
+            managerID: Role(id: managerID, name: "Managers", permissions: PermissionOverride(allow: [.manageRole]), colour: "#3366FF", rank: 20),
+            ordinaryID: Role(id: ordinaryID, name: "Members", permissions: PermissionOverride(), colour: "#00AA44", rank: 1)
+        ]
+        var snapshot = RealtimeSnapshot()
+        snapshot.serversByID[serverID] = server
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        snapshot.usersByID[userAdmin] = User(id: userAdmin, username: "admin", displayName: "Admin", online: true)
+        snapshot.usersByID[userManager] = User(id: userManager, username: "manager", displayName: "Manager", online: true)
+        snapshot.usersByID[userOrdinary] = User(id: userOrdinary, username: "ordinary", displayName: "Ordinary", online: true)
+        snapshot.usersByID[userBot] = User(id: userBot, username: "bot", displayName: "Bot", bot: BotInformation(ownerID: userAdmin), online: true)
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userAdmin)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userAdmin), joinedAt: Date(), roles: [adminID, ordinaryID])
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userManager)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userManager), joinedAt: Date(), roles: [managerID, ordinaryID])
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userOrdinary)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userOrdinary), joinedAt: Date(), roles: [ordinaryID])
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userBot)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userBot), joinedAt: Date(), roles: [])
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userUnknown)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userUnknown), joinedAt: Date(), roles: ["phase37-missing-role"])
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot)
+
+        let groups = model.memberListGroups(for: serverID)
+        XCTAssertEqual(groups.map(\.id).prefix(3), ["role-\(managerID.rawValue)", "role-\(ordinaryID.rawValue)", "bots"])
+        XCTAssertEqual(groups.first?.items.map(\.userID), [userManager])
+        XCTAssertEqual(groups.flatMap(\.items).filter { $0.userID == userAdmin }.count, 1)
+        XCTAssertEqual(model.memberRoleSortDiagnostics.unknownRoleCount, 1)
+
+        let managerDisplay = model.resolvedUserDisplay(for: snapshot.usersByID[userManager], member: snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userManager)], fallbackID: userManager, serverID: serverID)
+        XCTAssertEqual(managerDisplay.roleColor?.sourceRoleID, managerID)
+        let dmDisplay = model.resolvedUserDisplay(for: snapshot.usersByID[userManager], member: nil, fallbackID: userManager)
+        XCTAssertNil(dmDisplay.roleColor)
+    }
+
+    @MainActor
+    func testPhase37ProfileContextNotificationReadinessAndTopBarTitle() async throws {
+        let serverID: ServerID = "phase37-profile-server"
+        let userID: UserID = "phase37-profile-user"
+        let ownerID: UserID = "phase37-owner"
+        let roleID: RoleID = "phase37-role"
+        var server = Server(id: serverID, ownerID: ownerID, name: "Profile Server")
+        server.roles = [roleID: Role(id: roleID, name: "Staff", permissions: PermissionOverride(allow: [.manageServer]), colour: "#AA00AA", rank: 5)]
+        var snapshot = RealtimeSnapshot()
+        snapshot.serversByID[serverID] = server
+        snapshot.usersByID[ownerID] = User(id: ownerID, username: "owner", displayName: "Owner")
+        snapshot.usersByID[userID] = User(id: userID, username: "helper", displayName: "Helper", status: UserStatus(text: "Testing", presence: .focus), bot: BotInformation(ownerID: ownerID))
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date(), roles: [roleID])
+        let api = RecordingAPIClient(currentUser: snapshot.usersByID[ownerID]!, profilesByUserID: [userID: UserProfile(content: "**hello**")])
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, communityAPIClient: api)
+
+        model.showUserProfile(userID, source: .memberRow, serverID: serverID)
+        try await Task.sleep(for: .milliseconds(30))
+
+        let context = try XCTUnwrap(model.profilePresentationContext)
+        XCTAssertEqual(context.serverID, serverID)
+        XCTAssertEqual(context.openSource, .memberRow)
+        XCTAssertEqual(context.display.roleColor?.sourceRoleID, roleID)
+        XCTAssertEqual(context.botOwnerID, ownerID)
+        XCTAssertEqual(context.roles.map(\.id), [roleID])
+        let fetchCount = await api.fetchUserProfileCallCount
+        XCTAssertEqual(fetchCount, 1)
+        XCTAssertEqual(model.userProfilesByID[userID]?.content, "**hello**")
+        XCTAssertFalse(model.title.contains("checkmark"))
+        XCTAssertTrue(model.notificationBuildReadinessDiagnostics.codeSigningAllowed.contains("NO"))
+        XCTAssertEqual(model.notificationBuildReadinessDiagnostics.bundleIdentifier.isEmpty, false)
+    }
+
+    @MainActor
+    func testPhase37IdentityFreezeMarkdownAndImageSafeModeDiagnostics() async throws {
+        let serverID: ServerID = "phase37-freeze-server"
+        let channelID: ChannelID = "phase37-freeze-channel"
+        let userID: UserID = "01JPHASE37MISSING0000000001"
+        var snapshot = RealtimeSnapshot()
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: userID, name: "Freeze")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date())
+        snapshot.messagesByChannelID[channelID] = [Message(id: "01J00000000000000000370001", channelID: channelID, authorID: userID, content: "hello **markdown**")]
+        let loader = SlowImageResourceLoader(delayNanoseconds: 500_000_000)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, imageResourceLoader: loader)
+
+        _ = model.memberListGroups(for: serverID)
+        _ = model.memberListGroups(for: serverID)
+        model.updateTimelineVisibility(messageID: "01J00000000000000000370001", channelID: channelID, isVisible: true)
+        _ = MarkdownMessageContent("hello **markdown**")
+        _ = MarkdownMessageContent("hello **markdown**")
+        for index in 0..<24 {
+            let file = File(id: FileID(rawValue: "phase37-image-\(index)"), tag: "attachments", filename: "\(index).png", contentType: "image/png", size: 1)
+            model.loadImageResource(for: file, kind: .attachmentPreview)
+        }
+        try await Task.sleep(for: .milliseconds(25))
+
+        model.copyVisibleIdentityDiagnostics()
+        XCTAssertGreaterThanOrEqual(model.freezePerformanceDiagnostics.memberGroupingCacheHitCount, 1)
+        XCTAssertGreaterThanOrEqual(model.visibleIdentityDiagnostics.unresolvedVisibleUserCount, 1)
+        XCTAssertGreaterThanOrEqual(model.freezePerformanceDiagnostics.markdownCacheHitCount, 1)
+        XCTAssertTrue(model.freezePerformanceDiagnostics.mediaSafeModeEnabled)
+        let diagnostics = await model.imageResourceDiagnostics()
+        XCTAssertTrue(diagnostics.mediaSafeModeEnabled)
+        XCTAssertGreaterThan(diagnostics.queuedTaskCount, 0)
+    }
+
     private func ulid(milliseconds: UInt64) -> String {
         let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
         var value = milliseconds
