@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import StoatDesignSystem
 import StoatModels
 import SwiftUI
@@ -7,6 +8,20 @@ import UniformTypeIdentifiers
 #if canImport(AppKit)
 import AppKit
 #endif
+
+private enum StoatUILayoutDiagnostics {
+    private static let logger = Logger(subsystem: "LiquidBagel", category: "Layout")
+
+    static func body(_ name: StaticString, detail: String = "") {
+        #if DEBUG
+        if detail.isEmpty {
+            logger.debug("\(name) body")
+        } else {
+            logger.debug("\(name) body: \(detail)")
+        }
+        #endif
+    }
+}
 
 public struct StoatUISnapshot: Equatable, Sendable {
     public var currentUser: User?
@@ -921,9 +936,11 @@ private struct ComposerTextView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSTextView.scrollableTextView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         guard let textView = scrollView.documentView as? NSTextView else {
             return scrollView
@@ -936,9 +953,20 @@ private struct ComposerTextView: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.heightTracksTextView = false
+        textView.minSize = NSSize(width: 0, height: ComposerTextSizing.compactHeight)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.string = text
         return scrollView
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
+        let width = proposal.width ?? nsView.bounds.width
+        let height = proposal.height ?? ComposerTextSizing.height(for: text)
+        return CGSize(
+            width: max(1, width),
+            height: min(ComposerTextSizing.maximumHeight, max(ComposerTextSizing.compactHeight, height))
+        )
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
@@ -1046,6 +1074,7 @@ public struct AvatarView: View {
     }
 
     public var body: some View {
+        let _ = StoatUILayoutDiagnostics.body("AvatarView", detail: "size=\(size)")
         ZStack(alignment: .bottomTrailing) {
             avatarContent
             if presence != nil || isOnline != nil {
@@ -1344,6 +1373,7 @@ public struct MessageRow: View {
     }
 
     public var body: some View {
+        let _ = StoatUILayoutDiagnostics.body("MessageRow", detail: "id=\(message.id.rawValue)")
         let searchStyle = SearchHighlightStyle(
             isHighlighted: isSearchHighlighted,
             isCurrent: isCurrentSearchResult,
@@ -2435,6 +2465,7 @@ public struct MemberRow: View {
     }
 
     public var body: some View {
+        let _ = StoatUILayoutDiagnostics.body("MemberRow", detail: "id=\(user.id.rawValue)")
         let name = displayName ?? user.displayName ?? user.username
         HStack(spacing: StoatSpacing.medium) {
             AvatarView(title: name, size: StoatSize.compactAvatar, isOnline: user.online, presence: user.status?.presence, imageData: imageData)

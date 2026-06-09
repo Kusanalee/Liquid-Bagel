@@ -4296,3 +4296,371 @@ private struct StubSessionValidator: SessionValidating {
         return ValidatedSession(credential: credential, currentUser: user, environment: environment)
     }
 }
+
+// MARK: - Phase 38 Tests
+
+final class Phase38StartupStateTests: XCTestCase {
+
+    @MainActor
+    func testStartupStateIsNoCredentialWhenSignedOut() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        let appModel = LiquidBagelAppModel(coordinator: coordinator)
+        XCTAssertEqual(appModel.startupState, .noCredential)
+    }
+
+    @MainActor
+    func testStartupStateIsReadyForMockMode() async {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        await coordinator.startMockSession()
+        let appModel = LiquidBagelAppModel(coordinator: coordinator)
+        XCTAssertEqual(appModel.startupState, .ready)
+    }
+
+    @MainActor
+    func testStartupStateIsConnectingLiveWhenConnecting() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.connecting])
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+        let appModel = LiquidBagelAppModel(coordinator: coordinator)
+        await coordinator.validateSavedSession()
+        XCTAssertEqual(coordinator.sessionState, .readyToConnect)
+        XCTAssertEqual(appModel.startupState, .connectingLive)
+    }
+
+    @MainActor
+    func testStartupStateIsReadyAfterConnected() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.connecting, .ready])
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+        let appModel = LiquidBagelAppModel(coordinator: coordinator)
+        await coordinator.connectLiveManually()
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(coordinator.sessionState, .connected)
+        XCTAssertEqual(appModel.startupState, .ready)
+    }
+
+    @MainActor
+    func testStartupStateIsSavedCredentialFailedOnInvalidSession() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(error: SessionValidationError.invalidOrExpired),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        let appModel = LiquidBagelAppModel(coordinator: coordinator)
+        await coordinator.validateSavedSession()
+        if case .savedCredentialFailed = appModel.startupState {
+        } else {
+            XCTFail("Expected savedCredentialFailed, got \(appModel.startupState)")
+        }
+    }
+
+    @MainActor
+    func testForgetSessionReturnsToNoCredential() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        let appModel = LiquidBagelAppModel(coordinator: coordinator)
+        await coordinator.validateSavedSession()
+        await coordinator.forgetLocalSession()
+        XCTAssertEqual(appModel.startupState, .noCredential)
+        XCTAssertFalse(coordinator.hasSavedCredential)
+    }
+
+    @MainActor
+    func testNoShellSnapshotBeforeReady() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        let appModel = LiquidBagelAppModel(coordinator: coordinator)
+        XCTAssertEqual(appModel.startupState, .noCredential)
+        XCTAssertTrue(appModel.shell.snapshot.serversByID.isEmpty)
+    }
+}
+
+final class Phase38LoginDiagnosticsTests: XCTestCase {
+
+    @MainActor
+    func testLoginFlowStateStartsIdle() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        XCTAssertEqual(coordinator.loginFlowState, .idle)
+    }
+
+    @MainActor
+    func testLoginDiagnosticsStartEmpty() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        XCTAssertEqual(coordinator.loginDiagnostics.attemptCount, 0)
+        XCTAssertNil(coordinator.loginDiagnostics.lastAttemptAt)
+        XCTAssertNil(coordinator.loginDiagnostics.lastErrorCategory)
+    }
+
+    @MainActor
+    func testAutoConnectAttemptCountStartsZero() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        XCTAssertEqual(coordinator.autoConnectAttemptCount, 0)
+    }
+
+    @MainActor
+    func testAutoConnectAttemptCountIncrementsOnStartup() async {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        await coordinator.startLiveFirstSession()
+        XCTAssertGreaterThanOrEqual(coordinator.autoConnectAttemptCount, 1)
+    }
+
+    @MainActor
+    func testLoginDiagnosticsRedactedSummaryContainsAttemptCount() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        var diag = LoginDiagnostics()
+        diag.attemptCount = 3
+        diag.lastErrorCategory = .networkError
+        XCTAssertTrue(diag.redactedSummary.contains("attempts: 3"))
+        XCTAssertTrue(diag.redactedSummary.contains("network_error"))
+    }
+
+    @MainActor
+    func testLoginDiagnosticsDoesNotContainCredentials() {
+        var diag = LoginDiagnostics()
+        diag.attemptCount = 1
+        diag.lastErrorCategory = .unknown("Bad token abc123")
+        let summary = diag.redactedSummary
+        XCTAssertFalse(summary.contains("abc123"), "Summary must not contain raw error text that could include token values")
+    }
+
+    @MainActor
+    func testForgetSessionResetsLoginDiagnostics() async {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(error: SessionValidationError.invalidOrExpired),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        await coordinator.validateSavedSession()
+        await coordinator.validateImportedToken("badtoken")
+        XCTAssertGreaterThan(coordinator.loginDiagnostics.attemptCount, 0)
+        await coordinator.forgetLocalSession()
+        XCTAssertEqual(coordinator.loginDiagnostics.attemptCount, 0)
+        XCTAssertEqual(coordinator.loginFlowState, .idle)
+    }
+}
+
+final class Phase38FirstRunLoginViewModelTests: XCTestCase {
+
+    @MainActor
+    func testDefaultStateHasEmptyFields() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        let vm = FirstRunLoginViewModel(coordinator: coordinator)
+        XCTAssertEqual(vm.email, "")
+        XCTAssertEqual(vm.password, "")
+        XCTAssertFalse(vm.isAdvancedExpanded)
+        XCTAssertNil(vm.loginError)
+    }
+
+    @MainActor
+    func testCanSubmitLoginRequiresNonEmptyEmailAndPassword() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        let vm = FirstRunLoginViewModel(coordinator: coordinator)
+        XCTAssertFalse(vm.canSubmitLogin)
+        vm.email = "test@example.com"
+        XCTAssertFalse(vm.canSubmitLogin)
+        vm.password = "secret"
+        XCTAssertTrue(vm.canSubmitLogin)
+    }
+
+    @MainActor
+    func testCanSubmitTokenRequiresNonEmptyToken() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        let vm = FirstRunLoginViewModel(coordinator: coordinator)
+        XCTAssertFalse(vm.canSubmitToken)
+        vm.manualToken = "tok_test"
+        XCTAssertTrue(vm.canSubmitToken)
+    }
+
+    @MainActor
+    func testClearFormResetsAllFields() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        let vm = FirstRunLoginViewModel(coordinator: coordinator)
+        vm.email = "a@b.com"
+        vm.password = "pass"
+        vm.manualToken = "tok"
+        vm.tokenLabel = "label"
+        vm.clearForm()
+        XCTAssertEqual(vm.email, "")
+        XCTAssertEqual(vm.password, "")
+        XCTAssertEqual(vm.manualToken, "")
+        XCTAssertEqual(vm.tokenLabel, "")
+    }
+
+    @MainActor
+    func testMFAChallengeForwardedFromCoordinator() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        let vm = FirstRunLoginViewModel(coordinator: coordinator)
+        XCTAssertNil(vm.mfaChallenge)
+        XCTAssertNotEqual(vm.flowState, .mfaRequired)
+    }
+
+    @MainActor
+    func testIsLoadingWhenSubmitting() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        let vm = FirstRunLoginViewModel(coordinator: coordinator)
+        XCTAssertFalse(vm.isLoading)
+        XCTAssertEqual(vm.flowState, .idle)
+    }
+}
+
+final class Phase38AuthFlowTests: XCTestCase {
+
+    @MainActor
+    func testLoginWithInvalidCredentialsShowsError() async {
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            sessionValidator: StubSessionValidator(error: SessionValidationError.invalidOrExpired),
+            apiClientFactory: { _, _ in
+                StubLoginAPIClient(response: .success(SessionLoginSuccess(
+                    id: "sess1",
+                    userID: "user1",
+                    token: "tok",
+                    name: "Test",
+                    lastSeen: Date()
+                )))
+            },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        await coordinator.login(email: "a@b.com", password: "wrong")
+        XCTAssertEqual(coordinator.loginFlowState, .idle)
+        XCTAssertEqual(coordinator.loginDiagnostics.lastErrorCategory, .invalidCredentials)
+        XCTAssertEqual(coordinator.loginDiagnostics.attemptCount, 1)
+        XCTAssertNotNil(coordinator.loginDiagnostics.lastAttemptAt)
+    }
+
+    @MainActor
+    func testTokenImportSuccessUpdatesFlowState() async {
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        await coordinator.validateImportedToken("validtoken", localLabel: "Dev")
+        XCTAssertEqual(coordinator.loginFlowState, .succeeded)
+        XCTAssertNotNil(coordinator.pendingValidatedSession)
+    }
+
+    @MainActor
+    func testTokenImportFailureDoesNotSaveCredential() async {
+        let store = InMemoryTokenStore()
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(error: SessionValidationError.invalidOrExpired),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        await coordinator.validateImportedToken("badtoken")
+        XCTAssertEqual(coordinator.loginFlowState, .idle)
+        XCTAssertNil(coordinator.pendingValidatedSession)
+        let saved = try? await store.loadCredential()
+        XCTAssertNil(saved)
+    }
+
+    @MainActor
+    func testFinishValidatedSessionAndConnectSavesToKeychain() async throws {
+        let store = InMemoryTokenStore()
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        await coordinator.validateImportedToken("validtoken")
+        XCTAssertNotNil(coordinator.pendingValidatedSession)
+        await coordinator.finishValidatedSessionAndConnect()
+        let saved = try await store.loadCredential()
+        XCTAssertNotNil(saved)
+    }
+
+    @MainActor
+    func testFinishValidatedSessionAndConnectDoesNothingWithNoPending() async throws {
+        let store = InMemoryTokenStore()
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        await coordinator.finishValidatedSessionAndConnect()
+        XCTAssertEqual(coordinator.sessionState, .signedOut)
+        let saved = try? await store.loadCredential()
+        XCTAssertNil(saved)
+    }
+
+    @MainActor
+    func testNetworkErrorCategorizedCorrectly() async {
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            sessionValidator: StubSessionValidator(error: SessionValidationError.networkUnavailable("timeout")),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        await coordinator.validateImportedToken("anytoken")
+        XCTAssertEqual(coordinator.loginDiagnostics.lastErrorCategory, .networkError)
+    }
+
+    @MainActor
+    func testRateLimitCategorizedCorrectly() async {
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            sessionValidator: StubSessionValidator(error: SessionValidationError.rateLimited(retryAfterMilliseconds: 5000)),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient() }
+        )
+        await coordinator.validateImportedToken("anytoken")
+        XCTAssertEqual(coordinator.loginDiagnostics.lastErrorCategory, .rateLimited)
+    }
+}
+
+// MARK: - Phase 38 Support Types
+
+private actor StubLoginAPIClient: StoatAPIClient {
+    let loginResponse: SessionLoginResponse
+
+    init(response: SessionLoginResponse) {
+        self.loginResponse = response
+    }
+
+    // Required protocol methods without default implementations
+    func fetchRootConfiguration() async throws -> StoatConfig { throw StoatAPIError.unimplementedEndpoint("stub") }
+    func fetchCurrentUser() async throws -> User { User(id: "user1", username: "test") }
+    func fetchServers() async throws -> [Server] { [] }
+    func fetchChannels() async throws -> [Channel] { [] }
+    func fetchChannel(id: ChannelID) async throws -> Channel { throw StoatAPIError.unimplementedEndpoint("stub") }
+    func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message] { [] }
+    func sendMessage(channelID: ChannelID, draft: MessageDraft) async throws -> Message { throw StoatAPIError.unimplementedEndpoint("stub") }
+    func editMessage(channelID: ChannelID, messageID: MessageID, draft: MessageEditDraft) async throws -> Message { throw StoatAPIError.unimplementedEndpoint("stub") }
+    func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {}
+    func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String, removeAll: Bool) async throws {}
+    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile { throw StoatAPIError.unimplementedEndpoint("stub") }
+
+    func login(request: SessionLoginRequest) async throws -> SessionLoginResponse { loginResponse }
+    func continueLogin(request: SessionMFALoginRequest) async throws -> SessionLoginResponse { loginResponse }
+}

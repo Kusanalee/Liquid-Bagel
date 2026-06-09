@@ -1,36 +1,18 @@
 import StoatFeatures
-import StoatRealtime
 import SwiftUI
 
 struct RootScene: Scene {
+    @State private var appModel = LiquidBagelAppModel()
+
     var body: some Scene {
         WindowGroup("Liquid Bagel") {
-            LiquidBagelRootView()
+            LiquidBagelRootView(appModel: appModel)
                 .frame(minWidth: 960, minHeight: 640)
         }
         .defaultSize(width: 1280, height: 820)
 
         Settings {
-            CurrentSettingsSceneView()
+            AccountConnectionSettingsView(viewModel: appModel.shell)
         }
-    }
-}
-
-private struct CurrentSettingsSceneView: View {
-    @State private var sessionCoordinator = AppSessionCoordinator()
-    @State private var viewModel = MainShellViewModel(
-        snapshot: RealtimeSnapshot(),
-        runtimeMode: .liveManual,
-        sessionState: .signedOut,
-        currentUser: nil
-    )
-
-    var body: some View {
-        AccountConnectionSettingsView(viewModel: viewModel)
-            .task {
-                viewModel.attachSessionCoordinator(sessionCoordinator)
-                await sessionCoordinator.startLiveFirstSession()
-                viewModel.syncFromSessionCoordinator()
-            }
     }
 }

@@ -32,6 +32,78 @@ public struct LoginMFAChallenge: Hashable, Sendable {
     }
 }
 
+public enum LoginFlowState: Hashable, Sendable {
+    case idle
+    case submitting
+    case mfaRequired
+    case succeeded
+}
+
+public enum LoginErrorDisplay: Hashable, Sendable {
+    case invalidCredentials
+    case accountDisabled
+    case mfaFailed
+    case rateLimited
+    case networkError
+    case serverError
+    case keychainError
+    case environmentError
+    case unknown(String)
+
+    public var localizedDescription: String {
+        switch self {
+        case .invalidCredentials: "Invalid email or password."
+        case .accountDisabled: "This account is disabled or unavailable."
+        case .mfaFailed: "Multi-factor authentication failed."
+        case .rateLimited: "Too many attempts. Please wait a moment and try again."
+        case .networkError: "Network unavailable. Check your connection and try again."
+        case .serverError: "The server is unavailable. Try again later."
+        case .keychainError: "Could not save your session. Check Keychain access."
+        case .environmentError: "The selected environment is invalid."
+        case let .unknown(message): message
+        }
+    }
+}
+
+public struct LoginDiagnostics: Hashable, Sendable {
+    public var lastAttemptAt: Date?
+    public var attemptCount: Int
+    public var lastErrorCategory: LoginErrorDisplay?
+
+    public init() {
+        lastAttemptAt = nil
+        attemptCount = 0
+        lastErrorCategory = nil
+    }
+
+    public var redactedSummary: String {
+        var parts: [String] = []
+        parts.append("attempts: \(attemptCount)")
+        if let lastAttemptAt {
+            let formatter = ISO8601DateFormatter()
+            parts.append("last: \(formatter.string(from: lastAttemptAt))")
+        }
+        if let lastErrorCategory {
+            parts.append("last error: \(loginErrorCategoryName(lastErrorCategory))")
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
+private func loginErrorCategoryName(_ error: LoginErrorDisplay) -> String {
+    switch error {
+    case .invalidCredentials: "invalid_credentials"
+    case .accountDisabled: "account_disabled"
+    case .mfaFailed: "mfa_failed"
+    case .rateLimited: "rate_limited"
+    case .networkError: "network_error"
+    case .serverError: "server_error"
+    case .keychainError: "keychain_error"
+    case .environmentError: "environment_error"
+    case .unknown: "unknown"
+    }
+}
+
 public struct LiveVerificationState: Equatable, Sendable {
     public var credentialLoaded = false
     public var currentUserFetched = false
@@ -1235,6 +1307,9 @@ public final class AppSessionCoordinator {
     public private(set) var verificationState: LiveVerificationState
     public private(set) var hydrationStatus: LiveHydrationStatus
     public private(set) var liveConnectionGeneration: Int
+    public private(set) var loginFlowState: LoginFlowState
+    public private(set) var loginDiagnostics: LoginDiagnostics
+    public private(set) var autoConnectAttemptCount: Int
 
     @ObservationIgnored public private(set) var snapshotSource: any ShellSnapshotSource
     @ObservationIgnored public private(set) var apiClient: (any StoatAPIClient)?
@@ -1300,6 +1375,9 @@ public final class AppSessionCoordinator {
         self.verificationState = LiveVerificationState()
         self.hydrationStatus = .empty
         self.liveConnectionGeneration = 0
+        self.loginFlowState = .idle
+        self.loginDiagnostics = LoginDiagnostics()
+        self.autoConnectAttemptCount = 0
         self.snapshotSource = MockShellSnapshotSource(snapshot: RealtimeSnapshot())
         self.messageActionHandler = UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
     }
@@ -1337,6 +1415,7 @@ public final class AppSessionCoordinator {
             sessionState = .signedOut
             return
         }
+        autoConnectAttemptCount += 1
         await connectLive(source: .startupAuto)
     }
 
@@ -1500,9 +1579,12 @@ public final class AppSessionCoordinator {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         mode = .liveManual
         sessionState = .validatingCredential
+        loginFlowState = .submitting
         lastErrorMessage = nil
         pendingValidatedSession = nil
         mfaChallenge = nil
+        loginDiagnostics.attemptCount += 1
+        loginDiagnostics.lastAttemptAt = Date()
         do {
             let session = try await sessionValidator.validate(credential: .sessionToken(trimmed), environment: environment)
             pendingValidatedSession = session
@@ -1510,12 +1592,15 @@ public final class AppSessionCoordinator {
             localSessionLabel = localLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
             verificationState.currentUserFetched = true
             sessionState = .validatedReady
+            loginFlowState = .succeeded
         } catch {
             let message = error.userFacingMessage
             pendingValidatedSession = nil
             currentUser = nil
             sessionState = sessionFailureState(for: error, fallback: message)
             lastErrorMessage = message
+            loginDiagnostics.lastErrorCategory = loginErrorCategory(for: error)
+            loginFlowState = .idle
         }
     }
 
@@ -1541,6 +1626,13 @@ public final class AppSessionCoordinator {
             sessionState = .keychainFailed(message)
             lastErrorMessage = message
         }
+    }
+
+    public func finishValidatedSessionAndConnect() async {
+        guard pendingValidatedSession != nil else { return }
+        await savePendingValidatedSession()
+        guard case .readyToConnect = sessionState else { return }
+        await connectLive(source: .userInitiated)
     }
 
     public func validateSavedSession() async {
@@ -1592,9 +1684,12 @@ public final class AppSessionCoordinator {
     public func login(email: String, password: String, friendlyName: String = "Liquid Bagel macOS") async {
         mode = .liveManual
         sessionState = .validatingCredential
+        loginFlowState = .submitting
         lastErrorMessage = nil
         mfaChallenge = nil
         pendingValidatedSession = nil
+        loginDiagnostics.attemptCount += 1
+        loginDiagnostics.lastAttemptAt = Date()
         let client = apiClientFactory(environment, StaticCredentialProvider(nil))
         do {
             let response = try await client.login(request: SessionLoginRequest(email: email, password: password, friendlyName: friendlyName))
@@ -1603,6 +1698,9 @@ public final class AppSessionCoordinator {
             let message = "Login failed: \(error.userFacingMessage)"
             sessionState = .validationFailed(message)
             lastErrorMessage = message
+            let category = loginErrorCategory(for: error)
+            loginDiagnostics.lastErrorCategory = category
+            loginFlowState = .idle
         }
     }
 
@@ -1614,7 +1712,10 @@ public final class AppSessionCoordinator {
             return
         }
         sessionState = .validatingCredential
+        loginFlowState = .submitting
         lastErrorMessage = nil
+        loginDiagnostics.attemptCount += 1
+        loginDiagnostics.lastAttemptAt = Date()
         let client = apiClientFactory(environment, StaticCredentialProvider(nil))
         do {
             let response = try await client.continueLogin(
@@ -1625,6 +1726,8 @@ public final class AppSessionCoordinator {
             let message = "MFA login failed: \(error.userFacingMessage)"
             sessionState = .validationFailed(message)
             lastErrorMessage = message
+            loginDiagnostics.lastErrorCategory = .mfaFailed
+            loginFlowState = .mfaRequired
         }
     }
 
@@ -1640,19 +1743,25 @@ public final class AppSessionCoordinator {
                 currentUser = session.currentUser
                 verificationState.currentUserFetched = true
                 sessionState = .validatedReady
+                loginFlowState = .succeeded
             } catch {
                 let message = "Login succeeded, but validation failed: \(error.userFacingMessage)"
                 sessionState = sessionFailureState(for: error, fallback: message)
                 lastErrorMessage = message
+                loginDiagnostics.lastErrorCategory = loginErrorCategory(for: error)
+                loginFlowState = .idle
             }
         case let .mfa(ticket, allowedMethods):
             mfaChallenge = LoginMFAChallenge(ticket: ticket, allowedMethods: allowedMethods)
             sessionState = .validationFailed("Multi-factor authentication is required.")
             lastErrorMessage = nil
+            loginFlowState = .mfaRequired
         case let .disabled(userID):
             let message = "This account is disabled or unavailable. User ID: \(UserDisplayResolver.shortenedID(userID))"
             sessionState = .validationFailed(message)
             lastErrorMessage = message
+            loginDiagnostics.lastErrorCategory = .accountDisabled
+            loginFlowState = .idle
         }
     }
 
@@ -1743,6 +1852,7 @@ public final class AppSessionCoordinator {
         diagnostics = nil
         currentUser = nil
         apiClient = nil
+        loginFlowState = .idle
         messageActionHandler = UnavailableMessageActionHandler(message: "Reconnect before sending messages.")
         installLiveSafeSnapshot()
         await refreshCredentialAvailability()
@@ -1765,6 +1875,8 @@ public final class AppSessionCoordinator {
             verificationState = LiveVerificationState()
             hydrationStatus = .empty
             apiClient = nil
+            loginFlowState = .idle
+            loginDiagnostics = LoginDiagnostics()
             messageActionHandler = UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
             installLiveSafeSnapshot()
             lastErrorMessage = nil
@@ -1971,6 +2083,26 @@ public final class AppSessionCoordinator {
         } else {
             try await tokenStore.clearCredential()
         }
+    }
+
+    private func loginErrorCategory(for error: Error) -> LoginErrorDisplay {
+        if let validationError = error as? SessionValidationError {
+            switch validationError {
+            case .invalidOrExpired, .missingCredential, .forbidden:
+                return .invalidCredentials
+            case .rateLimited:
+                return .rateLimited
+            case .networkUnavailable:
+                return .networkError
+            case .serverUnavailable:
+                return .serverError
+            case .invalidEnvironment:
+                return .environmentError
+            case .failed:
+                return .unknown(validationError.errorDescription ?? "Unknown error")
+            }
+        }
+        return .unknown(error.userFacingMessage)
     }
 
     private func sessionFailureState(for error: Error, fallback: String) -> AppSessionState {

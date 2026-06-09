@@ -592,10 +592,43 @@ private struct DeveloperVerificationTab: View {
             VStack(alignment: .leading, spacing: StoatSpacing.large) {
                 CredentialSetupView(viewModel: viewModel)
                     .frame(minHeight: 220)
+                if viewModel.sessionCoordinator?.preferences.showDeveloperRuntimeControls == true {
+                    LoginDiagnosticsSection(coordinator: viewModel.sessionCoordinator)
+                }
                 TimelineValidationHarnessView(viewModel: viewModel)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+}
+
+private struct LoginDiagnosticsSection: View {
+    let coordinator: AppSessionCoordinator?
+
+    var body: some View {
+        GroupBox("Login Diagnostics") {
+            VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                if let coordinator {
+                    let summary = coordinator.loginDiagnostics.redactedSummary
+                    Text(summary)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button("Copy Redacted Diagnostics") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(summary, forType: .string)
+                    }
+                    .controlSize(.small)
+                } else {
+                    Text("No coordinator attached.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(StoatSpacing.small)
+        }
+        .padding(.horizontal, StoatSpacing.medium)
     }
 }
 

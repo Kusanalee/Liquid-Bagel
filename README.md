@@ -44,7 +44,9 @@ The check script runs every local Swift package test target, then builds the mac
 6. Phase 5: manual credential import, login/MFA, Keychain scoping, and verification.
 7. Phase 6: safe preferences, environment profiles, account summary, and session management.
 8. Phases 7-21: timeline actions, replies, diagnostics, search, attachments/media, notifications/lifecycle, live send repair, live-first startup, inline images, avatars, server icons, and banners.
+9. Phases 22-37: member hydration, role-colored names, emoji picker, paste/drop upload, advanced diagnostics, profile popovers, status menu, notification readiness, member ordering, identity diagnostics, and cache diagnostics.
+10. Phase 38: first-run login window, startup state gating, shared app model, `LoginFlowState`/`LoginErrorDisplay`/`LoginDiagnostics`, `finishValidatedSessionAndConnect()`, developer login diagnostics.
 
 ## Current Limits
 
-No real Stoat credentials are required to run the app. Normal launch is live-first and starts signed out or ready for manual connection; it never auto-connects to live Stoat, never auto-validates credentials on launch, and stores session tokens only in Keychain. Preview/mock data remains available for tests, previews, and developer controls. Persistent message/media cache, friends/discover APIs, voice, broad server/channel settings, and automatic background networking remain deferred.
+No real Stoat credentials are required to run the app. On first launch with no saved credential the app shows a native login card (`FirstRunLoginView`) instead of the shell. If a credential was saved from a previous session the app auto-validates and connects; the shell appears only after the realtime Ready event. Session tokens are stored only in scoped Keychain; nothing credential-adjacent is logged or sent to diagnostics. Preview/mock data remains available for tests, previews, and developer controls. Persistent message/media cache, friends/discover APIs, voice, broad server/channel settings, and automatic background networking remain deferred.

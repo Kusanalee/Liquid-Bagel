@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import OSLog
 import StoatAPI
 import StoatDesignSystem
 import StoatModels
@@ -13,6 +14,20 @@ import UniformTypeIdentifiers
 import AppKit
 #endif
 
+private enum StoatFeatureLayoutDiagnostics {
+    private static let logger = Logger(subsystem: "LiquidBagel", category: "Layout")
+
+    static func body(_ name: StaticString, detail: String = "") {
+        #if DEBUG
+        if detail.isEmpty {
+            logger.debug("\(name) body")
+        } else {
+            logger.debug("\(name) body: \(detail)")
+        }
+        #endif
+    }
+}
+
 #if canImport(UserNotifications)
 @preconcurrency import UserNotifications
 #endif
@@ -20,6 +35,28 @@ import AppKit
 public enum AppRuntimeMode: Codable, Hashable, Sendable {
     case mock
     case liveManual
+}
+
+public enum AppStartupState: Hashable, Sendable {
+    case loadingPreferences
+    case noCredential
+    case validatingCredential
+    case connectingLive
+    case ready
+    case savedCredentialFailed(String)
+    case startupFailed(AppStartupFailure)
+}
+
+public enum AppStartupFailure: Hashable, Sendable {
+    case keychainUnavailable(String)
+    case unknown(String)
+
+    public var message: String {
+        switch self {
+        case let .keychainUnavailable(msg): msg
+        case let .unknown(msg): msg
+        }
+    }
 }
 
 public enum SettingsSectionTab: String, Codable, Hashable, Sendable, CaseIterable {
@@ -923,6 +960,8 @@ public final class MainShellViewModel {
             botOwnerID: user?.bot?.ownerID
         )
     }
+    
+    // MARK: - Private Helper Methods
 
     private func serverContextForProfile(userID: UserID) -> ServerID? {
         if case let .serverMembers(serverID, _) = rightSidebarContext,
@@ -1343,8 +1382,13 @@ public final class MainShellViewModel {
     }
 
     private func updateTimelinePerformanceDiagnostics(messages: [TimelineMessage], groups: [TimelineMessageGroup], elapsed: TimeInterval? = nil) {
+        timelinePerformanceDiagnostics = makeTimelinePerformanceDiagnostics(messages: messages, groups: groups, elapsed: elapsed)
+        updateFreezePerformanceDiagnostics(marker: timelinePerformanceDiagnostics.lastSlowOperation)
+    }
+
+    private func makeTimelinePerformanceDiagnostics(messages: [TimelineMessage], groups: [TimelineMessageGroup], elapsed: TimeInterval? = nil) -> TimelinePerformanceDiagnostics {
         let visibleCount = selectedConversationChannelID.flatMap { visibleMessageIDsByChannelID[$0]?.count } ?? 0
-        timelinePerformanceDiagnostics = TimelinePerformanceDiagnostics(
+        return TimelinePerformanceDiagnostics(
             loadedMessageCount: messages.count,
             renderedMessageEstimate: visibleCount == 0 ? min(messages.count, 80) : visibleCount,
             groupedMessageCount: groups.count,
@@ -1354,7 +1398,6 @@ public final class MainShellViewModel {
             visibleRangeUpdateCount: timelineVisibleRangeUpdateCount,
             lastSlowOperation: elapsed.map { $0 > 0.05 ? "timeline grouping \(Int($0 * 1000))ms" : nil } ?? timelinePerformanceDiagnostics.lastSlowOperation
         )
-        updateFreezePerformanceDiagnostics(marker: timelinePerformanceDiagnostics.lastSlowOperation)
     }
 
     private func missingVisibleUserIDs() -> Set<UserID> {
@@ -1708,6 +1751,8 @@ public final class MainShellViewModel {
             profilePresentationContext = profileContext(userID: context.userID, serverID: context.serverID, source: context.openSource)
         }
     }
+    
+    // MARK: - Diagnostics Updates
 
     private func updateVisibleIdentityDiagnostics() {
         let visibleDisplays = selectedTimelineMessages.map { resolvedUserDisplay(for: $0.message) }
@@ -7082,29 +7127,434 @@ public enum MockShellData {
     }
 }
 
-public struct LiquidBagelRootView: View {
-    @Environment(\.scenePhase) private var scenePhase
-    @State private var sessionCoordinator: AppSessionCoordinator
-    @State private var viewModel: MainShellViewModel
+@MainActor
+@Observable
+public final class LiquidBagelAppModel {
+    public let coordinator: AppSessionCoordinator
+    public let shell: MainShellViewModel
+    public let loginViewModel: FirstRunLoginViewModel
 
-    public init(
-        viewModel: MainShellViewModel = MainShellViewModel(snapshot: RealtimeSnapshot(), runtimeMode: .liveManual, sessionState: .signedOut, currentUser: nil),
-        sessionCoordinator: AppSessionCoordinator = AppSessionCoordinator()
-    ) {
-        _sessionCoordinator = State(initialValue: sessionCoordinator)
-        _viewModel = State(initialValue: viewModel)
+    public init(coordinator: AppSessionCoordinator = AppSessionCoordinator()) {
+        self.coordinator = coordinator
+        self.shell = MainShellViewModel(
+            snapshot: RealtimeSnapshot(),
+            runtimeMode: .liveManual,
+            sessionState: .signedOut,
+            currentUser: nil
+        )
+        self.loginViewModel = FirstRunLoginViewModel(coordinator: coordinator)
+    }
+
+    public var startupState: AppStartupState {
+        switch coordinator.sessionState {
+        case .mock:
+            return .ready
+        case .signedOut:
+            return .noCredential
+        case .loadingCredential, .savedCredentialUnvalidated, .validatingCredential:
+            return coordinator.hasSavedCredential ? .validatingCredential : .noCredential
+        case .validatedReady, .readyToConnect, .connecting:
+            return .connectingLive
+        case .connected:
+            return .ready
+        case let .validationFailed(msg), let .invalidSession(msg), let .connectionFailed(msg):
+            return coordinator.hasSavedCredential ? .savedCredentialFailed(msg) : .noCredential
+        case let .keychainFailed(msg):
+            return .startupFailed(.keychainUnavailable(msg))
+        case let .failed(msg):
+            return .startupFailed(.unknown(msg))
+        }
+    }
+}
+
+@MainActor
+@Observable
+public final class FirstRunLoginViewModel {
+    public var email: String = ""
+    public var password: String = ""
+    public var sessionName: String = "Liquid Bagel macOS"
+    public var mfaResponse: String = ""
+    public var manualToken: String = ""
+    public var tokenLabel: String = ""
+    public var isAdvancedExpanded: Bool = false
+    public var loginError: LoginErrorDisplay?
+
+    private let coordinator: AppSessionCoordinator
+
+    public init(coordinator: AppSessionCoordinator) {
+        self.coordinator = coordinator
+    }
+
+    public var flowState: LoginFlowState { coordinator.loginFlowState }
+    public var mfaChallenge: LoginMFAChallenge? { coordinator.mfaChallenge }
+    public var isLoading: Bool { flowState == .submitting }
+    public var canSubmitLogin: Bool { !email.trimmingCharacters(in: .whitespaces).isEmpty && !password.isEmpty && !isLoading }
+    public var canSubmitMFA: Bool { !mfaResponse.trimmingCharacters(in: .whitespaces).isEmpty && !isLoading }
+    public var canSubmitToken: Bool { !manualToken.trimmingCharacters(in: .whitespaces).isEmpty && !isLoading }
+
+    public func submitLogin() async {
+        loginError = nil
+        await coordinator.login(email: email, password: password, friendlyName: sessionName)
+        updateLoginError()
+        if flowState == .mfaRequired {
+            mfaResponse = ""
+        }
+    }
+
+    public func submitMFA() async {
+        guard let challenge = mfaChallenge, let method = challenge.allowedMethods.first else { return }
+        loginError = nil
+        let response = mfaResponseValue(method: method, code: mfaResponse)
+        await coordinator.continueLoginMFA(response: response, friendlyName: sessionName)
+        updateLoginError()
+    }
+
+    private func mfaResponseValue(method: MFAMethod, code: String) -> MFAResponse {
+        switch method {
+        case .password: .password(code)
+        case .recovery: .recoveryCode(code)
+        case .totp: .totpCode(code)
+        }
+    }
+
+    public func submitToken() async {
+        loginError = nil
+        let label = tokenLabel.trimmingCharacters(in: .whitespaces)
+        await coordinator.validateImportedToken(manualToken, localLabel: label.isEmpty ? nil : label)
+        updateLoginError()
+        if flowState == .succeeded {
+            manualToken = ""
+            tokenLabel = ""
+        }
+    }
+
+    public func clearForm() {
+        email = ""
+        password = ""
+        sessionName = "Liquid Bagel macOS"
+        mfaResponse = ""
+        manualToken = ""
+        tokenLabel = ""
+        loginError = nil
+    }
+
+    private func updateLoginError() {
+        loginError = coordinator.loginDiagnostics.lastErrorCategory
+    }
+}
+
+public struct FirstRunLoginView: View {
+    @Bindable private var viewModel: FirstRunLoginViewModel
+    private let coordinator: AppSessionCoordinator
+
+    public init(viewModel: FirstRunLoginViewModel, coordinator: AppSessionCoordinator) {
+        self.viewModel = viewModel
+        self.coordinator = coordinator
+    }
+
+    enum Field: Hashable {
+        case email, password, sessionName, mfaCode, manualToken, tokenLabel
+    }
+
+    @FocusState private var focused: Field?
+
+    public var body: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor).ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 60)
+                    loginCard
+                    Spacer(minLength: 60)
+                }
+            }
+        }
+        .frame(minWidth: 480, minHeight: 500)
+    }
+
+    @ViewBuilder
+    private var loginCard: some View {
+        VStack(spacing: 24) {
+            header
+            if let mfaChallenge = viewModel.mfaChallenge {
+                mfaSection(challenge: mfaChallenge)
+            } else {
+                credentialsSection
+            }
+            if let error = viewModel.loginError {
+                Text(error.localizedDescription)
+                    .foregroundStyle(.red)
+                    .font(.callout)
+                    .multilineTextAlignment(.center)
+                    .accessibilityLabel("Login error: \(error.localizedDescription)")
+            }
+            advancedSection
+            signInButton
+        }
+        .padding(32)
+        .frame(maxWidth: 440)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .shadow(color: .black.opacity(0.12), radius: 20, y: 4)
+    }
+
+    @ViewBuilder
+    private var header: some View {
+        VStack(spacing: 12) {
+            if let appIcon = NSImage(named: "AppIcon") {
+                Image(nsImage: appIcon)
+                    .resizable()
+                    .frame(width: 80, height: 80)
+                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .accessibilityLabel("Liquid Bagel app icon")
+            }
+            Text("Liquid Bagel")
+                .font(.title.bold())
+            environmentRow
+        }
+    }
+
+    @ViewBuilder
+    private var environmentRow: some View {
+        let env = coordinator.environment
+        let envLabel = env.isProduction ? "Production" : (env.apiBaseURL.host() ?? env.apiBaseURL.absoluteString)
+        HStack(spacing: 4) {
+            Image(systemName: "network")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(envLabel)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityLabel("Environment: \(envLabel)")
+    }
+
+    @ViewBuilder
+    private var credentialsSection: some View {
+        VStack(spacing: 12) {
+            TextField("Email", text: $viewModel.email)
+                .textFieldStyle(.roundedBorder)
+                .textContentType(.emailAddress)
+                .autocorrectionDisabled()
+                .focused($focused, equals: .email)
+                .accessibilityLabel("Email address")
+                .onSubmit { focused = .password }
+
+            SecureField("Password", text: $viewModel.password)
+                .textFieldStyle(.roundedBorder)
+                .focused($focused, equals: .password)
+                .accessibilityLabel("Password")
+                .onSubmit {
+                    Task { await viewModel.submitLogin() }
+                }
+
+            TextField("Session name", text: $viewModel.sessionName)
+                .textFieldStyle(.roundedBorder)
+                .focused($focused, equals: .sessionName)
+                .accessibilityLabel("Session name")
+                .onSubmit {
+                    Task { await viewModel.submitLogin() }
+                }
+        }
+    }
+
+    @ViewBuilder
+    private func mfaSection(challenge: LoginMFAChallenge) -> some View {
+        VStack(spacing: 12) {
+            Text("Two-factor authentication required")
+                .font(.headline)
+            Text("Enter the code from your authenticator app or other MFA method.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            SecureField("Authentication code", text: $viewModel.mfaResponse)
+                .textFieldStyle(.roundedBorder)
+                .focused($focused, equals: .mfaCode)
+                .accessibilityLabel("MFA authentication code")
+                .onSubmit {
+                    Task { await viewModel.submitMFA() }
+                }
+            Button("Continue") {
+                Task { await viewModel.submitMFA() }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!viewModel.canSubmitMFA)
+        }
+    }
+
+    @ViewBuilder
+    private var advancedSection: some View {
+        DisclosureGroup(
+            isExpanded: $viewModel.isAdvancedExpanded,
+            content: {
+                VStack(spacing: 12) {
+                    SecureField("Session token", text: $viewModel.manualToken)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($focused, equals: .manualToken)
+                        .accessibilityLabel("Session token for manual import")
+                    TextField("Token label (optional)", text: $viewModel.tokenLabel)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($focused, equals: .tokenLabel)
+                        .accessibilityLabel("Label for the imported token")
+                    Button("Import Token") {
+                        Task {
+                            await viewModel.submitToken()
+                            if viewModel.flowState == .succeeded {
+                                await coordinator.finishValidatedSessionAndConnect()
+                            }
+                        }
+                    }
+                    .disabled(!viewModel.canSubmitToken)
+                }
+                .padding(.top, 8)
+            },
+            label: {
+                Text("Advanced")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var signInButton: some View {
+        if viewModel.mfaChallenge == nil {
+            HStack(spacing: 12) {
+                if viewModel.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Button("Sign In") {
+                    Task {
+                        await viewModel.submitLogin()
+                        if viewModel.flowState == .succeeded {
+                            await coordinator.finishValidatedSessionAndConnect()
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!viewModel.canSubmitLogin)
+                .keyboardShortcut(.defaultAction)
+                .accessibilityLabel("Sign in with email and password")
+            }
+        }
+    }
+}
+
+public struct SavedCredentialFailureView: View {
+    public let message: String
+    public let coordinator: AppSessionCoordinator
+
+    public init(message: String, coordinator: AppSessionCoordinator) {
+        self.message = message
+        self.coordinator = coordinator
     }
 
     public var body: some View {
-        MainShellView(viewModel: viewModel)
-            .task {
-                viewModel.attachSessionCoordinator(sessionCoordinator)
-                await sessionCoordinator.startLiveFirstSession()
-                viewModel.syncFromSessionCoordinator()
+        ZStack {
+            Color(nsColor: .windowBackgroundColor).ignoresSafeArea()
+            VStack(spacing: 20) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 48))
+                    .foregroundStyle(.orange)
+                Text("Session Unavailable")
+                    .font(.title2.bold())
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 360)
+                HStack(spacing: 12) {
+                    Button("Try Again") {
+                        Task { await coordinator.reconnectLiveManually() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("Sign In Again") {
+                        Task { await coordinator.validateSavedSession() }
+                    }
+                    Button("Forget Session") {
+                        Task { await coordinator.forgetLocalSession() }
+                    }
+                    .foregroundStyle(.red)
+                }
             }
-            .onChange(of: scenePhase) { _, phase in
-                viewModel.updateAppLifecyclePhase(AppLifecyclePhase(phase))
+            .padding(40)
+        }
+    }
+}
+
+public struct StartupFailureView: View {
+    public let failure: AppStartupFailure
+
+    public init(failure: AppStartupFailure) {
+        self.failure = failure
+    }
+
+    public var body: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor).ignoresSafeArea()
+            VStack(spacing: 20) {
+                Image(systemName: "xmark.circle")
+                    .font(.system(size: 48))
+                    .foregroundStyle(.red)
+                Text("Startup Failed")
+                    .font(.title2.bold())
+                Text(failure.message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 360)
             }
+            .padding(40)
+        }
+    }
+}
+
+private struct StartupProgressView: View {
+    var body: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor).ignoresSafeArea()
+            VStack(spacing: 16) {
+                ProgressView()
+                    .controlSize(.large)
+                Text("Liquid Bagel")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+public struct LiquidBagelRootView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var appModel: LiquidBagelAppModel
+
+    public init(appModel: LiquidBagelAppModel = LiquidBagelAppModel()) {
+        _appModel = State(initialValue: appModel)
+    }
+
+    public var body: some View {
+        Group {
+            switch appModel.startupState {
+            case .loadingPreferences, .validatingCredential, .connectingLive:
+                StartupProgressView()
+            case .noCredential:
+                FirstRunLoginView(viewModel: appModel.loginViewModel, coordinator: appModel.coordinator)
+            case let .savedCredentialFailed(message):
+                SavedCredentialFailureView(message: message, coordinator: appModel.coordinator)
+            case let .startupFailed(failure):
+                StartupFailureView(failure: failure)
+            case .ready:
+                MainShellView(viewModel: appModel.shell)
+            }
+        }
+        .task {
+            appModel.shell.attachSessionCoordinator(appModel.coordinator)
+            await appModel.coordinator.startLiveFirstSession()
+            appModel.shell.syncFromSessionCoordinator()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            appModel.shell.updateAppLifecyclePhase(AppLifecyclePhase(phase))
+        }
     }
 }
 
@@ -8659,6 +9109,7 @@ public struct MessageTimelineView: View {
     }
 
     public var body: some View {
+        let _ = StoatFeatureLayoutDiagnostics.body("MessageTimelineView", detail: "messages=\(viewModel.selectedTimelineMessages.count)")
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: viewModel.messageDensity == .compact ? StoatSpacing.small : StoatSpacing.medium) {
@@ -8980,6 +9431,7 @@ public struct TimelineMessageGroupView: View {
     }
 
     public var body: some View {
+        let _ = StoatFeatureLayoutDiagnostics.body("TimelineMessageGroupView", detail: "id=\(group.id)")
         VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(group.messages.enumerated()), id: \.element.id) { index, timelineMessage in
                 VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
@@ -9310,6 +9762,7 @@ public struct MemberPanelView: View {
     }
 
     public var body: some View {
+        let _ = StoatFeatureLayoutDiagnostics.body("MemberSidebarView", detail: "\(context)")
         VStack(alignment: .leading, spacing: StoatSpacing.large) {
             HStack {
                 Text(title)
@@ -9430,6 +9883,7 @@ public struct MemberPanelView: View {
                         }
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -9463,12 +9917,14 @@ public struct MemberPanelView: View {
                             .onAppear { viewModel.loadImageResource(for: item.avatar, kind: .userAvatar) }
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
 
     private func memberListRow(_ item: MemberListItem) -> some View {
-        Button {
+        StoatFeatureLayoutDiagnostics.body("MemberRowView", detail: "id=\(item.userID.rawValue)")
+        return Button {
             viewModel.showUserProfile(item.userID, source: item.member == nil ? .directMessageParticipant : .memberRow, serverID: item.member?.id.serverID)
         } label: {
             HStack(spacing: StoatSpacing.medium) {
@@ -10079,6 +10535,7 @@ private struct UserProfileCardView: View {
     let user: User
 
     var body: some View {
+        let _ = StoatFeatureLayoutDiagnostics.body("ProfilePopoverView", detail: "id=\(user.id.rawValue)")
         VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottomLeading) {
                 profileBackground
