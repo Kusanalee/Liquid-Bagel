@@ -452,7 +452,10 @@ public final class MainShellViewModel {
         didSet { invalidateCapabilityCache() }
     }
     public var snapshot: RealtimeSnapshot {
-        didSet { invalidateCapabilityCache() }
+        didSet {
+            invalidateCapabilityCache()
+            snapshotRevision &+= 1
+        }
     }
     public var connectionState: RealtimeConnectionState
     public var diagnostics: RealtimeDiagnostics?
@@ -666,9 +669,14 @@ public final class MainShellViewModel {
     @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
     @ObservationIgnored private var selectedTimelineGroupCacheKey: String?
     @ObservationIgnored private var selectedTimelineGroupCache: [TimelineMessageGroup] = []
-    @ObservationIgnored private var memberListGroupCacheKey: String?
+    @ObservationIgnored private var memberListGroupCacheKey: MemberListCacheKey?
     @ObservationIgnored private var memberListGroupCache: [MemberListGroup] = []
     @ObservationIgnored private var memberListDiagnosticsCache = RoleSortDiagnostics()
+    @ObservationIgnored private var snapshotRevision: Int = 0
+    @ObservationIgnored private var memberDiagnosticsPublishPending = false
+    @ObservationIgnored private var memberListLastCacheHit = false
+    @ObservationIgnored private var memberListLastGroupingElapsed: TimeInterval = 0
+    @ObservationIgnored private var memberListLastGroupingServerID: ServerID? = nil
     @ObservationIgnored private var timelineVisibleRangeUpdateCount = 0
     @ObservationIgnored private var memberGroupingCount = 0
     @ObservationIgnored private var memberGroupingCacheHitCount = 0
@@ -1050,12 +1058,44 @@ public final class MainShellViewModel {
 
     public func memberListGroups(for serverID: ServerID?, query: String = "") -> [MemberListGroup] {
         guard let serverID, let server = snapshot.serversByID[serverID] else {
-            memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(avatarLoadQueueCount: imageResourceQueueCount)
+            memberListLastGroupingServerID = nil
+            memberListLastCacheHit = false
+            scheduleDeferredMemberDiagnosticsPublish()
             return []
         }
         let key = memberListCacheKey(serverID: serverID, query: query)
         if key == memberListGroupCacheKey {
             memberGroupingCacheHitCount += 1
+            memberListLastCacheHit = true
+            scheduleDeferredMemberDiagnosticsPublish()
+            return memberListGroupCache
+        }
+        let started = Date()
+        memberGroupingCount += 1
+        let result = MemberListDeriver.result(server: server, snapshot: snapshot, query: query)
+        let groups = result.groups
+        memberListGroupCacheKey = key
+        memberListGroupCache = groups
+        memberListDiagnosticsCache = result.diagnostics
+        memberListLastCacheHit = false
+        memberListLastGroupingElapsed = Date().timeIntervalSince(started)
+        memberListLastGroupingServerID = serverID
+        scheduleDeferredMemberDiagnosticsPublish()
+        return groups
+    }
+
+    private func scheduleDeferredMemberDiagnosticsPublish() {
+        guard !memberDiagnosticsPublishPending else { return }
+        memberDiagnosticsPublishPending = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.memberDiagnosticsPublishPending = false
+            self.flushMemberDiagnostics()
+        }
+    }
+
+    private func flushMemberDiagnostics() {
+        if memberListLastCacheHit {
             memberRoleSortDiagnostics = RoleSortDiagnostics(
                 sortMode: memberListDiagnosticsCache.sortMode,
                 groupOrder: memberListDiagnosticsCache.groupOrder,
@@ -1067,39 +1107,36 @@ public final class MainShellViewModel {
             )
             memberListPerformanceDiagnostics.avatarLoadQueueCount = imageResourceQueueCount
             updateFreezePerformanceDiagnostics(marker: "member grouping cache hit")
-            return memberListGroupCache
+        } else if let serverID = memberListLastGroupingServerID {
+            let groups = memberListGroupCache
+            memberRoleSortDiagnostics = memberListDiagnosticsCache
+            let knownMemberCount = snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID }.count
+            let knownUserCount = snapshot.usersByID.count
+            let missingUserCount = snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID && snapshot.usersByID[$0.id.userID] == nil }.count
+            let missingAvatarCount = groups.flatMap(\.items).filter { $0.avatar == nil }.count
+            let total = groups.reduce(0) { $0 + $1.items.count }
+            let dropped = max(0, knownMemberCount - total)
+            let elapsedMs = "\(Int(memberListLastGroupingElapsed * 1000))ms"
+            memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(
+                totalMembers: total,
+                visibleMemberEstimate: min(total, 80),
+                groupCount: groups.count,
+                avatarLoadQueueCount: imageResourceQueueCount,
+                lastGroupingDurationDescription: elapsedMs,
+                knownMemberCount: knownMemberCount,
+                knownUserCount: knownUserCount,
+                missingUserCount: missingUserCount,
+                missingAvatarCount: missingAvatarCount,
+                renderedMemberCount: total,
+                droppedMemberCount: dropped,
+                droppedReasonSummary: dropped == 0 ? "missing avatars \(missingAvatarCount)" : "Filtered by query; missing avatars \(missingAvatarCount)"
+            )
+            updateVisibleIdentityDiagnostics()
+            updateFreezePerformanceDiagnostics(marker: "member grouping \(elapsedMs)")
+        } else {
+            memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(avatarLoadQueueCount: imageResourceQueueCount)
+            updateFreezePerformanceDiagnostics(marker: nil)
         }
-        let started = Date()
-        memberGroupingCount += 1
-        let result = MemberListDeriver.result(server: server, snapshot: snapshot, query: query)
-        let groups = result.groups
-        memberListGroupCacheKey = key
-        memberListGroupCache = groups
-        memberListDiagnosticsCache = result.diagnostics
-        memberRoleSortDiagnostics = result.diagnostics
-        let knownMemberCount = snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID }.count
-        let knownUserCount = snapshot.usersByID.count
-        let missingUserCount = snapshot.membersByServerAndUserID.values.filter { $0.id.serverID == serverID && snapshot.usersByID[$0.id.userID] == nil }.count
-        let missingAvatarCount = groups.flatMap(\.items).filter { $0.avatar == nil }.count
-        let total = groups.reduce(0) { $0 + $1.items.count }
-        let dropped = max(0, knownMemberCount - total)
-        memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics(
-            totalMembers: total,
-            visibleMemberEstimate: min(total, 80),
-            groupCount: groups.count,
-            avatarLoadQueueCount: imageResourceQueueCount,
-            lastGroupingDurationDescription: "\(Int(Date().timeIntervalSince(started) * 1000))ms",
-            knownMemberCount: knownMemberCount,
-            knownUserCount: knownUserCount,
-            missingUserCount: missingUserCount,
-            missingAvatarCount: missingAvatarCount,
-            renderedMemberCount: total,
-            droppedMemberCount: dropped,
-            droppedReasonSummary: dropped == 0 ? "missing avatars \(missingAvatarCount)" : "Filtered by query; missing avatars \(missingAvatarCount)"
-        )
-        updateVisibleIdentityDiagnostics()
-        updateFreezePerformanceDiagnostics(marker: "member grouping \(memberListPerformanceDiagnostics.lastGroupingDurationDescription ?? "-")")
-        return groups
     }
 
     public func serverMembers(for serverID: ServerID?) -> [ServerMember] {
@@ -1389,19 +1426,14 @@ public final class MainShellViewModel {
         return "\(channelID.rawValue)|\(messages.count)|\(oldest)|\(newest)|\(pending)"
     }
 
-    private func memberListCacheKey(serverID: ServerID, query: String) -> String {
-        let memberVersion = snapshot.membersByServerAndUserID.values
-            .filter { $0.id.serverID == serverID }
-            .map { member in
-                "\(member.id.userID.rawValue):\(member.nickname ?? ""):\(member.roles.map(\.rawValue).joined(separator: ",")):\(member.avatar?.id.rawValue ?? "-")"
-            }
-            .sorted()
-            .joined(separator: "|")
-        let userVersion = snapshot.usersByID.values
-            .map { "\($0.id.rawValue):\($0.displayName ?? ""):\($0.username):\($0.online):\($0.avatar?.id.rawValue ?? "-")" }
-            .sorted()
-            .joined(separator: "|")
-        return "\(serverID.rawValue)|\(query)|\(memberVersion)|\(userVersion)"
+    private struct MemberListCacheKey: Hashable {
+        let serverID: ServerID
+        let normalizedQuery: String
+        let snapshotRevision: Int
+    }
+
+    private func memberListCacheKey(serverID: ServerID, query: String) -> MemberListCacheKey {
+        MemberListCacheKey(serverID: serverID, normalizedQuery: query, snapshotRevision: snapshotRevision)
     }
 
     private func updateTimelinePerformanceDiagnostics(messages: [TimelineMessage], groups: [TimelineMessageGroup], elapsed: TimeInterval? = nil) {
@@ -10598,9 +10630,10 @@ public struct MemberPanelView: View {
 
     public var body: some View {
         let _ = StoatFeatureLayoutDiagnostics.body("MemberSidebarView", detail: "\(context)")
+        let resolvedGroups = serverMemberGroups
         VStack(alignment: .leading, spacing: StoatSpacing.large) {
             HStack {
-                Text(title)
+                Text(panelTitle)
                     .font(.headline)
                 Spacer()
                 if case let .serverMembers(serverID, _) = context {
@@ -10611,14 +10644,14 @@ public struct MemberPanelView: View {
                     }
                     .buttonStyle(.borderless)
                     .disabled(viewModel.isMemberHydrationLoading(serverID: serverID) || !viewModel.canRefreshSelectedServerMembers)
-                    .help("Refresh Members")
+                    .help(String("Refresh Members"))
                     .accessibilityLabel("Refresh members")
                 }
-                Text("\(count)")
+                Text("\(panelCount(groups: resolvedGroups))")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
             }
-            content
+            panelContent(groups: resolvedGroups)
             Spacer()
         }
         .padding(StoatSpacing.large)
@@ -10628,23 +10661,24 @@ public struct MemberPanelView: View {
         }
     }
 
-    @ViewBuilder private var content: some View {
+    private var serverMemberGroups: [MemberListGroup] {
+        guard case let .serverMembers(serverID, _) = context else { return [] }
+        return viewModel.memberListGroups(for: serverID)
+    }
+
+    private func panelCount(groups: [MemberListGroup]) -> Int {
         switch context {
         case let .directMessageParticipants(channelID), let .groupDMParticipants(channelID):
-            if let channel = viewModel.snapshot.channelsByID[channelID] {
-                dmParticipants(channel)
-            } else {
-                EmptyStateView(title: "No participants", message: "Participant data is not present in the current snapshot.", systemImage: "person")
-                    .frame(maxWidth: .infinity)
-            }
+            guard let channel = viewModel.snapshot.channelsByID[channelID] else { return 0 }
+            return viewModel.directMessageParticipantItems(for: channel).count
         case .serverMembers:
-            serverMembers
+            return groups.reduce(0) { $0 + $1.items.count }
         case .hidden, .homeSummary, .friendsSummary, .discoverSummary:
-            EmptyView()
+            return 0
         }
     }
 
-    private var title: String {
+    private var panelTitle: String {
         switch context {
         case let .directMessageParticipants(channelID), let .groupDMParticipants(channelID):
             if viewModel.snapshot.channelsByID[channelID]?.kind == .savedMessages {
@@ -10658,35 +10692,23 @@ public struct MemberPanelView: View {
         }
     }
 
-    private var count: Int {
+    @ViewBuilder private func panelContent(groups: [MemberListGroup]) -> some View {
         switch context {
         case let .directMessageParticipants(channelID), let .groupDMParticipants(channelID):
-            guard let channel = viewModel.snapshot.channelsByID[channelID] else { return 0 }
-            return viewModel.directMessageParticipantItems(for: channel).count
+            if let channel = viewModel.snapshot.channelsByID[channelID] {
+                dmParticipants(channel)
+            } else {
+                EmptyStateView(title: "No participants", message: "Participant data is not present in the current snapshot.", systemImage: "person")
+                    .frame(maxWidth: .infinity)
+            }
         case .serverMembers:
-            return groups.reduce(0) { $0 + $1.items.count }
+            serverMembersPanel(groups: groups)
         case .hidden, .homeSummary, .friendsSummary, .discoverSummary:
-            return 0
+            EmptyView()
         }
     }
 
-    private var groups: [MemberListGroup] {
-        guard case let .serverMembers(serverID, _) = context else { return [] }
-        return viewModel.memberListGroups(for: serverID)
-    }
-
-    @ViewBuilder private var legacyContent: some View {
-        if let channel = viewModel.selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
-            dmParticipants(channel)
-        } else if viewModel.selection.serverID != nil {
-            serverMembers
-        } else {
-            EmptyStateView(title: "No member list", message: "Open a server channel or DM to show people here.", systemImage: "person.2")
-                .frame(maxWidth: .infinity)
-        }
-    }
-
-    @ViewBuilder private var serverMembers: some View {
+    @ViewBuilder private func serverMembersPanel(groups: [MemberListGroup]) -> some View {
         if case let .serverMembers(serverID, _) = context,
            let status = viewModel.memberHydrationStatusMessage(for: serverID) {
             HStack(spacing: StoatSpacing.small) {
