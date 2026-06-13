@@ -10,6 +10,7 @@ public actor MockStoatAPIClient: StoatAPIClient {
     private var invites: [InviteID: Invite]
     private var members: [MemberCompositeKey: ServerMember]
     private var bans: [MemberCompositeKey: ServerBan]
+    private var profiles: [UserID: UserProfile]
 
     public init() {
         let liquid = User(
@@ -103,6 +104,11 @@ public actor MockStoatAPIClient: StoatAPIClient {
             MemberCompositeKey(serverID: lab, userID: design.id): ServerMember(id: MemberCompositeKey(serverID: lab, userID: design.id), joinedAt: Date(timeIntervalSince1970: 1_700_000_200))
         ]
         self.bans = [:]
+        self.profiles = [
+            liquid.id: UserProfile(content: "Mock profile for Liquid Bagel."),
+            stoat.id: UserProfile(content: "Mock profile for Stoat System."),
+            design.id: UserProfile(content: "Mock profile for Design Pilot.")
+        ]
         self.messagesByChannel = [
             general: [
                 Message(
@@ -170,11 +176,55 @@ public actor MockStoatAPIClient: StoatAPIClient {
             user.status = status
             user.online = status.presence != .invisible
         }
+        if let displayName = draft.displayName {
+            user.displayName = displayName
+        }
+        if let avatar = draft.avatar {
+            user.avatar = File(
+                id: FileID(rawValue: avatar),
+                tag: UploadTag.avatars.rawAPIValue,
+                filename: "mock-user-avatar.png",
+                metadata: .image(width: 96, height: 96, thumbhash: nil, animated: nil),
+                contentType: "image/png",
+                size: 1024,
+                userID: userID
+            )
+        }
+        if draft.remove.contains(.displayName) {
+            user.displayName = nil
+        }
+        if draft.remove.contains(.avatar) {
+            user.avatar = nil
+        }
         if draft.remove.contains(.statusText) {
             user.status?.text = nil
         }
         if draft.remove.contains(.statusPresence) {
             user.status?.presence = nil
+        }
+        if draft.profile != nil || draft.remove.contains(.profileContent) || draft.remove.contains(.profileBackground) {
+            var profile = profiles[userID] ?? UserProfile()
+            if draft.remove.contains(.profileContent) {
+                profile.content = nil
+            }
+            if draft.remove.contains(.profileBackground) {
+                profile.background = nil
+            }
+            if let content = draft.profile?.content {
+                profile.content = content
+            }
+            if let background = draft.profile?.background {
+                profile.background = File(
+                    id: FileID(rawValue: background),
+                    tag: UploadTag.backgrounds.rawAPIValue,
+                    filename: "mock-profile-background.png",
+                    metadata: .image(width: 960, height: 320, thumbhash: nil, animated: nil),
+                    contentType: "image/png",
+                    size: 4096,
+                    userID: userID
+                )
+            }
+            profiles[userID] = profile
         }
         users[userID] = user
         if currentUser.id == userID {
@@ -187,7 +237,7 @@ public actor MockStoatAPIClient: StoatAPIClient {
         guard let user = users[userID] else {
             throw StoatAPIError.notFound
         }
-        return UserProfile(content: "Mock profile for \(user.displayName ?? user.username).")
+        return profiles[userID] ?? UserProfile(content: "Mock profile for \(user.displayName ?? user.username).")
     }
 
     public func fetchServers() async throws -> [Server] {

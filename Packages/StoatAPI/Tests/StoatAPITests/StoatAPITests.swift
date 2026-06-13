@@ -289,6 +289,101 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(openRequest.url?.path, "/users/user-2/dm")
     }
 
+    func testPhase41CurrentUserEditEndpointRequestPayloads() async throws {
+        try await assertUserEditPayload(
+            draft: UserEditDraft(displayName: "Liquid Tester"),
+            check: { body in
+                XCTAssertEqual(body["display_name"] as? String, "Liquid Tester")
+                XCTAssertNil(body["status"])
+                XCTAssertNil(body["profile"])
+            }
+        )
+        try await assertUserEditPayload(
+            draft: UserEditDraft(remove: [.displayName]),
+            check: { body in
+                XCTAssertEqual(body["remove"] as? [String], ["DisplayName"])
+                XCTAssertNil(body["display_name"])
+            }
+        )
+        try await assertUserEditPayload(
+            draft: UserEditDraft(profile: UserProfileEditDraft(content: "hello profile")),
+            check: { body in
+                let profile = try XCTUnwrap(body["profile"] as? [String: Any])
+                XCTAssertEqual(profile["content"] as? String, "hello profile")
+                XCTAssertNil(profile["background"])
+                XCTAssertNil(body["status"])
+            }
+        )
+        try await assertUserEditPayload(
+            draft: UserEditDraft(remove: [.profileContent]),
+            check: { body in
+                XCTAssertEqual(body["remove"] as? [String], ["ProfileContent"])
+                XCTAssertNil(body["profile"])
+            }
+        )
+        try await assertUserEditPayload(
+            draft: UserEditDraft(avatar: "avatar-file"),
+            check: { body in
+                XCTAssertEqual(body["avatar"] as? String, "avatar-file")
+                XCTAssertNil(body["status"])
+            }
+        )
+        try await assertUserEditPayload(
+            draft: UserEditDraft(remove: [.avatar]),
+            check: { body in
+                XCTAssertEqual(body["remove"] as? [String], ["Avatar"])
+            }
+        )
+        try await assertUserEditPayload(
+            draft: UserEditDraft(profile: UserProfileEditDraft(background: "background-file")),
+            check: { body in
+                let profile = try XCTUnwrap(body["profile"] as? [String: Any])
+                XCTAssertEqual(profile["background"] as? String, "background-file")
+                XCTAssertNil(profile["content"])
+                XCTAssertNil(body["status"])
+            }
+        )
+        try await assertUserEditPayload(
+            draft: UserEditDraft(remove: [.profileBackground]),
+            check: { body in
+                XCTAssertEqual(body["remove"] as? [String], ["ProfileBackground"])
+                XCTAssertNil(body["profile"])
+            }
+        )
+    }
+
+    func testPhase41AvatarAndBackgroundUploadTagsUseMultipartFileField() async throws {
+        let avatarTransport = RecordingHTTPTransport(data: Data(#"{"id":"avatar-file"}"#.utf8))
+        let avatarClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: avatarTransport
+        )
+        let avatar = try await avatarClient.uploadFile(data: Data("avatar".utf8), filename: "avatar.png", mimeType: "image/png", tag: .avatars)
+        let capturedAvatarRequest = await avatarTransport.lastRequest()
+        let avatarRequest = try XCTUnwrap(capturedAvatarRequest)
+        let avatarBody = String(data: try XCTUnwrap(avatarRequest.httpBody), encoding: .utf8)
+
+        XCTAssertEqual(avatar.id.rawValue, "avatar-file")
+        XCTAssertEqual(avatarRequest.httpMethod, "POST")
+        XCTAssertEqual(avatarRequest.url?.path, "/avatars")
+        XCTAssertTrue(avatarBody?.contains(#"name="file""#) == true)
+
+        let backgroundTransport = RecordingHTTPTransport(data: Data(#"{"id":"background-file"}"#.utf8))
+        let backgroundClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: backgroundTransport
+        )
+        let background = try await backgroundClient.uploadFile(data: Data("background".utf8), filename: "banner.png", mimeType: "image/png", tag: .backgrounds)
+        let capturedBackgroundRequest = await backgroundTransport.lastRequest()
+        let backgroundRequest = try XCTUnwrap(capturedBackgroundRequest)
+        let backgroundBody = String(data: try XCTUnwrap(backgroundRequest.httpBody), encoding: .utf8)
+
+        XCTAssertEqual(background.id.rawValue, "background-file")
+        XCTAssertEqual(backgroundRequest.httpMethod, "POST")
+        XCTAssertEqual(backgroundRequest.url?.path, "/backgrounds")
+        XCTAssertTrue(backgroundBody?.contains(#"name="file""#) == true)
+    }
+
     func testPhase22RelationshipEndpointRequests() async throws {
         let userJSON = Data(#"{"_id":"user-1","username":"friend","relationship":"Friend","online":true}"#.utf8)
 
@@ -742,6 +837,29 @@ final class StoatAPITests: XCTestCase {
         let channelPermissionRequest = try XCTUnwrap(capturedChannelPermissionRequest)
         XCTAssertEqual(channelPermissionRequest.httpMethod, "PUT")
         XCTAssertEqual(channelPermissionRequest.url?.path, "/channels/channel-1/permissions/default")
+    }
+
+    private func assertUserEditPayload(draft: UserEditDraft, check: ([String: Any]) throws -> Void) async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"{"_id":"user-1","username":"liquid","display_name":"Liquid"}"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+        let user = try await client.editUser(userID: "user-1", draft: draft)
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let body = try requestJSONBody(request)
+
+        XCTAssertEqual(user.id.rawValue, "user-1")
+        XCTAssertEqual(request.httpMethod, "PATCH")
+        XCTAssertEqual(request.url?.path, "/users/user-1")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
+        try check(body)
+    }
+
+    private func requestJSONBody(_ request: URLRequest) throws -> [String: Any] {
+        let body = try XCTUnwrap(request.httpBody)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
     }
 
     private func assertThrows<T>(_ expression: @autoclosure () throws -> T, _ expected: StoatAPIError) {

@@ -120,16 +120,28 @@ public enum UserEditRemovedField: String, Codable, Hashable, Sendable {
     case displayName = "DisplayName"
 }
 
+public struct UserProfileEditDraft: Codable, Hashable, Sendable {
+    public var content: String?
+    public var background: String?
+
+    public init(content: String? = nil, background: String? = nil) {
+        self.content = content
+        self.background = background
+    }
+}
+
 public struct UserEditDraft: Codable, Hashable, Sendable {
     public var displayName: String?
     public var avatar: String?
     public var status: UserStatus?
+    public var profile: UserProfileEditDraft?
     public var remove: [UserEditRemovedField]
 
-    public init(displayName: String? = nil, avatar: String? = nil, status: UserStatus? = nil, remove: [UserEditRemovedField] = []) {
+    public init(displayName: String? = nil, avatar: String? = nil, status: UserStatus? = nil, profile: UserProfileEditDraft? = nil, remove: [UserEditRemovedField] = []) {
         self.displayName = displayName
         self.avatar = avatar
         self.status = status
+        self.profile = profile
         self.remove = remove
     }
 
@@ -137,6 +149,7 @@ public struct UserEditDraft: Codable, Hashable, Sendable {
         case displayName = "display_name"
         case avatar
         case status
+        case profile
         case remove
     }
 }

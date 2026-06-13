@@ -295,6 +295,12 @@ public enum NotificationBadgeCalculator {
         for (channelID, unread) in snapshot.unreadsByChannelID {
             let channelPreference = preferences.preference(for: channelID)
             guard !channelPreference.isMuted else { continue }
+            if let local = localReadStates[channelID],
+               local.lastReadMessageID != nil,
+               local.unreadCount == 0,
+               local.mentionCount == 0 {
+                continue
+            }
             if unread.lastMessageID != nil {
                 unreadChannels.insert(channelID)
             }

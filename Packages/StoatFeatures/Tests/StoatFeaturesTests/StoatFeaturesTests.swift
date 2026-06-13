@@ -15,6 +15,8 @@ private func makeTemporaryAttachment(name: String, contents: Data) throws -> URL
 }
 
 final class StoatFeaturesTests: XCTestCase {
+    private static let phase41PNGData = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
     func testPhaseThreeStatusUsesOfficialEnvironment() {
         XCTAssertEqual(PhaseThreeStatus.current.environment.apiBaseURL.host(), "api.stoat.chat")
         XCTAssertTrue(PhaseThreeStatus.current.readyFields.contains(.servers))
@@ -247,25 +249,25 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testManualTokenImportSavesOnlyAfterValidationSucceeds() async throws {
+    func testManualTokenImportValidatesSavesAndConnects() async throws {
         let store = InMemoryTokenStore()
         let validator = StubSessionValidator(user: User(id: "user-validated", username: "validated"))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
         let session = AppSessionCoordinator(
             tokenStore: store,
             sessionValidator: validator,
-            apiClientFactory: { _, _ in RecordingAPIClient() }
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
         )
 
         await session.validateImportedToken("secret-token", localLabel: "Main Stoat")
-        XCTAssertEqual(session.sessionState, .validatedReady)
-        let beforeSaveCredential = try await store.loadCredential(scope: .production)
-        XCTAssertNil(beforeSaveCredential)
+        try await Task.sleep(for: .milliseconds(30))
 
-        await session.savePendingValidatedSession()
-
-        let afterSaveCredential = try await store.loadCredential(scope: .production)
-        XCTAssertEqual(afterSaveCredential?.token, "secret-token")
-        XCTAssertEqual(session.sessionState, .readyToConnect)
+        let savedCredential = try await store.loadCredential(scope: .production)
+        XCTAssertEqual(savedCredential?.token, "secret-token")
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 1)
+        XCTAssertTrue(session.sessionState == .connecting || session.sessionState == .connected)
     }
 
     @MainActor
@@ -3431,7 +3433,7 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertFalse(text.contains(#"{"raw":"body"}"#))
     }
 
-    func testPhase30ParityMatrixContainsRequiredSectionsAndKeepsDMsBrokenUntilLiveQA() {
+    func testPhase30ParityMatrixContainsRequiredSectionsAndKeepsDMsPartialUntilLiveQA() {
         let matrix = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: false)
         let sections = Set(matrix.sections)
         XCTAssertTrue(sections.isSuperset(of: [
@@ -3444,13 +3446,550 @@ final class StoatFeaturesTests: XCTestCase {
         ]))
         XCTAssertFalse(matrix.items.contains { $0.status.rawValue.isEmpty })
         let dm = matrix.items.first { $0.section == "Core chat" && $0.name == "DMs" }
-        XCTAssertEqual(dm?.status, .broken)
+        XCTAssertEqual(dm?.status, .partial)
         XCTAssertFalse(matrix.items.contains { item in
             (item.status == .deferred || item.status == .blockedByUnverifiedAPI) && item.recommendedNextAction.isEmpty
         })
 
+        let unrecovered = Phase30ParityMatrixBuilder.build(dmRecoveredByTests: false, dmLiveQAPassed: false)
+        XCTAssertEqual(unrecovered.items.first { $0.section == "Core chat" && $0.name == "DMs" }?.status, .broken)
         let passed = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: true)
         XCTAssertEqual(passed.items.first { $0.section == "Core chat" && $0.name == "DMs" }?.status, .done)
+    }
+
+    @MainActor
+    func testPhase41UploadFailurePreventsProfileMutation() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase41-me", username: "me", displayName: "Old Name", relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(currentUser: currentUser, uploadError: StoatAPIError.unknown(statusCode: 400, body: #"{"error":"reject"}"#))
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        model.prepareProfileEditor(force: true)
+        try model.stageProfileMediaData(kind: .avatar, data: Self.phase41PNGData, filename: "/Users/enka/secret/avatar.png", mimeType: "image/png")
+        await model.saveProfileEdit()
+
+        let uploadCount = await api.uploadedFiles.count
+        let editCount = await api.editUserCallCount
+        XCTAssertEqual(uploadCount, 1)
+        XCTAssertEqual(editCount, 0)
+        XCTAssertNil(model.currentUserForPresentation?.avatar)
+        XCTAssertEqual(model.profileEditDiagnostics.safeErrorCategory, .uploadRejected)
+        XCTAssertEqual(model.profileEditDiagnostics.mutationResultCategory, .skipped)
+    }
+
+    @MainActor
+    func testPhase41MutationFailurePreservesPreviousLocalProfileState() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase41-me", username: "me", displayName: "Old Name", relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(currentUser: currentUser, editUserError: StoatAPIError.serverError(statusCode: 500, message: "nope"))
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+        model.userProfilesByID[currentUser.id] = UserProfile(content: "old bio")
+
+        model.prepareProfileEditor(force: true)
+        model.profileEditDraft.displayName = "New Name"
+        model.profileEditDraft.profileContent = "new bio"
+        await model.saveProfileEdit()
+
+        let editCount = await api.editUserCallCount
+        XCTAssertEqual(editCount, 1)
+        XCTAssertEqual(model.currentUserForPresentation?.displayName, "Old Name")
+        XCTAssertEqual(model.userProfilesByID[currentUser.id]?.content, "old bio")
+        XCTAssertEqual(model.profileEditDiagnostics.safeErrorCategory, .server)
+        XCTAssertEqual(model.profileEditDiagnostics.mutationResultCategory, .failed)
+    }
+
+    @MainActor
+    func testPhase41SuccessfulProfileEditMergesSnapshotAndInvalidatesTargetedCaches() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase41-me"
+        let oldAvatar = File(id: "phase41-old-avatar", tag: "avatars", filename: "old.png", contentType: "image/png", size: 1, userID: currentUserID)
+        let oldBackground = File(id: "phase41-old-background", tag: "backgrounds", filename: "old-bg.png", contentType: "image/png", size: 1, userID: currentUserID)
+        let unrelatedAvatar = File(id: "phase41-unrelated-avatar", tag: "avatars", filename: "other.png", contentType: "image/png", size: 1)
+        let currentUser = User(id: currentUserID, username: "me", displayName: "Old Name", avatar: oldAvatar, relationship: .user)
+        let channelID: ChannelID = "phase41-saved"
+        let message = Message(id: "phase41-message", channelID: channelID, authorID: currentUserID, content: "hello")
+        snapshot.usersByID[currentUserID] = currentUser
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .savedMessages, userID: currentUserID, active: true)
+        snapshot.messagesByChannelID[channelID] = [message]
+        let api = RecordingAPIClient(
+            currentUser: currentUser,
+            uploadedFileIDsByTag: [.avatars: "phase41-new-avatar", .backgrounds: "phase41-new-background"]
+        )
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+        model.userProfilesByID[currentUserID] = UserProfile(content: "old bio", background: oldBackground)
+        model.loadedImageResources[ImageCacheKey(id: oldAvatar.id.rawValue, kind: .userAvatar)] = Data("old-avatar".utf8)
+        model.loadedImageResources[ImageCacheKey(id: oldBackground.id.rawValue, kind: .profileBackground)] = Data("old-background".utf8)
+        model.loadedImageResources[ImageCacheKey(id: unrelatedAvatar.id.rawValue, kind: .userAvatar)] = Data("keep".utf8)
+
+        model.prepareProfileEditor(force: true)
+        model.profileEditDraft.displayName = "New Name"
+        model.profileEditDraft.profileContent = "new bio"
+        try model.stageProfileMediaData(kind: .avatar, data: Self.phase41PNGData, filename: "avatar.png", mimeType: "image/png")
+        try model.stageProfileMediaData(kind: .background, data: Self.phase41PNGData, filename: "banner.png", mimeType: "image/png")
+        await model.saveProfileEdit()
+
+        let editCount = await api.editUserCallCount
+        let uploadedTags = await api.uploadedFiles.map(\.tag)
+        XCTAssertEqual(editCount, 1)
+        XCTAssertEqual(uploadedTags, [.avatars, .backgrounds])
+        XCTAssertEqual(model.currentUserForPresentation?.displayName, "New Name")
+        XCTAssertEqual(model.resolvedUserDisplay(for: message).displayName, "New Name")
+        XCTAssertEqual(model.directMessageParticipantItems(for: snapshot.channelsByID[channelID]!).first?.displayName, "New Name")
+        XCTAssertEqual(model.userProfilesByID[currentUserID]?.content, "new bio")
+        XCTAssertEqual(model.userProfilesByID[currentUserID]?.background?.id, "phase41-new-background")
+        XCTAssertNil(model.loadedImageResources[ImageCacheKey(id: oldAvatar.id.rawValue, kind: .userAvatar)])
+        XCTAssertNil(model.loadedImageResources[ImageCacheKey(id: oldBackground.id.rawValue, kind: .profileBackground)])
+        XCTAssertEqual(model.loadedImageResources[ImageCacheKey(id: unrelatedAvatar.id.rawValue, kind: .userAvatar)], Data("keep".utf8))
+        XCTAssertNotNil(model.loadedImageResources[ImageCacheKey(id: "phase41-new-avatar", kind: .userAvatar)])
+        XCTAssertNotNil(model.loadedImageResources[ImageCacheKey(id: "phase41-new-background", kind: .profileBackground)])
+        XCTAssertEqual(model.profileEditDiagnostics.cacheInvalidationCount, 4)
+        XCTAssertEqual(model.profileEditDiagnostics.returnedDataShape, .fullUser)
+    }
+
+    @MainActor
+    func testPhase41ProfileEditorDirtyStateAndSaveEnablement() {
+        var snapshot = RealtimeSnapshot()
+        let avatar = File(id: "phase41-avatar", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: 1)
+        let currentUser = User(id: "phase41-me", username: "me", displayName: "Old Name", avatar: avatar, relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser)
+
+        model.prepareProfileEditor(force: true)
+        XCTAssertFalse(model.profileEditDraft.isDirty)
+        XCTAssertFalse(model.canSaveProfileEdit)
+
+        model.profileEditDraft.displayName = "New Name"
+        XCTAssertTrue(model.profileEditDraft.isDirty)
+        XCTAssertTrue(model.canSaveProfileEdit)
+
+        model.cancelProfileEdit()
+        XCTAssertFalse(model.profileEditDraft.isDirty)
+        model.removeProfileAvatar()
+        XCTAssertTrue(model.profileEditDraft.isDirty)
+        XCTAssertTrue(model.canSaveProfileEdit)
+    }
+
+    func testPhase41SafeErrorCategoryMapping() {
+        XCTAssertEqual(ProfileEditSafeErrorCategory.categorize(StoatAPIError.unauthorized), .unauthenticated)
+        XCTAssertEqual(ProfileEditSafeErrorCategory.categorize(StoatAPIError.forbidden), .forbidden)
+        XCTAssertEqual(ProfileEditSafeErrorCategory.categorize(StoatAPIError.rateLimited(retryAfterMilliseconds: 1)), .rateLimited)
+        XCTAssertEqual(ProfileEditSafeErrorCategory.categorize(StoatAPIError.transport("offline")), .network)
+        XCTAssertEqual(ProfileEditSafeErrorCategory.categorize(StoatAPIError.serverError(statusCode: 503, message: nil)), .server)
+        XCTAssertEqual(ProfileEditSafeErrorCategory.categorize(StoatAPIError.decodingFailed("bad")), .decode)
+        XCTAssertEqual(ProfileEditSafeErrorCategory.categorize(ProfileEditValidationError.fileTooLarge(maxBytes: 4)), .fileTooLarge)
+        XCTAssertEqual(ProfileEditSafeErrorCategory.categorize(ProfileEditValidationError.unsupportedFileType), .unsupportedFileType)
+        XCTAssertEqual(ProfileEditSafeErrorCategory.uploadCategory(StoatAPIError.unknown(statusCode: 400, body: "raw")), .uploadRejected)
+    }
+
+    func testPhase41DiagnosticsRedactionDropsSecretsIDsPathsURLsAndUserContent() {
+        let secretBio = "private profile bio text"
+        let diagnostics = ProfileEditDiagnostics(
+            lastAction: "save succeeded",
+            routeCategory: .currentUserPatch,
+            editedFieldCategories: [.displayName, .profileContent, .avatar, .profileBackground],
+            uploadTagCategory: .multiple,
+            uploadResultCategory: .succeeded,
+            mutationResultCategory: .succeeded,
+            durationMilliseconds: 42,
+            cacheInvalidationCount: 2,
+            returnedDataShape: .fullUser
+        )
+        let text = ProfileEditDiagnosticsFormatter.redactedText(diagnostics)
+        let redacted = ProfileEditDiagnosticsFormatter.redactSensitiveText("""
+        X-Session-Token: supersecret
+        token=secret-token
+        session_id=01J12345678901234567890123
+        file id 01JFILE123456789012345678
+        user id 01JUSER123456789012345678
+        /Users/enka/private/file.png
+        https://api.stoat.chat/users/@me
+        user@example.com
+        password hunter2
+        mfa response ticket-secret
+        {"content":"\(secretBio)","token":"secret"}
+        """)
+
+        XCTAssertFalse(text.contains(secretBio))
+        XCTAssertFalse(redacted.contains("supersecret"))
+        XCTAssertFalse(redacted.contains("secret-token"))
+        XCTAssertFalse(redacted.contains("01J12345678901234567890123"))
+        XCTAssertFalse(redacted.contains("01JFILE123456789012345678"))
+        XCTAssertFalse(redacted.contains("01JUSER123456789012345678"))
+        XCTAssertFalse(redacted.contains("/Users/enka/private"))
+        XCTAssertFalse(redacted.contains("https://api.stoat.chat"))
+        XCTAssertFalse(redacted.contains("user@example.com"))
+        XCTAssertFalse(redacted.contains("hunter2"))
+        XCTAssertFalse(redacted.contains("ticket-secret"))
+        XCTAssertFalse(redacted.contains(secretBio))
+    }
+
+    func testPhase41ParityRowsRemainPartialUntilLiveQA() {
+        let matrix = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: true)
+        let profileEdit = matrix.items.first { $0.section == "Account and session" && $0.name == "account profile edit" }
+        let avatarEdit = matrix.items.first { $0.section == "Account and session" && $0.name == "avatar edit" }
+        let backgroundEdit = matrix.items.first { $0.section == "Account and session" && $0.name == "profile banner/background edit" }
+
+        XCTAssertEqual(profileEdit?.status, .partial)
+        XCTAssertEqual(avatarEdit?.status, .partial)
+        XCTAssertEqual(backgroundEdit?.status, .partial)
+        XCTAssertFalse([profileEdit, avatarEdit, backgroundEdit].contains { $0?.status == .done })
+    }
+
+    @MainActor
+    private func phase40LiveModel(snapshot: RealtimeSnapshot, currentUser: User, api: RecordingAPIClient) async -> MainShellViewModel {
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(credential: .sessionToken("phase40-token")),
+            sessionValidator: StubSessionValidator(user: currentUser),
+            apiClientFactory: { _, _ in api },
+            realtimeClientFactory: { RecordingRealtimeClient(statesOnConnect: [.connected, .ready]) }
+        )
+        await coordinator.startLiveFirstSession()
+        for _ in 0..<20 where coordinator.sessionState != .connected {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return MainShellViewModel(
+            snapshot: snapshot,
+            runtimeMode: .liveManual,
+            sessionState: .connected,
+            currentUser: currentUser,
+            sessionCoordinator: coordinator
+        )
+    }
+
+    func testPhase40ReadyDMChannelsAppearInHomeConversations() {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase40-me"
+        let friendID: UserID = "phase40-friend"
+        let groupID: ChannelID = "phase40-group"
+        let dmID: ChannelID = "phase40-dm"
+        let savedID: ChannelID = "phase40-saved"
+        let icon = File(id: "phase40-group-icon", tag: "icons", filename: "group.png", contentType: "image/png", size: 100)
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[friendID] = User(id: friendID, username: "friend", displayName: "Friend")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, friendID])
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Weekend", recipients: [currentUserID, friendID, "phase40-third"], icon: icon)
+        snapshot.channelsByID[savedID] = Channel(id: savedID, kind: .savedMessages, userID: currentUserID)
+        let preferences = NotificationPreferences(channelPreferences: [dmID: ChannelNotificationPreference(isMuted: true)])
+
+        let items = Phase22Derivations.directMessageItems(
+            snapshot: snapshot,
+            currentUserID: currentUserID,
+            notificationPreferences: preferences,
+            selectedChannelID: groupID
+        )
+
+        XCTAssertEqual(items.first?.channel.kind, .savedMessages)
+        XCTAssertTrue(items.contains { $0.id == dmID && $0.displayName == "Friend" && $0.isMuted })
+        XCTAssertTrue(items.contains { $0.id == groupID && $0.displayName == "Weekend" && $0.groupMemberCount == 3 && $0.groupIcon == icon && $0.isSelected })
+        XCTAssertFalse(items.contains { $0.displayName.contains(friendID.rawValue) })
+    }
+
+    @MainActor
+    func testPhase40RefreshDMsMergesChannelsWithoutDuplicates() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase40-me"
+        let friendID: UserID = "phase40-friend"
+        let existingID: ChannelID = "phase40-existing"
+        let newID: ChannelID = "phase40-new"
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[friendID] = User(id: friendID, username: "friend", displayName: "Friend")
+        snapshot.channelsByID[existingID] = Channel(id: existingID, kind: .directMessage, name: "Ready Name", recipients: [currentUserID, friendID], lastMessageID: "ready-last")
+        let api = RecordingAPIClient(directMessages: [
+            Channel(id: existingID, kind: .directMessage, active: true, recipients: []),
+            Channel(id: newID, kind: .directMessage, recipients: [currentUserID, "phase40-new-user"]),
+            Channel(id: newID, kind: .directMessage, recipients: [currentUserID, "phase40-new-user"])
+        ])
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: api)
+
+        await model.refreshDMs(source: DMRefreshSource.directMessages)
+
+        let callCount = await api.fetchDirectMessagesCallCount
+        XCTAssertEqual(callCount, 1)
+        XCTAssertEqual(model.snapshot.channelsByID[existingID]?.recipients, [currentUserID, friendID])
+        XCTAssertEqual(model.snapshot.channelsByID[existingID]?.lastMessageID, "ready-last")
+        XCTAssertEqual(model.snapshot.channelsByID[newID]?.kind, .directMessage)
+        XCTAssertEqual(model.directMessageItems.filter { $0.id == newID }.count, 1)
+        XCTAssertEqual(model.dmDiagnostics.lastRefreshStatus, DMOperationStatus.succeeded)
+        XCTAssertEqual(model.dmDiagnostics.lastRefreshCount, 3)
+        XCTAssertGreaterThanOrEqual(model.dmDiagnostics.duplicateMergeCount, 1)
+    }
+
+    @MainActor
+    func testPhase40DMRefreshFailurePreservesReadyChannels() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase40-me"
+        let dmID: ChannelID = "phase40-ready-dm"
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, "phase40-friend"])
+        let api = RecordingAPIClient(directMessagesFetchError: StoatAPIError.transport("offline token=secret"))
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: api)
+
+        await model.refreshDMs(source: .home)
+
+        XCTAssertEqual(model.snapshot.channelsByID[dmID]?.id, dmID)
+        XCTAssertEqual(model.dmDiagnostics.lastRefreshStatus, .failed)
+        XCTAssertEqual(model.dmDiagnostics.lastRefreshErrorCategory, .network)
+    }
+
+    @MainActor
+    func testPhase40OpenKnownDMSelectsExistingWithoutNetwork() async {
+        var snapshot = RealtimeSnapshot()
+        let current = User(id: "phase40-me", username: "me")
+        let otherID: UserID = "phase40-other"
+        let dmID: ChannelID = "phase40-known-dm"
+        snapshot.usersByID[current.id] = current
+        snapshot.usersByID[otherID] = User(id: otherID, username: "other")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [current.id, otherID])
+        let api = RecordingAPIClient(currentUser: current)
+        let model = await phase40LiveModel(snapshot: snapshot, currentUser: current, api: api)
+
+        await model.openDirectMessage(with: otherID, source: .friendsRow)
+
+        let openCount = await api.openDirectMessageCallCount
+        XCTAssertEqual(openCount, 0)
+        XCTAssertEqual(model.selection.dmChannelID, dmID)
+        XCTAssertEqual(model.dmDiagnostics.lastOpenSource, .friendsRow)
+        XCTAssertEqual(model.dmDiagnostics.lastOpenStatus, .succeeded)
+    }
+
+    @MainActor
+    func testPhase40OpenDMMergesNewReturnedChannelAndSelectsIt() async {
+        var snapshot = RealtimeSnapshot()
+        let current = User(id: "phase40-me", username: "me")
+        let otherID: UserID = "phase40-new-other"
+        let dmID: ChannelID = "phase40-opened-dm"
+        snapshot.usersByID[current.id] = current
+        snapshot.usersByID[otherID] = User(id: otherID, username: "other", displayName: "Other")
+        let api = RecordingAPIClient(
+            currentUser: current,
+            openDirectMessagesByUserID: [otherID: Channel(id: dmID, kind: .directMessage, recipients: [current.id, otherID])]
+        )
+        let model = await phase40LiveModel(snapshot: snapshot, currentUser: current, api: api)
+
+        await model.openDirectMessage(with: otherID, source: .profilePopover)
+
+        let openCount = await api.openDirectMessageCallCount
+        XCTAssertEqual(openCount, 1)
+        XCTAssertEqual(model.snapshot.channelsByID[dmID]?.kind, .directMessage)
+        XCTAssertEqual(model.selection.dmChannelID, dmID)
+        XCTAssertEqual(model.activeConversation, .directMessage(channelID: dmID))
+    }
+
+    @MainActor
+    func testPhase40RapidDuplicateOpenDMCallsAreIdempotent() async throws {
+        var snapshot = RealtimeSnapshot()
+        let current = User(id: "phase40-me", username: "me")
+        let otherID: UserID = "phase40-rapid-other"
+        let dmID: ChannelID = "phase40-rapid-dm"
+        snapshot.usersByID[current.id] = current
+        snapshot.usersByID[otherID] = User(id: otherID, username: "other")
+        let api = RecordingAPIClient(
+            currentUser: current,
+            openDirectMessagesByUserID: [otherID: Channel(id: dmID, kind: .directMessage, recipients: [current.id, otherID])],
+            openDirectMessageDelayNanoseconds: 50_000_000
+        )
+        let model = await phase40LiveModel(snapshot: snapshot, currentUser: current, api: api)
+
+        let first = Task { await model.openDirectMessage(with: otherID, source: .profilePopover, forceNetwork: true) }
+        try await Task.sleep(nanoseconds: 5_000_000)
+        let second = Task { await model.openDirectMessage(with: otherID, source: .profilePopover, forceNetwork: true) }
+        await first.value
+        await second.value
+
+        let openCount = await api.openDirectMessageCallCount
+        XCTAssertEqual(openCount, 1)
+        XCTAssertEqual(model.selection.dmChannelID, dmID)
+    }
+
+    @MainActor
+    func testPhase40FriendsProfileAndMemberSourcesUseSameOpenPath() async {
+        var snapshot = RealtimeSnapshot()
+        let current = User(id: "phase40-me", username: "me")
+        let otherID: UserID = "phase40-source-other"
+        let dmID: ChannelID = "phase40-source-dm"
+        snapshot.usersByID[current.id] = current
+        snapshot.usersByID[otherID] = User(id: otherID, username: "other")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [current.id, otherID])
+        let api = RecordingAPIClient(currentUser: current)
+        let model = await phase40LiveModel(snapshot: snapshot, currentUser: current, api: api)
+
+        await model.openDirectMessage(with: otherID, source: .friendsRow)
+        XCTAssertEqual(model.dmDiagnostics.lastOpenSource, .friendsRow)
+        await model.openDirectMessage(with: otherID, source: .profilePopover)
+        XCTAssertEqual(model.dmDiagnostics.lastOpenSource, .profilePopover)
+        await model.openDirectMessage(with: otherID, source: .memberRow)
+        XCTAssertEqual(model.dmDiagnostics.lastOpenSource, .memberRow)
+        let openCount = await api.openDirectMessageCallCount
+        XCTAssertEqual(openCount, 0)
+    }
+
+    @MainActor
+    func testPhase40SavedNotesResolvesAndUnavailableStateIsRecoverable() async {
+        var snapshot = RealtimeSnapshot()
+        let current = User(id: "phase40-me", username: "me")
+        let savedID: ChannelID = "phase40-saved"
+        snapshot.usersByID[current.id] = current
+        let successAPI = RecordingAPIClient(
+            currentUser: current,
+            openDirectMessagesByUserID: [current.id: Channel(id: savedID, kind: .savedMessages, userID: current.id)]
+        )
+        let successModel = await phase40LiveModel(snapshot: snapshot, currentUser: current, api: successAPI)
+
+        await successModel.openSavedNotes()
+
+        XCTAssertEqual(successModel.selection.dmChannelID, savedID)
+        XCTAssertEqual(successModel.dmDiagnostics.savedNotesState, .available(savedID))
+
+        let failureAPI = RecordingAPIClient(currentUser: current, openDirectMessageError: StoatAPIError.notFound)
+        let failureModel = await phase40LiveModel(snapshot: snapshot, currentUser: current, api: failureAPI)
+        await failureModel.openSavedNotes()
+
+        XCTAssertEqual(failureModel.dmDiagnostics.savedNotesState, .failed(.notFound))
+        XCTAssertNil(failureModel.selection.dmChannelID)
+    }
+
+    @MainActor
+    func testPhase40DMTimelineActionsUseSharedChannelPipeline() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase40-me"
+        let otherID: UserID = "phase40-other"
+        let dmID: ChannelID = "phase40-actions-dm"
+        let message = Message(id: "01J00000000000000000400001", channelID: dmID, authorID: currentUserID, content: "original")
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[otherID] = User(id: otherID, username: "other")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, otherID])
+        snapshot.messagesByChannelID[dmID] = [message]
+        let handler = MockMessageActionHandler(currentUserID: currentUserID)
+        let uploader = MockAttachmentUploadHandler()
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: handler, attachmentUploadHandler: uploader)
+        model.selectChannel(dmID)
+
+        model.updateDraft("with file", for: dmID)
+        let url = try makeTemporaryAttachment(name: "phase40.txt", contents: Data("dm".utf8))
+        model.addAttachmentURLs([url], to: dmID)
+        await model.sendDraft(for: dmID)
+
+        let sent = await handler.sentMessages
+        XCTAssertEqual(sent.last?.channelID, dmID)
+        XCTAssertEqual(sent.last?.attachments?.count, 1)
+
+        let editable = try XCTUnwrap(model.selectedTimelineMessages.first { $0.message.id == message.id })
+        model.beginEditing(editable)
+        model.updateInlineEditDraft("edited")
+        await model.saveEditingDraft()
+        let edited = await handler.editedMessages
+        XCTAssertEqual(edited.last?.0, dmID)
+
+        let reacted = try XCTUnwrap(model.selectedTimelineMessages.first { $0.message.id == message.id })
+        await model.toggleReaction("👍", on: reacted)
+        let reactions = await handler.addedReactions
+        XCTAssertEqual(reactions.last?.0, dmID)
+
+        let deletable = try XCTUnwrap(model.selectedTimelineMessages.first { $0.message.id == message.id })
+        model.requestDelete(deletable)
+        await model.confirmPendingDelete()
+        let deleted = await handler.deletedMessages
+        XCTAssertEqual(deleted.last?.0, dmID)
+    }
+
+    @MainActor
+    func testPhase40DMAckClearsUnreadAndMentionsLocally() async throws {
+        let sender = RecordingChannelAckSender()
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase40-me"
+        let otherID: UserID = "phase40-other"
+        let dmID: ChannelID = "phase40-ack-dm"
+        let message = Message(id: "01J00000000000000000400002", channelID: dmID, authorID: otherID, content: "mention", mentions: [currentUserID])
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[otherID] = User(id: otherID, username: "other")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, otherID])
+        snapshot.messagesByChannelID[dmID] = [message]
+        snapshot.unreadsByChannelID[dmID] = ChannelUnread(id: ChannelCompositeKey(channelID: dmID, userID: currentUserID), lastMessageID: message.id, mentions: [message.id])
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .liveManual, sessionState: .connected, currentUser: snapshot.usersByID[currentUserID], channelAckSender: sender)
+        model.timelineTuning.ackDebounceMilliseconds = 0
+
+        model.selectChannel(dmID)
+        model.updateTimelineAtNewest(true)
+        try await Task.sleep(for: .milliseconds(30))
+
+        let acks = await sender.acks
+        XCTAssertEqual(acks.last?.0, dmID)
+        XCTAssertEqual(model.localReadStates[dmID]?.mentionCount, 0)
+        XCTAssertEqual(model.dmDiagnostics.mentionCount, 0)
+    }
+
+    @MainActor
+    func testPhase40DMNotificationRouteQueuesUntilReadyAndReadyRouteSelectsMessage() async throws {
+        let queuedModel = MainShellViewModel(
+            snapshot: RealtimeSnapshot(),
+            runtimeMode: .liveManual,
+            sessionState: .connected,
+            currentUser: User(id: "phase40-me", username: "me"),
+            notificationDeliverer: MockNotificationService(),
+            notificationPermissionManager: MockNotificationPermissionManager(),
+            dockBadgeManager: MockDockBadgeManager(),
+            notificationRouteCenter: NotificationRouteCenter()
+        )
+        let dmID: ChannelID = "phase40-notification-dm"
+        await queuedModel.openNotificationRoute(NotificationRoute(channelID: dmID, messageID: "01J00000000000000000400003"))
+
+        XCTAssertEqual(queuedModel.queuedNotificationRoutes.count, 1)
+        XCTAssertNil(queuedModel.selection.dmChannelID)
+
+        var snapshot = RealtimeSnapshot()
+        let current = User(id: "phase40-me", username: "me")
+        let otherID: UserID = "phase40-other"
+        let messageID: MessageID = "01J00000000000000000400004"
+        snapshot.usersByID[current.id] = current
+        snapshot.usersByID[otherID] = User(id: otherID, username: "other")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [current.id, otherID])
+        snapshot.messagesByChannelID[dmID] = [Message(id: messageID, channelID: dmID, authorID: otherID, content: "route")]
+        let api = RecordingAPIClient(currentUser: current)
+        let readyModel = await phase40LiveModel(snapshot: snapshot, currentUser: current, api: api)
+
+        await readyModel.openNotificationRoute(NotificationRoute(channelID: dmID, messageID: messageID))
+
+        XCTAssertEqual(readyModel.selection.dmChannelID, dmID)
+        XCTAssertEqual(readyModel.timelineSelection.messageID, messageID)
+    }
+
+    func testPhase40ActiveDMNotificationSuppressionUsesActiveConversationID() {
+        var snapshot = RealtimeSnapshot()
+        let currentUserID: UserID = "phase40-me"
+        let otherID: UserID = "phase40-other"
+        let dmID: ChannelID = "phase40-active-dm"
+        snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
+        snapshot.usersByID[otherID] = User(id: otherID, username: "other")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, otherID])
+        let message = Message(id: "01J00000000000000000400005", channelID: dmID, authorID: otherID, content: "active")
+        let context = NotificationClassificationContext(runtimeMode: .liveManual, currentUserID: currentUserID, activeChannelID: dmID, isActiveChannelVisible: true, preferences: .defaults, snapshot: snapshot)
+
+        XCTAssertEqual(NotificationClassifier.classify(message: message, context: context), .suppress(.activeChannel))
+    }
+
+    func testPhase40DMDiagnosticsRedactionPreventsSensitiveLeaks() {
+        let diagnostics = DMDiagnostics(
+            savedNotesState: .available("01J123456789ABCDEFGHJKLMNP"),
+            lastRefreshStatus: .failed,
+            lastRefreshSource: .home,
+            lastRefreshErrorCategory: .network,
+            lastOpenStatus: .failed,
+            lastOpenSource: .profilePopover,
+            lastOpenTarget: "01J123456789ABCDEFGHJKLMNP",
+            lastOpenErrorCategory: .authentication,
+            lastAckSummary: #"token=secret /Users/enka/private {"raw":"body"} https://api.example.test"#
+        )
+
+        let text = DMDiagnosticsFormatter.redactedText(diagnostics)
+
+        XCTAssertFalse(text.contains("secret"))
+        XCTAssertFalse(text.contains("/Users/enka"))
+        XCTAssertFalse(text.contains(#"{"raw":"body"}"#))
+        XCTAssertFalse(text.contains("https://api.example.test"))
+        XCTAssertFalse(text.contains("01J123456789ABCDEFGHJKLMNP"))
+        XCTAssertTrue(text.contains("[redacted"))
     }
 
     @MainActor
@@ -4076,44 +4615,74 @@ private actor RecordingRealtimeClient: StoatRealtimeClient {
 
 private actor RecordingAPIClient: StoatAPIClient {
     private(set) var fetchCurrentUserCallCount = 0
+    private(set) var editUserCallCount = 0
     private(set) var fetchMessagesCallCount = 0
     private(set) var fetchServerMembersCallCount = 0
     private(set) var fetchedServerMemberIDs: [ServerID] = []
     private(set) var fetchUserProfileCallCount = 0
+    private(set) var fetchDirectMessagesCallCount = 0
+    private(set) var openDirectMessageCallCount = 0
+    private(set) var openedDirectMessageUserIDs: [UserID] = []
     private(set) var sentDrafts: [(ChannelID, MessageDraft)] = []
     private(set) var editedMessages: [(ChannelID, MessageID, MessageEditDraft)] = []
     private(set) var deletedMessages: [(ChannelID, MessageID)] = []
     private(set) var addedReactions: [(ChannelID, MessageID, String)] = []
     private(set) var removedReactions: [(ChannelID, MessageID, String)] = []
+    private(set) var editedUserDrafts: [(UserID, UserEditDraft)] = []
+    private(set) var uploadedFiles: [RecordedUpload] = []
 
     private let currentUser: User
     private var messagesByChannel: [ChannelID: [Message]]
     private var membersByServer: [ServerID: [ServerMember]]
     private var usersByServer: [ServerID: [User]]
+    private var directMessages: [Channel]
+    private var openDirectMessagesByUserID: [UserID: Channel]
     private var editedUsersByID: [UserID: User] = [:]
     private var profilesByUserID: [UserID: UserProfile]
     private let fetchError: (any Error & Sendable)?
+    private let directMessagesFetchError: (any Error & Sendable)?
+    private let openDirectMessageError: (any Error & Sendable)?
+    private let openDirectMessageDelayNanoseconds: UInt64
     private let memberFetchError: (any Error & Sendable)?
     private let memberFetchDelayNanoseconds: UInt64
+    private let editUserError: (any Error & Sendable)?
+    private let uploadError: (any Error & Sendable)?
+    private let uploadedFileIDsByTag: [UploadTag: FileID]
 
     init(
         currentUser: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
         messagesByChannel: [ChannelID: [Message]] = [:],
         membersByServer: [ServerID: [ServerMember]] = [:],
         usersByServer: [ServerID: [User]] = [:],
+        directMessages: [Channel] = [],
+        openDirectMessagesByUserID: [UserID: Channel] = [:],
         profilesByUserID: [UserID: UserProfile] = [:],
         fetchError: (any Error & Sendable)? = nil,
+        directMessagesFetchError: (any Error & Sendable)? = nil,
+        openDirectMessageError: (any Error & Sendable)? = nil,
+        openDirectMessageDelayNanoseconds: UInt64 = 0,
         memberFetchError: (any Error & Sendable)? = nil,
-        memberFetchDelayNanoseconds: UInt64 = 0
+        memberFetchDelayNanoseconds: UInt64 = 0,
+        editUserError: (any Error & Sendable)? = nil,
+        uploadError: (any Error & Sendable)? = nil,
+        uploadedFileIDsByTag: [UploadTag: FileID] = [:]
     ) {
         self.currentUser = currentUser
         self.messagesByChannel = messagesByChannel
         self.membersByServer = membersByServer
         self.usersByServer = usersByServer
+        self.directMessages = directMessages
+        self.openDirectMessagesByUserID = openDirectMessagesByUserID
         self.profilesByUserID = profilesByUserID
         self.fetchError = fetchError
+        self.directMessagesFetchError = directMessagesFetchError
+        self.openDirectMessageError = openDirectMessageError
+        self.openDirectMessageDelayNanoseconds = openDirectMessageDelayNanoseconds
         self.memberFetchError = memberFetchError
         self.memberFetchDelayNanoseconds = memberFetchDelayNanoseconds
+        self.editUserError = editUserError
+        self.uploadError = uploadError
+        self.uploadedFileIDsByTag = uploadedFileIDsByTag
     }
 
     func fetchRootConfiguration() async throws -> StoatConfig {
@@ -4126,10 +4695,65 @@ private actor RecordingAPIClient: StoatAPIClient {
     }
 
     func editUser(userID: UserID, draft: UserEditDraft) async throws -> User {
+        editUserCallCount += 1
+        editedUserDrafts.append((userID, draft))
+        if let editUserError {
+            throw editUserError
+        }
         var user = editedUsersByID[userID] ?? (userID == currentUser.id ? currentUser : User(id: userID, username: UserDisplayResolver.shortenedID(userID)))
         if let status = draft.status {
             user.status = status
             user.online = status.presence != .invisible
+        }
+        if let displayName = draft.displayName {
+            user.displayName = displayName
+        }
+        if let avatar = draft.avatar {
+            user.avatar = File(
+                id: FileID(rawValue: avatar),
+                tag: UploadTag.avatars.rawAPIValue,
+                filename: "recorded-avatar.png",
+                metadata: .file,
+                contentType: "image/png",
+                size: 12,
+                userID: userID
+            )
+        }
+        if draft.remove.contains(.displayName) {
+            user.displayName = nil
+        }
+        if draft.remove.contains(.avatar) {
+            user.avatar = nil
+        }
+        if draft.remove.contains(.statusText) {
+            user.status?.text = nil
+        }
+        if draft.remove.contains(.statusPresence) {
+            user.status?.presence = nil
+        }
+        if draft.profile != nil || draft.remove.contains(.profileContent) || draft.remove.contains(.profileBackground) {
+            var profile = profilesByUserID[userID] ?? UserProfile()
+            if draft.remove.contains(.profileContent) {
+                profile.content = nil
+            }
+            if draft.remove.contains(.profileBackground) {
+                profile.background = nil
+            }
+            if let content = draft.profile?.content {
+                profile.content = content
+            }
+            if let background = draft.profile?.background {
+                profile.background = File(
+                    id: FileID(rawValue: background),
+                    tag: UploadTag.backgrounds.rawAPIValue,
+                    filename: "recorded-background.png",
+                    metadata: .file,
+                    contentType: "image/png",
+                    size: 24,
+                    userID: userID
+                )
+            }
+            profilesByUserID[userID] = profile
         }
         editedUsersByID[userID] = user
         return user
@@ -4138,6 +4762,31 @@ private actor RecordingAPIClient: StoatAPIClient {
     func fetchUserProfile(userID: UserID) async throws -> UserProfile {
         fetchUserProfileCallCount += 1
         return profilesByUserID[userID] ?? UserProfile(content: "Profile for \(userID.rawValue)")
+    }
+
+    func fetchDirectMessages() async throws -> [Channel] {
+        fetchDirectMessagesCallCount += 1
+        if let directMessagesFetchError {
+            throw directMessagesFetchError
+        }
+        return directMessages
+    }
+
+    func openDirectMessage(userID: UserID) async throws -> Channel {
+        openDirectMessageCallCount += 1
+        openedDirectMessageUserIDs.append(userID)
+        if openDirectMessageDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: openDirectMessageDelayNanoseconds)
+        }
+        if let openDirectMessageError {
+            throw openDirectMessageError
+        }
+        if let channel = openDirectMessagesByUserID[userID] {
+            return channel
+        }
+        let channel = Channel(id: ChannelID(rawValue: "recorded-dm-\(userID.rawValue)"), kind: userID == currentUser.id ? .savedMessages : .directMessage, userID: userID == currentUser.id ? currentUser.id : nil, active: true, recipients: [currentUser.id, userID])
+        openDirectMessagesByUserID[userID] = channel
+        return channel
     }
 
     func fetchServers() async throws -> [Server] {
@@ -4212,8 +4861,20 @@ private actor RecordingAPIClient: StoatAPIClient {
     func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
 
     func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile {
-        UploadedFile(id: "file")
+        uploadedFiles.append(RecordedUpload(data: data, filename: filename, mimeType: mimeType, tag: tag))
+        if let uploadError {
+            throw uploadError
+        }
+        let fallbackID = FileID(rawValue: "\(tag.rawAPIValue)-file-\(uploadedFiles.count)")
+        return UploadedFile(id: uploadedFileIDsByTag[tag] ?? fallbackID)
     }
+}
+
+private struct RecordedUpload: Sendable, Hashable {
+    var data: Data
+    var filename: String
+    var mimeType: String
+    var tag: UploadTag
 }
 
 private struct RecordedAttachmentSend: Sendable {
@@ -4297,6 +4958,28 @@ private struct StubSessionValidator: SessionValidating {
     }
 }
 
+private actor RecordingSessionValidator: SessionValidating {
+    private var errors: [any Error & Sendable]
+    private let user: User
+    private(set) var validateCallCount = 0
+
+    init(
+        user: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
+        errors: [any Error & Sendable] = []
+    ) {
+        self.user = user
+        self.errors = errors
+    }
+
+    func validate(credential: StoatAuthCredential, environment: StoatAPIEnvironment) async throws -> ValidatedSession {
+        validateCallCount += 1
+        if !errors.isEmpty {
+            throw errors.removeFirst()
+        }
+        return ValidatedSession(credential: credential, currentUser: user, environment: environment)
+    }
+}
+
 // MARK: - Phase 38 Tests
 
 final class Phase38StartupStateTests: XCTestCase {
@@ -4317,7 +5000,7 @@ final class Phase38StartupStateTests: XCTestCase {
     }
 
     @MainActor
-    func testStartupStateIsConnectingLiveWhenConnecting() async throws {
+    func testStartupStateIsRecoverableWhenSavedCredentialReadyButNotConnecting() async throws {
         let store = InMemoryTokenStore(credential: .sessionToken("token"))
         let realtime = RecordingRealtimeClient(statesOnConnect: [.connecting])
         let coordinator = AppSessionCoordinator(
@@ -4329,7 +5012,10 @@ final class Phase38StartupStateTests: XCTestCase {
         let appModel = LiquidBagelAppModel(coordinator: coordinator)
         await coordinator.validateSavedSession()
         XCTAssertEqual(coordinator.sessionState, .readyToConnect)
-        XCTAssertEqual(appModel.startupState, .connectingLive)
+        if case .savedCredentialFailed = appModel.startupState {
+        } else {
+            XCTFail("Expected savedCredentialFailed recovery state, got \(appModel.startupState)")
+        }
     }
 
     @MainActor
@@ -4428,7 +5114,6 @@ final class Phase38LoginDiagnosticsTests: XCTestCase {
 
     @MainActor
     func testLoginDiagnosticsRedactedSummaryContainsAttemptCount() {
-        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
         var diag = LoginDiagnostics()
         diag.attemptCount = 3
         diag.lastErrorCategory = .networkError
@@ -4554,15 +5239,18 @@ final class Phase38AuthFlowTests: XCTestCase {
 
     @MainActor
     func testTokenImportSuccessUpdatesFlowState() async {
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
         let coordinator = AppSessionCoordinator(
             tokenStore: InMemoryTokenStore(),
             sessionValidator: StubSessionValidator(),
             apiClientFactory: { _, _ in RecordingAPIClient() },
-            realtimeClientFactory: { RecordingRealtimeClient() }
+            realtimeClientFactory: { realtime }
         )
         await coordinator.validateImportedToken("validtoken", localLabel: "Dev")
+        try? await Task.sleep(for: .milliseconds(30))
         XCTAssertEqual(coordinator.loginFlowState, .succeeded)
-        XCTAssertNotNil(coordinator.pendingValidatedSession)
+        XCTAssertNil(coordinator.pendingValidatedSession)
+        XCTAssertTrue(coordinator.hasSavedCredential)
     }
 
     @MainActor
@@ -4584,17 +5272,20 @@ final class Phase38AuthFlowTests: XCTestCase {
     @MainActor
     func testFinishValidatedSessionAndConnectSavesToKeychain() async throws {
         let store = InMemoryTokenStore()
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
         let coordinator = AppSessionCoordinator(
             tokenStore: store,
             sessionValidator: StubSessionValidator(),
             apiClientFactory: { _, _ in RecordingAPIClient() },
-            realtimeClientFactory: { RecordingRealtimeClient() }
+            realtimeClientFactory: { realtime }
         )
         await coordinator.validateImportedToken("validtoken")
-        XCTAssertNotNil(coordinator.pendingValidatedSession)
         await coordinator.finishValidatedSessionAndConnect()
+        try await Task.sleep(for: .milliseconds(30))
         let saved = try await store.loadCredential()
         XCTAssertNotNil(saved)
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 1)
     }
 
     @MainActor
@@ -4636,13 +5327,232 @@ final class Phase38AuthFlowTests: XCTestCase {
     }
 }
 
+// MARK: - Phase 39 Tests
+
+final class Phase39StartupAuthStabilizationTests: XCTestCase {
+
+    @MainActor
+    func testStartupAutoConnectIsIdempotentPerLaunchEnvironment() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+
+        await coordinator.startLiveFirstSession()
+        await coordinator.startLiveFirstSession()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 1)
+        XCTAssertEqual(coordinator.autoConnectAttemptCount, 1)
+        XCTAssertEqual(coordinator.startupAuthDiagnostics.startupSkippedCount, 1)
+    }
+
+    @MainActor
+    func testEmailPasswordLoginSavesValidatedSessionAndConnects() async throws {
+        let store = InMemoryTokenStore()
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
+        let loginSuccess = SessionLoginSuccess(id: "sess-login", userID: "user-login", token: "login-token", name: "Mac", lastSeen: Date())
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(user: User(id: "user-login", username: "login")),
+            apiClientFactory: { _, _ in StubLoginAPIClient(response: .success(loginSuccess)) },
+            realtimeClientFactory: { realtime }
+        )
+
+        await coordinator.login(email: "user@example.com", password: "correct horse battery staple", friendlyName: "Mac")
+        try await Task.sleep(for: .milliseconds(30))
+
+        let saved = try await store.loadCredential(scope: .production)
+        XCTAssertEqual(saved?.token, "login-token")
+        XCTAssertEqual(coordinator.loginFlowState, .succeeded)
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(connectCallCount, 1)
+        XCTAssertTrue(coordinator.sessionState == .connecting || coordinator.sessionState == .connected)
+    }
+
+    @MainActor
+    func testMFAContinuationSavesValidatedSessionAndConnects() async throws {
+        let store = InMemoryTokenStore()
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
+        let loginSuccess = SessionLoginSuccess(id: "sess-mfa", userID: "user-mfa", token: "mfa-token", name: "Mac", lastSeen: Date())
+        let api = StubLoginAPIClient(response: .mfa(ticket: "ticket-secret", allowedMethods: [.totp]), continueResponse: .success(loginSuccess))
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: StubSessionValidator(user: User(id: "user-mfa", username: "mfa")),
+            apiClientFactory: { _, _ in api },
+            realtimeClientFactory: { realtime }
+        )
+
+        await coordinator.login(email: "mfa@example.com", password: "password", friendlyName: "Mac")
+        XCTAssertEqual(coordinator.loginFlowState, .mfaRequired)
+        await coordinator.continueLoginMFA(response: .totpCode("123456"), friendlyName: "Mac")
+        try await Task.sleep(for: .milliseconds(30))
+
+        let saved = try await store.loadCredential(scope: .production)
+        XCTAssertEqual(saved?.token, "mfa-token")
+        XCTAssertEqual(coordinator.loginFlowState, .succeeded)
+        let continueCallCount = await api.continueCallCount
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(continueCallCount, 1)
+        XCTAssertEqual(connectCallCount, 1)
+        XCTAssertTrue(coordinator.sessionState == .connecting || coordinator.sessionState == .connected)
+    }
+
+    @MainActor
+    func testTokenImportSavesToSelectedEnvironmentAndConnects() async throws {
+        let custom = try EnvironmentProfile.custom(
+            name: "Local",
+            environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:14702")!, eventsURL: URL(string: "ws://localhost:14703")!)
+        )
+        let preferences = try AppPreferences.defaults.upserting(profile: custom).withSelectedEnvironmentID(custom.id)
+        let store = InMemoryTokenStore()
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            preferencesStore: InMemoryAppPreferencesStore(preferences: preferences),
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+
+        await coordinator.startLiveFirstSession()
+        await coordinator.validateImportedToken("custom-token", localLabel: "Local")
+        try await Task.sleep(for: .milliseconds(30))
+
+        let productionSaved = try await store.loadCredential(scope: .production)
+        let customSaved = try await store.loadCredential(scope: CredentialScope(environmentID: custom.id))
+        let connectedEnvironments = await realtime.connectedEnvironments
+        let connectedCredentials = await realtime.connectedCredentials
+        XCTAssertNil(productionSaved)
+        XCTAssertEqual(customSaved?.token, "custom-token")
+        XCTAssertEqual(connectedEnvironments.last, custom.environment)
+        XCTAssertEqual(connectedCredentials.last?.token, "custom-token")
+    }
+
+    @MainActor
+    func testSavedCredentialNetworkFailureDoesNotLoopAndRetryCanRecover() async throws {
+        let store = InMemoryTokenStore(credential: .sessionToken("token"))
+        let realtime = RecordingRealtimeClient(statesOnConnect: [.ready])
+        let validator = RecordingSessionValidator(errors: [SessionValidationError.networkUnavailable("timeout token=secret /Users/enka/Library/Keychains/login.keychain-db")])
+        let coordinator = AppSessionCoordinator(
+            tokenStore: store,
+            sessionValidator: validator,
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { realtime }
+        )
+        let appModel = LiquidBagelAppModel(coordinator: coordinator)
+
+        await coordinator.startLiveFirstSession()
+        await coordinator.startLiveFirstSession()
+        if case .savedCredentialFailed = appModel.startupState {
+        } else {
+            XCTFail("Expected saved credential recovery state, got \(appModel.startupState)")
+        }
+        XCTAssertEqual(coordinator.autoConnectAttemptCount, 1)
+        XCTAssertEqual(coordinator.startupAuthDiagnostics.startupSkippedCount, 1)
+
+        await coordinator.reconnectLiveManually()
+        try await Task.sleep(for: .milliseconds(30))
+
+        let validateCallCount = await validator.validateCallCount
+        let connectCallCount = await realtime.connectCallCount
+        XCTAssertEqual(validateCallCount, 2)
+        XCTAssertEqual(connectCallCount, 1)
+        XCTAssertTrue(coordinator.sessionState == .connecting || coordinator.sessionState == .connected)
+    }
+
+    @MainActor
+    func testForgetSessionAndEnvironmentSwitchLandInRecoverableStates() async throws {
+        let custom = try EnvironmentProfile.custom(
+            name: "Local",
+            environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:14702")!, eventsURL: URL(string: "ws://localhost:14703")!)
+        )
+        let forgetStore = InMemoryTokenStore(credential: .sessionToken("production-token"))
+        let forgetCoordinator = AppSessionCoordinator(
+            tokenStore: forgetStore,
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient(statesOnConnect: [.ready]) }
+        )
+        let forgetAppModel = LiquidBagelAppModel(coordinator: forgetCoordinator)
+
+        await forgetCoordinator.startLiveFirstSession()
+        await forgetCoordinator.forgetLocalSession()
+        XCTAssertEqual(forgetAppModel.startupState, .noCredential)
+
+        let switchPreferences = try AppPreferences.defaults.upserting(profile: custom)
+        let switchStore = InMemoryTokenStore()
+        try await switchStore.saveCredential(.sessionToken("custom-token"), scope: CredentialScope(environmentID: custom.id))
+        let switchCoordinator = AppSessionCoordinator(
+            tokenStore: switchStore,
+            preferencesStore: InMemoryAppPreferencesStore(preferences: switchPreferences),
+            sessionValidator: StubSessionValidator(),
+            apiClientFactory: { _, _ in RecordingAPIClient() },
+            realtimeClientFactory: { RecordingRealtimeClient(statesOnConnect: [.ready]) }
+        )
+        let switchAppModel = LiquidBagelAppModel(coordinator: switchCoordinator)
+
+        await switchCoordinator.startMockSession()
+        await switchCoordinator.selectEnvironmentProfile(id: custom.id)
+        XCTAssertTrue(switchCoordinator.hasSavedCredential)
+        if case .savedCredentialFailed = switchAppModel.startupState {
+        } else {
+            XCTFail("Expected saved credential recovery state after environment switch, got \(switchAppModel.startupState)")
+        }
+    }
+
+    @MainActor
+    func testLiquidBagelAppModelSharesCoordinatorWithShell() {
+        let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        let appModel = LiquidBagelAppModel(coordinator: coordinator)
+
+        appModel.shell.attachSessionCoordinator(appModel.coordinator)
+
+        XCTAssertTrue(appModel.coordinator === coordinator)
+        XCTAssertTrue(appModel.shell.sessionCoordinator === coordinator)
+    }
+
+    @MainActor
+    func testStartupAuthDiagnosticsRedactSensitiveValues() {
+        var diagnostics = StartupAuthDiagnostics()
+        diagnostics.startupInvocationCount = 1
+        diagnostics.startupAutoConnectAttemptCount = 1
+        diagnostics.lastEnvironmentKind = "custom https://api.example.test"
+        diagnostics.lastStartupAction = #"token=abc123 password=hunter2 /Users/enka/Library/Keychains/login.keychain-db"#
+        diagnostics.lastStartupResult = #"{"error":"raw body","token":"secret","mfa_response":"123456"}"#
+        diagnostics.lastAuthAction = "session 01J123456789ABCDEFGHJKLMNP"
+        diagnostics.lastAuthResult = "mfa_ticket=secret-ticket"
+        diagnostics.lastErrorCategory = .unknown("raw body secret")
+
+        let summary = diagnostics.redactedSummary
+
+        XCTAssertFalse(summary.contains("abc123"))
+        XCTAssertFalse(summary.contains("hunter2"))
+        XCTAssertFalse(summary.contains("/Users/enka"))
+        XCTAssertFalse(summary.contains(#""token":"secret""#))
+        XCTAssertFalse(summary.contains("123456"))
+        XCTAssertFalse(summary.contains("01J123456789ABCDEFGHJKLMNP"))
+        XCTAssertFalse(summary.contains("secret-ticket"))
+        XCTAssertTrue(summary.contains("[redacted"))
+    }
+}
+
 // MARK: - Phase 38 Support Types
 
 private actor StubLoginAPIClient: StoatAPIClient {
     let loginResponse: SessionLoginResponse
+    let continueResponse: SessionLoginResponse
+    private(set) var loginCallCount = 0
+    private(set) var continueCallCount = 0
 
-    init(response: SessionLoginResponse) {
+    init(response: SessionLoginResponse, continueResponse: SessionLoginResponse? = nil) {
         self.loginResponse = response
+        self.continueResponse = continueResponse ?? response
     }
 
     // Required protocol methods without default implementations
@@ -4661,6 +5571,13 @@ private actor StubLoginAPIClient: StoatAPIClient {
     func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
     func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile { throw StoatAPIError.unimplementedEndpoint("stub") }
 
-    func login(request: SessionLoginRequest) async throws -> SessionLoginResponse { loginResponse }
-    func continueLogin(request: SessionMFALoginRequest) async throws -> SessionLoginResponse { loginResponse }
+    func login(request: SessionLoginRequest) async throws -> SessionLoginResponse {
+        loginCallCount += 1
+        return loginResponse
+    }
+
+    func continueLogin(request: SessionMFALoginRequest) async throws -> SessionLoginResponse {
+        continueCallCount += 1
+        return continueResponse
+    }
 }

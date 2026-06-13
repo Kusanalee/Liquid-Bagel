@@ -120,6 +120,11 @@ public actor ImageMemoryCache {
         currentBytes = 0
     }
 
+    public func remove(_ key: ImageCacheKey) {
+        guard let existing = entries.removeValue(forKey: key) else { return }
+        currentBytes -= existing.data.count
+    }
+
     public func snapshot() -> ImageMemoryCacheSnapshot {
         ImageMemoryCacheSnapshot(count: entries.count, byteCount: currentBytes)
     }

@@ -516,6 +516,7 @@ public final class MainShellViewModel {
     public var messageSendDiagnostics = MessageSendDiagnostics()
     public var dmRouteDiagnostics = DMRouteDiagnostics()
     public var dmLiveTrace = DirectMessageLiveTrace()
+    public var dmDiagnostics = DMDiagnostics()
     public var notificationPermissionStatus: NotificationPermissionStatus = .unknown
     public var notificationBanners: [NotificationEvent] = []
     public var notificationDiagnostics = NotificationDiagnostics()
@@ -542,6 +543,8 @@ public final class MainShellViewModel {
     public var userProfilesByID: [UserID: UserProfile] = [:]
     public var profileErrorsByID: [UserID: String] = [:]
     public var profileLoadingUserIDs: Set<UserID> = []
+    public var profileEditDraft = ProfileEditDraftState()
+    public var profileEditDiagnostics = ProfileEditDiagnostics()
     public var statusUpdateStatus: String?
     public var pendingRelationshipAction: PendingRelationshipAction?
     public var isJoinInvitePresented = false
@@ -644,6 +647,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private let visibleRangeValidator = TimelineVisibleRangeValidator()
     @ObservationIgnored private let loadedMessageFinder = LoadedMessageFinder()
     @ObservationIgnored private let attachmentValidationPolicy = AttachmentValidationPolicy()
+    @ObservationIgnored private let profileMediaValidationPolicy = ProfileEditMediaValidationPolicy()
     @ObservationIgnored private var visibleRangeUpdateTasks: [ChannelID: Task<Void, Never>] = [:]
     @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
     @ObservationIgnored private var selectedTimelineGroupCacheKey: String?
@@ -659,6 +663,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var profileFetchMergeCount = 0
     @ObservationIgnored private var memberWrapperUserMergeCount = 0
     @ObservationIgnored private var transientStatusTask: Task<Void, Never>?
+    @ObservationIgnored private var openingDirectMessageUserIDs: Set<UserID> = []
 
     public init(
         selection: ShellSelection = ShellSelection(),
@@ -726,6 +731,7 @@ public final class MainShellViewModel {
         )
         validateSelection()
         self.messageController.hydrate(from: snapshot)
+        refreshDMDiagnosticsSnapshot()
         installNotificationRouteHandler()
         installAppLifecycleHandler()
         if let snapshotSource {
@@ -995,7 +1001,7 @@ public final class MainShellViewModel {
     private func directMessageTitle(for channel: Channel) -> String {
         switch channel.kind {
         case .savedMessages:
-            return "Saved Messages"
+            return "Saved Notes"
         case .group:
             return channel.displayName.isEmpty ? "Group DM" : channel.displayName
         default:
@@ -1467,12 +1473,19 @@ public final class MainShellViewModel {
         Phase22Derivations.directMessageItems(
             snapshot: snapshot,
             currentUserID: currentUserID,
-            localReadStates: localReadStates
+            localReadStates: localReadStates,
+            notificationPreferences: notificationPreferences,
+            selectedChannelID: selectedConversationChannelID
         )
     }
 
     public var incomingFriendRequestCount: Int {
         Phase22Derivations.pendingIncomingCount(snapshot: snapshot, currentUserID: currentUserID, currentUser: currentUser)
+    }
+
+    public var canRefreshDMs: Bool {
+        effectiveRuntimeMode == .mock ||
+            (effectiveRuntimeMode == .liveManual && effectiveSessionState == .connected)
     }
 
     public func relationshipStatus(for user: User) -> RelationshipStatus {
@@ -1482,6 +1495,15 @@ public final class MainShellViewModel {
     public func openFriends(tab: FriendsTab = .online) {
         friendsTab = tab
         selectDirectMessages()
+    }
+
+    public func openSavedNotes(source: DMOpenSource = .savedNotes) async {
+        guard let currentUserID else {
+            relationshipActionStatus = "Sign in before opening Saved Notes."
+            failDMOpen(userID: UserID(rawValue: "current-user"), source: source, category: .authentication, message: "Sign in before opening Saved Notes.")
+            return
+        }
+        await openDirectMessage(with: currentUserID, source: source)
     }
 
     public func showUserProfile(_ userID: UserID, source: ProfileOpenSource = .unknown, serverID explicitServerID: ServerID? = nil) {
@@ -1552,27 +1574,500 @@ public final class MainShellViewModel {
         profileLoadingUserIDs.remove(userID)
     }
 
+    public func openProfileEditorFromProfile() {
+        selectedSettingsTab = .account
+        isCredentialSetupPresented = true
+        prepareProfileEditor(force: true)
+        Task { [weak self] in await self?.ensureCurrentUserProfileForEditing() }
+    }
+
+    public func prepareProfileEditor(force: Bool = false) {
+        guard let user = currentUserForPresentation else {
+            if force || profileEditDraft.userID != nil {
+                profileEditDraft = ProfileEditDraftState()
+            }
+            return
+        }
+        if !force,
+           profileEditDraft.userID == user.id,
+           (profileEditDraft.isDirty || profileEditDraft.isSaving) {
+            return
+        }
+        profileEditDraft = ProfileEditDraftState(user: user, profile: userProfilesByID[user.id])
+    }
+
+    public func ensureCurrentUserProfileForEditing() async {
+        guard let user = currentUserForPresentation else {
+            prepareProfileEditor(force: true)
+            return
+        }
+        await fetchUserProfileIfNeeded(user.id)
+        if !profileEditDraft.isDirty && !profileEditDraft.isSaving {
+            prepareProfileEditor(force: true)
+        }
+    }
+
+    public var canSaveProfileEdit: Bool {
+        profileEditDraft.canSave
+    }
+
+    public func cancelProfileEdit() {
+        prepareProfileEditor(force: true)
+    }
+
+    public func chooseProfileAvatar() {
+        chooseProfileMedia(kind: .avatar)
+    }
+
+    public func chooseProfileBackground() {
+        chooseProfileMedia(kind: .background)
+    }
+
+    public func removeProfileAvatar() {
+        profileEditDraft.safeErrorMessage = nil
+        profileEditDraft.saveStatusMessage = nil
+        profileEditDraft.avatarChange = profileEditDraft.originalAvatarFileID == nil ? .unchanged : .remove
+    }
+
+    public func removeProfileBackground() {
+        profileEditDraft.safeErrorMessage = nil
+        profileEditDraft.saveStatusMessage = nil
+        profileEditDraft.backgroundChange = profileEditDraft.originalBackgroundFileID == nil ? .unchanged : .remove
+    }
+
+    public func stageProfileMedia(_ draft: ProfileEditMediaDraft) {
+        profileEditDraft.safeErrorMessage = nil
+        profileEditDraft.saveStatusMessage = nil
+        switch draft.kind {
+        case .avatar:
+            profileEditDraft.avatarChange = .upload(draft)
+        case .background:
+            profileEditDraft.backgroundChange = .upload(draft)
+        }
+    }
+
+    public func stageProfileMediaData(kind: ProfileEditMediaKind, data: Data, filename: String, mimeType: String) throws {
+        let draft = try profileMediaValidationPolicy.draft(data: data, filename: filename, mimeType: mimeType, kind: kind)
+        stageProfileMedia(draft)
+    }
+
+    public func stageProfileMediaFile(url: URL, kind: ProfileEditMediaKind) async {
+        do {
+            let draft = try profileMediaValidationPolicy.draft(for: url, kind: kind)
+            stageProfileMedia(draft)
+            profileEditDiagnostics = ProfileEditDiagnostics(
+                lastAction: "staged \(kind.rawValue)",
+                editedFieldCategories: profileEditDraft.editedFieldCategories,
+                uploadTagCategory: kind.uploadTagCategory,
+                uploadResultCategory: .skipped,
+                mutationResultCategory: .idle
+            )
+        } catch {
+            let category = ProfileEditSafeErrorCategory.categorize(error)
+            profileEditDraft.safeErrorMessage = category.userFacingMessage
+            profileEditDiagnostics = ProfileEditDiagnostics(
+                lastAction: "stage \(kind.rawValue) failed",
+                editedFieldCategories: profileEditDraft.editedFieldCategories,
+                uploadTagCategory: kind.uploadTagCategory,
+                uploadResultCategory: .failed,
+                mutationResultCategory: .skipped,
+                safeErrorCategory: category
+            )
+        }
+    }
+
+    public func saveProfileEdit() async {
+        guard profileEditDraft.canSave else { return }
+        guard let userID = currentUserID,
+              let originalUser = currentUserForPresentation
+        else {
+            failProfileEdit(error: ProfileEditValidationError.missingCurrentUser, action: "save failed")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            failProfileEdit(error: ProfileEditValidationError.missingClient, action: "save failed")
+            return
+        }
+
+        let started = Date()
+        let originalProfile = userProfilesByID[userID]
+        let stagedDraft = profileEditDraft
+        var remove: [UserEditRemovedField] = []
+        var displayName: String?
+        var profileContent: String?
+        var avatarUpload: ProfileEditMediaDraft?
+        var backgroundUpload: ProfileEditMediaDraft?
+        var uploadTagCategories: Set<ProfileEditUploadTagCategory> = []
+
+        profileEditDraft.isSaving = true
+        profileEditDraft.safeErrorMessage = nil
+        profileEditDraft.saveStatusMessage = nil
+        profileEditDiagnostics = ProfileEditDiagnostics(
+            lastAction: "save started",
+            routeCategory: .currentUserPatch,
+            editedFieldCategories: stagedDraft.editedFieldCategories,
+            uploadTagCategory: .none,
+            uploadResultCategory: .skipped,
+            mutationResultCategory: .pending,
+            returnedDataShape: .none
+        )
+
+        do {
+            let displayChange = try displayNameMutation(from: stagedDraft)
+            displayName = displayChange.value
+            if displayChange.remove {
+                remove.append(.displayName)
+            }
+
+            let profileContentChange = try profileContentMutation(from: stagedDraft)
+            profileContent = profileContentChange.value
+            if profileContentChange.remove {
+                remove.append(.profileContent)
+            }
+
+            switch stagedDraft.avatarChange {
+            case .unchanged:
+                break
+            case .remove:
+                remove.append(.avatar)
+            case let .upload(draft):
+                avatarUpload = draft
+                uploadTagCategories.insert(.avatars)
+            }
+
+            switch stagedDraft.backgroundChange {
+            case .unchanged:
+                break
+            case .remove:
+                remove.append(.profileBackground)
+            case let .upload(draft):
+                backgroundUpload = draft
+                uploadTagCategories.insert(.backgrounds)
+            }
+        } catch {
+            failProfileEdit(error: error, action: "validation failed", started: started, fields: stagedDraft.editedFieldCategories)
+            return
+        }
+
+        var uploadedAvatar: (fileID: FileID, draft: ProfileEditMediaDraft)?
+        var uploadedBackground: (fileID: FileID, draft: ProfileEditMediaDraft)?
+        do {
+            if let avatarUpload {
+                uploadedAvatar = try await uploadProfileMedia(avatarUpload, apiClient: apiClient, started: started, fields: stagedDraft.editedFieldCategories, uploadTagCategories: uploadTagCategories)
+            }
+            if let backgroundUpload {
+                uploadedBackground = try await uploadProfileMedia(backgroundUpload, apiClient: apiClient, started: started, fields: stagedDraft.editedFieldCategories, uploadTagCategories: uploadTagCategories)
+            }
+        } catch {
+            let category = ProfileEditSafeErrorCategory.uploadCategory(error)
+            profileEditDraft.isSaving = false
+            profileEditDraft.safeErrorMessage = category.userFacingMessage
+            profileEditDiagnostics = ProfileEditDiagnostics(
+                lastAction: "upload failed",
+                routeCategory: .currentUserPatch,
+                editedFieldCategories: stagedDraft.editedFieldCategories,
+                uploadTagCategory: uploadTagCategory(from: uploadTagCategories),
+                uploadResultCategory: .failed,
+                mutationResultCategory: .skipped,
+                durationMilliseconds: durationMilliseconds(since: started),
+                safeErrorCategory: category,
+                returnedDataShape: .none
+            )
+            return
+        }
+
+        let profileDraft = profileEditPayload(content: profileContent, backgroundFileID: uploadedBackground?.fileID)
+        let mutationDraft = UserEditDraft(
+            displayName: displayName,
+            avatar: uploadedAvatar?.fileID.rawValue,
+            profile: profileDraft,
+            remove: remove
+        )
+
+        do {
+            let updated = try await apiClient.editUser(userID: userID, draft: mutationDraft)
+            upsertUser(updated)
+            let overlayProfile = overlayProfileAfterEdit(
+                userID: userID,
+                original: originalProfile,
+                profileContent: profileContent,
+                removedContent: remove.contains(.profileContent),
+                uploadedBackground: uploadedBackground,
+                removedBackground: remove.contains(.profileBackground)
+            )
+            if stagedDraft.editedFieldCategories.contains(.profileContent) || stagedDraft.editedFieldCategories.contains(.profileBackground) {
+                userProfilesByID[userID] = overlayProfile
+            }
+            let invalidationCount = await invalidateProfileEditImageCaches(
+                oldUser: originalUser,
+                oldProfile: originalProfile,
+                newUser: updated,
+                newProfile: overlayProfile,
+                uploadedAvatar: uploadedAvatar,
+                uploadedBackground: uploadedBackground
+            )
+            if profilePresentationContext?.userID == userID {
+                profilePresentationContext = profileContext(userID: userID, serverID: profilePresentationContext?.serverID, source: profilePresentationContext?.openSource ?? .unknown)
+            }
+            profileEditDraft = ProfileEditDraftState(user: updated, profile: overlayProfile)
+            profileEditDraft.saveStatusMessage = "Profile updated."
+            placeholderStatus = "Profile updated."
+            profileEditDiagnostics = ProfileEditDiagnostics(
+                lastAction: "save succeeded",
+                routeCategory: .currentUserPatch,
+                editedFieldCategories: stagedDraft.editedFieldCategories,
+                uploadTagCategory: uploadTagCategory(from: uploadTagCategories),
+                uploadResultCategory: uploadTagCategories.isEmpty ? .skipped : .succeeded,
+                mutationResultCategory: .succeeded,
+                durationMilliseconds: durationMilliseconds(since: started),
+                cacheInvalidationCount: invalidationCount,
+                returnedDataShape: .fullUser
+            )
+        } catch {
+            let category = ProfileEditSafeErrorCategory.categorize(error)
+            profileEditDraft.isSaving = false
+            profileEditDraft.safeErrorMessage = category.userFacingMessage
+            profileEditDiagnostics = ProfileEditDiagnostics(
+                lastAction: "mutation failed",
+                routeCategory: .currentUserPatch,
+                editedFieldCategories: stagedDraft.editedFieldCategories,
+                uploadTagCategory: uploadTagCategory(from: uploadTagCategories),
+                uploadResultCategory: uploadTagCategories.isEmpty ? .skipped : .succeeded,
+                mutationResultCategory: .failed,
+                durationMilliseconds: durationMilliseconds(since: started),
+                safeErrorCategory: category,
+                returnedDataShape: category == .decode ? .decodeFailed : .none
+            )
+        }
+    }
+
+    public func copyRedactedProfileEditDiagnostics() async {
+        let text = ProfileEditDiagnosticsFormatter.redactedText(profileEditDiagnostics)
+        await messageCopier.copy(text)
+    }
+
+    @discardableResult
+    public func invalidateImageResource(for file: File?, kind: ImageResourceKind) async -> Int {
+        guard let file else { return 0 }
+        let key = ImageCacheKey(id: file.id.rawValue, kind: kind)
+        loadedImageResources.removeValue(forKey: key)
+        imageResourceStates.removeValue(forKey: key)
+        queuedImageResourceRequests.removeValue(forKey: key)
+        imageResourceLoadTasks[key]?.cancel()
+        imageResourceLoadTasks.removeValue(forKey: key)
+        await imageMemoryCache.remove(key)
+        return 1
+    }
+
+    private func chooseProfileMedia(kind: ProfileEditMediaKind) {
+        #if canImport(AppKit)
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.image]
+        panel.prompt = "Choose"
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { [weak self] in
+                await self?.stageProfileMediaFile(url: url, kind: kind)
+            }
+        }
+        #else
+        failProfileEdit(error: ProfileEditValidationError.unsupportedFileType, action: "file chooser unavailable")
+        #endif
+    }
+
+    private func displayNameMutation(from draft: ProfileEditDraftState) throws -> (value: String?, remove: Bool) {
+        let original = draft.originalDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let current = draft.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard current != original else { return (nil, false) }
+        if current.isEmpty {
+            return (nil, true)
+        }
+        guard current.count >= 2, current.count <= 32 else {
+            throw ProfileEditValidationError.invalidDisplayName
+        }
+        return (current, false)
+    }
+
+    private func profileContentMutation(from draft: ProfileEditDraftState) throws -> (value: String?, remove: Bool) {
+        let original = draft.originalProfileContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : draft.originalProfileContent
+        let current = draft.profileContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : draft.profileContent
+        guard current != original else { return (nil, false) }
+        guard current.count <= 2_000 else {
+            throw ProfileEditValidationError.profileContentTooLong
+        }
+        if current.isEmpty {
+            return (nil, true)
+        }
+        return (current, false)
+    }
+
+    private func profileEditPayload(content: String?, backgroundFileID: FileID?) -> UserProfileEditDraft? {
+        guard content != nil || backgroundFileID != nil else { return nil }
+        return UserProfileEditDraft(content: content, background: backgroundFileID?.rawValue)
+    }
+
+    private func uploadProfileMedia(
+        _ draft: ProfileEditMediaDraft,
+        apiClient: any StoatAPIClient,
+        started: Date,
+        fields: Set<ProfileEditFieldCategory>,
+        uploadTagCategories: Set<ProfileEditUploadTagCategory>
+    ) async throws -> (fileID: FileID, draft: ProfileEditMediaDraft) {
+        profileEditDiagnostics = ProfileEditDiagnostics(
+            lastAction: "uploading \(draft.kind.rawValue)",
+            routeCategory: .currentUserPatch,
+            editedFieldCategories: fields,
+            uploadTagCategory: uploadTagCategory(from: uploadTagCategories),
+            uploadResultCategory: .pending,
+            mutationResultCategory: .skipped,
+            durationMilliseconds: durationMilliseconds(since: started)
+        )
+        let uploaded = try await apiClient.uploadFile(
+            data: draft.data,
+            filename: draft.filename,
+            mimeType: draft.mimeType,
+            tag: draft.kind.uploadTag
+        )
+        return (uploaded.id, draft)
+    }
+
+    private func overlayProfileAfterEdit(
+        userID: UserID,
+        original: UserProfile?,
+        profileContent: String?,
+        removedContent: Bool,
+        uploadedBackground: (fileID: FileID, draft: ProfileEditMediaDraft)?,
+        removedBackground: Bool
+    ) -> UserProfile {
+        var profile = original ?? userProfilesByID[userID] ?? UserProfile()
+        if removedContent {
+            profile.content = nil
+        } else if let profileContent {
+            profile.content = profileContent
+        }
+        if removedBackground {
+            profile.background = nil
+        } else if let uploadedBackground {
+            profile.background = profileMediaFile(id: uploadedBackground.fileID, draft: uploadedBackground.draft, userID: userID)
+        }
+        return profile
+    }
+
+    private func profileMediaFile(id: FileID, draft: ProfileEditMediaDraft, userID: UserID) -> File {
+        File(
+            id: id,
+            tag: draft.kind.uploadTag.rawAPIValue,
+            filename: draft.filename,
+            metadata: .file,
+            contentType: draft.mimeType,
+            size: draft.byteCount,
+            userID: userID
+        )
+    }
+
+    private func invalidateProfileEditImageCaches(
+        oldUser: User?,
+        oldProfile: UserProfile?,
+        newUser: User,
+        newProfile: UserProfile,
+        uploadedAvatar: (fileID: FileID, draft: ProfileEditMediaDraft)?,
+        uploadedBackground: (fileID: FileID, draft: ProfileEditMediaDraft)?
+    ) async -> Int {
+        var keys: Set<ImageCacheKey> = []
+        func add(_ file: File?, _ kind: ImageResourceKind) {
+            guard let file else { return }
+            keys.insert(ImageCacheKey(id: file.id.rawValue, kind: kind))
+        }
+        add(oldUser?.avatar, .userAvatar)
+        add(newUser.avatar, .userAvatar)
+        add(oldProfile?.background, .profileBackground)
+        add(newProfile.background, .profileBackground)
+        for key in keys {
+            loadedImageResources.removeValue(forKey: key)
+            imageResourceStates.removeValue(forKey: key)
+            queuedImageResourceRequests.removeValue(forKey: key)
+            imageResourceLoadTasks[key]?.cancel()
+            imageResourceLoadTasks.removeValue(forKey: key)
+            await imageMemoryCache.remove(key)
+        }
+        if let uploadedAvatar, let avatar = newUser.avatar {
+            loadedImageResources[ImageCacheKey(id: avatar.id.rawValue, kind: .userAvatar)] = uploadedAvatar.draft.previewData ?? uploadedAvatar.draft.data
+        }
+        if let uploadedBackground, let background = newProfile.background {
+            loadedImageResources[ImageCacheKey(id: background.id.rawValue, kind: .profileBackground)] = uploadedBackground.draft.previewData ?? uploadedBackground.draft.data
+        }
+        return keys.count
+    }
+
+    private func uploadTagCategory(from categories: Set<ProfileEditUploadTagCategory>) -> ProfileEditUploadTagCategory {
+        let tags = categories.filter { $0 != .none }
+        if tags.count > 1 { return .multiple }
+        return tags.first ?? .none
+    }
+
+    private func failProfileEdit(
+        error: any Error,
+        action: String,
+        started: Date? = nil,
+        fields: Set<ProfileEditFieldCategory>? = nil
+    ) {
+        let category = ProfileEditSafeErrorCategory.categorize(error)
+        profileEditDraft.isSaving = false
+        profileEditDraft.safeErrorMessage = category.userFacingMessage
+        profileEditDiagnostics = ProfileEditDiagnostics(
+            lastAction: action,
+            routeCategory: .currentUserPatch,
+            editedFieldCategories: fields ?? profileEditDraft.editedFieldCategories,
+            uploadTagCategory: .none,
+            uploadResultCategory: .skipped,
+            mutationResultCategory: .skipped,
+            durationMilliseconds: started.map { durationMilliseconds(since: $0) },
+            safeErrorCategory: category,
+            returnedDataShape: category == .decode ? .decodeFailed : .none
+        )
+    }
+
     public func refreshRelationshipsAndDirectMessages() async {
+        guard effectiveRuntimeMode != .mock else {
+            await refreshDMs(source: .friends)
+            return
+        }
         guard effectiveRuntimeMode == .liveManual,
               effectiveSessionState == .connected,
               let apiClient = sessionCoordinator?.apiClient
         else {
             relationshipActionStatus = "Reconnect before refreshing friends and DMs."
+            recordDMRefreshSkipped(source: .friends, category: .authentication)
             return
         }
         isRelationshipRefreshInProgress = true
+        let started = Date()
+        beginDMRefresh(source: .friends)
         defer { isRelationshipRefreshInProgress = false }
         do {
             let user = try await apiClient.fetchCurrentUser()
             applyRelationshipUser(user)
             let dms = try await apiClient.fetchDirectMessages()
-            for channel in dms {
-                snapshot.channelsByID[channel.id] = channel
-            }
-            relationshipActionStatus = nil
-            lastTimelineActionResult = "Friends and DMs refreshed"
+            finishDMRefresh(channels: dms, source: .friends, started: started, successMessage: "Friends and DMs refreshed")
         } catch {
-            relationshipActionStatus = "Refresh failed."
+            failDMRefresh(error, source: .friends, started: started, userMessage: "Refresh failed.")
+        }
+    }
+
+    public func refreshDMs(source: DMRefreshSource = .explicit) async {
+        guard let apiClient = apiClientForDMRefresh(source: source) else { return }
+        isRelationshipRefreshInProgress = true
+        let started = Date()
+        beginDMRefresh(source: source)
+        defer { isRelationshipRefreshInProgress = false }
+        do {
+            let channels = try await apiClient.fetchDirectMessages()
+            finishDMRefresh(channels: channels, source: source, started: started, successMessage: "DMs refreshed")
+        } catch {
+            failDMRefresh(error, source: source, started: started, userMessage: "DM refresh failed.")
         }
     }
 
@@ -1648,15 +2143,28 @@ public final class MainShellViewModel {
         }
     }
 
-    public func openDirectMessage(with userID: UserID) async {
-        if let existing = directMessageItems.first(where: { item in
-            guard item.channel.kind == .directMessage || item.channel.kind == .savedMessages else { return false }
-            return item.participants.contains { $0.id == userID } || item.channel.recipients.contains(userID)
-        }) {
+    public func openDirectMessage(with userID: UserID, source: DMOpenSource = .directCall, forceNetwork: Bool = false) async {
+        beginDMOpen(userID: userID, source: source)
+        if !forceNetwork, let existing = knownDirectMessageChannel(for: userID) {
             selectChannel(existing.id)
             dmLiveTrace.clickedUserID = userID
             dmLiveTrace.clickedRowID = "user-\(userID.rawValue)"
+            finishDMOpen(channelID: existing.id, userID: userID, source: source)
             return
+        }
+        guard !openingDirectMessageUserIDs.contains(userID) else {
+            relationshipActionStatus = "Direct message is already opening."
+            var diagnostics = dmDiagnostics
+            diagnostics.lastOpenStatus = .skipped
+            diagnostics.lastOpenSource = source
+            diagnostics.lastOpenTarget = userID.rawValue
+            dmDiagnostics = diagnostics
+            refreshDMDiagnosticsSnapshot()
+            return
+        }
+        openingDirectMessageUserIDs.insert(userID)
+        defer {
+            openingDirectMessageUserIDs.remove(userID)
         }
         if effectiveRuntimeMode == .mock {
             let channel = Channel(
@@ -1666,23 +2174,29 @@ public final class MainShellViewModel {
                 active: true,
                 recipients: [currentUserID, userID].compactMap { $0 }
             )
-            snapshot.channelsByID[channel.id] = channel
+            _ = mergeDMChannels([channel], source: .mock)
             selectChannel(channel.id)
             dmLiveTrace.clickedUserID = userID
             dmLiveTrace.clickedRowID = "user-\(userID.rawValue)"
             relationshipActionStatus = "Direct message opened"
+            finishDMOpen(channelID: channel.id, userID: userID, source: source)
             return
         }
-        guard let apiClient = availableRelationshipAPIClient() else { return }
+        guard let apiClient = availableRelationshipAPIClient() else {
+            failDMOpen(userID: userID, source: source, category: .authentication, message: "Reconnect before opening direct messages.")
+            return
+        }
         do {
             let channel = try await apiClient.openDirectMessage(userID: userID)
-            snapshot.channelsByID[channel.id] = channel
+            _ = mergeDMChannels([channel], source: .explicit)
             selectChannel(channel.id)
             dmLiveTrace.clickedUserID = userID
             dmLiveTrace.clickedRowID = "user-\(userID.rawValue)"
             relationshipActionStatus = "Direct message opened"
+            finishDMOpen(channelID: channel.id, userID: userID, source: source)
         } catch {
             relationshipActionStatus = "Could not open direct message."
+            let category = DMSafeErrorCategory.categorize(error)
             dmLiveTrace = DirectMessageLiveTrace(
                 clickedRowID: "user-\(userID.rawValue)",
                 clickedUserID: userID,
@@ -1696,6 +2210,7 @@ public final class MainShellViewModel {
                 selectedConversationChannelID: selectedConversationChannelID,
                 lastError: "Could not open direct message."
             )
+            failDMOpen(userID: userID, source: source, category: category, message: "Could not open direct message.")
         }
     }
 
@@ -1711,6 +2226,217 @@ public final class MainShellViewModel {
             return nil
         }
         return apiClient
+    }
+
+    private func apiClientForDMRefresh(source: DMRefreshSource) -> (any StoatAPIClient)? {
+        if effectiveRuntimeMode == .mock {
+            return communityAPIClient
+        }
+        guard effectiveRuntimeMode == .liveManual,
+              effectiveSessionState == .connected,
+              let apiClient = sessionCoordinator?.apiClient
+        else {
+            relationshipActionStatus = "Reconnect before refreshing DMs."
+            recordDMRefreshSkipped(source: source, category: .authentication)
+            return nil
+        }
+        return apiClient
+    }
+
+    private func beginDMRefresh(source: DMRefreshSource) {
+        var diagnostics = dmDiagnostics
+        diagnostics.lastRefreshStatus = .loading
+        diagnostics.lastRefreshSource = source
+        diagnostics.lastRefreshErrorCategory = nil
+        dmDiagnostics = diagnostics
+        refreshDMDiagnosticsSnapshot()
+    }
+
+    private func finishDMRefresh(channels: [Channel], source: DMRefreshSource, started: Date, successMessage: String) {
+        let result = mergeDMChannels(channels, source: source)
+        var diagnostics = dmDiagnostics
+        diagnostics.lastRefreshStatus = .succeeded
+        diagnostics.lastRefreshSource = source
+        diagnostics.lastRefreshCount = result.returnedCount
+        diagnostics.lastRefreshDurationMilliseconds = durationMilliseconds(since: started)
+        diagnostics.lastRefreshErrorCategory = nil
+        diagnostics.duplicateMergeCount += result.updatedCount + result.duplicateCount
+        dmDiagnostics = diagnostics
+        refreshDMDiagnosticsSnapshot()
+        relationshipActionStatus = nil
+        placeholderStatus = successMessage
+        lastTimelineActionResult = successMessage
+        quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+        loadVisibleIdentityImagesForCurrentSelection()
+    }
+
+    private func failDMRefresh(_ error: any Error, source: DMRefreshSource, started: Date, userMessage: String) {
+        let category = DMSafeErrorCategory.categorize(error)
+        var diagnostics = dmDiagnostics
+        diagnostics.lastRefreshStatus = .failed
+        diagnostics.lastRefreshSource = source
+        diagnostics.lastRefreshDurationMilliseconds = durationMilliseconds(since: started)
+        diagnostics.lastRefreshErrorCategory = category
+        diagnostics = diagnostics.addingErrorCategory(category)
+        dmDiagnostics = diagnostics
+        refreshDMDiagnosticsSnapshot()
+        relationshipActionStatus = userMessage
+        placeholderStatus = userMessage
+        lastTimelineActionResult = userMessage
+    }
+
+    private func recordDMRefreshSkipped(source: DMRefreshSource, category: DMSafeErrorCategory?) {
+        var diagnostics = dmDiagnostics
+        diagnostics.lastRefreshStatus = .skipped
+        diagnostics.lastRefreshSource = source
+        diagnostics.lastRefreshErrorCategory = category
+        diagnostics = diagnostics.addingErrorCategory(category)
+        dmDiagnostics = diagnostics
+        refreshDMDiagnosticsSnapshot()
+    }
+
+    @discardableResult
+    private func mergeDMChannels(_ channels: [Channel], source: DMRefreshSource) -> DMChannelMergeResult {
+        var result = DMChannelMergeResult(source: source)
+        var seenIDs: Set<ChannelID> = []
+        for channel in channels where DMChannelClassifier.isDirectMessageLike(channel) {
+            result.returnedCount += 1
+            guard seenIDs.insert(channel.id).inserted else {
+                result.duplicateCount += 1
+                continue
+            }
+            let existing = snapshot.channelsByID[channel.id]
+            if existing == nil {
+                result.insertedCount += 1
+            } else {
+                result.updatedCount += 1
+            }
+            snapshot.channelsByID[channel.id] = mergedDMChannel(existing: existing, incoming: channel)
+        }
+        refreshDMDiagnosticsSnapshot()
+        return result
+    }
+
+    private func mergedDMChannel(existing: Channel?, incoming: Channel) -> Channel {
+        guard let existing else { return incoming }
+        var merged = incoming
+        if merged.userID == nil { merged.userID = existing.userID }
+        if merged.serverID == nil { merged.serverID = existing.serverID }
+        if merged.name == nil { merged.name = existing.name }
+        if merged.ownerID == nil { merged.ownerID = existing.ownerID }
+        if merged.description == nil { merged.description = existing.description }
+        if merged.active == nil { merged.active = existing.active }
+        if merged.recipients.isEmpty { merged.recipients = existing.recipients }
+        if merged.icon == nil { merged.icon = existing.icon }
+        if merged.lastMessageID == nil { merged.lastMessageID = existing.lastMessageID }
+        if merged.permissions == nil { merged.permissions = existing.permissions }
+        if merged.defaultPermissions == nil { merged.defaultPermissions = existing.defaultPermissions }
+        if merged.rolePermissions.isEmpty { merged.rolePermissions = existing.rolePermissions }
+        if merged.voice == nil { merged.voice = existing.voice }
+        if merged.slowmode == nil { merged.slowmode = existing.slowmode }
+        return merged
+    }
+
+    private func knownDirectMessageChannel(for userID: UserID) -> Channel? {
+        if userID == currentUserID {
+            return snapshot.channelsByID.values.first { channel in
+                guard channel.kind == .savedMessages, DMChannelClassifier.isDirectMessageLike(channel) else { return false }
+                return channel.userID == userID || channel.recipients.contains(userID) || currentUserID == userID
+            }
+        }
+        return snapshot.channelsByID.values.first { channel in
+            guard channel.kind == .directMessage,
+                  DMChannelClassifier.isDirectMessageLike(channel),
+                  channel.recipients.contains(userID)
+            else { return false }
+            if let currentUserID {
+                return channel.recipients.contains(currentUserID)
+            }
+            return true
+        }
+    }
+
+    private func beginDMOpen(userID: UserID, source: DMOpenSource) {
+        var diagnostics = dmDiagnostics
+        diagnostics.lastOpenStatus = .loading
+        diagnostics.lastOpenSource = source
+        diagnostics.lastOpenTarget = userID.rawValue
+        diagnostics.lastOpenErrorCategory = nil
+        if source == .savedNotes || userID == currentUserID {
+            diagnostics.savedNotesState = .opening
+        }
+        dmDiagnostics = diagnostics
+        refreshDMDiagnosticsSnapshot()
+    }
+
+    private func finishDMOpen(channelID: ChannelID, userID: UserID, source: DMOpenSource) {
+        var diagnostics = dmDiagnostics
+        diagnostics.lastOpenStatus = .succeeded
+        diagnostics.lastOpenSource = source
+        diagnostics.lastOpenTarget = userID.rawValue
+        diagnostics.lastOpenErrorCategory = nil
+        if snapshot.channelsByID[channelID]?.kind == .savedMessages {
+            diagnostics.savedNotesState = .available(channelID)
+        }
+        dmDiagnostics = diagnostics
+        refreshDMDiagnosticsSnapshot()
+    }
+
+    private func failDMOpen(userID: UserID, source: DMOpenSource, category: DMSafeErrorCategory, message: String) {
+        var diagnostics = dmDiagnostics
+        diagnostics.lastOpenStatus = .failed
+        diagnostics.lastOpenSource = source
+        diagnostics.lastOpenTarget = userID.rawValue
+        diagnostics.lastOpenErrorCategory = category
+        if source == .savedNotes || userID == currentUserID {
+            diagnostics.savedNotesState = .failed(category)
+        }
+        diagnostics = diagnostics.addingErrorCategory(category)
+        dmDiagnostics = diagnostics
+        refreshDMDiagnosticsSnapshot()
+        relationshipActionStatus = message
+        placeholderStatus = message
+    }
+
+    private func refreshDMDiagnosticsSnapshot() {
+        let dmChannels = snapshot.channelsByID.values.filter(DMChannelClassifier.isDirectMessageLike)
+        var diagnostics = dmDiagnostics
+        diagnostics.knownDirectMessageCount = dmChannels.filter { $0.kind == .directMessage }.count
+        diagnostics.knownGroupDMCount = dmChannels.filter { $0.kind == .group }.count
+        if let saved = dmChannels.first(where: { $0.kind == .savedMessages }) {
+            diagnostics.savedNotesState = .available(saved.id)
+        } else {
+            switch diagnostics.savedNotesState {
+            case .opening, .failed:
+                break
+            case .available, .unavailable:
+                diagnostics.savedNotesState = .unavailable
+            }
+        }
+        diagnostics.missingRecipientUserCount = dmChannels.reduce(0) { partial, channel in
+            let ids: [UserID]
+            if channel.kind == .savedMessages {
+                ids = [currentUserID ?? channel.userID].compactMap { $0 }
+            } else {
+                ids = channel.recipients
+            }
+            return partial + ids.filter { !knownUserExists($0) }.count
+        }
+        diagnostics.rawIDFallbackCount = directMessageItems.filter(\.usesRawIDFallback).count
+        let counts = NotificationBadgeCalculator.counts(snapshot: snapshot, preferences: notificationPreferences, localReadStates: localReadStates)
+        diagnostics.unreadChannelCount = counts.unreadChannelCount
+        diagnostics.mentionCount = counts.mentionCount
+        diagnostics.locallyClearedUnreadCount = locallyClearedUnreadChannelIDs.count
+        diagnostics.lastAckSummary = lastAckResult
+        dmDiagnostics = diagnostics
+    }
+
+    private func knownUserExists(_ userID: UserID) -> Bool {
+        snapshot.usersByID[userID] != nil || currentUser?.id == userID || sessionCoordinator?.currentUser?.id == userID
+    }
+
+    private func durationMilliseconds(since started: Date) -> Int {
+        max(0, Int(Date().timeIntervalSince(started) * 1000))
     }
 
     private func updatePreviewRelationship(userID: UserID, status: RelationshipStatus) {
@@ -3092,7 +3818,7 @@ public final class MainShellViewModel {
         dmRouteDiagnostics.selectedServerID = selection.serverID
         dmRouteDiagnostics.messageLoadRequested = false
         dmRouteDiagnostics.lastLoadResult = nil
-        dmRouteDiagnostics.composerTargetDescription = channel.displayName
+        dmRouteDiagnostics.composerTargetDescription = directMessageTitle(for: channel)
         dmLiveTrace = DirectMessageLiveTrace(
             clickedRowID: clickedRowID,
             clickedChannelID: channelID,
@@ -3223,6 +3949,7 @@ public final class MainShellViewModel {
     public func showAccountSessions() {
         selectedSettingsTab = .account
         isCredentialSetupPresented = true
+        prepareProfileEditor(force: false)
     }
 
     public func confirmLiveVerificationSend() async {
@@ -5262,6 +5989,17 @@ public final class MainShellViewModel {
         lastTimelineActionResult = "Copied redacted DM trace"
     }
 
+    public func copyRedactedDMDiagnostics() {
+        refreshDMDiagnosticsSnapshot()
+        let text = DMDiagnosticsFormatter.redactedText(dmDiagnostics)
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+        placeholderStatus = "DM diagnostics copied"
+        lastTimelineActionResult = "Copied redacted DM diagnostics"
+    }
+
     public func copyRedactedParityDiagnostics() {
         let text = ParityMatrixFormatter.redactedText(phase30ParityMatrix)
         #if canImport(AppKit)
@@ -5524,6 +6262,28 @@ public final class MainShellViewModel {
 
     public func openNotificationRoute(_ route: NotificationRoute) async {
         expiredNotificationRouteCount += removeExpiredQueuedNotificationRoutes()
+        let knownChannel = snapshot.channelsByID[route.channelID]
+        let isDMRoute = knownChannel.map(DMChannelClassifier.isDirectMessageLike) == true || route.serverID == nil
+        if isDMRoute,
+           effectiveRuntimeMode == .liveManual,
+           (effectiveSessionState != .connected || sessionCoordinator?.hydrationStatus.readyReceived != true) {
+            queueNotificationRoute(route)
+            placeholderStatus = "Reconnect to open this message."
+            recordNotificationRouteOutcome(.queuedAwaitingManualConnect)
+            return
+        }
+        if isDMRoute,
+           knownChannel == nil,
+           effectiveRuntimeMode == .liveManual,
+           effectiveSessionState == .connected,
+           sessionCoordinator?.hydrationStatus.readyReceived == true {
+            await refreshDMs(source: .notification)
+            guard snapshot.channelsByID[route.channelID] != nil else {
+                placeholderStatus = "Notification DM is not available."
+                recordNotificationRouteOutcome(.failed)
+                return
+            }
+        }
         selectChannel(route.channelID)
         guard let messageID = route.messageID else { return }
         if selectedTimelineMessages.contains(where: { $0.message.id == messageID }) {
@@ -6202,6 +6962,7 @@ public final class MainShellViewModel {
         quickSwitcherViewModel.update(snapshot: mergedSnapshot, selection: selection)
         updateDockBadge()
         updateNotificationDiagnostics()
+        refreshDMDiagnosticsSnapshot()
         replayQueuedNotificationRoutesIfReady()
         if effectiveRuntimeMode == .liveManual, effectiveSessionState == .connected {
             loadVisibleIdentityImagesForCurrentSelection()
@@ -6539,6 +7300,7 @@ public final class MainShellViewModel {
         scheduleLiveAckIfNeeded(channelID: channelID)
         updateDockBadge()
         updateNotificationDiagnostics()
+        refreshDMDiagnosticsSnapshot()
     }
 
     private func scheduleLiveAckIfNeeded(channelID: ChannelID) {
@@ -6565,10 +7327,12 @@ public final class MainShellViewModel {
                     }
                     self?.updateDockBadge()
                     self?.updateNotificationDiagnostics()
+                    self?.refreshDMDiagnosticsSnapshot()
                 }
             } catch {
                 await MainActor.run {
                     self?.lastAckResult = "Failed: \(error.userFacingMessage)"
+                    self?.refreshDMDiagnosticsSnapshot()
                 }
             }
         }
@@ -7151,9 +7915,13 @@ public final class LiquidBagelAppModel {
             return .ready
         case .signedOut:
             return .noCredential
-        case .loadingCredential, .savedCredentialUnvalidated, .validatingCredential:
+        case .loadingCredential, .validatingCredential:
             return coordinator.hasSavedCredential ? .validatingCredential : .noCredential
-        case .validatedReady, .readyToConnect, .connecting:
+        case .savedCredentialUnvalidated:
+            return coordinator.hasSavedCredential ? .savedCredentialFailed("A saved session is available for this environment. Retry connection when you are ready.") : .noCredential
+        case .validatedReady, .readyToConnect:
+            return coordinator.hasSavedCredential ? .savedCredentialFailed("The saved session is ready, but realtime is not connected.") : .noCredential
+        case .connecting:
             return .connectingLive
         case .connected:
             return .ready
@@ -7398,9 +8166,6 @@ public struct FirstRunLoginView: View {
                     Button("Import Token") {
                         Task {
                             await viewModel.submitToken()
-                            if viewModel.flowState == .succeeded {
-                                await coordinator.finishValidatedSessionAndConnect()
-                            }
                         }
                     }
                     .disabled(!viewModel.canSubmitToken)
@@ -7426,9 +8191,6 @@ public struct FirstRunLoginView: View {
                 Button("Sign In") {
                     Task {
                         await viewModel.submitLogin()
-                        if viewModel.flowState == .succeeded {
-                            await coordinator.finishValidatedSessionAndConnect()
-                        }
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -7469,7 +8231,7 @@ public struct SavedCredentialFailureView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     Button("Sign In Again") {
-                        Task { await coordinator.validateSavedSession() }
+                        Task { await coordinator.forgetLocalSession() }
                     }
                     Button("Forget Session") {
                         Task { await coordinator.forgetLocalSession() }
@@ -8169,7 +8931,7 @@ public struct CredentialSetupView: View {
                 TextField("Local label", text: $localLabel)
                 SecureField("Session token", text: $token)
                 HStack {
-                    Button("Validate") {
+                    Button("Import and Connect") {
                         Task {
                             let submitted = token
                             token = ""
@@ -8178,14 +8940,6 @@ public struct CredentialSetupView: View {
                         }
                     }
                     .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                    Button("Save") {
-                        Task {
-                            await viewModel.sessionCoordinator?.savePendingValidatedSession()
-                            viewModel.syncFromSessionCoordinator()
-                        }
-                    }
-                    .disabled(viewModel.sessionCoordinator?.pendingValidatedSession == nil)
                 }
             }
 
@@ -8383,6 +9137,7 @@ public struct CredentialSetupView: View {
         let identity = viewModel.visibleIdentityDiagnostics
         let freeze = viewModel.freezePerformanceDiagnostics
         let roleSort = viewModel.memberRoleSortDiagnostics
+        let dmConversation = viewModel.dmDiagnostics
         Section("Developer Diagnostics") {
             LabeledContent("Timeline", value: "loaded \(timeline.loadedMessageCount), visible \(TimelineCopyFormatter.shortID(timeline.firstVisibleMessageID?.rawValue)) to \(TimelineCopyFormatter.shortID(timeline.lastVisibleMessageID?.rawValue))")
             LabeledContent("DM route", value: "clicked \(TimelineCopyFormatter.shortID(dm.clickedChannelID?.rawValue)), selected \(TimelineCopyFormatter.shortID(dm.selectedConversationChannelID?.rawValue)), load \(dm.messageLoadRequested ? "requested" : "idle")")
@@ -8433,6 +9188,12 @@ public struct CredentialSetupView: View {
             if let error = viewModel.dmLiveTrace.lastError {
                 LabeledContent("DM trace error", value: error)
             }
+            LabeledContent("DM conversations", value: "direct \(dmConversation.knownDirectMessageCount), groups \(dmConversation.knownGroupDMCount), saved \(dmConversation.savedNotesState.label)")
+            LabeledContent("DM refresh", value: "\(dmConversation.lastRefreshStatus.rawValue), source \(dmConversation.lastRefreshSource?.rawValue ?? "-"), count \(dmConversation.lastRefreshCount), duration \(dmConversation.lastRefreshDurationMilliseconds.map(String.init) ?? "-")ms")
+            LabeledContent("DM open", value: "\(dmConversation.lastOpenStatus.rawValue), source \(dmConversation.lastOpenSource?.rawValue ?? "-"), target \(TimelineCopyFormatter.shortID(dmConversation.lastOpenTarget))")
+            LabeledContent("DM merge/fallbacks", value: "duplicates \(dmConversation.duplicateMergeCount), missing users \(dmConversation.missingRecipientUserCount), raw fallbacks \(dmConversation.rawIDFallbackCount)")
+            LabeledContent("DM unread/ack", value: "unread \(dmConversation.unreadChannelCount), mentions \(dmConversation.mentionCount), local clears \(dmConversation.locallyClearedUnreadCount), ack \(dmConversation.lastAckSummary ?? "-")")
+            LabeledContent("DM safe errors", value: dmConversation.safeErrorCategories.map(\.rawValue).joined(separator: ", "))
             LabeledContent("Parity Matrix", value: "\(parity.count(.done)) done, \(parity.count(.partial)) partial, \(parity.count(.broken)) broken, \(parity.count(.blockedByUnverifiedAPI)) blocked, \(parity.count(.deferred)) deferred, \(parity.count(.outOfScope)) out of scope")
             if let dmParity = parity.items.first(where: { $0.section == "Core chat" && $0.name == "DMs" }) {
                 LabeledContent("DM parity", value: "\(dmParity.status.rawValue): \(dmParity.recommendedNextAction)")
@@ -8443,6 +9204,9 @@ public struct CredentialSetupView: View {
                 }
                 Button("Copy DM Trace") {
                     viewModel.copyRedactedDMTrace()
+                }
+                Button("Copy DM Diagnostics") {
+                    viewModel.copyRedactedDMDiagnostics()
                 }
                 Button("Copy Parity Diagnostics") {
                     viewModel.copyRedactedParityDiagnostics()
@@ -8836,9 +9600,19 @@ public struct ChannelListView: View {
             ) {
                 viewModel.openFriends(tab: .online)
             }
-            if !viewModel.directMessageItems.isEmpty {
-                section("Direct Messages") {
-                    ForEach(viewModel.directMessageItems.prefix(8)) { item in
+            section("Direct Messages") {
+                let items = viewModel.directMessageItems
+                if !items.contains(where: { $0.channel.kind == .savedMessages }) {
+                    SavedNotesEntryButton(viewModel: viewModel)
+                        .padding(.horizontal, StoatSpacing.medium)
+                }
+                if items.isEmpty {
+                    Text("No direct messages")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, StoatSpacing.medium)
+                } else {
+                    ForEach(items.prefix(8)) { item in
                         DirectMessageItemButton(viewModel: viewModel, item: item)
                             .padding(.horizontal, StoatSpacing.medium)
                     }
@@ -8860,13 +9634,41 @@ public struct ChannelListView: View {
                 viewModel.openFriends(tab: .online)
             }
             section("Direct Messages") {
-                if viewModel.directMessageItems.isEmpty {
+                HStack(spacing: StoatSpacing.small) {
+                    Button {
+                        Task { await viewModel.refreshDMs(source: .directMessages) }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!viewModel.canRefreshDMs || viewModel.isRelationshipRefreshInProgress)
+                    .help("Refresh DMs")
+                    .accessibilityLabel("Refresh DMs")
+                    if viewModel.isRelationshipRefreshInProgress {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    if let status = viewModel.relationshipActionStatus {
+                        Text(status)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, StoatSpacing.medium)
+                let items = viewModel.directMessageItems
+                if !items.contains(where: { $0.channel.kind == .savedMessages }) {
+                    SavedNotesEntryButton(viewModel: viewModel)
+                        .padding(.horizontal, StoatSpacing.medium)
+                }
+                if items.isEmpty {
                     Text("No direct messages")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, StoatSpacing.medium)
                 } else {
-                    ForEach(viewModel.directMessageItems) { item in
+                    ForEach(items) { item in
                         DirectMessageItemButton(viewModel: viewModel, item: item)
                             .padding(.horizontal, StoatSpacing.medium)
                     }
@@ -9954,7 +10756,13 @@ public struct MemberPanelView: View {
         .padding(.vertical, StoatSpacing.xxSmall)
         .contentShape(Rectangle())
         .contextMenu {
+            Button {
+                Task { await viewModel.openDirectMessage(with: item.userID, source: .memberRow) }
+            } label: {
+                Label("Message", systemImage: "bubble.left.and.bubble.right")
+            }
             if let member = item.member {
+                Divider()
                 Button {
                     viewModel.openMemberDetail(member)
                     viewModel.openServerOverview()
@@ -10111,12 +10919,29 @@ public struct HomeView: View {
         GlassPanel {
             VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                 Text("Recent DMs").font(.headline)
-                if viewModel.directMessageItems.isEmpty {
-                    EmptyStateView(title: "No DMs", message: "Existing direct messages will appear after Ready or manual refresh.", systemImage: "bubble.left.and.bubble.right")
+                let items = viewModel.directMessageItems
+                if !items.contains(where: { $0.channel.kind == .savedMessages }) {
+                    SavedNotesEntryButton(viewModel: viewModel)
+                }
+                if items.isEmpty {
+                    EmptyStateView(title: "No DMs", message: viewModel.canRefreshDMs ? "Existing direct messages will appear after Ready or refresh." : "Connect before refreshing direct messages.", systemImage: "bubble.left.and.bubble.right")
+                    Button {
+                        Task { await viewModel.refreshDMs(source: .home) }
+                    } label: {
+                        Label("Refresh DMs", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .disabled(!viewModel.canRefreshDMs || viewModel.isRelationshipRefreshInProgress)
                 } else {
-                    ForEach(viewModel.directMessageItems.prefix(5)) { item in
+                    ForEach(items.prefix(5)) { item in
                         DirectMessageItemButton(viewModel: viewModel, item: item)
                     }
+                }
+                if let status = viewModel.relationshipActionStatus {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
             }
         }
@@ -10428,17 +11253,24 @@ private struct DirectMessageItemButton: View {
             viewModel.selectDirectMessageItem(item)
         } label: {
             HStack(spacing: StoatSpacing.medium) {
-                AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.avatarUser?.online == true, presence: item.avatarUser?.status?.presence, imageData: item.avatarUser.flatMap { viewModel.imageData(for: $0.avatar, kind: .userAvatar) })
+                AvatarView(title: item.displayName, size: StoatSize.compactAvatar, isOnline: item.avatarUser?.online == true && item.channel.kind == .directMessage, presence: item.channel.kind == .directMessage ? item.avatarUser?.status?.presence : nil, imageData: avatarData)
                 VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                     Text(item.displayName)
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
-                    Text(item.lastMessagePreview ?? "No loaded messages")
+                    Text(subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 Spacer()
+                if item.isMuted {
+                    Image(systemName: "bell.slash")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("Muted")
+                        .accessibilityLabel("Muted")
+                }
                 if item.mentionCount > 0 {
                     MentionBadge(count: item.mentionCount)
                 } else if item.unreadCount > 0 {
@@ -10448,13 +11280,86 @@ private struct DirectMessageItemButton: View {
             .padding(StoatSpacing.small)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
-            .background(viewModel.selection.dmChannelID == item.id ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
+            .background(item.isSelected ? Color.accentColor.opacity(0.14) : Color.primary.opacity(item.isMuted ? 0.025 : 0.04), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
+            .opacity(item.isMuted ? 0.72 : 1)
         }
         .buttonStyle(.plain)
         .onAppear {
-            if let user = item.avatarUser {
+            if item.channel.kind == .group {
+                viewModel.loadImageResource(for: item.groupIcon, kind: .serverIcon)
+            } else if let user = item.avatarUser {
                 viewModel.loadImageResource(for: user.avatar, kind: .userAvatar)
             }
+        }
+    }
+
+    private var avatarData: Data? {
+        if item.channel.kind == .group {
+            return viewModel.imageData(for: item.groupIcon, kind: .serverIcon)
+        }
+        return item.avatarUser.flatMap { viewModel.imageData(for: $0.avatar, kind: .userAvatar) }
+    }
+
+    private var subtitle: String {
+        switch item.channel.kind {
+        case .savedMessages:
+            return item.lastMessagePreview ?? "Private notes"
+        case .group:
+            let members = item.groupMemberCount == 1 ? "1 member" : "\(item.groupMemberCount) members"
+            if let preview = item.lastMessagePreview {
+                return "\(members) · \(preview)"
+            }
+            return members
+        default:
+            return item.lastMessagePreview ?? item.avatarUser?.status?.text ?? "No loaded messages"
+        }
+    }
+}
+
+private struct SavedNotesEntryButton: View {
+    @Bindable var viewModel: MainShellViewModel
+
+    var body: some View {
+        Button {
+            Task { await viewModel.openSavedNotes() }
+        } label: {
+            HStack(spacing: StoatSpacing.medium) {
+                AvatarView(title: "Saved Notes", size: StoatSize.compactAvatar, imageData: nil)
+                VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                    Text("Saved Notes")
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if case .opening = viewModel.dmDiagnostics.savedNotesState {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            .padding(StoatSpacing.small)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help("Open Saved Notes")
+        .accessibilityLabel("Open Saved Notes")
+    }
+
+    private var subtitle: String {
+        switch viewModel.dmDiagnostics.savedNotesState {
+        case .opening:
+            return "Opening"
+        case let .failed(category):
+            return "Unavailable: \(category.rawValue)"
+        case .available:
+            return "Ready"
+        case .unavailable:
+            return "Open or refresh"
         }
     }
 }
@@ -10492,7 +11397,7 @@ private struct FriendItemRow: View {
     @ViewBuilder private var relationshipButtons: some View {
         switch item.relationshipStatus {
         case .friend:
-            Button("Message") { Task { await viewModel.openDirectMessage(with: item.user.id) } }
+            Button("Message") { Task { await viewModel.openDirectMessage(with: item.user.id, source: .friendsRow) } }
                 .buttonStyle(GlassButtonStyle())
             Button("Remove") { viewModel.requestRelationshipAction(.remove, userID: item.user.id) }
                 .buttonStyle(GlassButtonStyle())
@@ -10692,25 +11597,31 @@ private struct UserProfileCardView: View {
         let status = viewModel.relationshipStatus(for: user)
         switch status {
         case .user:
+            Button("Saved Notes") { Task { await viewModel.openSavedNotes(source: .profilePopover) } }
+                .buttonStyle(GlassButtonStyle())
+            Button("Edit Profile") { viewModel.openProfileEditorFromProfile() }
+                .buttonStyle(GlassButtonStyle())
             Button("Account") { viewModel.showAccountSessions() }
                 .buttonStyle(GlassButtonStyle())
         case .friend:
-            Button("Message") { Task { await viewModel.openDirectMessage(with: user.id) } }
-                .buttonStyle(GlassButtonStyle())
+            messageProfileButton
             Button("Remove") { viewModel.requestRelationshipAction(.remove, userID: user.id) }
                 .buttonStyle(GlassButtonStyle())
         case .incoming:
+            messageProfileButton
             Button("Accept") { Task { await viewModel.performRelationshipAction(.accept, userID: user.id) } }
                 .buttonStyle(GlassButtonStyle())
             Button("Deny") { viewModel.requestRelationshipAction(.deny, userID: user.id) }
                 .buttonStyle(GlassButtonStyle())
         case .outgoing:
+            messageProfileButton
             Button("Cancel") { viewModel.requestRelationshipAction(.remove, userID: user.id) }
                 .buttonStyle(GlassButtonStyle())
         case .blocked:
             Button("Unblock") { viewModel.requestRelationshipAction(.unblock, userID: user.id) }
                 .buttonStyle(GlassButtonStyle())
         case .none:
+            messageProfileButton
             Button("Add Friend") {
                 viewModel.addFriendText = "\(user.username)#\(user.discriminator)"
                 Task { await viewModel.sendFriendRequestFromInput() }
@@ -10721,6 +11632,11 @@ private struct UserProfileCardView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var messageProfileButton: some View {
+        Button("Message") { Task { await viewModel.openDirectMessage(with: user.id, source: .profilePopover) } }
+            .buttonStyle(GlassButtonStyle())
     }
 
     private var displayName: String {

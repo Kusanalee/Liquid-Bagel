@@ -60,7 +60,7 @@ public enum LoginErrorDisplay: Hashable, Sendable {
         case .serverError: "The server is unavailable. Try again later."
         case .keychainError: "Could not save your session. Check Keychain access."
         case .environmentError: "The selected environment is invalid."
-        case let .unknown(message): message
+        case let .unknown(message): StartupAuthDiagnosticsRedactor.redact(message)
         }
     }
 }
@@ -87,6 +87,74 @@ public struct LoginDiagnostics: Hashable, Sendable {
             parts.append("last error: \(loginErrorCategoryName(lastErrorCategory))")
         }
         return parts.joined(separator: ", ")
+    }
+}
+
+public struct StartupAuthDiagnostics: Hashable, Sendable {
+    public var startupInvocationCount: Int
+    public var startupSkippedCount: Int
+    public var startupAutoConnectAttemptCount: Int
+    public var lastEnvironmentKind: String?
+    public var lastStartupAction: String?
+    public var lastStartupResult: String?
+    public var lastAuthAction: String?
+    public var lastAuthResult: String?
+    public var lastErrorCategory: LoginErrorDisplay?
+
+    public init() {
+        startupInvocationCount = 0
+        startupSkippedCount = 0
+        startupAutoConnectAttemptCount = 0
+        lastEnvironmentKind = nil
+        lastStartupAction = nil
+        lastStartupResult = nil
+        lastAuthAction = nil
+        lastAuthResult = nil
+        lastErrorCategory = nil
+    }
+
+    public var redactedSummary: String {
+        var parts = [
+            "startup invocations: \(startupInvocationCount)",
+            "startup skipped: \(startupSkippedCount)",
+            "auto-connect attempts: \(startupAutoConnectAttemptCount)"
+        ]
+        if let lastEnvironmentKind {
+            parts.append("environment: \(StartupAuthDiagnosticsRedactor.redact(lastEnvironmentKind))")
+        }
+        if let lastStartupAction {
+            parts.append("startup action: \(StartupAuthDiagnosticsRedactor.redact(lastStartupAction))")
+        }
+        if let lastStartupResult {
+            parts.append("startup result: \(StartupAuthDiagnosticsRedactor.redact(lastStartupResult))")
+        }
+        if let lastAuthAction {
+            parts.append("auth action: \(StartupAuthDiagnosticsRedactor.redact(lastAuthAction))")
+        }
+        if let lastAuthResult {
+            parts.append("auth result: \(StartupAuthDiagnosticsRedactor.redact(lastAuthResult))")
+        }
+        if let lastErrorCategory {
+            parts.append("last error: \(loginErrorCategoryName(lastErrorCategory))")
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
+enum StartupAuthDiagnosticsRedactor {
+    static func redact(_ value: String) -> String {
+        var output = value
+        let replacements: [(String, String)] = [
+            (#"\{[^\n]*(authorization|token|session|password|secret|mfa|ticket|response|error)[^\n]*\}"#, "[redacted-payload]"),
+            (#"https?://\S+"#, "[redacted-url]"),
+            (#"/(?:Users|tmp|var|private|Volumes|Library|System)/[^\s,;\)]+"#, "[redacted-path]"),
+            (#"(?i)(authorization|token|session|password|secret|mfa|mfa_response|mfa_ticket|keychain)[\s:=]+"?[^"\s,;]+"?"#, "$1=[redacted]"),
+            (#"\b(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{24,}\b"#, "[redacted-id]")
+        ]
+        for (pattern, replacement) in replacements {
+            output = output.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
+        }
+        return output
     }
 }
 
@@ -1309,6 +1377,7 @@ public final class AppSessionCoordinator {
     public private(set) var liveConnectionGeneration: Int
     public private(set) var loginFlowState: LoginFlowState
     public private(set) var loginDiagnostics: LoginDiagnostics
+    public private(set) var startupAuthDiagnostics: StartupAuthDiagnostics
     public private(set) var autoConnectAttemptCount: Int
 
     @ObservationIgnored public private(set) var snapshotSource: any ShellSnapshotSource
@@ -1329,6 +1398,7 @@ public final class AppSessionCoordinator {
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var connectionTask: Task<Void, Never>?
     @ObservationIgnored private var diagnosticsTask: Task<Void, Never>?
+    @ObservationIgnored private var liveFirstStartupAttemptedEnvironmentIDs: Set<String>
 
     public init(
         tokenStore: any TokenStore = KeychainTokenStore(),
@@ -1377,7 +1447,9 @@ public final class AppSessionCoordinator {
         self.liveConnectionGeneration = 0
         self.loginFlowState = .idle
         self.loginDiagnostics = LoginDiagnostics()
+        self.startupAuthDiagnostics = StartupAuthDiagnostics()
         self.autoConnectAttemptCount = 0
+        self.liveFirstStartupAttemptedEnvironmentIDs = []
         self.snapshotSource = MockShellSnapshotSource(snapshot: RealtimeSnapshot())
         self.messageActionHandler = UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
     }
@@ -1393,7 +1465,17 @@ public final class AppSessionCoordinator {
     }
 
     public func startLiveFirstSession() async {
+        startupAuthDiagnostics.startupInvocationCount += 1
         await loadPreferences()
+        startupAuthDiagnostics.lastEnvironmentKind = startupDiagnosticEnvironmentKind(environment)
+        let environmentID = environment.stableID
+        guard !liveFirstStartupAttemptedEnvironmentIDs.contains(environmentID) else {
+            startupAuthDiagnostics.startupSkippedCount += 1
+            startupAuthDiagnostics.lastStartupAction = "startup_auto_connect"
+            startupAuthDiagnostics.lastStartupResult = "already_attempted_for_environment"
+            return
+        }
+        liveFirstStartupAttemptedEnvironmentIDs.insert(environmentID)
         await disconnectActiveRealtime()
         mode = .liveManual
         connectionState = .idle
@@ -1409,13 +1491,21 @@ public final class AppSessionCoordinator {
         installLiveSafeSnapshot()
         await refreshCredentialAvailability()
         if case .keychainFailed = sessionState {
+            startupAuthDiagnostics.lastStartupAction = "startup_auto_connect"
+            startupAuthDiagnostics.lastStartupResult = "keychain_failed"
+            startupAuthDiagnostics.lastErrorCategory = .keychainError
             return
         }
         guard hasSavedCredential else {
             sessionState = .signedOut
+            startupAuthDiagnostics.lastStartupAction = "startup_auto_connect"
+            startupAuthDiagnostics.lastStartupResult = "no_saved_credential"
             return
         }
         autoConnectAttemptCount += 1
+        startupAuthDiagnostics.startupAutoConnectAttemptCount = autoConnectAttemptCount
+        startupAuthDiagnostics.lastStartupAction = "startup_auto_connect"
+        startupAuthDiagnostics.lastStartupResult = "attempting"
         await connectLive(source: .startupAuto)
     }
 
@@ -1454,7 +1544,7 @@ public final class AppSessionCoordinator {
         } catch {
             preferences = .defaults
             environment = .production
-            let message = "Could not load preferences: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Could not load preferences: \(error.userFacingMessage)")
             preferenceErrorMessage = message
             lastErrorMessage = message
         }
@@ -1467,7 +1557,7 @@ public final class AppSessionCoordinator {
             try await preferencesStore.savePreferences(validated)
             preferenceErrorMessage = nil
         } catch {
-            let message = "Could not save preferences: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Could not save preferences: \(error.userFacingMessage)")
             preferenceErrorMessage = message
             lastErrorMessage = message
         }
@@ -1479,7 +1569,7 @@ public final class AppSessionCoordinator {
             try update(&updated)
             await savePreferences(updated)
         } catch {
-            let message = "Could not update preferences: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Could not update preferences: \(error.userFacingMessage)")
             preferenceErrorMessage = message
             lastErrorMessage = message
         }
@@ -1493,9 +1583,10 @@ public final class AppSessionCoordinator {
             }
         } catch {
             hasSavedCredential = false
-            let message = "Could not read saved credential: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Could not read saved credential: \(error.userFacingMessage)")
             lastErrorMessage = message
             sessionState = .keychainFailed(message)
+            startupAuthDiagnostics.lastErrorCategory = .keychainError
         }
         verificationState.credentialLoaded = hasSavedCredential
     }
@@ -1526,9 +1617,10 @@ public final class AppSessionCoordinator {
             installLiveSafeSnapshot()
             await refreshCredentialAvailability()
         } catch {
-            let message = "Custom environment is invalid: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Custom environment is invalid: \(error.userFacingMessage)")
             sessionState = .validationFailed(message)
             lastErrorMessage = message
+            startupAuthDiagnostics.lastErrorCategory = .environmentError
         }
     }
 
@@ -1537,6 +1629,7 @@ public final class AppSessionCoordinator {
             let message = "Environment profile was not found."
             sessionState = .validationFailed(message)
             lastErrorMessage = message
+            startupAuthDiagnostics.lastErrorCategory = .environmentError
             return
         }
         var updated = preferences.withSelectedEnvironmentID(profile.id)
@@ -1551,9 +1644,10 @@ public final class AppSessionCoordinator {
             await savePreferences(updated)
             await setEnvironment(profile.environment)
         } catch {
-            let message = "Could not save environment profile: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Could not save environment profile: \(error.userFacingMessage)")
             sessionState = .validationFailed(message)
             lastErrorMessage = message
+            startupAuthDiagnostics.lastErrorCategory = .environmentError
         }
     }
 
@@ -1569,9 +1663,10 @@ public final class AppSessionCoordinator {
                 await setEnvironment(.production)
             }
         } catch {
-            let message = "Could not delete environment profile: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Could not delete environment profile: \(error.userFacingMessage)")
             sessionState = .validationFailed(message)
             lastErrorMessage = message
+            startupAuthDiagnostics.lastErrorCategory = .environmentError
         }
     }
 
@@ -1585,21 +1680,21 @@ public final class AppSessionCoordinator {
         mfaChallenge = nil
         loginDiagnostics.attemptCount += 1
         loginDiagnostics.lastAttemptAt = Date()
+        startupAuthDiagnostics.lastAuthAction = "token_import"
+        startupAuthDiagnostics.lastAuthResult = "validating"
         do {
             let session = try await sessionValidator.validate(credential: .sessionToken(trimmed), environment: environment)
-            pendingValidatedSession = session
-            currentUser = session.currentUser
-            localSessionLabel = localLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
-            verificationState.currentUserFetched = true
-            sessionState = .validatedReady
-            loginFlowState = .succeeded
+            await completeValidatedSessionAndConnect(session, localLabel: localLabel, authAction: "token_import")
         } catch {
-            let message = error.userFacingMessage
+            let message = StartupAuthDiagnosticsRedactor.redact(error.userFacingMessage)
             pendingValidatedSession = nil
             currentUser = nil
             sessionState = sessionFailureState(for: error, fallback: message)
             lastErrorMessage = message
-            loginDiagnostics.lastErrorCategory = loginErrorCategory(for: error)
+            let category = loginErrorCategory(for: error)
+            loginDiagnostics.lastErrorCategory = category
+            startupAuthDiagnostics.lastErrorCategory = category
+            startupAuthDiagnostics.lastAuthResult = "failed_\(loginErrorCategoryName(category))"
             loginFlowState = .idle
         }
     }
@@ -1621,10 +1716,15 @@ public final class AppSessionCoordinator {
             currentUser = pendingValidatedSession.currentUser
             sessionState = .readyToConnect
             lastErrorMessage = nil
+            startupAuthDiagnostics.lastAuthResult = "saved"
         } catch {
-            let message = "Could not save credential to Keychain: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Could not save credential to Keychain: \(error.userFacingMessage)")
             sessionState = .keychainFailed(message)
             lastErrorMessage = message
+            loginDiagnostics.lastErrorCategory = .keychainError
+            startupAuthDiagnostics.lastErrorCategory = .keychainError
+            startupAuthDiagnostics.lastAuthResult = "failed_keychain_error"
+            loginFlowState = .idle
         }
     }
 
@@ -1632,6 +1732,7 @@ public final class AppSessionCoordinator {
         guard pendingValidatedSession != nil else { return }
         await savePendingValidatedSession()
         guard case .readyToConnect = sessionState else { return }
+        loginFlowState = .succeeded
         await connectLive(source: .userInitiated)
     }
 
@@ -1639,6 +1740,8 @@ public final class AppSessionCoordinator {
         mode = .liveManual
         sessionState = .loadingCredential
         lastErrorMessage = nil
+        startupAuthDiagnostics.lastAuthAction = "saved_session_validation"
+        startupAuthDiagnostics.lastAuthResult = "loading_credential"
         do {
             guard let credential = try await loadCredentialForCurrentEnvironment() else {
                 hasSavedCredential = false
@@ -1646,6 +1749,7 @@ public final class AppSessionCoordinator {
                 sessionState = .signedOut
                 currentUser = nil
                 installLiveSafeSnapshot()
+                startupAuthDiagnostics.lastAuthResult = "missing_credential"
                 return
             }
             hasSavedCredential = true
@@ -1656,12 +1760,16 @@ public final class AppSessionCoordinator {
             currentUser = session.currentUser
             verificationState.currentUserFetched = true
             sessionState = .readyToConnect
+            startupAuthDiagnostics.lastAuthResult = "validated_ready"
         } catch {
-            let message = error.userFacingMessage
+            let message = StartupAuthDiagnosticsRedactor.redact(error.userFacingMessage)
             validatedSession = nil
             currentUser = nil
             sessionState = sessionFailureState(for: error, fallback: message)
             lastErrorMessage = message
+            let category = loginErrorCategory(for: error)
+            startupAuthDiagnostics.lastErrorCategory = category
+            startupAuthDiagnostics.lastAuthResult = "failed_\(loginErrorCategoryName(category))"
         }
     }
 
@@ -1690,16 +1798,20 @@ public final class AppSessionCoordinator {
         pendingValidatedSession = nil
         loginDiagnostics.attemptCount += 1
         loginDiagnostics.lastAttemptAt = Date()
+        startupAuthDiagnostics.lastAuthAction = "email_password_login"
+        startupAuthDiagnostics.lastAuthResult = "submitting"
         let client = apiClientFactory(environment, StaticCredentialProvider(nil))
         do {
             let response = try await client.login(request: SessionLoginRequest(email: email, password: password, friendlyName: friendlyName))
             await handleLoginResponse(response, friendlyName: friendlyName)
         } catch {
-            let message = "Login failed: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Login failed: \(error.userFacingMessage)")
             sessionState = .validationFailed(message)
             lastErrorMessage = message
             let category = loginErrorCategory(for: error)
             loginDiagnostics.lastErrorCategory = category
+            startupAuthDiagnostics.lastErrorCategory = category
+            startupAuthDiagnostics.lastAuthResult = "failed_\(loginErrorCategoryName(category))"
             loginFlowState = .idle
         }
     }
@@ -1716,6 +1828,8 @@ public final class AppSessionCoordinator {
         lastErrorMessage = nil
         loginDiagnostics.attemptCount += 1
         loginDiagnostics.lastAttemptAt = Date()
+        startupAuthDiagnostics.lastAuthAction = "mfa_continuation"
+        startupAuthDiagnostics.lastAuthResult = "submitting"
         let client = apiClientFactory(environment, StaticCredentialProvider(nil))
         do {
             let response = try await client.continueLogin(
@@ -1723,10 +1837,12 @@ public final class AppSessionCoordinator {
             )
             await handleLoginResponse(response, friendlyName: friendlyName)
         } catch {
-            let message = "MFA login failed: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("MFA login failed: \(error.userFacingMessage)")
             sessionState = .validationFailed(message)
             lastErrorMessage = message
             loginDiagnostics.lastErrorCategory = .mfaFailed
+            startupAuthDiagnostics.lastErrorCategory = .mfaFailed
+            startupAuthDiagnostics.lastAuthResult = "failed_mfa_failed"
             loginFlowState = .mfaRequired
         }
     }
@@ -1739,16 +1855,15 @@ public final class AppSessionCoordinator {
             let credential = success.credential
             do {
                 let session = try await sessionValidator.validate(credential: credential, environment: environment)
-                pendingValidatedSession = session
-                currentUser = session.currentUser
-                verificationState.currentUserFetched = true
-                sessionState = .validatedReady
-                loginFlowState = .succeeded
+                await completeValidatedSessionAndConnect(session, localLabel: friendlyName, authAction: startupAuthDiagnostics.lastAuthAction ?? "login")
             } catch {
-                let message = "Login succeeded, but validation failed: \(error.userFacingMessage)"
+                let message = StartupAuthDiagnosticsRedactor.redact("Login succeeded, but validation failed: \(error.userFacingMessage)")
                 sessionState = sessionFailureState(for: error, fallback: message)
                 lastErrorMessage = message
-                loginDiagnostics.lastErrorCategory = loginErrorCategory(for: error)
+                let category = loginErrorCategory(for: error)
+                loginDiagnostics.lastErrorCategory = category
+                startupAuthDiagnostics.lastErrorCategory = category
+                startupAuthDiagnostics.lastAuthResult = "failed_\(loginErrorCategoryName(category))"
                 loginFlowState = .idle
             }
         case let .mfa(ticket, allowedMethods):
@@ -1756,13 +1871,30 @@ public final class AppSessionCoordinator {
             sessionState = .validationFailed("Multi-factor authentication is required.")
             lastErrorMessage = nil
             loginFlowState = .mfaRequired
+            startupAuthDiagnostics.lastAuthResult = "mfa_required"
         case let .disabled(userID):
             let message = "This account is disabled or unavailable. User ID: \(UserDisplayResolver.shortenedID(userID))"
             sessionState = .validationFailed(message)
             lastErrorMessage = message
             loginDiagnostics.lastErrorCategory = .accountDisabled
+            startupAuthDiagnostics.lastErrorCategory = .accountDisabled
+            startupAuthDiagnostics.lastAuthResult = "failed_account_disabled"
             loginFlowState = .idle
         }
+    }
+
+    private func completeValidatedSessionAndConnect(_ session: ValidatedSession, localLabel: String?, authAction: String) async {
+        pendingValidatedSession = session
+        currentUser = session.currentUser
+        localSessionLabel = localLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        verificationState.currentUserFetched = true
+        sessionState = .validatedReady
+        startupAuthDiagnostics.lastAuthAction = authAction
+        startupAuthDiagnostics.lastAuthResult = "validated"
+        await savePendingValidatedSession()
+        guard case .readyToConnect = sessionState else { return }
+        loginFlowState = .succeeded
+        await connectLive(source: .userInitiated)
     }
 
     public func connectLiveManually() async {
@@ -1786,6 +1918,17 @@ public final class AppSessionCoordinator {
                 return "Live connection failed"
             }
         }
+
+        var diagnosticsAction: String {
+            switch self {
+            case .startupAuto:
+                return "startup_auto_connect"
+            case .userInitiated:
+                return "connect"
+            case .retry:
+                return "retry_connect"
+            }
+        }
     }
 
     private func connectLive(source: LiveConnectSource) async {
@@ -1795,6 +1938,8 @@ public final class AppSessionCoordinator {
         connectionState = .idle
         diagnostics = nil
         lastErrorMessage = nil
+        startupAuthDiagnostics.lastAuthAction = source.diagnosticsAction
+        startupAuthDiagnostics.lastAuthResult = "loading_credential"
 
         let credential: StoatAuthCredential
         do {
@@ -1802,6 +1947,7 @@ public final class AppSessionCoordinator {
                 hasSavedCredential = false
                 sessionState = .signedOut
                 installLiveSafeSnapshot()
+                startupAuthDiagnostics.lastAuthResult = "missing_credential"
                 return
             }
             credential = loaded
@@ -1810,8 +1956,10 @@ public final class AppSessionCoordinator {
             sessionState = validatedSession == nil ? .validatingCredential : .readyToConnect
         } catch {
             hasSavedCredential = false
-            let message = "Could not load saved credential: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Could not load saved credential: \(error.userFacingMessage)")
             sessionState = .keychainFailed(message)
+            startupAuthDiagnostics.lastErrorCategory = .keychainError
+            startupAuthDiagnostics.lastAuthResult = "failed_keychain_error"
             failLiveSession(message)
             return
         }
@@ -1832,15 +1980,33 @@ public final class AppSessionCoordinator {
         startObservingRealtime(realtimeClient: realtimeClient, store: store)
 
         do {
-            let validation = try await sessionValidator.validate(credential: credential, environment: environment)
+            let validation: ValidatedSession
+            if let existing = validatedSession,
+               existing.credential == credential,
+               existing.environment == environment {
+                validation = existing
+            } else {
+                validation = try await sessionValidator.validate(credential: credential, environment: environment)
+            }
             validatedSession = validation
             currentUser = validation.currentUser
             verificationState.currentUserFetched = true
+            startupAuthDiagnostics.lastAuthResult = "connecting_realtime"
             try await realtimeClient.connect(credential: credential, environment: environment, readyFields: readyFields)
+            startupAuthDiagnostics.lastAuthResult = "realtime_connect_started"
+            if source == .startupAuto {
+                startupAuthDiagnostics.lastStartupResult = "realtime_connect_started"
+            }
         } catch {
             await disconnectActiveRealtime()
-            let message = "\(source.failurePrefix): \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("\(source.failurePrefix): \(error.userFacingMessage)")
             sessionState = .connectionFailed(message)
+            let category = loginErrorCategory(for: error)
+            startupAuthDiagnostics.lastErrorCategory = category
+            startupAuthDiagnostics.lastAuthResult = "failed_\(loginErrorCategoryName(category))"
+            if source == .startupAuto {
+                startupAuthDiagnostics.lastStartupResult = "failed_\(loginErrorCategoryName(category))"
+            }
             failLiveSession(message, replaceConnectionState: true)
         }
     }
@@ -1857,6 +2023,8 @@ public final class AppSessionCoordinator {
         installLiveSafeSnapshot()
         await refreshCredentialAvailability()
         sessionState = hasSavedCredential ? .readyToConnect : .signedOut
+        startupAuthDiagnostics.lastAuthAction = "disconnect"
+        startupAuthDiagnostics.lastAuthResult = "disconnected"
     }
 
     public func forgetLocalSession() async {
@@ -1877,13 +2045,18 @@ public final class AppSessionCoordinator {
             apiClient = nil
             loginFlowState = .idle
             loginDiagnostics = LoginDiagnostics()
+            startupAuthDiagnostics.lastAuthAction = "forget_session"
+            startupAuthDiagnostics.lastAuthResult = "forgot_local_session"
             messageActionHandler = UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
             installLiveSafeSnapshot()
             lastErrorMessage = nil
         } catch {
-            let message = "Could not delete saved credential: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Could not delete saved credential: \(error.userFacingMessage)")
             sessionState = .keychainFailed(message)
             lastErrorMessage = message
+            loginDiagnostics.lastErrorCategory = .keychainError
+            startupAuthDiagnostics.lastErrorCategory = .keychainError
+            startupAuthDiagnostics.lastAuthResult = "failed_keychain_error"
         }
     }
 
@@ -1893,15 +2066,21 @@ public final class AppSessionCoordinator {
                 let message = "No saved session is available to revoke."
                 sessionState = .signedOut
                 lastErrorMessage = message
+                startupAuthDiagnostics.lastAuthAction = "revoke_session"
+                startupAuthDiagnostics.lastAuthResult = "missing_credential"
                 return
             }
             let client = apiClientFactory(environment, StaticCredentialProvider(credential))
             try await client.logoutCurrentSession()
             await forgetLocalSession()
         } catch {
-            let message = "Server-side session revocation failed: \(error.userFacingMessage)"
+            let message = StartupAuthDiagnosticsRedactor.redact("Server-side session revocation failed: \(error.userFacingMessage)")
             sessionState = .validationFailed(message)
             lastErrorMessage = message
+            let category = loginErrorCategory(for: error)
+            startupAuthDiagnostics.lastErrorCategory = category
+            startupAuthDiagnostics.lastAuthAction = "revoke_session"
+            startupAuthDiagnostics.lastAuthResult = "failed_\(loginErrorCategoryName(category))"
         }
     }
 
@@ -2056,6 +2235,10 @@ public final class AppSessionCoordinator {
 
     private var currentCredentialScope: CredentialScope {
         CredentialScope(environmentID: environment.stableID)
+    }
+
+    private func startupDiagnosticEnvironmentKind(_ environment: StoatAPIEnvironment) -> String {
+        environment.isProduction ? "production" : "custom"
     }
 
     private func loadCredentialForCurrentEnvironment() async throws -> StoatAuthCredential? {

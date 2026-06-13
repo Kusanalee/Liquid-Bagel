@@ -1,5 +1,6 @@
 import Foundation
 import StoatModels
+import StoatPersistence
 import StoatRealtime
 
 public enum FriendsTab: String, CaseIterable, Hashable, Sendable {
@@ -55,26 +56,44 @@ public struct DirectMessageListItem: Identifiable, Hashable, Sendable {
     public var participants: [User]
     public var displayName: String
     public var avatarUser: User?
+    public var groupIcon: File?
+    public var groupMemberCount: Int
     public var lastMessagePreview: String?
     public var unreadCount: Int
     public var mentionCount: Int
+    public var isMuted: Bool
+    public var isSelected: Bool
+    public var hasMissingRecipientUsers: Bool
+    public var usesRawIDFallback: Bool
 
     public init(
         channel: Channel,
         participants: [User],
         displayName: String,
         avatarUser: User? = nil,
+        groupIcon: File? = nil,
+        groupMemberCount: Int = 0,
         lastMessagePreview: String? = nil,
         unreadCount: Int = 0,
-        mentionCount: Int = 0
+        mentionCount: Int = 0,
+        isMuted: Bool = false,
+        isSelected: Bool = false,
+        hasMissingRecipientUsers: Bool = false,
+        usesRawIDFallback: Bool = false
     ) {
         self.channel = channel
         self.participants = participants
         self.displayName = displayName
         self.avatarUser = avatarUser
+        self.groupIcon = groupIcon
+        self.groupMemberCount = groupMemberCount
         self.lastMessagePreview = lastMessagePreview
         self.unreadCount = unreadCount
         self.mentionCount = mentionCount
+        self.isMuted = isMuted
+        self.isSelected = isSelected
+        self.hasMissingRecipientUsers = hasMissingRecipientUsers
+        self.usesRawIDFallback = usesRawIDFallback
     }
 }
 
@@ -190,25 +209,42 @@ public enum Phase22Derivations {
     public static func directMessageItems(
         snapshot: RealtimeSnapshot,
         currentUserID: UserID?,
-        localReadStates: [ChannelID: LocalReadState] = [:]
+        localReadStates: [ChannelID: LocalReadState] = [:],
+        notificationPreferences: NotificationPreferences = .defaults,
+        selectedChannelID: ChannelID? = nil
     ) -> [DirectMessageListItem] {
         snapshot.channelsByID.values
             .filter(DMChannelClassifier.isDirectMessageLike)
             .map { channel in
-                let participants = channel.recipients.compactMap { snapshot.usersByID[$0] }
-                let visibleParticipants = currentUserID.map { id in participants.filter { $0.id != id } } ?? participants
+                let visibleRecipientIDs = visibleRecipientIDs(for: channel, currentUserID: currentUserID)
+                let visibleParticipants = visibleRecipientIDs.compactMap { snapshot.usersByID[$0] }
                 let counts = unreadCounts(channelID: channel.id, snapshot: snapshot, localReadStates: localReadStates)
+                let missingRecipientUsers = visibleRecipientIDs.filter { snapshot.usersByID[$0] == nil }
+                let usesRawIDFallback = !missingRecipientUsers.isEmpty && channel.kind != .savedMessages
                 return DirectMessageListItem(
                     channel: channel,
                     participants: visibleParticipants,
-                    displayName: directMessageDisplayName(channel: channel, participants: visibleParticipants, currentUserID: currentUserID),
+                    displayName: directMessageDisplayName(
+                        channel: channel,
+                        participants: visibleParticipants,
+                        currentUserID: currentUserID,
+                        missingRecipientCount: missingRecipientUsers.count
+                    ),
                     avatarUser: visibleParticipants.first,
+                    groupIcon: channel.kind == .group ? channel.icon : nil,
+                    groupMemberCount: groupMemberCount(for: channel, currentUserID: currentUserID),
                     lastMessagePreview: lastMessagePreview(channelID: channel.id, snapshot: snapshot),
                     unreadCount: counts.unread,
-                    mentionCount: counts.mentions
+                    mentionCount: counts.mentions,
+                    isMuted: notificationPreferences.preference(for: channel.id).isMuted,
+                    isSelected: selectedChannelID == channel.id,
+                    hasMissingRecipientUsers: !missingRecipientUsers.isEmpty,
+                    usesRawIDFallback: usesRawIDFallback
                 )
             }
             .sorted { lhs, rhs in
+                if lhs.channel.kind == .savedMessages, rhs.channel.kind != .savedMessages { return true }
+                if rhs.channel.kind == .savedMessages, lhs.channel.kind != .savedMessages { return false }
                 if lhs.mentionCount != rhs.mentionCount { return lhs.mentionCount > rhs.mentionCount }
                 if lhs.unreadCount != rhs.unreadCount { return lhs.unreadCount > rhs.unreadCount }
                 let leftLast = lhs.channel.lastMessageID?.rawValue ?? ""
@@ -245,7 +281,29 @@ public enum Phase22Derivations {
         }
     }
 
-    private static func directMessageDisplayName(channel: Channel, participants: [User], currentUserID: UserID?) -> String {
+    private static func visibleRecipientIDs(for channel: Channel, currentUserID: UserID?) -> [UserID] {
+        if channel.kind == .savedMessages {
+            return [currentUserID ?? channel.userID].compactMap { $0 }
+        }
+        let ids = currentUserID.map { id in channel.recipients.filter { $0 != id } } ?? channel.recipients
+        return ids
+    }
+
+    private static func groupMemberCount(for channel: Channel, currentUserID: UserID?) -> Int {
+        guard channel.kind == .group else { return 0 }
+        var ids = Set(channel.recipients)
+        if let currentUserID {
+            ids.insert(currentUserID)
+        }
+        return ids.count
+    }
+
+    private static func directMessageDisplayName(
+        channel: Channel,
+        participants: [User],
+        currentUserID: UserID?,
+        missingRecipientCount: Int
+    ) -> String {
         switch channel.kind {
         case .savedMessages:
             return "Saved Notes"
@@ -253,13 +311,13 @@ public enum Phase22Derivations {
             if let name = channel.name, !name.isEmpty { return name }
             let names = participants.map { UserDisplayResolver.displayName(user: $0, fallbackID: $0.id) }
             if !names.isEmpty { return names.joined(separator: ", ") }
-            let fallbackIDs = channel.recipients.filter { $0 != currentUserID }.map(UserDisplayResolver.shortenedID)
-            return fallbackIDs.isEmpty ? channel.displayName : fallbackIDs.joined(separator: ", ")
+            let count = groupMemberCount(for: channel, currentUserID: currentUserID)
+            return count > 0 ? "Group DM (\(count))" : "Group DM"
         case .directMessage:
             if let participant = participants.first {
                 return UserDisplayResolver.displayName(user: participant, fallbackID: participant.id)
             }
-            return channel.recipients.first(where: { $0 != currentUserID }).map(UserDisplayResolver.shortenedID) ?? channel.displayName
+            return missingRecipientCount > 0 ? "Unknown User" : channel.displayName
         default:
             return channel.displayName
         }

@@ -196,6 +196,8 @@ private struct AccountSettingsTab: View {
                 LabeledContent("Credential", value: viewModel.sessionCoordinator?.hasSavedCredential == true ? "Token stored in Keychain" : "No saved credential")
             }
 
+            ProfileEditorSection(viewModel: viewModel)
+
             Section("Actions") {
                 HStack {
                     Button("Validate Saved Session") {
@@ -320,6 +322,198 @@ private struct AccountSettingsTab: View {
             return true
         case .idle, .ready, .disconnected, .failed:
             return false
+        }
+    }
+}
+
+private struct ProfileEditorSection: View {
+    @Bindable var viewModel: MainShellViewModel
+
+    var body: some View {
+        Section("Profile") {
+            if let user = viewModel.currentUserForPresentation {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    HStack(alignment: .top, spacing: StoatSpacing.large) {
+                        AvatarView(title: viewModel.profileEditDraft.displayName.isEmpty ? user.username : viewModel.profileEditDraft.displayName, size: 72, isOnline: user.online, presence: user.status?.presence, imageData: avatarPreviewData(for: user))
+                        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                            backgroundPreview(for: user)
+                                .frame(height: 92)
+                            HStack(spacing: StoatSpacing.small) {
+                                Button {
+                                    viewModel.chooseProfileAvatar()
+                                } label: {
+                                    Label("Choose Avatar", systemImage: "photo")
+                                }
+                                Button(role: .destructive) {
+                                    viewModel.removeProfileAvatar()
+                                } label: {
+                                    Label("Remove Avatar", systemImage: "person.crop.circle.badge.minus")
+                                }
+                                .disabled(!canRemoveAvatar)
+                            }
+                            HStack(spacing: StoatSpacing.small) {
+                                Button {
+                                    viewModel.chooseProfileBackground()
+                                } label: {
+                                    Label("Choose Banner", systemImage: "rectangle.on.rectangle.angled")
+                                }
+                                Button(role: .destructive) {
+                                    viewModel.removeProfileBackground()
+                                } label: {
+                                    Label("Remove Banner", systemImage: "rectangle.badge.minus")
+                                }
+                                .disabled(!canRemoveBackground)
+                            }
+                        }
+                    }
+
+                    TextField("Display name", text: $viewModel.profileEditDraft.displayName)
+                        .textFieldStyle(.roundedBorder)
+
+                    TextEditor(text: $viewModel.profileEditDraft.profileContent)
+                        .font(.body)
+                        .frame(minHeight: 94)
+                        .overlay(alignment: .topLeading) {
+                            if viewModel.profileEditDraft.profileContent.isEmpty {
+                                Text("Profile bio")
+                                    .foregroundStyle(.tertiary)
+                                    .padding(.top, 8)
+                                    .padding(.leading, 5)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+
+                    if !viewModel.profileEditDraft.profileContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        MarkdownMessageContent(viewModel.profileEditDraft.profileContent)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(StoatSpacing.small)
+                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                    }
+
+                    if viewModel.profileEditDraft.isSaving {
+                        HStack(spacing: StoatSpacing.small) {
+                            ProgressView().controlSize(.small)
+                            Text("Saving profile")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if let error = viewModel.profileEditDraft.safeErrorMessage {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    } else if let status = viewModel.profileEditDraft.saveStatusMessage {
+                        Text(status)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Button {
+                            Task { await viewModel.saveProfileEdit() }
+                        } label: {
+                            Label("Save", systemImage: "checkmark.circle")
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!viewModel.canSaveProfileEdit)
+
+                        Button {
+                            viewModel.cancelProfileEdit()
+                        } label: {
+                            Label("Cancel", systemImage: "xmark.circle")
+                        }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(viewModel.profileEditDraft.isSaving || !viewModel.profileEditDraft.isDirty)
+                    }
+                }
+            } else {
+                ContentUnavailableView("No editable account", systemImage: "person.crop.circle.badge.questionmark")
+            }
+        }
+        .onAppear {
+            viewModel.prepareProfileEditor(force: false)
+            loadCurrentImages()
+        }
+        .task {
+            await viewModel.ensureCurrentUserProfileForEditing()
+            loadCurrentImages()
+        }
+    }
+
+    private func loadCurrentImages() {
+        guard let user = viewModel.currentUserForPresentation else { return }
+        viewModel.loadImageResource(for: user.avatar, kind: .userAvatar)
+        viewModel.loadImageResource(for: viewModel.userProfilesByID[user.id]?.background, kind: .profileBackground)
+    }
+
+    private func avatarPreviewData(for user: User) -> Data? {
+        switch viewModel.profileEditDraft.avatarChange {
+        case .unchanged:
+            return viewModel.imageData(for: user.avatar, kind: .userAvatar)
+        case .remove:
+            return nil
+        case let .upload(draft):
+            return draft.previewData
+        }
+    }
+
+    @ViewBuilder private func backgroundPreview(for user: User) -> some View {
+        let data = backgroundPreviewData(for: user)
+        #if canImport(AppKit)
+        if let data, let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
+        } else {
+            backgroundFallback
+        }
+        #else
+        backgroundFallback
+        #endif
+    }
+
+    private func backgroundPreviewData(for user: User) -> Data? {
+        switch viewModel.profileEditDraft.backgroundChange {
+        case .unchanged:
+            return viewModel.imageData(for: viewModel.userProfilesByID[user.id]?.background, kind: .profileBackground)
+        case .remove:
+            return nil
+        case let .upload(draft):
+            return draft.previewData
+        }
+    }
+
+    private var backgroundFallback: some View {
+        RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous)
+            .fill(LinearGradient(colors: [Color.accentColor.opacity(0.22), Color.primary.opacity(0.08)], startPoint: .topLeading, endPoint: .bottomTrailing))
+            .overlay {
+                Image(systemName: "rectangle.on.rectangle.angled")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+    }
+
+    private var canRemoveAvatar: Bool {
+        switch viewModel.profileEditDraft.avatarChange {
+        case .unchanged:
+            return viewModel.profileEditDraft.originalAvatarFileID != nil
+        case .remove:
+            return false
+        case .upload:
+            return true
+        }
+    }
+
+    private var canRemoveBackground: Bool {
+        switch viewModel.profileEditDraft.backgroundChange {
+        case .unchanged:
+            return viewModel.profileEditDraft.originalBackgroundFileID != nil
+        case .remove:
+            return false
+        case .upload:
+            return true
         }
     }
 }
@@ -594,6 +788,7 @@ private struct DeveloperVerificationTab: View {
                     .frame(minHeight: 220)
                 if viewModel.sessionCoordinator?.preferences.showDeveloperRuntimeControls == true {
                     LoginDiagnosticsSection(coordinator: viewModel.sessionCoordinator)
+                    ProfileEditDiagnosticsSection(viewModel: viewModel)
                 }
                 TimelineValidationHarnessView(viewModel: viewModel)
             }
@@ -609,7 +804,10 @@ private struct LoginDiagnosticsSection: View {
         GroupBox("Login Diagnostics") {
             VStack(alignment: .leading, spacing: StoatSpacing.small) {
                 if let coordinator {
-                    let summary = coordinator.loginDiagnostics.redactedSummary
+                    let summary = """
+                    login: \(coordinator.loginDiagnostics.redactedSummary)
+                    startup/auth: \(coordinator.startupAuthDiagnostics.redactedSummary)
+                    """
                     Text(summary)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
@@ -629,6 +827,42 @@ private struct LoginDiagnosticsSection: View {
             .padding(StoatSpacing.small)
         }
         .padding(.horizontal, StoatSpacing.medium)
+    }
+}
+
+private struct ProfileEditDiagnosticsSection: View {
+    @Bindable var viewModel: MainShellViewModel
+
+    var body: some View {
+        GroupBox("Profile Edit Diagnostics") {
+            VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                LabeledContent("Last action", value: diagnostics.lastAction)
+                LabeledContent("Route", value: diagnostics.routeCategory.rawValue)
+                LabeledContent("Edited fields", value: editedFields)
+                LabeledContent("Upload tag", value: diagnostics.uploadTagCategory.rawValue)
+                LabeledContent("Upload result", value: diagnostics.uploadResultCategory.rawValue)
+                LabeledContent("Mutation result", value: diagnostics.mutationResultCategory.rawValue)
+                LabeledContent("Duration", value: diagnostics.durationMilliseconds.map { "\($0) ms" } ?? "-")
+                LabeledContent("Cache invalidations", value: "\(diagnostics.cacheInvalidationCount)")
+                LabeledContent("Safe error", value: diagnostics.safeErrorCategory?.rawValue ?? "-")
+                LabeledContent("Returned data", value: diagnostics.returnedDataShape.rawValue)
+                Button("Copy Redacted Diagnostics") {
+                    Task { await viewModel.copyRedactedProfileEditDiagnostics() }
+                }
+                .controlSize(.small)
+            }
+            .padding(StoatSpacing.small)
+        }
+        .padding(.horizontal, StoatSpacing.medium)
+    }
+
+    private var diagnostics: ProfileEditDiagnostics {
+        viewModel.profileEditDiagnostics
+    }
+
+    private var editedFields: String {
+        let fields = diagnostics.editedFieldCategories.map(\.rawValue).sorted()
+        return fields.isEmpty ? "-" : fields.joined(separator: ", ")
     }
 }
 

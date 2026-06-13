@@ -137,9 +137,50 @@ final class StoatModelsTests: XCTestCase {
         XCTAssertEqual(settings.values["compact"], .bool(true))
     }
 
+    func testPhase41UserProfileEditDraftEncodesVerifiedFieldsAndOmitsNil() throws {
+        let draft = UserEditDraft(
+            displayName: "Liquid Tester",
+            avatar: "avatar-file",
+            profile: UserProfileEditDraft(content: "hello profile", background: "background-file")
+        )
+        let object = try encodedJSONObject(draft)
+
+        XCTAssertEqual(object["display_name"] as? String, "Liquid Tester")
+        XCTAssertEqual(object["avatar"] as? String, "avatar-file")
+        let profile = try XCTUnwrap(object["profile"] as? [String: Any])
+        XCTAssertEqual(profile["content"] as? String, "hello profile")
+        XCTAssertEqual(profile["background"] as? String, "background-file")
+        XCTAssertNil(object["status"])
+        XCTAssertNil(object["badges"])
+        XCTAssertNil(object["flags"])
+    }
+
+    func testPhase41UserProfileEditDraftPartialProfileOmitsNilFields() throws {
+        let object = try encodedJSONObject(UserEditDraft(profile: UserProfileEditDraft(content: "bio")))
+        let profile = try XCTUnwrap(object["profile"] as? [String: Any])
+
+        XCTAssertEqual(profile["content"] as? String, "bio")
+        XCTAssertNil(profile["background"])
+        XCTAssertNil(object["display_name"])
+        XCTAssertNil(object["avatar"])
+        XCTAssertNil(object["status"])
+    }
+
+    func testPhase41UserEditRemoveFieldsEncodeExactSourceStrings() throws {
+        let object = try encodedJSONObject(UserEditDraft(remove: [.displayName, .avatar, .profileContent, .profileBackground]))
+        let remove = try XCTUnwrap(object["remove"] as? [String])
+
+        XCTAssertEqual(Set(remove), Set(["DisplayName", "Avatar", "ProfileContent", "ProfileBackground"]))
+    }
+
     private func decodeFixture<T: Decodable>(_ type: T.Type, named name: String) throws -> T {
         let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json"))
         let data = try Data(contentsOf: url)
         return try JSONDecoder.stoat.decode(type, from: data)
+    }
+
+    private func encodedJSONObject<T: Encodable>(_ value: T) throws -> [String: Any] {
+        let data = try JSONEncoder.stoat.encode(value)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 }

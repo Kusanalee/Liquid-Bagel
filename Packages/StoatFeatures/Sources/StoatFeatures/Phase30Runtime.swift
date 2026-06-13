@@ -274,7 +274,10 @@ public enum ParityMatrixFormatter {
 }
 
 public enum Phase30ParityMatrixBuilder {
-    public static func build(dmLiveQAPassed: Bool = false) -> ParityMatrix {
+    public static func build(dmRecoveredByTests: Bool = true, dmLiveQAPassed: Bool = false) -> ParityMatrix {
+        let dmStatus: ParityStatus = dmLiveQAPassed ? .done : (dmRecoveredByTests ? .partial : .broken)
+        let dmKnownGaps = dmLiveQAPassed ? "No critical live QA gaps recorded" : "Live QA has not proven list/load/send/attachments/participants"
+        let dmNextAction = dmLiveQAPassed ? "Keep monitoring" : "Run Phase 40 live DM checklist"
         let specs: [(String, String, ParityStatus, String, String, String, String, String, String)] = [
             ("Account and session", "login", .done, "Verified API/client behavior", "Manual credential/session setup exists", "MFA and full login creation remain limited", "Existing session tests", "Launch and validate manually", "Keep stable"),
             ("Account and session", "MFA", .partial, "Official client", "Validation failure states exist", "Full MFA login flow is not implemented", "Session validation tests", "Test with MFA account when available", "Phase 31 research"),
@@ -283,14 +286,14 @@ public enum Phase30ParityMatrixBuilder {
             ("Account and session", "revoke sessions", .partial, "Verified session routes", "Logout/revoke support is present", "Bulk/session-list parity not fully audited", "Auth endpoint tests", "Revoke a test session", "Audit in Phase 31"),
             ("Account and session", "logout", .done, "Verified auth route", "Explicit logout/disconnect behavior", "None critical", "Auth endpoint tests", "Logout manually", "Keep stable"),
             ("Account and session", "account profile view", .partial, "Verified profile route", "Profile popovers and fetch-on-click", "No hidden fetch storm by design", "Profile mock tests", "Open profile explicitly", "Keep explicit"),
-            ("Account and session", "account profile edit", .blockedByUnverifiedAPI, "Unverified route", "Not implemented", "Edit route not verified in current docs", "Matrix coverage", "N/A", "Verify before implementation"),
-            ("Account and session", "avatar edit", .blockedByUnverifiedAPI, "Unverified account edit route", "Upload helpers exist", "Account avatar mutation route not wired", "Upload tests only", "N/A", "Verify account route"),
-            ("Account and session", "profile banner/background edit", .blockedByUnverifiedAPI, "Unverified account edit route", "Background media model exists", "Mutation route not wired", "Model/upload tests", "N/A", "Verify account route"),
+            ("Account and session", "account profile edit", .partial, "Verified PATCH /users/{currentUserID}", "Phase 41 editor patches display name and profile content with source-verified fields", "Source/mock verified only; live edit propagation QA pending", "Phase 41 model/API/feature tests", "Run Phase 41 profile checklist", "Live QA before done"),
+            ("Account and session", "avatar edit", .partial, "Verified avatar upload tag and user edit route", "Phase 41 uploads image to avatars then patches avatar file ID", "Source/mock verified only; live avatar propagation QA pending", "Phase 41 upload/edit/cache tests", "Upload and remove avatar live", "Live QA before done"),
+            ("Account and session", "profile banner/background edit", .partial, "Verified backgrounds upload tag and user edit route", "Phase 41 uploads image to backgrounds then patches profile.background file ID", "Source/mock verified only; live banner propagation QA pending", "Phase 41 upload/edit/cache tests", "Upload and remove banner live", "Live QA before done"),
             ("Account and session", "status/custom status", .partial, "Ready/User settings", "Status renders where present", "Editing/sync not fully wired", "Display tests", "Inspect user status", "Audit settings route"),
             ("Account and session", "user settings sync", .partial, "Ready user_settings", "Preferences are local plus decoded settings", "Full cloud sync parity incomplete", "Persistence tests", "Open settings", "Phase 31"),
 
             ("Core chat", "server text channels", .done, "Ready channels and channel messages", "Server channel selection, load, send", "Critical path covered", "Message load/send tests", "Open server channel", "Keep stable"),
-            ("Core chat", "DMs", dmLiveQAPassed ? .done : .broken, "Ready channels, users/dms, users/{target}/dm", "Phase 31 active-conversation timeline routing", dmLiveQAPassed ? "No critical live QA gaps recorded" : "Live QA has not proven DMs fixed", "Phase 31 DM regression tests", "Run Phase 31 DM checklist", dmLiveQAPassed ? "Keep monitoring" : "Do not claim parity"),
+            ("Core chat", "DMs", dmStatus, "Ready channels, users/dms, users/{target}/dm", "Phase 40 explicit DM refresh/open merge, stable Home rows, shared timeline pipeline, notification routing, and redacted diagnostics", dmKnownGaps, "Phase 31/32/40 DM regression tests", "Run Phase 40 DM checklist", dmNextAction),
             ("Core chat", "group DMs", .partial, "Ready channel kind Group", "Selection/load/sidebar supported", "Create/open group route not verified", "Group DM tests", "Click group DM", "Verify creation route later"),
             ("Core chat", "saved messages", .partial, "Ready channel kind SavedMessages", "Selection/load supported when modeled", "Live availability needs QA", "Saved selection tests", "Click Saved Messages if present", "Live QA"),
             ("Core chat", "send/edit/delete messages", .done, "Verified channel message routes", "Send/edit/delete wired with confirmations", "No persistent success toast by design", "Message action tests", "Send/edit/delete manually", "Keep stable"),
