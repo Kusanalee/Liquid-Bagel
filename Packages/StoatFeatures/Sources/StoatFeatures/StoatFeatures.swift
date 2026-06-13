@@ -556,6 +556,7 @@ public final class MainShellViewModel {
     public var userProfilesByID: [UserID: UserProfile] = [:]
     public var profileErrorsByID: [UserID: String] = [:]
     public var profileLoadingUserIDs: Set<UserID> = []
+    private var systemUserHydrationInFlight: Set<UserID> = []
     public var profileEditDraft = ProfileEditDraftState()
     public var profileEditDiagnostics = ProfileEditDiagnostics()
     public var statusUpdateStatus: String?
@@ -1461,6 +1462,11 @@ public final class MainShellViewModel {
             if snapshot.usersByID[message.message.authorID] == nil {
                 ids.insert(message.message.authorID)
             }
+            if let system = message.message.system {
+                for userID in system.referencedUserIDs() where snapshot.usersByID[userID] == nil {
+                    ids.insert(userID)
+                }
+            }
         }
         if let channel = selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
             for id in channel.recipients where snapshot.usersByID[id] == nil {
@@ -1621,6 +1627,52 @@ public final class MainShellViewModel {
             profileErrorsByID[userID] = "Profile unavailable."
         }
         profileLoadingUserIDs.remove(userID)
+    }
+
+    /// Fetches the `User` objects referenced by visible system messages (joined/left/banned/etc.)
+    /// that are not already in the cache. These users may no longer be server members — they are
+    /// resolved through the global `/users/{id}` route so system rows can show real usernames.
+    /// Runs entirely off the SwiftUI body; merges results via `upsertUser`, which re-renders rows.
+    public func hydrateSystemMessageUsersIfNeeded() async {
+        var pending = Set<UserID>()
+        for message in selectedTimelineMessages {
+            guard let system = message.message.system else { continue }
+            for userID in system.referencedUserIDs()
+            where snapshot.usersByID[userID] == nil && !systemUserHydrationInFlight.contains(userID) {
+                pending.insert(userID)
+            }
+        }
+        guard !pending.isEmpty else { return }
+        guard let apiClient = sessionCoordinator?.apiClient ?? (effectiveRuntimeMode == .mock ? communityAPIClient : nil)
+        else { return }
+
+        let targets = Array(pending)
+        for id in targets { systemUserHydrationInFlight.insert(id) }
+        defer { for id in targets { systemUserHydrationInFlight.remove(id) } }
+
+        let fetched = await withTaskGroup(of: User?.self) { group -> [User] in
+            let maxConcurrency = 6
+            var iterator = targets.makeIterator()
+            var results: [User] = []
+            func addNext() {
+                if let id = iterator.next() {
+                    group.addTask { try? await apiClient.fetchUser(userID: id) }
+                }
+            }
+            for _ in 0..<min(maxConcurrency, targets.count) { addNext() }
+            while let result = await group.next() {
+                if let result { results.append(result) }
+                addNext()
+            }
+            return results
+        }
+
+        for user in fetched {
+            upsertUser(user)
+        }
+        if !fetched.isEmpty {
+            updateVisibleIdentityDiagnostics()
+        }
     }
 
     public func openProfileEditorFromProfile() {
@@ -2540,12 +2592,40 @@ public final class MainShellViewModel {
                 return false
             }()
         }.count
+
+        var systemCount = 0
+        var systemWithTarget = 0
+        var systemResolved = 0
+        var systemPending = 0
+        var systemFallback = 0
+        for message in selectedTimelineMessages {
+            guard let system = message.message.system else { continue }
+            systemCount += 1
+            let referenced = system.referencedUserIDs()
+            guard !referenced.isEmpty else { continue }
+            systemWithTarget += 1
+            let allResolved = referenced.allSatisfy { snapshot.usersByID[$0] != nil }
+            if allResolved {
+                systemResolved += 1
+            } else {
+                systemFallback += 1
+                if referenced.contains(where: { systemUserHydrationInFlight.contains($0) }) {
+                    systemPending += 1
+                }
+            }
+        }
+
         visibleIdentityDiagnostics = VisibleIdentityDiagnostics(
             unresolvedVisibleUserCount: missingVisibleUserIDs().count,
             shortenedVisibleIDCount: visibleDisplays.filter(\.isFallback).count,
             avatarFailureCacheCount: failedAvatars,
             profileFetchMergeCount: profileFetchMergeCount,
-            memberWrapperUserMergeCount: memberWrapperUserMergeCount
+            memberWrapperUserMergeCount: memberWrapperUserMergeCount,
+            systemMessageCount: systemCount,
+            systemMessageWithTargetCount: systemWithTarget,
+            systemMessageResolvedTargetCount: systemResolved,
+            systemMessagePendingHydrationCount: systemPending,
+            systemMessageFallbackTargetCount: systemFallback
         )
     }
 
@@ -7305,6 +7385,7 @@ public final class MainShellViewModel {
         selectedChannelLoadTask = Task { [weak self] in
             guard let self else { return }
             await self.messageController.loadInitialIfNeeded(channelID: channelID, snapshotMessages: snapshotMessages)
+            await self.hydrateSystemMessageUsersIfNeeded()
             if isDMRoute {
                 let result = self.safeLoadResultDescription(for: channelID)
                 self.dmRouteDiagnostics.lastLoadResult = result

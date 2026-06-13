@@ -2668,7 +2668,7 @@ final class StoatFeaturesTests: XCTestCase {
         let joined = Message(id: "01J00000000000000000270001", channelID: "phase27-channel", authorID: userID, system: SystemMessage(kind: .userJoined, by: userID))
         let unknown = Message(id: "01J00000000000000000270002", channelID: "phase27-channel", authorID: userID, system: SystemMessage(kind: .unknown("custom_event")))
 
-        XCTAssertEqual(Phase27SystemEventPresenter.text(for: joined, usersByID: users), "Phase User joined")
+        XCTAssertEqual(Phase27SystemEventPresenter.text(for: joined, usersByID: users), "Phase User joined the server")
         XCTAssertEqual(Phase27SystemEventPresenter.text(for: unknown, usersByID: users), "Unsupported system event: custom_event")
     }
 
@@ -3219,7 +3219,10 @@ final class StoatFeaturesTests: XCTestCase {
         let unknown = Message(id: "01J00000000000000000350001", channelID: channelID, authorID: unknownID, system: SystemMessage(kind: .userJoined, by: unknownID))
         let pinned = Message(id: "01J00000000000000000350002", channelID: channelID, authorID: knownID, system: SystemMessage(kind: .messagePinned, by: knownID))
 
-        XCTAssertEqual(model.systemEventText(for: unknown), "A member joined")
+        let unknownText = model.systemEventText(for: unknown)
+        XCTAssertTrue(unknownText.hasPrefix("User "), unknownText)
+        XCTAssertTrue(unknownText.hasSuffix("joined the server"), unknownText)
+        XCTAssertFalse(unknownText.contains("A member"), unknownText)
         XCTAssertEqual(model.systemEventProfileTarget(for: pinned), knownID)
         XCTAssertNil(model.systemEventProfileTarget(for: unknown))
     }
@@ -3278,9 +3281,12 @@ final class StoatFeaturesTests: XCTestCase {
         let joined = Message(id: "01J00000000000000000290002", channelID: channelID, authorID: namedUserID, system: SystemMessage(kind: .userJoined, by: namedUserID))
         let left = Message(id: "01J00000000000000000290003", channelID: channelID, authorID: unknownUserID, system: SystemMessage(kind: .userLeft, by: unknownUserID))
 
-        XCTAssertEqual(model.systemEventText(for: joined), "Member Nick joined")
-        XCTAssertEqual(model.systemEventText(for: left), "A member left")
-        XCTAssertFalse(model.systemEventText(for: left).contains(unknownUserID.rawValue))
+        XCTAssertEqual(model.systemEventText(for: joined), "Member Nick joined the server")
+        let leftText = model.systemEventText(for: left)
+        XCTAssertTrue(leftText.hasPrefix("User "), leftText)
+        XCTAssertTrue(leftText.hasSuffix("left the server"), leftText)
+        XCTAssertFalse(leftText.contains("A member"), leftText)
+        XCTAssertFalse(leftText.contains(unknownUserID.rawValue))
     }
 
     @MainActor
@@ -3294,7 +3300,9 @@ final class StoatFeaturesTests: XCTestCase {
         let message = Message(id: "01J00000000000000000330001", channelID: channelID, authorID: zeroUserID, system: SystemMessage(kind: .userJoined, by: zeroUserID))
         let model = MainShellViewModel(snapshot: snapshot)
 
-        XCTAssertEqual(model.systemEventText(for: message), "A member joined")
+        // All-zero actor is a system actor with no resolvable user, so the anonymous phrase
+        // is still correct here (no real ID is present).
+        XCTAssertEqual(model.systemEventText(for: message), "A member joined the server")
     }
 
     @MainActor
@@ -5654,5 +5662,118 @@ private actor StubLoginAPIClient: StoatAPIClient {
     func continueLogin(request: SessionMFALoginRequest) async throws -> SessionLoginResponse {
         continueCallCount += 1
         return continueResponse
+    }
+}
+
+final class Phase27SystemEventPresenterTests: XCTestCase {
+    private let serverID: ServerID = "server-1"
+    private let channelID: ChannelID = "channel-1"
+    private let targetID: UserID = "01KHTARGET00000000000000ID"
+
+    private func channel() -> Channel {
+        Channel(
+            id: channelID,
+            kind: .textChannel,
+            serverID: serverID,
+            name: "Passenger List"
+        )
+    }
+
+    private func systemMessage(_ system: SystemMessage) -> Message {
+        Message(id: "msg-1", channelID: channelID, authorID: targetID, system: system)
+    }
+
+    func testJoinedResolvesUsernameWhenCached() {
+        let users: [UserID: User] = [targetID: User(id: targetID, username: "Atmomni")]
+        let text = Phase27SystemEventPresenter.text(
+            for: systemMessage(SystemMessage(kind: .userJoined, id: targetID.rawValue)),
+            usersByID: users,
+            membersByServerAndUserID: [:],
+            channel: channel()
+        )
+        XCTAssertEqual(text, "Atmomni joined the server")
+        XCTAssertNotEqual(text, "A member joined")
+    }
+
+    func testJoinedFallsBackToShortenedIDWhenNotCached() {
+        let text = Phase27SystemEventPresenter.text(
+            for: systemMessage(SystemMessage(kind: .userJoined, id: targetID.rawValue)),
+            usersByID: [:],
+            membersByServerAndUserID: [:],
+            channel: channel()
+        )
+        XCTAssertTrue(text.hasSuffix("joined the server"), text)
+        XCTAssertTrue(text.contains("01KH"), text)
+        XCTAssertFalse(text.contains("A member"), text)
+    }
+
+    func testBannedWording() {
+        let users: [UserID: User] = [targetID: User(id: targetID, username: "Vivian_32")]
+        let text = Phase27SystemEventPresenter.text(
+            for: systemMessage(SystemMessage(kind: .userBanned, id: targetID.rawValue)),
+            usersByID: users,
+            membersByServerAndUserID: [:],
+            channel: channel()
+        )
+        XCTAssertEqual(text, "Vivian_32 has been banned from the server")
+    }
+
+    func testLeftWording() {
+        let users: [UserID: User] = [targetID: User(id: targetID, username: "OvenToastedOwl")]
+        let text = Phase27SystemEventPresenter.text(
+            for: systemMessage(SystemMessage(kind: .userLeft, id: targetID.rawValue)),
+            usersByID: users,
+            membersByServerAndUserID: [:],
+            channel: channel()
+        )
+        XCTAssertEqual(text, "OvenToastedOwl left the server")
+    }
+
+    func testKickedWording() {
+        let users: [UserID: User] = [targetID: User(id: targetID, username: "Drifter")]
+        let text = Phase27SystemEventPresenter.text(
+            for: systemMessage(SystemMessage(kind: .userKicked, id: targetID.rawValue)),
+            usersByID: users,
+            membersByServerAndUserID: [:],
+            channel: channel()
+        )
+        XCTAssertEqual(text, "Drifter was kicked from the server")
+    }
+
+    func testUserAddedUsesActorAndTarget() {
+        let actorID: UserID = "01KHACTOR000000000000000BY"
+        let users: [UserID: User] = [
+            actorID: User(id: actorID, username: "Captain"),
+            targetID: User(id: targetID, username: "Newbie")
+        ]
+        let text = Phase27SystemEventPresenter.text(
+            for: systemMessage(SystemMessage(kind: .userAdded, id: targetID.rawValue, by: actorID, to: targetID)),
+            usersByID: users,
+            membersByServerAndUserID: [:],
+            channel: channel()
+        )
+        XCTAssertEqual(text, "Captain added Newbie")
+    }
+
+    func testMessagePinnedUsesActor() {
+        let actorID: UserID = "01KHACTOR000000000000000BY"
+        let users: [UserID: User] = [actorID: User(id: actorID, username: "Captain")]
+        let text = Phase27SystemEventPresenter.text(
+            for: systemMessage(SystemMessage(kind: .messagePinned, id: "01KHPINNEDMSG000000000000", by: actorID)),
+            usersByID: users,
+            membersByServerAndUserID: [:],
+            channel: channel()
+        )
+        XCTAssertEqual(text, "Captain pinned a message")
+    }
+
+    func testUnknownTypeDoesNotCrash() {
+        let text = Phase27SystemEventPresenter.text(
+            for: systemMessage(SystemMessage(kind: .unknown("future_event"))),
+            usersByID: [:],
+            membersByServerAndUserID: [:],
+            channel: channel()
+        )
+        XCTAssertTrue(text.contains("future_event"), text)
     }
 }

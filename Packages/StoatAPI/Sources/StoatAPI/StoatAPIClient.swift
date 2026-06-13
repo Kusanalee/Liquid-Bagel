@@ -4,6 +4,7 @@ import StoatModels
 public protocol StoatAPIClient: Sendable {
     func fetchRootConfiguration() async throws -> StoatConfig
     func fetchCurrentUser() async throws -> User
+    func fetchUser(userID: UserID) async throws -> User
     func editUser(userID: UserID, draft: UserEditDraft) async throws -> User
     func fetchUserProfile(userID: UserID) async throws -> UserProfile
     func fetchServers() async throws -> [Server]
@@ -74,6 +75,10 @@ public extension StoatAPIClient {
 
     func searchMessages(channelID: ChannelID, request: ChannelMessageSearchRequest) async throws -> [Message] {
         throw StoatAPIError.unimplementedEndpoint("Channel message search is not implemented by this API client.")
+    }
+
+    func fetchUser(userID: UserID) async throws -> User {
+        throw StoatAPIError.unimplementedEndpoint("User fetch is not implemented by this API client.")
     }
 
     func fetchUserProfile(userID: UserID) async throws -> UserProfile {
@@ -274,6 +279,10 @@ public actor LiveStoatAPIClient: StoatAPIClient {
 
     public func fetchCurrentUser() async throws -> User {
         try await perform(StoatRequest<User>(method: .get, path: "/users/@me"))
+    }
+
+    public func fetchUser(userID: UserID) async throws -> User {
+        try await perform(StoatRequest<User>(method: .get, path: "/users/\(userID.rawValue.stoatPathComponentEscaped)"))
     }
 
     public func editUser(userID: UserID, draft: UserEditDraft) async throws -> User {

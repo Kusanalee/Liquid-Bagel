@@ -1,6 +1,15 @@
 import Foundation
 import StoatModels
 import StoatRealtime
+#if DEBUG
+import os
+#endif
+
+#if DEBUG
+enum Phase27Logger {
+    static let systemMessage = Logger(subsystem: "com.liquidbagel.stoat", category: "system-message")
+}
+#endif
 
 public struct Phase27Diagnostics: Hashable, Sendable {
     public var selectedRouteDescription: String
@@ -48,7 +57,7 @@ public struct Phase27Diagnostics: Hashable, Sendable {
 public enum Phase27SystemEventPresenter {
     public static func profileTarget(for message: Message) -> UserID? {
         guard let system = message.system else { return nil }
-        let candidate = system.by ?? system.from ?? system.to ?? message.authorID
+        let candidate = system.affectedUserID ?? system.by ?? system.from ?? system.to ?? message.authorID
         guard !isSystemActor(candidate) else { return nil }
         return candidate
     }
@@ -71,8 +80,10 @@ public enum Phase27SystemEventPresenter {
         let target = displayName(targetID, usersByID: usersByID, membersByServerAndUserID: membersByServerAndUserID, serverID: serverID)
         let named = system.name?.trimmingCharacters(in: .whitespacesAndNewlines)
         let fallbackActor = actor ?? "Someone"
+        // The affected user of a membership event lives in `system.id`. Fall back to the actor
+        // or message author for older payloads that omit it.
         let eventMember = displayName(
-            actorID ?? targetID ?? message.authorID,
+            system.affectedUserID ?? actorID ?? targetID ?? message.authorID,
             usersByID: usersByID,
             membersByServerAndUserID: membersByServerAndUserID,
             serverID: serverID
@@ -88,24 +99,24 @@ public enum Phase27SystemEventPresenter {
             if let target { return "\(fallbackActor) removed \(target)" }
             return "\(fallbackActor) removed a member"
         case .userJoined:
-            return "\(eventMember ?? "A member") joined"
+            return "\(eventMember ?? "A member") joined the server"
         case .userLeft:
-            return "\(eventMember ?? "A member") left"
+            return "\(eventMember ?? "A member") left the server"
         case .userKicked:
-            if let target { return "\(fallbackActor) kicked \(target)" }
-            return "\(fallbackActor) kicked a member"
+            return "\(eventMember ?? "A member") was kicked from the server"
         case .userBanned:
-            if let target { return "\(fallbackActor) banned \(target)" }
-            return "\(fallbackActor) banned a member"
+            return "\(eventMember ?? "A member") has been banned from the server"
         case .channelRenamed:
-            if let named, !named.isEmpty { return "Channel renamed to \(named)" }
-            return "Channel renamed"
+            if let named, !named.isEmpty { return "\(fallbackActor) renamed the channel to \(named)" }
+            return "\(fallbackActor) renamed the channel"
         case .channelDescriptionChanged:
-            return "Channel description changed"
+            return "\(fallbackActor) changed the channel description"
         case .channelIconChanged:
-            return "Channel icon changed"
+            return "\(fallbackActor) changed the channel icon"
         case .channelOwnershipChanged:
-            if let target { return "Channel ownership transferred to \(target)" }
+            let fromName = displayName(system.from, usersByID: usersByID, membersByServerAndUserID: membersByServerAndUserID, serverID: serverID)
+            if let fromName, let target { return "\(fromName) transferred ownership to \(target)" }
+            if let target { return "Ownership transferred to \(target)" }
             return "Channel ownership changed"
         case .messagePinned:
             return "\(fallbackActor) pinned a message"
@@ -114,10 +125,17 @@ public enum Phase27SystemEventPresenter {
         case .callStarted:
             return "\(fallbackActor) started a call"
         case let .unknown(value):
+            #if DEBUG
+            Phase27Logger.systemMessage.warning("Unknown system message type=\(value, privacy: .public)")
+            #endif
             return "Unsupported system event: \(value)"
         }
     }
 
+    /// Resolves a user ID to a display name. When the user is in neither the user cache nor the
+    /// member list we still return a non-anonymous fallback ("User 01KH…OS0M") so system rows
+    /// never read as anonymous when a real ID is present. Returns `nil` only for absent or
+    /// system-actor (all-zero) IDs.
     private static func displayName(
         _ id: UserID?,
         usersByID: [UserID: User],
@@ -130,7 +148,7 @@ public enum Phase27SystemEventPresenter {
         if member != nil || user != nil {
             return UserDisplayResolver.displayName(user: user, member: member, fallbackID: id)
         }
-        return nil
+        return UserDisplayResolver.systemFallbackName(id)
     }
 
     private static func nonEmpty(_ value: String?) -> String? {

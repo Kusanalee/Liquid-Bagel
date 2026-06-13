@@ -173,6 +173,81 @@ final class StoatModelsTests: XCTestCase {
         XCTAssertEqual(Set(remove), Set(["DisplayName", "Avatar", "ProfileContent", "ProfileBackground"]))
     }
 
+    // MARK: - System message decoding
+
+    private func decodeSystemMessage(_ systemJSON: String) throws -> SystemMessage {
+        let json = """
+        { "_id": "msg1", "channel": "chan1", "author": "01HX0000000000000000000001", "system": \(systemJSON) }
+        """
+        let message = try JSONDecoder.stoat.decode(Message.self, from: Data(json.utf8))
+        return try XCTUnwrap(message.system)
+    }
+
+    func testSystemMessageUserJoinedPreservesAffectedID() throws {
+        let system = try decodeSystemMessage(#"{ "type": "user_joined", "id": "01KHJOIN0000000000000000OS" }"#)
+        XCTAssertEqual(system.kind, .userJoined)
+        XCTAssertEqual(system.affectedUserID?.rawValue, "01KHJOIN0000000000000000OS")
+        XCTAssertTrue(system.referencedUserIDs().contains(UserID(rawValue: "01KHJOIN0000000000000000OS")))
+    }
+
+    func testSystemMessageMembershipEventsCarryAffectedID() throws {
+        let cases: [(type: String, kind: SystemMessageKind)] = [
+            ("user_joined", .userJoined),
+            ("user_left", .userLeft),
+            ("user_kicked", .userKicked),
+            ("user_banned", .userBanned)
+        ]
+        for testCase in cases {
+            let system = try decodeSystemMessage(#"{ "type": "\#(testCase.type)", "id": "01KHTARGET00000000000000ID" }"#)
+            XCTAssertEqual(system.kind, testCase.kind, "kind for \(testCase.type)")
+            XCTAssertEqual(system.affectedUserID?.rawValue, "01KHTARGET00000000000000ID", "affectedUserID for \(testCase.type)")
+        }
+    }
+
+    func testSystemMessageUserAddedPreservesByAndTarget() throws {
+        let system = try decodeSystemMessage(#"{ "type": "user_added", "id": "01KHTARGET00000000000000ID", "by": "01KHACTOR000000000000000BY" }"#)
+        XCTAssertEqual(system.kind, .userAdded)
+        XCTAssertEqual(system.by?.rawValue, "01KHACTOR000000000000000BY")
+        // user_added is moderated: affectedUserID is nil; the referenced set still includes `by`.
+        XCTAssertNil(system.affectedUserID)
+        XCTAssertTrue(system.referencedUserIDs().contains(UserID(rawValue: "01KHACTOR000000000000000BY")))
+    }
+
+    func testSystemMessageUserRemovePreservesByAndTarget() throws {
+        let system = try decodeSystemMessage(#"{ "type": "user_remove", "id": "01KHTARGET00000000000000ID", "by": "01KHACTOR000000000000000BY" }"#)
+        XCTAssertEqual(system.kind, .userRemove)
+        XCTAssertEqual(system.by?.rawValue, "01KHACTOR000000000000000BY")
+    }
+
+    func testSystemMessageChannelRenamedPreservesByAndName() throws {
+        let system = try decodeSystemMessage(#"{ "type": "channel_renamed", "name": "passengers", "by": "01KHACTOR000000000000000BY" }"#)
+        XCTAssertEqual(system.kind, .channelRenamed)
+        XCTAssertEqual(system.name, "passengers")
+        XCTAssertEqual(system.by?.rawValue, "01KHACTOR000000000000000BY")
+        XCTAssertNil(system.affectedUserID)
+    }
+
+    func testSystemMessageMessagePinnedPreservesByAndID() throws {
+        let system = try decodeSystemMessage(#"{ "type": "message_pinned", "id": "01KHPINNEDMSG000000000000", "by": "01KHACTOR000000000000000BY" }"#)
+        XCTAssertEqual(system.kind, .messagePinned)
+        XCTAssertEqual(system.id, "01KHPINNEDMSG000000000000")
+        XCTAssertEqual(system.by?.rawValue, "01KHACTOR000000000000000BY")
+        // message_pinned id is a message ID, not a user ID — must not be treated as affected user.
+        XCTAssertNil(system.affectedUserID)
+    }
+
+    func testSystemMessageUnknownTypePreserved() throws {
+        let system = try decodeSystemMessage(#"{ "type": "future_event_type", "id": "x" }"#)
+        XCTAssertEqual(system.kind, .unknown("future_event_type"))
+        XCTAssertNil(system.affectedUserID)
+    }
+
+    func testSystemMessageIgnoresSystemActorID() throws {
+        let system = try decodeSystemMessage(#"{ "type": "user_joined", "id": "0000000000000000000000000" }"#)
+        XCTAssertNil(system.affectedUserID)
+        XCTAssertTrue(system.referencedUserIDs().isEmpty)
+    }
+
     private func decodeFixture<T: Decodable>(_ type: T.Type, named name: String) throws -> T {
         let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json"))
         let data = try Data(contentsOf: url)

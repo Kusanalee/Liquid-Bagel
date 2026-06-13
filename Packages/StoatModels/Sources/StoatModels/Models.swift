@@ -1011,6 +1011,36 @@ public struct SystemMessage: Codable, Hashable, Sendable {
         case to
         case finishedAt = "finished_at"
     }
+
+    /// The user affected by a membership event. For join/left/kicked/banned events the
+    /// affected user's ID is carried in `id` (not in `by`/`from`/`to`). Returns `nil` for
+    /// other kinds or when the ID is empty/a system actor (all-zero).
+    public var affectedUserID: UserID? {
+        switch kind {
+        case .userJoined, .userLeft, .userKicked, .userBanned:
+            guard let id else { return nil }
+            let candidate = UserID(rawValue: id)
+            return Self.isSystemActor(candidate) ? nil : candidate
+        default:
+            return nil
+        }
+    }
+
+    /// Every user ID referenced by this system message (actor, source, target, affected),
+    /// excluding empty/all-zero "system" IDs. Used to drive timeline user hydration.
+    public func referencedUserIDs() -> Set<UserID> {
+        var ids = Set<UserID>()
+        for candidate in [by, from, to, affectedUserID] {
+            guard let candidate, !Self.isSystemActor(candidate) else { continue }
+            ids.insert(candidate)
+        }
+        return ids
+    }
+
+    private static func isSystemActor(_ id: UserID) -> Bool {
+        let raw = id.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty || Set(raw).isSubset(of: Set("0"))
+    }
 }
 
 public enum SystemMessageKind: Codable, Hashable, Sendable {

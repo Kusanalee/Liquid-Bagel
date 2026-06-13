@@ -680,19 +680,34 @@ public struct VisibleIdentityDiagnostics: Hashable, Sendable {
     public var avatarFailureCacheCount: Int
     public var profileFetchMergeCount: Int
     public var memberWrapperUserMergeCount: Int
+    public var systemMessageCount: Int
+    public var systemMessageWithTargetCount: Int
+    public var systemMessageResolvedTargetCount: Int
+    public var systemMessagePendingHydrationCount: Int
+    public var systemMessageFallbackTargetCount: Int
 
     public init(
         unresolvedVisibleUserCount: Int = 0,
         shortenedVisibleIDCount: Int = 0,
         avatarFailureCacheCount: Int = 0,
         profileFetchMergeCount: Int = 0,
-        memberWrapperUserMergeCount: Int = 0
+        memberWrapperUserMergeCount: Int = 0,
+        systemMessageCount: Int = 0,
+        systemMessageWithTargetCount: Int = 0,
+        systemMessageResolvedTargetCount: Int = 0,
+        systemMessagePendingHydrationCount: Int = 0,
+        systemMessageFallbackTargetCount: Int = 0
     ) {
         self.unresolvedVisibleUserCount = unresolvedVisibleUserCount
         self.shortenedVisibleIDCount = shortenedVisibleIDCount
         self.avatarFailureCacheCount = avatarFailureCacheCount
         self.profileFetchMergeCount = profileFetchMergeCount
         self.memberWrapperUserMergeCount = memberWrapperUserMergeCount
+        self.systemMessageCount = systemMessageCount
+        self.systemMessageWithTargetCount = systemMessageWithTargetCount
+        self.systemMessageResolvedTargetCount = systemMessageResolvedTargetCount
+        self.systemMessagePendingHydrationCount = systemMessagePendingHydrationCount
+        self.systemMessageFallbackTargetCount = systemMessageFallbackTargetCount
     }
 }
 
