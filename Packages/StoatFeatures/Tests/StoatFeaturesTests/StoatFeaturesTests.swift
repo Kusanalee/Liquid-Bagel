@@ -4348,6 +4348,81 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertNil(model.snapshot.membersByServerAndUserID[targetKey])
     }
 
+    @MainActor func testCapabilityCachePopulatedOnInit() {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock)
+        model.selectServer(server.id)
+        let caps = model.serverManagementCapabilities()
+        // Mock mode is always connected — cache must reflect this immediately without re-scanning channels.
+        XCTAssertTrue(caps.isConnectedForLiveActions)
+        XCTAssertEqual(caps, model.cachedServerCapabilities)
+    }
+
+    @MainActor func testCapabilityCacheUpdatesWhenSnapshotChanges() {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock)
+        model.selectServer(server.id)
+
+        let before = model.cachedServerCapabilities
+        // Replace the snapshot — cache must update.
+        model.snapshot = RealtimeSnapshot()
+        let after = model.cachedServerCapabilities
+        // After clearing the snapshot the selected server no longer exists; capabilities should differ.
+        XCTAssertNotEqual(before, after)
+        XCTAssertFalse(after.canManageServer)
+    }
+
+    @MainActor func testCapabilityCacheUpdatesWhenSelectionChanges() {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock)
+
+        let beforeSelect = model.cachedServerCapabilities
+        model.selectServer(server.id)
+        let afterSelect = model.cachedServerCapabilities
+        XCTAssertNotEqual(beforeSelect, afterSelect)
+    }
+
+    @MainActor func testMemberActionDisabledReasonUsesCache() {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let targetUserID: UserID = "01HX0000000000000000000002"
+        let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
+        let targetMember = snapshot.membersByServerAndUserID[targetKey]!
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock)
+        model.selectServer(server.id)
+
+        // Call four times — this should read from the cache each time, not re-scan channels.
+        let r1 = model.memberActionDisabledReason(for: targetMember, action: .kick)
+        let r2 = model.memberActionDisabledReason(for: targetMember, action: .ban)
+        let r3 = model.memberActionDisabledReason(for: targetMember, action: .timeout)
+        let r4 = model.memberActionDisabledReason(for: targetMember, action: .clearTimeout)
+        // All four calls share the same cached permission resolution — results should be consistent.
+        XCTAssertEqual(r1, r2)
+        XCTAssertEqual(r3, r4)
+        // Capability cache must not have changed (no snapshot/selection mutation occurred).
+        let capsBefore = model.cachedServerCapabilities
+        _ = model.memberActionDisabledReason(for: targetMember, action: .kick)
+        XCTAssertEqual(capsBefore, model.cachedServerCapabilities)
+    }
+
+    @MainActor func testChannelsForServerUsesOrderedIDsWithDictLookup() {
+        let serverID: ServerID = "server-order-test"
+        let ch1 = Channel(id: "ch1", kind: .textChannel, serverID: serverID, name: "Zeta")
+        let ch2 = Channel(id: "ch2", kind: .textChannel, serverID: serverID, name: "Alpha")
+        let server = Server(id: serverID, ownerID: "u1", name: "Order Test", channelIDs: [ch2.id, ch1.id])
+        let snap = RealtimeSnapshot(
+            serversByID: [server.id: server],
+            channelsByID: [ch1.id: ch1, ch2.id: ch2]
+        )
+        let model = MainShellViewModel(snapshot: snap, runtimeMode: .mock)
+        let channels = model.channels(for: serverID)
+        // Ordered by channelIDs list (ch2 first), NOT alphabetically.
+        XCTAssertEqual(channels.map(\.id), [ch2.id, ch1.id])
+    }
+
     private func phase18Snapshot(currentUserID: UserID, otherUserID: UserID, textChannelID: ChannelID, dmChannelID: ChannelID) -> RealtimeSnapshot {
         let currentUser = User(id: currentUserID, username: "me", displayName: "Me")
         let otherUser = User(id: otherUserID, username: "other", displayName: "Other")

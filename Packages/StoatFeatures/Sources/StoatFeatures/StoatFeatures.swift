@@ -448,13 +448,23 @@ public enum MessageQuickActions {
 @MainActor
 @Observable
 public final class MainShellViewModel {
-    public var selection: ShellSelection
-    public var snapshot: RealtimeSnapshot
+    public var selection: ShellSelection {
+        didSet { invalidateCapabilityCache() }
+    }
+    public var snapshot: RealtimeSnapshot {
+        didSet { invalidateCapabilityCache() }
+    }
     public var connectionState: RealtimeConnectionState
     public var diagnostics: RealtimeDiagnostics?
-    public var runtimeMode: AppRuntimeMode
-    public var sessionState: AppSessionState
-    public var currentUser: User?
+    public var runtimeMode: AppRuntimeMode {
+        didSet { invalidateCapabilityCache() }
+    }
+    public var sessionState: AppSessionState {
+        didSet { invalidateCapabilityCache() }
+    }
+    public var currentUser: User? {
+        didSet { invalidateCapabilityCache() }
+    }
     public var sessionCoordinator: AppSessionCoordinator?
     public var messageController: ChannelMessageController
     public var isQuickSwitcherPresented = false
@@ -597,6 +607,10 @@ public final class MainShellViewModel {
     public var phase25Status: String?
     public var phase26Status: String?
     public var testingSignedNotificationBuild = false
+    // Cached per-server capability snapshot — updated lazily whenever snapshot/selection/session state changes.
+    // Context-menu disabled checks read from this; never recompute on every SwiftUI layout pass.
+    public private(set) var cachedServerCapabilities: ServerManagementCapabilities = ServerManagementCapabilities(canManageServer: false, canManageChannels: false, canInvite: false, isConnectedForLiveActions: false)
+    public private(set) var cachedCurrentPermissionResolution: PermissionResolutionResult = PermissionResolutionResult(effectivePermissions: [], warnings: [.missingServer])
 
     @ObservationIgnored public var messageActionHandler: any MessageActionHandling
     @ObservationIgnored public var messageCopier: any MessageCopying
@@ -658,6 +672,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var timelineVisibleRangeUpdateCount = 0
     @ObservationIgnored private var memberGroupingCount = 0
     @ObservationIgnored private var memberGroupingCacheHitCount = 0
+    @ObservationIgnored private var capabilityCacheUpdateCount = 0
     @ObservationIgnored private var imageCompletedCount = 0
     @ObservationIgnored private var diagnosticsPublishCount = 0
     @ObservationIgnored private var profileFetchMergeCount = 0
@@ -730,6 +745,7 @@ public final class MainShellViewModel {
             disabledReason: { [weak self] command in self?.disabledReason(for: command) }
         )
         validateSelection()
+        invalidateCapabilityCache()
         self.messageController.hydrate(from: snapshot)
         refreshDMDiagnosticsSnapshot()
         installNotificationRouteHandler()
@@ -1015,11 +1031,12 @@ public final class MainShellViewModel {
     public func channels(for serverID: ServerID?) -> [Channel] {
         guard let serverID else { return [] }
         let server = snapshot.serversByID[serverID]
-        let channels = snapshot.channelsByID.values.filter { $0.serverID == serverID }
         if let orderedIDs = server?.channelIDs, !orderedIDs.isEmpty {
-            return orderedIDs.compactMap { id in channels.first { $0.id == id } }
+            return orderedIDs.compactMap { snapshot.channelsByID[$0] }
         }
-        return channels.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+        return snapshot.channelsByID.values
+            .filter { $0.serverID == serverID }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
 
     public func members(for serverID: ServerID?) -> [User] {
@@ -2535,7 +2552,29 @@ public final class MainShellViewModel {
             visibleRangeUpdateCount: timelineVisibleRangeUpdateCount,
             diagnosticsPublishCount: diagnosticsPublishCount,
             lastStateLoopSuspicion: freezePerformanceDiagnostics.lastStateLoopSuspicion,
-            mediaSafeModeEnabled: freezePerformanceDiagnostics.mediaSafeModeEnabled
+            mediaSafeModeEnabled: freezePerformanceDiagnostics.mediaSafeModeEnabled,
+            capabilityCacheUpdateCount: capabilityCacheUpdateCount
+        )
+    }
+
+    private func invalidateCapabilityCache() {
+        capabilityCacheUpdateCount += 1
+        #if DEBUG
+        StoatFeatureLayoutDiagnostics.body("capabilityCache", detail: "update=\(capabilityCacheUpdateCount)")
+        #endif
+        let fallbackChannel = selection.serverID.flatMap { firstVisibleTextChannel(in: $0) }
+        cachedServerCapabilities = Phase24Management.capabilities(
+            server: selectedServer,
+            selectedChannel: selectedChannel ?? fallbackChannel,
+            currentUserID: currentUserID,
+            runtimeMode: effectiveRuntimeMode,
+            sessionState: effectiveSessionState
+        )
+        cachedCurrentPermissionResolution = Phase25PermissionResolver.resolve(
+            server: selectedServer,
+            channel: selectedChannel,
+            member: selectedServerMember,
+            currentUserID: currentUserID
         )
     }
 
@@ -2787,14 +2826,7 @@ public final class MainShellViewModel {
     }
 
     public func serverManagementCapabilities() -> ServerManagementCapabilities {
-        let fallbackChannel = selection.serverID.flatMap { firstVisibleTextChannel(in: $0) }
-        return Phase24Management.capabilities(
-            server: selectedServer,
-            selectedChannel: selectedChannel ?? fallbackChannel,
-            currentUserID: currentUserID,
-            runtimeMode: effectiveRuntimeMode,
-            sessionState: effectiveSessionState
-        )
+        cachedServerCapabilities
     }
 
     public func channelManagementDisabledReason(destructive: Bool = false) -> String? {
@@ -3277,12 +3309,12 @@ public final class MainShellViewModel {
     }
 
     public func memberActionDisabledReason(for member: ServerMember, action: MemberModerationAction) -> String? {
-        let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
-        guard serverManagementCapabilities().isConnectedForLiveActions else { return "Reconnect before member moderation." }
+        guard cachedServerCapabilities.isConnectedForLiveActions else { return "Reconnect before member moderation." }
         guard member.id.userID != currentUserID else { return "You cannot moderate yourself from this guarded flow." }
         guard Phase26MemberSafety.canActOn(member: member, currentMember: selectedServerMember, server: selectedServer, currentUserID: currentUserID) || currentUserID == selectedServer?.ownerID else {
             return "Rank data is incomplete or this member is protected."
         }
+        let resolution = cachedCurrentPermissionResolution
         let allowed: Bool
         switch action {
         case .saveNickname, .resetNickname:
@@ -6029,6 +6061,7 @@ public final class MainShellViewModel {
         unknownRoles: \(roles.unknownRoleCount)
         memberGroupingCount: \(freeze.memberGroupingCount)
         memberGroupingCacheHits: \(freeze.memberGroupingCacheHitCount)
+        capabilityCacheUpdates: \(freeze.capabilityCacheUpdateCount)
         markdownParse/cacheHits: \(freeze.markdownParseCount)/\(freeze.markdownCacheHitCount)
         imageActiveQueuedFailed: \(freeze.imageActiveCount)/\(freeze.imageQueuedCount)/\(freeze.imageFailedCount)
         mediaSafeMode: \(freeze.mediaSafeModeEnabled ? "yes" : "no")
@@ -9157,7 +9190,7 @@ public struct CredentialSetupView: View {
             LabeledContent("Visible identity", value: "unresolved \(identity.unresolvedVisibleUserCount), shortened \(identity.shortenedVisibleIDCount), avatar failures \(identity.avatarFailureCacheCount)")
             LabeledContent("Identity merges", value: "profiles \(identity.profileFetchMergeCount), member wrapper users \(identity.memberWrapperUserMergeCount)")
             LabeledContent("Freeze markers", value: freeze.lastMainThreadMarker ?? "-")
-            LabeledContent("Freeze counts", value: "timeline \(freeze.timelineRenderPassCount), grouping \(freeze.memberGroupingCount), grouping cache \(freeze.memberGroupingCacheHitCount), visible \(freeze.visibleRangeUpdateCount)")
+            LabeledContent("Freeze counts", value: "timeline \(freeze.timelineRenderPassCount), grouping \(freeze.memberGroupingCount), grouping cache \(freeze.memberGroupingCacheHitCount), visible \(freeze.visibleRangeUpdateCount), capability cache \(freeze.capabilityCacheUpdateCount)")
             LabeledContent("Markdown cache", value: "parsed \(freeze.markdownParseCount), hits \(freeze.markdownCacheHitCount)")
             LabeledContent("Image queue", value: "active \(freeze.imageActiveCount), queued \(freeze.imageQueuedCount), completed \(freeze.imageCompletedCount), failed \(freeze.imageFailedCount), safe \(freeze.mediaSafeModeEnabled ? "yes" : "no")")
             LabeledContent("Member source", value: "\(memberHydration.source.rawValue), server \(TimelineCopyFormatter.shortID(memberHydration.lastMemberFetchServerID?.rawValue))")

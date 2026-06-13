@@ -714,6 +714,7 @@ public struct FreezePerformanceDiagnostics: Hashable, Sendable {
     public var diagnosticsPublishCount: Int
     public var lastStateLoopSuspicion: String?
     public var mediaSafeModeEnabled: Bool
+    public var capabilityCacheUpdateCount: Int
 
     public init(
         lastMainThreadMarker: String? = nil,
@@ -732,7 +733,8 @@ public struct FreezePerformanceDiagnostics: Hashable, Sendable {
         visibleRangeUpdateCount: Int = 0,
         diagnosticsPublishCount: Int = 0,
         lastStateLoopSuspicion: String? = nil,
-        mediaSafeModeEnabled: Bool = false
+        mediaSafeModeEnabled: Bool = false,
+        capabilityCacheUpdateCount: Int = 0
     ) {
         self.lastMainThreadMarker = lastMainThreadMarker
         self.timelineRenderPassCount = timelineRenderPassCount
@@ -751,6 +753,7 @@ public struct FreezePerformanceDiagnostics: Hashable, Sendable {
         self.diagnosticsPublishCount = diagnosticsPublishCount
         self.lastStateLoopSuspicion = lastStateLoopSuspicion
         self.mediaSafeModeEnabled = mediaSafeModeEnabled
+        self.capabilityCacheUpdateCount = capabilityCacheUpdateCount
     }
 }
 
