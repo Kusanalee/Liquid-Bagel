@@ -43,6 +43,141 @@ public enum ModerationAction: String, CaseIterable, Hashable, Sendable {
     }
 }
 
+public struct MemberModerationActionState: Hashable, Sendable {
+    public var isDisabled: Bool
+    public var disabledReason: ModerationDisabledReason?
+    public var disabledReasonText: String?
+
+    public init(isDisabled: Bool, disabledReason: ModerationDisabledReason? = nil, disabledReasonText: String? = nil) {
+        self.isDisabled = isDisabled
+        self.disabledReason = disabledReason
+        self.disabledReasonText = disabledReasonText ?? disabledReason?.message
+    }
+
+    public static var enabled: MemberModerationActionState {
+        MemberModerationActionState(isDisabled: false)
+    }
+
+    public static func disabled(_ reason: ModerationDisabledReason) -> MemberModerationActionState {
+        MemberModerationActionState(isDisabled: true, disabledReason: reason)
+    }
+
+    public static func disabled(_ text: String) -> MemberModerationActionState {
+        MemberModerationActionState(isDisabled: true, disabledReasonText: text)
+    }
+}
+
+public struct MemberModerationMenuState: Hashable, Sendable {
+    public var targetUserID: UserID
+    public var actions: [ModerationAction: MemberModerationActionState]
+
+    public init(targetUserID: UserID, actions: [ModerationAction: MemberModerationActionState] = [:]) {
+        self.targetUserID = targetUserID
+        self.actions = actions
+    }
+
+    public subscript(_ action: ModerationAction) -> MemberModerationActionState {
+        actions[action] ?? .disabled("Unavailable")
+    }
+}
+
+public struct ModerationBaseContextSnapshot: Hashable, Sendable {
+    public var serverID: ServerID?
+    public var currentUserID: UserID?
+    public var server: Server?
+    public var currentMember: ServerMember?
+    public var selectedOrFallbackTextChannelID: ChannelID?
+    public var permissionResolution: PermissionResolutionResult
+    public var isConnectedForLiveActions: Bool
+    public var routeAvailability: ModerationRouteAvailability
+    public var knownBannedUserIDs: Set<UserID>
+    public var generation: Int
+
+    public init(
+        serverID: ServerID?,
+        currentUserID: UserID?,
+        server: Server?,
+        currentMember: ServerMember?,
+        selectedOrFallbackTextChannelID: ChannelID?,
+        permissionResolution: PermissionResolutionResult,
+        isConnectedForLiveActions: Bool,
+        routeAvailability: ModerationRouteAvailability = ModerationRouteAvailability(),
+        knownBannedUserIDs: Set<UserID> = [],
+        generation: Int
+    ) {
+        self.serverID = serverID
+        self.currentUserID = currentUserID
+        self.server = server
+        self.currentMember = currentMember
+        self.selectedOrFallbackTextChannelID = selectedOrFallbackTextChannelID
+        self.permissionResolution = permissionResolution
+        self.isConnectedForLiveActions = isConnectedForLiveActions
+        self.routeAvailability = routeAvailability
+        self.knownBannedUserIDs = knownBannedUserIDs
+        self.generation = generation
+    }
+}
+
+public struct ModerationCacheDiagnostics: Hashable, Sendable {
+    public var moderationBaseContextCacheHits: Int
+    public var moderationBaseContextCacheMisses: Int
+    public var permissionResolutionCacheHits: Int
+    public var permissionResolutionCacheMisses: Int
+    public var memberMenuStateCacheHits: Int
+    public var memberMenuStateCacheMisses: Int
+    public var moderationContextLookupHits: Int
+    public var moderationContextLookupMisses: Int
+
+    public init(
+        moderationBaseContextCacheHits: Int = 0,
+        moderationBaseContextCacheMisses: Int = 0,
+        permissionResolutionCacheHits: Int = 0,
+        permissionResolutionCacheMisses: Int = 0,
+        memberMenuStateCacheHits: Int = 0,
+        memberMenuStateCacheMisses: Int = 0,
+        moderationContextLookupHits: Int = 0,
+        moderationContextLookupMisses: Int = 0
+    ) {
+        self.moderationBaseContextCacheHits = moderationBaseContextCacheHits
+        self.moderationBaseContextCacheMisses = moderationBaseContextCacheMisses
+        self.permissionResolutionCacheHits = permissionResolutionCacheHits
+        self.permissionResolutionCacheMisses = permissionResolutionCacheMisses
+        self.memberMenuStateCacheHits = memberMenuStateCacheHits
+        self.memberMenuStateCacheMisses = memberMenuStateCacheMisses
+        self.moderationContextLookupHits = moderationContextLookupHits
+        self.moderationContextLookupMisses = moderationContextLookupMisses
+    }
+}
+
+public enum MemberModerationMenuStateResolver {
+    public static func menuState(
+        targetUserID: UserID,
+        targetMember: ServerMember?,
+        baseContext: ModerationBaseContextSnapshot,
+        allowNonMemberBan: Bool = false,
+        now: Date = Date()
+    ) -> MemberModerationMenuState {
+        let context = ModerationActionContext(
+            currentUserID: baseContext.currentUserID,
+            server: baseContext.server,
+            currentMember: baseContext.currentMember,
+            targetUserID: targetUserID,
+            targetMember: targetMember,
+            knownBannedUserIDs: baseContext.knownBannedUserIDs,
+            permissionResolution: baseContext.permissionResolution,
+            isConnectedForLiveActions: baseContext.isConnectedForLiveActions,
+            routeAvailability: baseContext.routeAvailability,
+            allowNonMemberBan: allowNonMemberBan,
+            now: now
+        )
+        let actions = Dictionary(uniqueKeysWithValues: ModerationAction.allCases.map { action in
+            let reason = ModerationActionResolver.disabledReason(for: action, context: context)
+            return (action, reason.map(MemberModerationActionState.disabled) ?? .enabled)
+        })
+        return MemberModerationMenuState(targetUserID: targetUserID, actions: actions)
+    }
+}
+
 public enum ModerationTimeoutPreset: String, CaseIterable, Hashable, Sendable, Identifiable {
     case fiveMinutes
     case tenMinutes

@@ -29,6 +29,7 @@ Timeout apply uses `DataMemberEdit.timeout` as an absolute timestamp. Timeout cl
 
 - Added `Server Settings -> Moderation` with members, bans, and timeouts sections.
 - Added a central `ModerationActionResolver` for allowed actions, disabled reasons, hierarchy checks, route availability, and confirmation requirements.
+- Added cached `MemberModerationMenuState` availability so member rows, profile menus, and moderation dashboard rows do not walk channels or resolve permissions while SwiftUI builds context menus.
 - Routed kick, ban, unban, timeout, and remove-timeout through one native confirmation sheet.
 - Kept member-list row context menus, profile popover actions, server settings member rows, ban rows, and timeout rows on the same coordinator path.
 - Ban confirmation supports the verified optional reason field. Kick, timeout, remove-timeout, and unban do not expose reason fields.
@@ -82,6 +83,7 @@ Developer Verification includes Phase 42 Moderation Diagnostics with:
 - Ban and timeout known/rendered/pending counts.
 - Elapsed duration bucket.
 - Reason-redaction flag.
+- Moderation availability cache hit/miss counts for base context, permission resolution, member menu state, and context lookup.
 
 Copied diagnostics redact session tokens, raw payloads, full IDs, local paths, URLs, emails, password-like strings, MFA strings, and user-entered moderation reason text.
 
@@ -128,4 +130,5 @@ These remain intentionally out of scope or blocked by unverified API:
 - [ ] Copy moderation diagnostics and confirm no tokens, raw JSON, full IDs, URLs, paths, emails, or reason text leak.
 - [ ] Test on a larger/role-heavy server for member list performance.
 - [ ] Confirm member panel does not freeze when opening context menus.
+- [ ] Confirm Developer Verification moderation cache counters show menu-state hits after repeated member context-menu opens.
 - [ ] Confirm Phase 41 profile editor still works after moderation changes.

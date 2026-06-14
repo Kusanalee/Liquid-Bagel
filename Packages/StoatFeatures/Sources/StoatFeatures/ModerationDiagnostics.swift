@@ -22,6 +22,7 @@ public struct ModerationDiagnostics: Hashable, Sendable {
     public var copiedDiagnosticsRedactedReasonText: Bool
     public var targetIDPrefix: String
     public var serverIDPrefix: String
+    public var cacheDiagnostics: ModerationCacheDiagnostics
 
     public init(
         lastActionCategory: String = "none",
@@ -43,7 +44,8 @@ public struct ModerationDiagnostics: Hashable, Sendable {
         elapsedDurationBucket: String = "none",
         copiedDiagnosticsRedactedReasonText: Bool = true,
         targetIDPrefix: String = "-",
-        serverIDPrefix: String = "-"
+        serverIDPrefix: String = "-",
+        cacheDiagnostics: ModerationCacheDiagnostics = ModerationCacheDiagnostics()
     ) {
         self.lastActionCategory = lastActionCategory
         self.selectedServerPresenceCategory = selectedServerPresenceCategory
@@ -65,6 +67,7 @@ public struct ModerationDiagnostics: Hashable, Sendable {
         self.copiedDiagnosticsRedactedReasonText = copiedDiagnosticsRedactedReasonText
         self.targetIDPrefix = targetIDPrefix
         self.serverIDPrefix = serverIDPrefix
+        self.cacheDiagnostics = cacheDiagnostics
     }
 }
 
@@ -86,6 +89,7 @@ public enum ModerationDiagnosticsFormatter {
         bans: known \(diagnostics.bansKnownCount), rendered \(diagnostics.bansRenderedCount), pending \(diagnostics.bansPendingCount)
         timeouts: known \(diagnostics.timeoutsKnownCount), rendered \(diagnostics.timeoutsRenderedCount), pending \(diagnostics.timeoutsPendingCount)
         elapsed: \(diagnostics.elapsedDurationBucket)
+        cache: base \(diagnostics.cacheDiagnostics.moderationBaseContextCacheHits)/\(diagnostics.cacheDiagnostics.moderationBaseContextCacheMisses), permission \(diagnostics.cacheDiagnostics.permissionResolutionCacheHits)/\(diagnostics.cacheDiagnostics.permissionResolutionCacheMisses), memberMenu \(diagnostics.cacheDiagnostics.memberMenuStateCacheHits)/\(diagnostics.cacheDiagnostics.memberMenuStateCacheMisses), context \(diagnostics.cacheDiagnostics.moderationContextLookupHits)/\(diagnostics.cacheDiagnostics.moderationContextLookupMisses)
         reasonRedacted: \(diagnostics.copiedDiagnosticsRedactedReasonText ? "yes" : "no")
         """
         return redactModerationOnly(

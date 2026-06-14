@@ -4420,6 +4420,276 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(ModerationActionResolver.disabledReason(for: .timeout, context: timeoutPermissionTarget), .targetHasTimeoutPermission)
     }
 
+    func testPhase42MemberModerationMenuStateResolverCoversCoreStates() {
+        let owner: UserID = "owner"
+        let current: UserID = "mod"
+        let target: UserID = "target"
+        let serverID: ServerID = "menu-state-server"
+        let modRoleID: RoleID = "mod-role"
+        let adminRoleID: RoleID = "admin-role"
+        let memberRoleID: RoleID = "member-role"
+        let timeoutRoleID: RoleID = "timeout-role"
+        let server = Server(
+            id: serverID,
+            ownerID: owner,
+            name: "Moderation Menu Test",
+            roles: [
+                adminRoleID: Role(id: adminRoleID, name: "Admin", permissions: PermissionOverride(), rank: 5),
+                modRoleID: Role(id: modRoleID, name: "Mod", permissions: PermissionOverride(allow: [.kickMembers, .banMembers, .timeoutMembers]), rank: 10),
+                memberRoleID: Role(id: memberRoleID, name: "Member", permissions: PermissionOverride(), rank: 50),
+                timeoutRoleID: Role(id: timeoutRoleID, name: "Timeout Mod", permissions: PermissionOverride(allow: [.timeoutMembers]), rank: 60)
+            ],
+            defaultPermissions: [.viewChannel, .readMessageHistory]
+        )
+        let currentMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: current), joinedAt: Date(), roles: [modRoleID])
+        let targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [memberRoleID])
+        let base = ModerationBaseContextSnapshot(
+            serverID: serverID,
+            currentUserID: current,
+            server: server,
+            currentMember: currentMember,
+            selectedOrFallbackTextChannelID: nil,
+            permissionResolution: PermissionResolutionResult(effectivePermissions: [.kickMembers, .banMembers, .timeoutMembers]),
+            isConnectedForLiveActions: true,
+            knownBannedUserIDs: [],
+            generation: 1
+        )
+
+        let normal = MemberModerationMenuStateResolver.menuState(targetUserID: target, targetMember: targetMember, baseContext: base)
+        XCTAssertFalse(normal[.kick].isDisabled)
+        XCTAssertFalse(normal[.ban].isDisabled)
+        XCTAssertFalse(normal[.timeout].isDisabled)
+        XCTAssertEqual(normal[.removeTimeout].disabledReason, .targetNotTimedOut)
+
+        let timedOutMember = ServerMember(id: targetMember.id, joinedAt: targetMember.joinedAt, roles: [memberRoleID], timeout: Date().addingTimeInterval(300))
+        let timedOut = MemberModerationMenuStateResolver.menuState(targetUserID: target, targetMember: timedOutMember, baseContext: base)
+        XCTAssertFalse(timedOut[.removeTimeout].isDisabled)
+
+        let selfTarget = MemberModerationMenuStateResolver.menuState(targetUserID: current, targetMember: currentMember, baseContext: base)
+        XCTAssertEqual(selfTarget[.kick].disabledReason, .targetIsSelf)
+
+        let ownerMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: owner), joinedAt: Date(), roles: [adminRoleID])
+        let ownerTarget = MemberModerationMenuStateResolver.menuState(targetUserID: owner, targetMember: ownerMember, baseContext: base)
+        XCTAssertEqual(ownerTarget[.ban].disabledReason, .targetIsServerOwner)
+
+        let higherMember = ServerMember(id: targetMember.id, joinedAt: targetMember.joinedAt, roles: [adminRoleID])
+        let higher = MemberModerationMenuStateResolver.menuState(targetUserID: target, targetMember: higherMember, baseContext: base)
+        XCTAssertEqual(higher[.kick].disabledReason, .targetRoleEqualOrHigher)
+
+        var disconnectedBase = base
+        disconnectedBase.isConnectedForLiveActions = false
+        let disconnected = MemberModerationMenuStateResolver.menuState(targetUserID: target, targetMember: targetMember, baseContext: disconnectedBase)
+        XCTAssertEqual(disconnected[.ban].disabledReason, .disconnected)
+
+        var bannedBase = base
+        bannedBase.knownBannedUserIDs = [target]
+        let banned = MemberModerationMenuStateResolver.menuState(targetUserID: target, targetMember: targetMember, baseContext: bannedBase)
+        XCTAssertEqual(banned[.ban].disabledReason, .targetAlreadyBanned)
+        XCTAssertFalse(banned[.unban].isDisabled)
+
+        let nonMemberBan = MemberModerationMenuStateResolver.menuState(targetUserID: "non-member", targetMember: nil, baseContext: base, allowNonMemberBan: true)
+        XCTAssertFalse(nonMemberBan[.ban].isDisabled)
+
+        let timeoutCapableTarget = ServerMember(id: targetMember.id, joinedAt: targetMember.joinedAt, roles: [timeoutRoleID])
+        let timeoutBlocked = MemberModerationMenuStateResolver.menuState(targetUserID: target, targetMember: timeoutCapableTarget, baseContext: base)
+        XCTAssertEqual(timeoutBlocked[.timeout].disabledReason, .targetHasTimeoutPermission)
+    }
+
+    @MainActor
+    func testPhase42ModerationMenuStateUsesFallbackTextChannelAndCachesByTarget() {
+        let current: UserID = "phase42-current"
+        let target: UserID = "phase42-target"
+        let serverID: ServerID = "phase42-fallback-server"
+        let roleID: RoleID = "phase42-mod-role"
+        let memberRoleID: RoleID = "phase42-member-role"
+        let channelID: ChannelID = "phase42-general"
+        let role = Role(id: roleID, name: "Channel Mod", permissions: PermissionOverride(), rank: 10)
+        let memberRole = Role(id: memberRoleID, name: "Member", permissions: PermissionOverride(), rank: 50)
+        let server = Server(id: serverID, ownerID: "phase42-owner", name: "Fallback", channelIDs: [channelID], roles: [roleID: role, memberRoleID: memberRole], defaultPermissions: [.viewChannel, .readMessageHistory])
+        let channel = Channel(
+            id: channelID,
+            kind: .textChannel,
+            serverID: serverID,
+            name: "general",
+            rolePermissions: [roleID: PermissionOverride(allow: [.kickMembers, .banMembers, .timeoutMembers])]
+        )
+        let currentMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: current), joinedAt: Date(), roles: [roleID])
+        let targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [memberRoleID])
+        var snapshot = RealtimeSnapshot(
+            usersByID: [
+                current: User(id: current, username: "current"),
+                target: User(id: target, username: "target")
+            ],
+            serversByID: [serverID: server],
+            channelsByID: [channelID: channel],
+            membersByServerAndUserID: [
+                ServerMemberKey(currentMember.id): currentMember,
+                ServerMemberKey(targetMember.id): targetMember
+            ]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            currentUser: snapshot.usersByID[current]
+        )
+        model.selection.channelID = nil
+
+        let beforeChannels = model.channelsForServerInvocationCount
+        let first = model.memberModerationMenuState(targetUserID: target, member: targetMember)
+        XCTAssertFalse(first[.ban].isDisabled)
+        XCTAssertEqual(model.channelsForServerInvocationCount, beforeChannels)
+        let firstDiagnostics = model.moderationCacheDiagnostics
+        XCTAssertGreaterThan(firstDiagnostics.memberMenuStateCacheMisses, 0)
+
+        let second = model.memberModerationMenuState(targetUserID: target, member: targetMember)
+        XCTAssertFalse(second[.ban].isDisabled)
+        XCTAssertGreaterThan(model.moderationCacheDiagnostics.memberMenuStateCacheHits, firstDiagnostics.memberMenuStateCacheHits)
+
+        model.banListState = .loaded(BanListResult(users: [], bans: [ServerBan(id: MemberCompositeKey(serverID: serverID, userID: target))]))
+        let banned = model.memberModerationMenuState(targetUserID: target, member: targetMember)
+        XCTAssertEqual(banned[.ban].disabledReason, .targetAlreadyBanned)
+
+        snapshot.membersByServerAndUserID[ServerMemberKey(targetMember.id)] = ServerMember(id: targetMember.id, joinedAt: targetMember.joinedAt, roles: [roleID])
+        model.snapshot = snapshot
+        let elevatedTarget = model.memberModerationMenuState(targetUserID: target)
+        XCTAssertEqual(elevatedTarget[.timeout].disabledReason, .targetRoleEqualOrHigher)
+    }
+
+    @MainActor
+    func testPhase42ModerationMenuStateAllowsServerPermissionsWithoutVisibleTextChannel() {
+        let current: UserID = "phase42-server-current"
+        let target: UserID = "phase42-server-target"
+        let serverID: ServerID = "phase42-no-channel-server"
+        let roleID: RoleID = "phase42-server-mod"
+        let memberRoleID: RoleID = "phase42-server-member"
+        let role = Role(id: roleID, name: "Server Mod", permissions: PermissionOverride(allow: [.kickMembers, .banMembers, .timeoutMembers]), rank: 10)
+        let memberRole = Role(id: memberRoleID, name: "Member", permissions: PermissionOverride(), rank: 50)
+        let server = Server(id: serverID, ownerID: "phase42-owner", name: "No Channel", roles: [roleID: role, memberRoleID: memberRole], defaultPermissions: [.viewChannel, .readMessageHistory])
+        let currentMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: current), joinedAt: Date(), roles: [roleID])
+        let targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [memberRoleID])
+        let snapshot = RealtimeSnapshot(
+            usersByID: [
+                current: User(id: current, username: "current"),
+                target: User(id: target, username: "target")
+            ],
+            serversByID: [serverID: server],
+            membersByServerAndUserID: [
+                ServerMemberKey(currentMember.id): currentMember,
+                ServerMemberKey(targetMember.id): targetMember
+            ]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            currentUser: snapshot.usersByID[current]
+        )
+
+        let beforeChannels = model.channelsForServerInvocationCount
+        let state = model.memberModerationMenuState(targetUserID: target, member: targetMember)
+        XCTAssertFalse(state[.kick].isDisabled)
+        XCTAssertFalse(state[.ban].isDisabled)
+        XCTAssertEqual(model.channelsForServerInvocationCount, beforeChannels)
+    }
+
+    @MainActor
+    func testPhase42ModerationMenuStateInvalidatesWhenSessionDisconnects() {
+        let current: UserID = "phase42-live-current"
+        let target: UserID = "phase42-live-target"
+        let serverID: ServerID = "phase42-live-server"
+        let roleID: RoleID = "phase42-live-mod"
+        let memberRoleID: RoleID = "phase42-live-member"
+        let role = Role(id: roleID, name: "Live Mod", permissions: PermissionOverride(allow: [.kickMembers, .banMembers, .timeoutMembers]), rank: 10)
+        let memberRole = Role(id: memberRoleID, name: "Member", permissions: PermissionOverride(), rank: 50)
+        let server = Server(id: serverID, ownerID: "phase42-owner", name: "Live", roles: [roleID: role, memberRoleID: memberRole], defaultPermissions: [.viewChannel, .readMessageHistory])
+        let currentMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: current), joinedAt: Date(), roles: [roleID])
+        let targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [memberRoleID])
+        let snapshot = RealtimeSnapshot(
+            usersByID: [
+                current: User(id: current, username: "current"),
+                target: User(id: target, username: "target")
+            ],
+            serversByID: [serverID: server],
+            membersByServerAndUserID: [
+                ServerMemberKey(currentMember.id): currentMember,
+                ServerMemberKey(targetMember.id): targetMember
+            ]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID),
+            snapshot: snapshot,
+            runtimeMode: .liveManual,
+            sessionState: .connected,
+            currentUser: snapshot.usersByID[current]
+        )
+
+        XCTAssertFalse(model.memberModerationMenuState(targetUserID: target, member: targetMember)[.ban].isDisabled)
+        model.sessionState = .signedOut
+        XCTAssertEqual(model.memberModerationMenuState(targetUserID: target, member: targetMember)[.ban].disabledReason, .disconnected)
+    }
+
+    @MainActor
+    func testPhase42ModerationMenuStateLargeServerDoesNotWalkChannelsPerMember() {
+        let current: UserID = "phase42-large-current"
+        let serverID: ServerID = "phase42-large-server"
+        let modRoleID: RoleID = "phase42-large-mod"
+        var roles: [RoleID: Role] = [
+            modRoleID: Role(id: modRoleID, name: "Mod", permissions: PermissionOverride(allow: [.kickMembers, .banMembers, .timeoutMembers]), rank: 1)
+        ]
+        for index in 0..<19 {
+            let roleID = RoleID(rawValue: "phase42-large-role-\(index)")
+            roles[roleID] = Role(id: roleID, name: "Role \(index)", permissions: PermissionOverride(), rank: Int64(index + 10))
+        }
+        let channelIDs = (0..<50).map { ChannelID(rawValue: "phase42-large-channel-\($0)") }
+        let server = Server(id: serverID, ownerID: "phase42-owner", name: "Large", channelIDs: channelIDs, roles: roles, defaultPermissions: [.viewChannel, .readMessageHistory])
+        var channels: [ChannelID: Channel] = [:]
+        for channelID in channelIDs {
+            channels[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: channelID.rawValue)
+        }
+        var users: [UserID: User] = [current: User(id: current, username: "current")]
+        var members: [ServerMemberKey: ServerMember] = [
+            ServerMemberKey(serverID: serverID, userID: current): ServerMember(id: MemberCompositeKey(serverID: serverID, userID: current), joinedAt: Date(), roles: [modRoleID])
+        ]
+        var targetMembers: [ServerMember] = []
+        for index in 0..<1_000 {
+            let userID = UserID(rawValue: "phase42-large-user-\(index)")
+            users[userID] = User(id: userID, username: "user\(index)")
+            let member = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date())
+            targetMembers.append(member)
+            members[ServerMemberKey(member.id)] = member
+        }
+        let snapshot = RealtimeSnapshot(
+            usersByID: users,
+            serversByID: [serverID: server],
+            channelsByID: channels,
+            membersByServerAndUserID: members
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelIDs[0]),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            currentUser: users[current]
+        )
+
+        let beforeChannels = model.channelsForServerInvocationCount
+        let beforePermissionMisses = model.moderationCacheDiagnostics.permissionResolutionCacheMisses
+        for member in targetMembers {
+            _ = model.memberModerationMenuState(targetUserID: member.id.userID, member: member)
+        }
+        let afterFirstPass = model.moderationCacheDiagnostics
+        XCTAssertEqual(model.channelsForServerInvocationCount, beforeChannels)
+        XCTAssertLessThanOrEqual(afterFirstPass.permissionResolutionCacheMisses - beforePermissionMisses, 1)
+        XCTAssertEqual(afterFirstPass.memberMenuStateCacheMisses, targetMembers.count)
+
+        for member in targetMembers {
+            _ = model.memberModerationMenuState(targetUserID: member.id.userID, member: member)
+        }
+        let afterSecondPass = model.moderationCacheDiagnostics
+        XCTAssertEqual(model.channelsForServerInvocationCount, beforeChannels)
+        XCTAssertEqual(afterSecondPass.memberMenuStateCacheHits - afterFirstPass.memberMenuStateCacheHits, targetMembers.count)
+    }
+
     @MainActor
     func testPhase42BanAndUnbanPatchListsWithoutReaddingMember() async {
         let snapshot = MockShellData.snapshot

@@ -327,7 +327,7 @@ public enum Phase30ParityMatrixBuilder {
             ("Server/community", "permissions preview", .done, "Backend permission model", "Read-only resolver", "Write parity separate", "Permission resolver tests", "Open preview", "Keep stable"),
             ("Server/community", "permission editing", .partial, "Verified permission routes", "Guarded writes exist", "Full official UX parity incomplete", "Permission tests", "Edit test permission", "Audit later"),
             ("Server/community", "member list", .done, "Ready members/users", "Missing/offline fallbacks kept", "No hidden member fetch", "Member tests", "Open large server", "Keep stable"),
-            ("Server/community", "member moderation", .partial, "Verified moderation routes", "Phase 42 central resolver, confirmations, member/profile/settings/dashboard entry points", "Live hierarchy and destructive-action QA pending", "Moderation tests", "Use test server only", "Run Phase 42 checklist"),
+            ("Server/community", "member moderation", .partial, "Verified moderation routes", "Phase 42 central resolver, cached menu availability, confirmations, member/profile/settings/dashboard entry points", "Live hierarchy and destructive-action QA pending", "Moderation tests, menu cache regression tests", "Use test server only", "Run Phase 42 checklist"),
             ("Server/community", "bans/timeouts", .partial, "Verified moderation routes", "Phase 42 ban management plus member-state active timeout management", "Live QA pending; no separate verified timeout-list route", "Moderation tests", "Use test server only", "Run Phase 42 checklist"),
 
             ("Notifications", "local notifications", .partial, "UserNotifications", "Explicit opt-in with request diagnostics", "Live prompt still needs QA", "Notification tests", "Request manually", "Keep partial until live prompt works"),
@@ -344,10 +344,10 @@ public enum Phase30ParityMatrixBuilder {
             ("UI/platform", "high contrast", .partial, "SwiftUI environment", "Previews planned", "Manual QA pending", "Preview coverage", "Enable high contrast", "Phase 31"),
             ("UI/platform", "reduce transparency", .partial, "Local preference", "Reduce glass intensity exists", "System reduce-transparency audit pending", "Preference tests", "Toggle setting", "Polish later"),
             ("UI/platform", "performance with large channels", .partial, "Lazy timeline", "Diagnostics and caps exist", "More live QA needed", "Timeline perf tests", "Open large channel", "Monitor"),
-            ("UI/platform", "performance with large servers", .partial, "Lazy member list", "Member diagnostics exist", "More live QA needed", "Member perf tests", "Open large server", "Monitor"),
+            ("UI/platform", "performance with large servers", .partial, "Lazy member list", "Member diagnostics and Phase 42 menu availability cache counters exist", "More live QA needed", "Member perf tests and Phase 42 menu cache regression tests", "Open large server", "Monitor"),
             ("UI/platform", "native macOS window/menu behavior", .partial, "SwiftUI app commands", "Native app shell exists", "Official desktop parity incomplete", "App construction tests", "Use menus", "Audit later"),
             ("UI/platform", "settings organization", .partial, "Settings tabs", "Settings scene opens Account/connection/notifications/developer", "Official settings parity incomplete", "Settings tests", "Command-comma", "Polish later"),
-            ("UI/platform", "diagnostics", .done, "Developer Verification", "Redacted diagnostics and Phase 30 trace", "Developer-only by design", "Redaction tests", "Copy diagnostics", "Keep safe"),
+            ("UI/platform", "diagnostics", .done, "Developer Verification", "Redacted diagnostics, Phase 30 trace, and Phase 42 cache counters", "Developer-only by design", "Redaction tests", "Copy diagnostics", "Keep safe"),
 
             ("Deferred / not parity", "voice", .outOfScope, "Deferred scope", "Not implemented", "Out of Phase 30 scope", "Matrix test", "N/A", "Future verified phase"),
             ("Deferred / not parity", "video", .outOfScope, "Deferred scope", "Not implemented", "Out of Phase 30 scope", "Matrix test", "N/A", "Future verified phase"),

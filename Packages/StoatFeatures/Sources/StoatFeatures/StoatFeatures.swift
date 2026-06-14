@@ -445,6 +445,42 @@ public enum MessageQuickActions {
     public static let quickReactions = Phase17MessageActions.quickReactions
 }
 
+private struct ModerationPermissionResolutionCacheKey: Hashable {
+    var serverID: ServerID?
+    var currentUserID: UserID?
+    var currentMemberSignature: String
+    var selectedOrFallbackTextChannelID: ChannelID?
+    var serverPermissionSignature: String
+    var channelPermissionSignature: String
+    var runtimeMode: AppRuntimeMode
+    var sessionState: AppSessionState
+    var snapshotRevision: Int
+    var generation: Int
+}
+
+private struct ModerationBaseContextCacheKey: Hashable {
+    var serverID: ServerID?
+    var currentUserID: UserID?
+    var currentMemberSignature: String
+    var selectedOrFallbackTextChannelID: ChannelID?
+    var serverPermissionSignature: String
+    var channelPermissionSignature: String
+    var routeAvailability: ModerationRouteAvailability
+    var isConnectedForLiveActions: Bool
+    var knownBannedSignature: String
+    var snapshotRevision: Int
+    var banListGeneration: Int
+    var generation: Int
+}
+
+private struct ModerationMenuStateCacheKey: Hashable {
+    var baseGeneration: Int
+    var targetUserID: UserID
+    var targetMemberSignature: String
+    var allowNonMemberBan: Bool
+    var timeoutBucket: String
+}
+
 @MainActor
 @Observable
 public final class MainShellViewModel {
@@ -453,8 +489,8 @@ public final class MainShellViewModel {
     }
     public var snapshot: RealtimeSnapshot {
         didSet {
-            invalidateCapabilityCache()
             snapshotRevision &+= 1
+            invalidateCapabilityCache()
         }
     }
     public var connectionState: RealtimeConnectionState
@@ -603,7 +639,13 @@ public final class MainShellViewModel {
     public var memberTimeoutHours: Double = 1
     public var pendingMemberModerationAction: PendingMemberModerationAction?
     public var memberActionState: ManagementActionState<ServerMember> = .idle
-    public var banListState: ManagementActionState<BanListResult> = .idle
+    public var banListState: ManagementActionState<BanListResult> = .idle {
+        didSet {
+            banListGeneration &+= 1
+            invalidateModerationAvailabilityCaches()
+            prewarmModerationBaseContextCache()
+        }
+    }
     public var moderationBanSearchText: String = ""
     public var moderationTimeoutSearchText: String = ""
     public var pendingModerationConfirmation: PendingModerationConfirmation?
@@ -686,6 +728,14 @@ public final class MainShellViewModel {
     @ObservationIgnored private var memberGroupingCount = 0
     @ObservationIgnored private var memberGroupingCacheHitCount = 0
     @ObservationIgnored private var capabilityCacheUpdateCount = 0
+    @ObservationIgnored public private(set) var moderationCacheDiagnostics = ModerationCacheDiagnostics()
+    @ObservationIgnored public private(set) var channelsForServerInvocationCount = 0
+    @ObservationIgnored private var moderationCacheGeneration = 0
+    @ObservationIgnored private var banListGeneration = 0
+    @ObservationIgnored private var moderationBaseContextCacheKey: ModerationBaseContextCacheKey?
+    @ObservationIgnored private var moderationBaseContextCache: ModerationBaseContextSnapshot?
+    @ObservationIgnored private var moderationPermissionResolutionCache: [ModerationPermissionResolutionCacheKey: PermissionResolutionResult] = [:]
+    @ObservationIgnored private var memberModerationMenuStateCache: [ModerationMenuStateCacheKey: MemberModerationMenuState] = [:]
     @ObservationIgnored private var imageCompletedCount = 0
     @ObservationIgnored private var diagnosticsPublishCount = 0
     @ObservationIgnored private var profileFetchMergeCount = 0
@@ -1042,6 +1092,7 @@ public final class MainShellViewModel {
     }
 
     public func channels(for serverID: ServerID?) -> [Channel] {
+        channelsForServerInvocationCount += 1
         guard let serverID else { return [] }
         let server = snapshot.serversByID[serverID]
         if let orderedIDs = server?.channelIDs, !orderedIDs.isEmpty {
@@ -2597,23 +2648,25 @@ public final class MainShellViewModel {
 
     private func invalidateCapabilityCache() {
         capabilityCacheUpdateCount += 1
+        invalidateModerationAvailabilityCaches()
         #if DEBUG
         StoatFeatureLayoutDiagnostics.body("capabilityCache", detail: "update=\(capabilityCacheUpdateCount)")
         #endif
-        let fallbackChannel = selection.serverID.flatMap { firstVisibleTextChannel(in: $0) }
+        let moderationChannel = selectedOrFallbackModerationTextChannel()
         cachedServerCapabilities = Phase24Management.capabilities(
             server: selectedServer,
-            selectedChannel: selectedChannel ?? fallbackChannel,
+            selectedChannel: moderationChannel,
             currentUserID: currentUserID,
             runtimeMode: effectiveRuntimeMode,
             sessionState: effectiveSessionState
         )
-        cachedCurrentPermissionResolution = Phase25PermissionResolver.resolve(
+        cachedCurrentPermissionResolution = cachedModerationPermissionResolution(
             server: selectedServer,
-            channel: selectedChannel,
+            channel: moderationChannel,
             member: selectedServerMember,
             currentUserID: currentUserID
         )
+        prewarmModerationBaseContextCache()
     }
 
     private func showTransientStatus(_ message: String, keyPath: ReferenceWritableKeyPath<MainShellViewModel, String?> = \.placeholderStatus, duration: Duration = .seconds(2)) {
@@ -3346,9 +3399,46 @@ public final class MainShellViewModel {
         }
     }
 
+    public func memberModerationMenuState(for item: MemberListItem) -> MemberModerationMenuState {
+        memberModerationMenuState(targetUserID: item.userID, member: item.member)
+    }
+
+    func prewarmMemberModerationMenuBaseContext() {
+        prewarmModerationBaseContextCache()
+    }
+
+    public func memberModerationMenuState(targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) -> MemberModerationMenuState {
+        let resolvedMember = resolvedModerationTargetMember(targetUserID: targetUserID, member: member)
+        let baseContext = moderationBaseContextSnapshot()
+        let key = ModerationMenuStateCacheKey(
+            baseGeneration: baseContext.generation,
+            targetUserID: targetUserID,
+            targetMemberSignature: moderationMemberSignature(resolvedMember),
+            allowNonMemberBan: allowNonMemberBan,
+            timeoutBucket: moderationTimeoutBucket(resolvedMember?.timeout)
+        )
+        if let cached = memberModerationMenuStateCache[key] {
+            moderationCacheDiagnostics.memberMenuStateCacheHits += 1
+            moderationCacheDiagnostics.moderationContextLookupHits += 1
+            return cached
+        }
+        moderationCacheDiagnostics.memberMenuStateCacheMisses += 1
+        moderationCacheDiagnostics.moderationContextLookupMisses += 1
+        let state = MemberModerationMenuStateResolver.menuState(
+            targetUserID: targetUserID,
+            targetMember: resolvedMember,
+            baseContext: baseContext,
+            allowNonMemberBan: allowNonMemberBan
+        )
+        memberModerationMenuStateCache[key] = state
+        return state
+    }
+
+    // Compatibility helper for command/action revalidation. SwiftUI row or context-menu
+    // rendering must use memberModerationMenuState(...) so menu construction stays O(1).
     public func memberActionDisabledReason(for member: ServerMember, action: MemberModerationAction) -> String? {
         if let moderationAction = moderationAction(for: action) {
-            return moderationDisabledReasonText(for: moderationAction, targetUserID: member.id.userID, member: member)
+            return memberModerationMenuState(targetUserID: member.id.userID, member: member)[moderationAction].disabledReasonText
         }
         guard cachedServerCapabilities.isConnectedForLiveActions else { return "Reconnect before member moderation." }
         guard member.id.userID != currentUserID else { return "You cannot edit yourself from this guarded flow." }
@@ -3384,20 +3474,16 @@ public final class MainShellViewModel {
     }
 
     public func moderationDisabledReason(for action: ModerationAction, targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) -> ModerationDisabledReason? {
-        ModerationActionResolver.disabledReason(
-            for: action,
-            context: moderationContext(targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
-        )
+        memberModerationMenuState(targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)[action].disabledReason
     }
 
     public func moderationDisabledReasonText(for action: ModerationAction, targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) -> String? {
-        moderationDisabledReason(for: action, targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)?.message
+        memberModerationMenuState(targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)[action].disabledReasonText
     }
 
     public func availableModerationActions(for targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) -> [ModerationAction] {
-        ModerationActionResolver.availableModerationActions(
-            context: moderationContext(targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
-        )
+        let state = memberModerationMenuState(targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
+        return ModerationAction.allCases.filter { !state[$0].isDisabled }
     }
 
     public func requestModerationAction(_ action: ModerationAction, targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) {
@@ -3628,32 +3714,200 @@ public final class MainShellViewModel {
         }
     }
 
-    private func moderationContext(targetUserID: UserID, member: ServerMember?, allowNonMemberBan: Bool) -> ModerationActionContext {
+    private func invalidateModerationAvailabilityCaches() {
+        moderationCacheGeneration &+= 1
+        moderationBaseContextCacheKey = nil
+        moderationBaseContextCache = nil
+        moderationPermissionResolutionCache.removeAll(keepingCapacity: true)
+        memberModerationMenuStateCache.removeAll(keepingCapacity: true)
+    }
+
+    private func prewarmModerationBaseContextCache() {
+        _ = moderationBaseContextSnapshot()
+    }
+
+    private func moderationBaseContextSnapshot() -> ModerationBaseContextSnapshot {
         let server = selectedServer
-        let resolvedMember: ServerMember?
-        if let member {
-            resolvedMember = member
-        } else if let server {
-            resolvedMember = snapshot.membersByServerAndUserID[ServerMemberKey(serverID: server.id, userID: targetUserID)]
-        } else {
-            resolvedMember = nil
-        }
-        let fallbackChannel = selection.serverID.flatMap { firstVisibleTextChannel(in: $0) }
-        let resolution = Phase25PermissionResolver.resolve(
-            server: server,
-            channel: selectedChannel ?? fallbackChannel,
-            member: selectedServerMember,
-            currentUserID: currentUserID
+        let userID = currentUserID
+        let currentMember = selectedServerMember
+        let channel = selectedOrFallbackModerationTextChannel(in: server, snapshot: snapshot)
+        let routeAvailability = ModerationRouteAvailability()
+        let bannedIDs = knownBannedUserIDs
+        let key = ModerationBaseContextCacheKey(
+            serverID: server?.id,
+            currentUserID: userID,
+            currentMemberSignature: moderationMemberSignature(currentMember),
+            selectedOrFallbackTextChannelID: channel?.id,
+            serverPermissionSignature: moderationServerPermissionSignature(server),
+            channelPermissionSignature: moderationChannelPermissionSignature(channel),
+            routeAvailability: routeAvailability,
+            isConnectedForLiveActions: cachedServerCapabilities.isConnectedForLiveActions,
+            knownBannedSignature: moderationBannedSignature(bannedIDs),
+            snapshotRevision: snapshotRevision,
+            banListGeneration: banListGeneration,
+            generation: moderationCacheGeneration
         )
-        return ModerationActionContext(
-            currentUserID: currentUserID,
+        if key == moderationBaseContextCacheKey, let cached = moderationBaseContextCache {
+            moderationCacheDiagnostics.moderationBaseContextCacheHits += 1
+            return cached
+        }
+        moderationCacheDiagnostics.moderationBaseContextCacheMisses += 1
+        let resolution = cachedModerationPermissionResolution(server: server, channel: channel, member: currentMember, currentUserID: userID)
+        let base = ModerationBaseContextSnapshot(
+            serverID: server?.id,
+            currentUserID: userID,
             server: server,
-            currentMember: selectedServerMember,
-            targetUserID: targetUserID,
-            targetMember: resolvedMember,
-            knownBannedUserIDs: knownBannedUserIDs,
+            currentMember: currentMember,
+            selectedOrFallbackTextChannelID: channel?.id,
             permissionResolution: resolution,
             isConnectedForLiveActions: cachedServerCapabilities.isConnectedForLiveActions,
+            routeAvailability: routeAvailability,
+            knownBannedUserIDs: bannedIDs,
+            generation: moderationCacheGeneration
+        )
+        moderationBaseContextCacheKey = key
+        moderationBaseContextCache = base
+        return base
+    }
+
+    private func cachedModerationPermissionResolution(server: Server?, channel: Channel?, member: ServerMember?, currentUserID: UserID?) -> PermissionResolutionResult {
+        let key = ModerationPermissionResolutionCacheKey(
+            serverID: server?.id,
+            currentUserID: currentUserID,
+            currentMemberSignature: moderationMemberSignature(member),
+            selectedOrFallbackTextChannelID: channel?.id,
+            serverPermissionSignature: moderationServerPermissionSignature(server),
+            channelPermissionSignature: moderationChannelPermissionSignature(channel),
+            runtimeMode: effectiveRuntimeMode,
+            sessionState: effectiveSessionState,
+            snapshotRevision: snapshotRevision,
+            generation: moderationCacheGeneration
+        )
+        if let cached = moderationPermissionResolutionCache[key] {
+            moderationCacheDiagnostics.permissionResolutionCacheHits += 1
+            return cached
+        }
+        moderationCacheDiagnostics.permissionResolutionCacheMisses += 1
+        let resolution = Phase25PermissionResolver.resolve(server: server, channel: channel, member: member, currentUserID: currentUserID)
+        moderationPermissionResolutionCache[key] = resolution
+        return resolution
+    }
+
+    private func selectedOrFallbackModerationTextChannel() -> Channel? {
+        selectedOrFallbackModerationTextChannel(in: selectedServer, snapshot: snapshot)
+    }
+
+    private func selectedOrFallbackModerationTextChannel(in server: Server?, snapshot: RealtimeSnapshot) -> Channel? {
+        guard let server else { return nil }
+        if let channelID = selection.channelID,
+           let channel = snapshot.channelsByID[channelID],
+           channel.serverID == server.id,
+           channel.kind == .textChannel {
+            return channel
+        }
+        return firstModerationTextChannel(in: server, snapshot: snapshot)
+    }
+
+    private func firstModerationTextChannel(in server: Server, snapshot: RealtimeSnapshot) -> Channel? {
+        if !server.channelIDs.isEmpty {
+            for channelID in server.channelIDs {
+                guard let channel = snapshot.channelsByID[channelID],
+                      channel.serverID == server.id,
+                      channel.kind == .textChannel
+                else {
+                    continue
+                }
+                return channel
+            }
+            return nil
+        }
+        var first: Channel?
+        for channel in snapshot.channelsByID.values where channel.serverID == server.id && channel.kind == .textChannel {
+            guard let current = first else {
+                first = channel
+                continue
+            }
+            if channel.displayName.localizedCaseInsensitiveCompare(current.displayName) == .orderedAscending {
+                first = channel
+            }
+        }
+        return first
+    }
+
+    private func resolvedModerationTargetMember(targetUserID: UserID, member: ServerMember?) -> ServerMember? {
+        if let member { return member }
+        guard let serverID = selectedServer?.id else { return nil }
+        return snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: targetUserID)]
+    }
+
+    private func moderationMemberSignature(_ member: ServerMember?) -> String {
+        guard let member else { return "nil" }
+        let roles = member.roles.map(\.rawValue).sorted().joined(separator: ",")
+        return [
+            member.id.serverID.rawValue,
+            member.id.userID.rawValue,
+            roles,
+            moderationTimeoutBucket(member.timeout),
+            member.canPublish ? "publish" : "noPublish",
+            member.canReceive ? "receive" : "noReceive"
+        ].joined(separator: "|")
+    }
+
+    private func moderationTimeoutBucket(_ timeout: Date?) -> String {
+        guard let timeout else { return "none" }
+        return timeout > Date() ? "active" : "expired"
+    }
+
+    private func moderationServerPermissionSignature(_ server: Server?) -> String {
+        guard let server else { return "nil" }
+        let roleSignature = server.roles.values
+            .sorted { $0.id.rawValue < $1.id.rawValue }
+            .map { role in
+                "\(role.id.rawValue):\(role.rank):\(role.permissions.allow.rawValue):\(role.permissions.deny.rawValue)"
+            }
+            .joined(separator: ",")
+        return [
+            server.id.rawValue,
+            server.ownerID.rawValue,
+            "\(server.defaultPermissions.rawValue)",
+            server.channelIDs.map(\.rawValue).joined(separator: ","),
+            roleSignature
+        ].joined(separator: "|")
+    }
+
+    private func moderationChannelPermissionSignature(_ channel: Channel?) -> String {
+        guard let channel else { return "nil" }
+        let roleSignature = channel.rolePermissions
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+            .map { "\($0.key.rawValue):\($0.value.allow.rawValue):\($0.value.deny.rawValue)" }
+            .joined(separator: ",")
+        return [
+            channel.id.rawValue,
+            channel.kind.rawAPIValue,
+            channel.serverID?.rawValue ?? "-",
+            "\(channel.permissions?.rawValue ?? 0)",
+            "\(channel.defaultPermissions?.allow.rawValue ?? 0)",
+            "\(channel.defaultPermissions?.deny.rawValue ?? 0)",
+            roleSignature
+        ].joined(separator: "|")
+    }
+
+    private func moderationBannedSignature(_ ids: Set<UserID>) -> String {
+        ids.map(\.rawValue).sorted().joined(separator: ",")
+    }
+
+    private func moderationContext(targetUserID: UserID, member: ServerMember?, allowNonMemberBan: Bool) -> ModerationActionContext {
+        let baseContext = moderationBaseContextSnapshot()
+        return ModerationActionContext(
+            currentUserID: baseContext.currentUserID,
+            server: baseContext.server,
+            currentMember: baseContext.currentMember,
+            targetUserID: targetUserID,
+            targetMember: resolvedModerationTargetMember(targetUserID: targetUserID, member: member),
+            knownBannedUserIDs: baseContext.knownBannedUserIDs,
+            permissionResolution: baseContext.permissionResolution,
+            isConnectedForLiveActions: baseContext.isConnectedForLiveActions,
+            routeAvailability: baseContext.routeAvailability,
             allowNonMemberBan: allowNonMemberBan
         )
     }
@@ -3738,7 +3992,8 @@ public final class MainShellViewModel {
             elapsedDurationBucket: elapsed.map(ModerationDiagnosticsFormatter.elapsedBucket) ?? "none",
             copiedDiagnosticsRedactedReasonText: true,
             targetIDPrefix: ModerationDiagnosticsFormatter.shortID(targetUserID?.rawValue),
-            serverIDPrefix: ModerationDiagnosticsFormatter.shortID(selectedServer?.id.rawValue)
+            serverIDPrefix: ModerationDiagnosticsFormatter.shortID(selectedServer?.id.rawValue),
+            cacheDiagnostics: moderationCacheDiagnostics
         )
     }
 
@@ -6410,6 +6665,7 @@ public final class MainShellViewModel {
     }
 
     public func copyRedactedModerationDiagnostics() {
+        moderationDiagnostics.cacheDiagnostics = moderationCacheDiagnostics
         let text = ModerationDiagnosticsFormatter.redactedText(moderationDiagnostics)
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
@@ -9797,6 +10053,8 @@ public struct CredentialSetupView: View {
             LabeledContent("Phase 42 moderation", value: "\(moderation.lastActionCategory), \(moderation.requestResultCategory), route \(moderation.routeCategory)")
             LabeledContent("Moderation target", value: "\(moderation.targetCategory), permission \(moderation.permissionResultCategory), error \(moderation.safeErrorCategory)")
             LabeledContent("Moderation lists", value: "bans \(moderation.bansKnownCount)/\(moderation.bansRenderedCount)/\(moderation.bansPendingCount), timeouts \(moderation.timeoutsKnownCount)/\(moderation.timeoutsRenderedCount)/\(moderation.timeoutsPendingCount)")
+            let moderationCache = viewModel.moderationCacheDiagnostics
+            LabeledContent("Moderation cache", value: "base \(moderationCache.moderationBaseContextCacheHits)/\(moderationCache.moderationBaseContextCacheMisses), permission \(moderationCache.permissionResolutionCacheHits)/\(moderationCache.permissionResolutionCacheMisses), menu \(moderationCache.memberMenuStateCacheHits)/\(moderationCache.memberMenuStateCacheMisses), lookup \(moderationCache.moderationContextLookupHits)/\(moderationCache.moderationContextLookupMisses)")
             LabeledContent("Parity Matrix", value: "\(parity.count(.done)) done, \(parity.count(.partial)) partial, \(parity.count(.broken)) broken, \(parity.count(.blockedByUnverifiedAPI)) blocked, \(parity.count(.deferred)) deferred, \(parity.count(.outOfScope)) out of scope")
             if let dmParity = parity.items.first(where: { $0.section == "Core chat" && $0.name == "DMs" }) {
                 LabeledContent("DM parity", value: "\(dmParity.status.rawValue): \(dmParity.recommendedNextAction)")
@@ -11267,6 +11525,7 @@ public struct MemberPanelView: View {
             EmptyStateView(title: "No members", message: emptyMemberMessage, systemImage: "person.2")
                 .frame(maxWidth: .infinity)
         } else {
+            let _ = viewModel.prewarmMemberModerationMenuBaseContext()
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: StoatSpacing.medium) {
                     ForEach(groups) { group in
@@ -11322,6 +11581,9 @@ public struct MemberPanelView: View {
 
     private func memberListRow(_ item: MemberListItem) -> some View {
         StoatFeatureLayoutDiagnostics.body("MemberRowView", detail: "id=\(item.userID.rawValue)")
+        // SwiftUI can build context menus while flushing the view graph; moderation
+        // disabled states must come from cached row state, not permission/channel scans.
+        let moderationState = item.member == nil ? nil : viewModel.memberModerationMenuState(for: item)
         return Button {
             viewModel.showUserProfile(item.userID, source: item.member == nil ? .directMessageParticipant : .memberRow, serverID: item.member?.id.serverID)
         } label: {
@@ -11357,7 +11619,7 @@ public struct MemberPanelView: View {
             } label: {
                 Label("Message", systemImage: "bubble.left.and.bubble.right")
             }
-            if let member = item.member {
+            if let member = item.member, let moderationState {
                 Divider()
                 Button {
                     viewModel.openMemberDetail(member)
@@ -11371,25 +11633,29 @@ public struct MemberPanelView: View {
                 } label: {
                     Label("Timeout", systemImage: "clock.badge.exclamationmark")
                 }
-                .disabled(viewModel.memberActionDisabledReason(for: member, action: .timeout) != nil)
+                .disabled(moderationState[.timeout].isDisabled)
+                .help(moderationState[.timeout].disabledReasonText ?? "Timeout")
                 Button {
                     viewModel.requestMemberAction(.clearTimeout, for: member)
                 } label: {
                     Label("Clear Timeout", systemImage: "clock.arrow.circlepath")
                 }
-                .disabled(viewModel.memberActionDisabledReason(for: member, action: .clearTimeout) != nil)
+                .disabled(moderationState[.removeTimeout].isDisabled)
+                .help(moderationState[.removeTimeout].disabledReasonText ?? "Clear Timeout")
                 Button(role: .destructive) {
                     viewModel.requestMemberAction(.kick, for: member)
                 } label: {
                     Label("Kick", systemImage: "rectangle.portrait.and.arrow.right")
                 }
-                .disabled(viewModel.memberActionDisabledReason(for: member, action: .kick) != nil)
+                .disabled(moderationState[.kick].isDisabled)
+                .help(moderationState[.kick].disabledReasonText ?? "Kick")
                 Button(role: .destructive) {
                     viewModel.requestMemberAction(.ban, for: member)
                 } label: {
                     Label("Ban", systemImage: "hand.raised.fill")
                 }
-                .disabled(viewModel.memberActionDisabledReason(for: member, action: .ban) != nil)
+                .disabled(moderationState[.ban].isDisabled)
+                .help(moderationState[.ban].disabledReasonText ?? "Ban")
             }
         }
     }
@@ -12238,12 +12504,15 @@ private struct UserProfileCardView: View {
 
     @ViewBuilder private var moderationProfileMenu: some View {
         if context.serverID != nil {
+            let member = profileServerMember
+            let moderationState = viewModel.memberModerationMenuState(targetUserID: user.id, member: member)
             Menu {
                 ForEach(profileModerationActions, id: \.self) { action in
                     Button(action.title, role: action == .kick || action == .ban ? .destructive : nil) {
-                        viewModel.requestModerationAction(action, targetUserID: user.id, member: profileServerMember)
+                        viewModel.requestModerationAction(action, targetUserID: user.id, member: member)
                     }
-                    .disabled(viewModel.moderationDisabledReasonText(for: action, targetUserID: user.id, member: profileServerMember) != nil)
+                    .disabled(moderationState[action].isDisabled)
+                    .help(moderationState[action].disabledReasonText ?? action.title)
                 }
             } label: {
                 Label("Moderate", systemImage: "shield")
@@ -13171,7 +13440,8 @@ public struct ServerOverviewView: View {
     }
 
     private func moderationMemberRow(_ item: MemberManagementItem) -> some View {
-        HStack(spacing: StoatSpacing.medium) {
+        let moderationState = viewModel.memberModerationMenuState(targetUserID: item.member.id.userID, member: item.member)
+        return HStack(spacing: StoatSpacing.medium) {
             AvatarView(title: item.displayName, size: 32, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
             VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
                 Text(item.displayName)
@@ -13192,12 +13462,12 @@ public struct ServerOverviewView: View {
             } label: {
                 Label("Details", systemImage: "person.text.rectangle")
             }
-            moderationActionButton(.kick, targetUserID: item.member.id.userID, member: item.member)
-            moderationActionButton(.ban, targetUserID: item.member.id.userID, member: item.member)
+            moderationActionButton(.kick, targetUserID: item.member.id.userID, member: item.member, state: moderationState)
+            moderationActionButton(.ban, targetUserID: item.member.id.userID, member: item.member, state: moderationState)
             if item.timeoutSummary == nil {
-                moderationActionButton(.timeout, targetUserID: item.member.id.userID, member: item.member)
+                moderationActionButton(.timeout, targetUserID: item.member.id.userID, member: item.member, state: moderationState)
             } else {
-                moderationActionButton(.removeTimeout, targetUserID: item.member.id.userID, member: item.member)
+                moderationActionButton(.removeTimeout, targetUserID: item.member.id.userID, member: item.member, state: moderationState)
             }
         }
         .padding(StoatSpacing.small)
@@ -13214,22 +13484,24 @@ public struct ServerOverviewView: View {
                 Button(action.title, role: action == .kick || action == .ban ? .destructive : nil) {
                     viewModel.requestModerationAction(action, targetUserID: item.member.id.userID, member: item.member)
                 }
-                .disabled(viewModel.moderationDisabledReasonText(for: action, targetUserID: item.member.id.userID, member: item.member) != nil)
+                .disabled(moderationState[action].isDisabled)
+                .help(moderationState[action].disabledReasonText ?? action.title)
             }
         }
     }
 
-    private func moderationActionButton(_ action: ModerationAction, targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) -> some View {
-        let reason = viewModel.moderationDisabledReasonText(for: action, targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
+    private func moderationActionButton(_ action: ModerationAction, targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false, state: MemberModerationMenuState? = nil) -> some View {
+        let state = state ?? viewModel.memberModerationMenuState(targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
+        let actionState = state[action]
         return Button(role: action == .kick || action == .ban ? .destructive : nil) {
             viewModel.requestModerationAction(action, targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
         } label: {
             Image(systemName: action.systemImage)
-                .help(reason ?? action.title)
+                .help(actionState.disabledReasonText ?? action.title)
         }
-        .disabled(reason != nil)
+        .disabled(actionState.isDisabled)
         .accessibilityLabel(action.title)
-        .accessibilityHint(reason ?? "Requires confirmation")
+        .accessibilityHint(actionState.disabledReasonText ?? "Requires confirmation")
     }
 
     @ViewBuilder private func moderationBans() -> some View {
@@ -13290,6 +13562,7 @@ public struct ServerOverviewView: View {
 
     private func moderationBanRow(_ ban: ServerBan, result: BanListResult) -> some View {
         let user = bannedUser(for: ban, in: result)
+        let moderationState = viewModel.memberModerationMenuState(targetUserID: ban.id.userID)
         return HStack(spacing: StoatSpacing.medium) {
             AvatarView(title: banDisplayName(ban, result: result), size: 28, isOnline: false, presence: nil, imageData: viewModel.imageData(for: user?.avatar, kind: .userAvatar))
             VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
@@ -13311,7 +13584,7 @@ public struct ServerOverviewView: View {
             } label: {
                 Label("Profile", systemImage: "person.crop.circle")
             }
-            moderationActionButton(.unban, targetUserID: ban.id.userID)
+            moderationActionButton(.unban, targetUserID: ban.id.userID, state: moderationState)
         }
         .padding(StoatSpacing.small)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
@@ -13342,6 +13615,7 @@ public struct ServerOverviewView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
                             ForEach(items) { item in
+                                let moderationState = viewModel.memberModerationMenuState(targetUserID: item.member.id.userID, member: item.member)
                                 HStack(spacing: StoatSpacing.medium) {
                                     AvatarView(title: item.displayName, size: 28, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
                                     VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
@@ -13351,7 +13625,7 @@ public struct ServerOverviewView: View {
                                             .foregroundStyle(.orange)
                                     }
                                     Spacer()
-                                    moderationActionButton(.removeTimeout, targetUserID: item.member.id.userID, member: item.member)
+                                    moderationActionButton(.removeTimeout, targetUserID: item.member.id.userID, member: item.member, state: moderationState)
                                 }
                                 .padding(StoatSpacing.small)
                                 .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
@@ -13368,6 +13642,7 @@ public struct ServerOverviewView: View {
         GlassPanel {
             VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                 let user = viewModel.snapshot.usersByID[member.id.userID]
+                let moderationState = viewModel.memberModerationMenuState(targetUserID: member.id.userID, member: member)
                 HStack {
                     Text(member.nickname ?? user?.displayName ?? user?.username ?? "Member")
                         .font(.headline)
@@ -13395,9 +13670,9 @@ public struct ServerOverviewView: View {
                     Button { viewModel.requestMemberAction(.removeAvatar, for: member) } label: { Label("Remove Avatar", systemImage: "person.crop.circle.badge.xmark") }
                         .disabled(viewModel.memberActionDisabledReason(for: member, action: .removeAvatar) != nil)
                     Button(role: .destructive) { viewModel.requestMemberAction(.kick, for: member) } label: { Label("Kick", systemImage: "rectangle.portrait.and.arrow.right") }
-                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .kick) != nil)
+                        .disabled(moderationState[.kick].isDisabled)
                     Button(role: .destructive) { viewModel.requestMemberAction(.ban, for: member) } label: { Label("Ban", systemImage: "hand.raised.fill") }
-                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .ban) != nil)
+                        .disabled(moderationState[.ban].isDisabled)
                 }
 
                 HStack {
@@ -13405,9 +13680,9 @@ public struct ServerOverviewView: View {
                         Text("Timeout \(Int(viewModel.memberTimeoutHours))h")
                     }
                     Button { viewModel.requestMemberAction(.timeout, for: member) } label: { Label("Apply Timeout", systemImage: "clock.badge.exclamationmark") }
-                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .timeout) != nil)
+                        .disabled(moderationState[.timeout].isDisabled)
                     Button { viewModel.requestMemberAction(.clearTimeout, for: member) } label: { Label("Clear Timeout", systemImage: "clock.arrow.circlepath") }
-                        .disabled(viewModel.memberActionDisabledReason(for: member, action: .clearTimeout) != nil)
+                        .disabled(moderationState[.removeTimeout].isDisabled)
                 }
 
                 if let draft = viewModel.memberRoleDraft {
