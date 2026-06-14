@@ -4326,7 +4326,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase26MemberModerationIsConfirmedAndDoesNotAutoLoadBans() async {
+    func testPhase42MemberModerationUsesCentralConfirmationAndDoesNotAutoLoadBans() async {
         let snapshot = MockShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         let targetUserID: UserID = "01HX0000000000000000000002"
@@ -4341,11 +4341,213 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(model.canPerform(.openPermissionEditor))
 
         model.requestMemberAction(.ban, for: targetMember)
-        XCTAssertNotNil(model.pendingMemberModerationAction)
+        XCTAssertNil(model.pendingMemberModerationAction)
+        XCTAssertEqual(model.pendingModerationConfirmation?.action, .ban)
         XCTAssertNotNil(model.snapshot.membersByServerAndUserID[targetKey])
 
-        await model.confirmPendingMemberAction()
+        await model.confirmPendingModerationAction()
         XCTAssertNil(model.snapshot.membersByServerAndUserID[targetKey])
+        XCTAssertNotNil(model.snapshot.usersByID[targetUserID])
+    }
+
+    func testPhase42ModerationResolverBlocksUnsafeTargets() {
+        let owner: UserID = "owner"
+        let current: UserID = "mod"
+        let target: UserID = "target"
+        let serverID: ServerID = "server"
+        let modRoleID: RoleID = "mod-role"
+        let adminRoleID: RoleID = "admin-role"
+        let memberRoleID: RoleID = "member-role"
+        let timeoutRoleID: RoleID = "timeout-role"
+        let server = Server(
+            id: serverID,
+            ownerID: owner,
+            name: "Moderation Test",
+            roles: [
+                adminRoleID: Role(id: adminRoleID, name: "Admin", permissions: PermissionOverride(), rank: 5),
+                modRoleID: Role(id: modRoleID, name: "Mod", permissions: PermissionOverride(allow: [.kickMembers, .banMembers, .timeoutMembers]), rank: 10),
+                memberRoleID: Role(id: memberRoleID, name: "Member", permissions: PermissionOverride(), rank: 50),
+                timeoutRoleID: Role(id: timeoutRoleID, name: "Timeout Mod", permissions: PermissionOverride(allow: [.timeoutMembers]), rank: 60)
+            ],
+            defaultPermissions: [.viewChannel, .readMessageHistory]
+        )
+        let currentMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: current), joinedAt: Date(), roles: [modRoleID])
+        let targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [memberRoleID], timeout: Date().addingTimeInterval(300))
+        let permission = PermissionResolutionResult(effectivePermissions: [.kickMembers, .banMembers, .timeoutMembers])
+        let context = ModerationActionContext(
+            currentUserID: current,
+            server: server,
+            currentMember: currentMember,
+            targetUserID: target,
+            targetMember: targetMember,
+            permissionResolution: permission,
+            isConnectedForLiveActions: true
+        )
+
+        XCTAssertNil(ModerationActionResolver.disabledReason(for: .kick, context: context))
+        XCTAssertNil(ModerationActionResolver.disabledReason(for: .ban, context: context))
+        XCTAssertNil(ModerationActionResolver.disabledReason(for: .removeTimeout, context: context))
+
+        var selfContext = context
+        selfContext.targetUserID = current
+        selfContext.targetMember = currentMember
+        XCTAssertEqual(ModerationActionResolver.disabledReason(for: .kick, context: selfContext), .targetIsSelf)
+
+        var ownerContext = context
+        ownerContext.targetUserID = owner
+        ownerContext.targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: owner), joinedAt: Date(), roles: [adminRoleID])
+        XCTAssertEqual(ModerationActionResolver.disabledReason(for: .ban, context: ownerContext), .targetIsServerOwner)
+
+        var higherContext = context
+        higherContext.targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [adminRoleID])
+        XCTAssertEqual(ModerationActionResolver.disabledReason(for: .kick, context: higherContext), .targetRoleEqualOrHigher)
+
+        var missingPermission = context
+        missingPermission.permissionResolution = PermissionResolutionResult(effectivePermissions: [])
+        XCTAssertEqual(ModerationActionResolver.disabledReason(for: .ban, context: missingPermission), .currentUserMissingPermission)
+
+        var unknownHierarchy = context
+        unknownHierarchy.targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: ["missing-role"])
+        XCTAssertEqual(ModerationActionResolver.disabledReason(for: .ban, context: unknownHierarchy), .unknownPermissionHierarchy)
+
+        var alreadyBanned = context
+        alreadyBanned.knownBannedUserIDs = [target]
+        XCTAssertEqual(ModerationActionResolver.disabledReason(for: .ban, context: alreadyBanned), .targetAlreadyBanned)
+        XCTAssertNil(ModerationActionResolver.disabledReason(for: .unban, context: alreadyBanned))
+
+        var timeoutPermissionTarget = context
+        timeoutPermissionTarget.targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [timeoutRoleID])
+        XCTAssertEqual(ModerationActionResolver.disabledReason(for: .timeout, context: timeoutPermissionTarget), .targetHasTimeoutPermission)
+    }
+
+    @MainActor
+    func testPhase42BanAndUnbanPatchListsWithoutReaddingMember() async {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let targetUserID: UserID = "01HX0000000000000000000003"
+        let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
+        let targetMember = snapshot.membersByServerAndUserID[targetKey]!
+        let api = MockStoatAPIClient()
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: api)
+
+        model.selectServer(server.id)
+        await model.refreshBanList()
+        model.requestModerationAction(.ban, targetUserID: targetUserID, member: targetMember)
+        if var pending = model.pendingModerationConfirmation {
+            pending.reason = "private moderation note"
+            model.pendingModerationConfirmation = pending
+        }
+        await model.confirmPendingModerationAction()
+
+        XCTAssertNil(model.snapshot.membersByServerAndUserID[targetKey])
+        XCTAssertEqual(model.snapshot.usersByID[targetUserID]?.username, "designpilot")
+        guard case let .loaded(afterBan) = model.banListState else {
+            return XCTFail("Expected loaded ban list")
+        }
+        XCTAssertTrue(afterBan.bans.contains { $0.id.userID == targetUserID })
+
+        model.requestUnban(userID: targetUserID)
+        XCTAssertEqual(model.pendingModerationConfirmation?.action, .unban)
+        await model.confirmPendingModerationAction()
+
+        guard case let .loaded(afterUnban) = model.banListState else {
+            return XCTFail("Expected loaded ban list after unban")
+        }
+        XCTAssertFalse(afterUnban.bans.contains { $0.id.userID == targetUserID })
+        XCTAssertNil(model.snapshot.membersByServerAndUserID[targetKey])
+    }
+
+    @MainActor
+    func testPhase42KickPreservesIdentityAndFailurePreservesMember() async {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let targetUserID: UserID = "01HX0000000000000000000003"
+        let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
+        let targetMember = snapshot.membersByServerAndUserID[targetKey]!
+        let failingModel = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: RecordingAPIClient())
+
+        failingModel.selectServer(server.id)
+        failingModel.requestModerationAction(.kick, targetUserID: targetUserID, member: targetMember)
+        await failingModel.confirmPendingModerationAction()
+        XCTAssertNotNil(failingModel.snapshot.membersByServerAndUserID[targetKey])
+        guard case .failed = failingModel.moderationActionState else {
+            return XCTFail("Expected failed moderation state")
+        }
+
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+        model.selectServer(server.id)
+        model.requestModerationAction(.kick, targetUserID: targetUserID, member: targetMember)
+        await model.confirmPendingModerationAction()
+        XCTAssertNil(model.snapshot.membersByServerAndUserID[targetKey])
+        XCTAssertEqual(model.snapshot.usersByID[targetUserID]?.username, "designpilot")
+    }
+
+    @MainActor
+    func testPhase42TimeoutPresetAndRemoveTimeoutUpdateMember() async {
+        let snapshot = MockShellData.snapshot
+        let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let targetUserID: UserID = "01HX0000000000000000000002"
+        let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
+        let targetMember = snapshot.membersByServerAndUserID[targetKey]!
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+
+        model.selectServer(server.id)
+        model.requestModerationAction(.timeout, targetUserID: targetUserID, member: targetMember)
+        if var pending = model.pendingModerationConfirmation {
+            pending.timeoutPreset = .fiveMinutes
+            model.pendingModerationConfirmation = pending
+        }
+        await model.confirmPendingModerationAction()
+        let timedOutMember = try? XCTUnwrap(model.snapshot.membersByServerAndUserID[targetKey])
+        XCTAssertNotNil(timedOutMember?.timeout)
+        XCTAssertEqual(model.moderationDiagnostics.durationBucket, "minutes")
+
+        model.requestModerationAction(.removeTimeout, targetUserID: targetUserID, member: timedOutMember!)
+        await model.confirmPendingModerationAction()
+        XCTAssertNil(model.snapshot.membersByServerAndUserID[targetKey]?.timeout)
+    }
+
+    func testPhase42ModerationDiagnosticsRedactsReasonAndIDs() {
+        let diagnostics = ModerationDiagnostics(
+            lastActionCategory: "ban",
+            selectedServerPresenceCategory: "selected",
+            targetCategory: "member",
+            permissionResultCategory: "allowed",
+            routeCategory: "PUT /servers/{server}/bans/{target}",
+            requestResultCategory: "failed",
+            responseShapeCategory: "error",
+            safeErrorCategory: #"network token="secret" /Users/enka/private raw@example.com 01HX0000000000000000000002"#,
+            durationBucket: "minutes",
+            memberCacheMutationCategory: "none",
+            bansKnownCount: 1,
+            bansRenderedCount: 1,
+            bansPendingCount: 0,
+            timeoutsKnownCount: 0,
+            timeoutsRenderedCount: 0,
+            timeoutsPendingCount: 0,
+            elapsedDurationBucket: "under1s",
+            copiedDiagnosticsRedactedReasonText: true
+        )
+
+        let text = ModerationDiagnosticsFormatter.redactedText(diagnostics)
+
+        XCTAssertTrue(text.contains("reasonRedacted: yes"))
+        XCTAssertFalse(text.contains("secret"))
+        XCTAssertFalse(text.contains("/Users/enka"))
+        XCTAssertFalse(text.contains("raw@example.com"))
+        XCTAssertFalse(text.contains("01HX0000000000000000000002"))
+        XCTAssertFalse(text.contains("private moderation note"))
+    }
+
+    func testPhase42ParityRowsRemainPartialUntilLiveQA() {
+        let matrix = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: true)
+        let memberModeration = matrix.items.first { $0.section == "Server/community" && $0.name == "member moderation" }
+        let bansTimeouts = matrix.items.first { $0.section == "Server/community" && $0.name == "bans/timeouts" }
+
+        XCTAssertEqual(memberModeration?.status, .partial)
+        XCTAssertEqual(bansTimeouts?.status, .partial)
+        XCTAssertTrue(memberModeration?.currentImplementation.contains("Phase 42") == true)
+        XCTAssertTrue(bansTimeouts?.knownGaps.localizedCaseInsensitiveContains("live QA") == true)
     }
 
     @MainActor func testCapabilityCachePopulatedOnInit() {
@@ -4399,9 +4601,10 @@ final class StoatFeaturesTests: XCTestCase {
         let r2 = model.memberActionDisabledReason(for: targetMember, action: .ban)
         let r3 = model.memberActionDisabledReason(for: targetMember, action: .timeout)
         let r4 = model.memberActionDisabledReason(for: targetMember, action: .clearTimeout)
-        // All four calls share the same cached permission resolution — results should be consistent.
+        // All four calls share the same cached permission resolution; remove-timeout now has its own state gate.
         XCTAssertEqual(r1, r2)
-        XCTAssertEqual(r3, r4)
+        XCTAssertNil(r3)
+        XCTAssertEqual(r4, "This member is not currently timed out.")
         // Capability cache must not have changed (no snapshot/selection mutation occurred).
         let capsBefore = model.cachedServerCapabilities
         _ = model.memberActionDisabledReason(for: targetMember, action: .kick)

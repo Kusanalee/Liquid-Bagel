@@ -9,6 +9,7 @@ public enum ServerSettingsTab: String, CaseIterable, Hashable, Sendable {
     case roles
     case permissions
     case members
+    case moderation
     case danger
 
     public var title: String {
@@ -19,6 +20,7 @@ public enum ServerSettingsTab: String, CaseIterable, Hashable, Sendable {
         case .roles: "Roles"
         case .permissions: "Permissions"
         case .members: "Members"
+        case .moderation: "Moderation"
         case .danger: "Danger"
         }
     }

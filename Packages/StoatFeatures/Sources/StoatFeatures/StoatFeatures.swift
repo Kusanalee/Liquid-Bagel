@@ -604,6 +604,11 @@ public final class MainShellViewModel {
     public var pendingMemberModerationAction: PendingMemberModerationAction?
     public var memberActionState: ManagementActionState<ServerMember> = .idle
     public var banListState: ManagementActionState<BanListResult> = .idle
+    public var moderationBanSearchText: String = ""
+    public var moderationTimeoutSearchText: String = ""
+    public var pendingModerationConfirmation: PendingModerationConfirmation?
+    public var moderationActionState: ManagementActionState<String> = .idle
+    public var moderationDiagnostics = ModerationDiagnostics()
     public var permissionEditDraft: PermissionEditDraft?
     public var permissionSaveRequiresConfirmation = false
     public var permissionEditorState: ManagementActionState<String> = .idle
@@ -1067,7 +1072,7 @@ public final class MainShellViewModel {
         if key == memberListGroupCacheKey {
             memberGroupingCacheHitCount += 1
             memberListLastCacheHit = true
-            scheduleDeferredMemberDiagnosticsPublish()
+            flushMemberDiagnostics()
             return memberListGroupCache
         }
         let started = Date()
@@ -1077,10 +1082,11 @@ public final class MainShellViewModel {
         memberListGroupCacheKey = key
         memberListGroupCache = groups
         memberListDiagnosticsCache = result.diagnostics
+        memberRoleSortDiagnostics = result.diagnostics
         memberListLastCacheHit = false
         memberListLastGroupingElapsed = Date().timeIntervalSince(started)
         memberListLastGroupingServerID = serverID
-        scheduleDeferredMemberDiagnosticsPublish()
+        flushMemberDiagnostics()
         return groups
     }
 
@@ -3341,8 +3347,11 @@ public final class MainShellViewModel {
     }
 
     public func memberActionDisabledReason(for member: ServerMember, action: MemberModerationAction) -> String? {
+        if let moderationAction = moderationAction(for: action) {
+            return moderationDisabledReasonText(for: moderationAction, targetUserID: member.id.userID, member: member)
+        }
         guard cachedServerCapabilities.isConnectedForLiveActions else { return "Reconnect before member moderation." }
-        guard member.id.userID != currentUserID else { return "You cannot moderate yourself from this guarded flow." }
+        guard member.id.userID != currentUserID else { return "You cannot edit yourself from this guarded flow." }
         guard Phase26MemberSafety.canActOn(member: member, currentMember: selectedServerMember, server: selectedServer, currentUserID: currentUserID) || currentUserID == selectedServer?.ownerID else {
             return "Rank data is incomplete or this member is protected."
         }
@@ -3353,12 +3362,8 @@ public final class MainShellViewModel {
             allowed = resolution.effectivePermissions.contains(.manageNicknames) || currentUserID == selectedServer?.ownerID
         case .removeAvatar:
             allowed = resolution.effectivePermissions.contains(.removeAvatars) || currentUserID == selectedServer?.ownerID
-        case .kick:
-            allowed = resolution.effectivePermissions.contains(.kickMembers) || currentUserID == selectedServer?.ownerID
-        case .ban:
-            allowed = resolution.effectivePermissions.contains(.banMembers) || currentUserID == selectedServer?.ownerID
-        case .timeout, .clearTimeout:
-            allowed = resolution.effectivePermissions.contains(.timeoutMembers) || currentUserID == selectedServer?.ownerID
+        case .kick, .ban, .timeout, .clearTimeout:
+            allowed = false
         }
         guard allowed else {
             return resolution.warnings.isEmpty ? "You do not have permission for this member action." : "Permission resolution is incomplete for this member action."
@@ -3367,12 +3372,64 @@ public final class MainShellViewModel {
     }
 
     public func requestMemberAction(_ action: MemberModerationAction, for member: ServerMember) {
+        if let moderationAction = moderationAction(for: action) {
+            requestModerationAction(moderationAction, targetUserID: member.id.userID, member: member)
+            return
+        }
         guard memberActionDisabledReason(for: member, action: action) == nil else {
             phase26Status = memberActionDisabledReason(for: member, action: action)
             return
         }
-        let timeoutUntil = action == .timeout ? Date().addingTimeInterval(max(1, memberTimeoutHours) * 3600) : nil
-        pendingMemberModerationAction = PendingMemberModerationAction(member: member, action: action, timeoutUntil: timeoutUntil)
+        pendingMemberModerationAction = PendingMemberModerationAction(member: member, action: action)
+    }
+
+    public func moderationDisabledReason(for action: ModerationAction, targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) -> ModerationDisabledReason? {
+        ModerationActionResolver.disabledReason(
+            for: action,
+            context: moderationContext(targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
+        )
+    }
+
+    public func moderationDisabledReasonText(for action: ModerationAction, targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) -> String? {
+        moderationDisabledReason(for: action, targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)?.message
+    }
+
+    public func availableModerationActions(for targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) -> [ModerationAction] {
+        ModerationActionResolver.availableModerationActions(
+            context: moderationContext(targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
+        )
+    }
+
+    public func requestModerationAction(_ action: ModerationAction, targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) {
+        guard let server = selectedServer else {
+            let reason = ModerationDisabledReason.noSelectedServer
+            phase26Status = reason.message
+            updateModerationDiagnostics(action: action, targetUserID: targetUserID, targetMember: member, permissionResult: reason.rawValue, requestResult: "blocked", routeCategory: routeCategory(for: action), memberMutation: "none")
+            return
+        }
+        let resolvedMember = member ?? snapshot.membersByServerAndUserID[ServerMemberKey(serverID: server.id, userID: targetUserID)]
+        if let reason = moderationDisabledReason(for: action, targetUserID: targetUserID, member: resolvedMember, allowNonMemberBan: allowNonMemberBan) {
+            phase26Status = reason.message
+            updateModerationDiagnostics(action: action, targetUserID: targetUserID, targetMember: resolvedMember, permissionResult: reason.rawValue, requestResult: "blocked", routeCategory: routeCategory(for: action), memberMutation: "none")
+            return
+        }
+        let user = snapshot.usersByID[targetUserID]
+        let displayName = displayName(for: user, member: resolvedMember, fallbackID: targetUserID)
+        pendingModerationConfirmation = PendingModerationConfirmation(
+            action: action,
+            serverID: server.id,
+            serverName: server.name,
+            targetUserID: targetUserID,
+            targetMember: resolvedMember,
+            displayName: displayName,
+            allowNonMemberBan: allowNonMemberBan
+        )
+        moderationActionState = .idle
+        updateModerationDiagnostics(action: action, targetUserID: targetUserID, targetMember: resolvedMember, permissionResult: "allowed", requestResult: "pendingConfirmation", routeCategory: routeCategory(for: action), memberMutation: "none")
+    }
+
+    public func requestUnban(userID: UserID) {
+        requestModerationAction(.unban, targetUserID: userID)
     }
 
     public func confirmPendingMemberAction() async {
@@ -3406,28 +3463,9 @@ public final class MainShellViewModel {
                 let member = try await apiClient.editMember(serverID: server.id, userID: pending.member.id.userID, draft: MemberEditDraft(remove: [.avatar]))
                 upsert(member: member)
                 memberActionState = .loaded(member)
-            case .timeout:
-                guard let timeoutUntil = pending.timeoutUntil else {
-                    memberActionState = .failed("Choose a timeout duration before saving.")
-                    return
-                }
-                let member = try await apiClient.editMember(serverID: server.id, userID: pending.member.id.userID, draft: MemberEditDraft(timeout: timeoutUntil))
-                upsert(member: member)
-                memberActionState = .loaded(member)
-            case .clearTimeout:
-                let member = try await apiClient.editMember(serverID: server.id, userID: pending.member.id.userID, draft: MemberEditDraft(remove: [.timeout]))
-                upsert(member: member)
-                memberActionState = .loaded(member)
-            case .kick:
-                try await apiClient.kickMember(serverID: server.id, userID: pending.member.id.userID)
-                removeMember(serverID: server.id, userID: pending.member.id.userID)
-                memberActionState = .idle
-                selectedMemberDetailID = nil
-            case .ban:
-                _ = try await apiClient.banMember(serverID: server.id, userID: pending.member.id.userID, draft: BanCreateDraft(reason: pending.reason.isEmpty ? nil : pending.reason))
-                removeMember(serverID: server.id, userID: pending.member.id.userID)
-                memberActionState = .idle
-                selectedMemberDetailID = nil
+            case .timeout, .clearTimeout, .kick, .ban:
+                memberActionState = .failed("Use the Phase 42 moderation confirmation flow for this action.")
+                return
             }
             refreshLoadedServerSettings()
             phase26Status = "Member action completed"
@@ -3436,43 +3474,350 @@ public final class MainShellViewModel {
         }
     }
 
+    public func confirmPendingModerationAction() async {
+        guard let pending = pendingModerationConfirmation,
+              let apiClient = apiClientForCommunityAction()
+        else {
+            moderationActionState = .failed("Reconnect before member moderation.")
+            return
+        }
+        let resolvedMember = pending.targetMember ?? snapshot.membersByServerAndUserID[ServerMemberKey(serverID: pending.serverID, userID: pending.targetUserID)]
+        if let reason = moderationDisabledReason(for: pending.action, targetUserID: pending.targetUserID, member: resolvedMember, allowNonMemberBan: pending.allowNonMemberBan) {
+            moderationActionState = .failed(reason.message)
+            updateModerationDiagnostics(action: pending.action, targetUserID: pending.targetUserID, targetMember: resolvedMember, permissionResult: reason.rawValue, requestResult: "blocked", routeCategory: routeCategory(for: pending.action), memberMutation: "none")
+            return
+        }
+
+        moderationActionState = .loading
+        memberActionState = .loading
+        let startedAt = Date()
+        do {
+            let mutationCategory: String
+            let responseShape: String
+            switch pending.action {
+            case .kick:
+                try await apiClient.kickMember(serverID: pending.serverID, userID: pending.targetUserID)
+                removeMember(serverID: pending.serverID, userID: pending.targetUserID)
+                selectedMemberDetailID = nil
+                mutationCategory = "removedMember"
+                responseShape = "empty204"
+            case .ban:
+                let trimmedReason = pending.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+                let ban = try await apiClient.banMember(
+                    serverID: pending.serverID,
+                    userID: pending.targetUserID,
+                    draft: BanCreateDraft(reason: trimmedReason.isEmpty ? nil : String(trimmedReason.prefix(1024)), deleteMessageSeconds: nil)
+                )
+                removeMember(serverID: pending.serverID, userID: pending.targetUserID)
+                patchBanListAfterBan(ban)
+                selectedMemberDetailID = nil
+                mutationCategory = "removedMemberAddedBan"
+                responseShape = "serverBan"
+            case .unban:
+                try await apiClient.unbanMember(serverID: pending.serverID, userID: pending.targetUserID)
+                patchBanListAfterUnban(serverID: pending.serverID, userID: pending.targetUserID)
+                mutationCategory = "removedBanOnly"
+                responseShape = "empty204"
+            case .timeout:
+                guard let timeoutUntil = pending.timeoutUntil() else {
+                    moderationActionState = .failed("Choose a timeout duration before saving.")
+                    memberActionState = .failed("Choose a timeout duration before saving.")
+                    return
+                }
+                let member = try await apiClient.editMember(serverID: pending.serverID, userID: pending.targetUserID, draft: MemberEditDraft(timeout: timeoutUntil))
+                upsert(member: member)
+                mutationCategory = "updatedMemberTimeout"
+                responseShape = "member"
+            case .removeTimeout:
+                let member = try await apiClient.editMember(serverID: pending.serverID, userID: pending.targetUserID, draft: MemberEditDraft(remove: [.timeout]))
+                upsert(member: member)
+                mutationCategory = "clearedMemberTimeout"
+                responseShape = "member"
+            }
+            pendingModerationConfirmation = nil
+            moderationActionState = .loaded("\(pending.action.title) completed")
+            memberActionState = .idle
+            refreshLoadedServerSettings()
+            phase26Status = "\(pending.action.title) completed"
+            updateModerationDiagnostics(
+                action: pending.action,
+                targetUserID: pending.targetUserID,
+                targetMember: resolvedMember,
+                permissionResult: "allowed",
+                requestResult: "success",
+                routeCategory: routeCategory(for: pending.action),
+                responseShape: responseShape,
+                durationBucket: pending.action == .timeout ? pending.timeoutPreset.diagnosticsBucket : "none",
+                memberMutation: mutationCategory,
+                elapsed: Date().timeIntervalSince(startedAt)
+            )
+        } catch {
+            let safe = Phase23Safety.safeError(error)
+            moderationActionState = .failed(safe)
+            memberActionState = .failed(safe)
+            updateModerationDiagnostics(
+                action: pending.action,
+                targetUserID: pending.targetUserID,
+                targetMember: resolvedMember,
+                permissionResult: "allowed",
+                requestResult: "failed",
+                routeCategory: routeCategory(for: pending.action),
+                responseShape: "error",
+                safeError: moderationSafeErrorCategory(error),
+                durationBucket: pending.action == .timeout ? pending.timeoutPreset.diagnosticsBucket : "none",
+                memberMutation: "none",
+                elapsed: Date().timeIntervalSince(startedAt)
+            )
+        }
+    }
+
     public func refreshBanList() async {
         guard let server = selectedServer else {
             banListState = .failed("Select a server before loading bans.")
+            updateModerationDiagnostics(action: nil, targetUserID: nil, targetMember: nil, permissionResult: "noSelectedServer", requestResult: "blocked", routeCategory: "fetchBans", memberMutation: "none")
             return
         }
         let resolution = Phase25PermissionResolver.resolve(server: selectedServer, channel: selectedChannel, member: selectedServerMember, currentUserID: currentUserID)
         guard serverManagementCapabilities().isConnectedForLiveActions else {
             banListState = .failed("Reconnect before loading bans.")
+            updateModerationDiagnostics(action: nil, targetUserID: nil, targetMember: nil, permissionResult: "disconnected", requestResult: "blocked", routeCategory: "fetchBans", memberMutation: "none")
             return
         }
         guard resolution.effectivePermissions.contains(.banMembers) || currentUserID == server.ownerID else {
             banListState = .failed("You do not have permission to view bans.")
+            updateModerationDiagnostics(action: nil, targetUserID: nil, targetMember: nil, permissionResult: resolution.warnings.isEmpty ? "missingPermission" : "permissionIncomplete", requestResult: "blocked", routeCategory: "fetchBans", memberMutation: "none")
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
             banListState = .failed("Reconnect before loading bans.")
+            updateModerationDiagnostics(action: nil, targetUserID: nil, targetMember: nil, permissionResult: "disconnected", requestResult: "blocked", routeCategory: "fetchBans", memberMutation: "none")
             return
         }
         banListState = .loading
+        let startedAt = Date()
+        updateModerationDiagnostics(action: nil, targetUserID: nil, targetMember: nil, permissionResult: "allowed", requestResult: "loading", routeCategory: "fetchBans", memberMutation: "none")
         do {
-            banListState = .loaded(try await apiClient.fetchServerBans(serverID: server.id))
+            let result = try await apiClient.fetchServerBans(serverID: server.id)
+            mergeBanListIdentities(result)
+            banListState = .loaded(result)
+            await hydrateMissingBanUsersIfNeeded(result, apiClient: apiClient)
+            updateModerationDiagnostics(action: nil, targetUserID: nil, targetMember: nil, permissionResult: "allowed", requestResult: "success", routeCategory: "fetchBans", responseShape: "banList", memberMutation: "none", elapsed: Date().timeIntervalSince(startedAt))
         } catch {
             banListState = .failed(Phase23Safety.safeError(error))
+            updateModerationDiagnostics(action: nil, targetUserID: nil, targetMember: nil, permissionResult: "allowed", requestResult: "failed", routeCategory: "fetchBans", responseShape: "error", safeError: moderationSafeErrorCategory(error), memberMutation: "none", elapsed: Date().timeIntervalSince(startedAt))
         }
     }
 
     public func unban(userID: UserID) async {
-        guard let server = selectedServer, let apiClient = apiClientForCommunityAction() else {
-            banListState = .failed("Reconnect before removing bans.")
-            return
+        requestUnban(userID: userID)
+        await confirmPendingModerationAction()
+    }
+
+    private func moderationAction(for action: MemberModerationAction) -> ModerationAction? {
+        switch action {
+        case .kick:
+            .kick
+        case .ban:
+            .ban
+        case .timeout:
+            .timeout
+        case .clearTimeout:
+            .removeTimeout
+        case .saveNickname, .resetNickname, .removeAvatar:
+            nil
         }
-        do {
-            try await apiClient.unbanMember(serverID: server.id, userID: userID)
-            await refreshBanList()
-        } catch {
-            banListState = .failed(Phase23Safety.safeError(error))
+    }
+
+    private func moderationContext(targetUserID: UserID, member: ServerMember?, allowNonMemberBan: Bool) -> ModerationActionContext {
+        let server = selectedServer
+        let resolvedMember: ServerMember?
+        if let member {
+            resolvedMember = member
+        } else if let server {
+            resolvedMember = snapshot.membersByServerAndUserID[ServerMemberKey(serverID: server.id, userID: targetUserID)]
+        } else {
+            resolvedMember = nil
         }
+        let fallbackChannel = selection.serverID.flatMap { firstVisibleTextChannel(in: $0) }
+        let resolution = Phase25PermissionResolver.resolve(
+            server: server,
+            channel: selectedChannel ?? fallbackChannel,
+            member: selectedServerMember,
+            currentUserID: currentUserID
+        )
+        return ModerationActionContext(
+            currentUserID: currentUserID,
+            server: server,
+            currentMember: selectedServerMember,
+            targetUserID: targetUserID,
+            targetMember: resolvedMember,
+            knownBannedUserIDs: knownBannedUserIDs,
+            permissionResolution: resolution,
+            isConnectedForLiveActions: cachedServerCapabilities.isConnectedForLiveActions,
+            allowNonMemberBan: allowNonMemberBan
+        )
+    }
+
+    private var knownBannedUserIDs: Set<UserID> {
+        guard case let .loaded(result) = banListState else { return [] }
+        return Set(result.bans.map(\.id.userID))
+    }
+
+    private func routeCategory(for action: ModerationAction) -> String {
+        switch action {
+        case .kick:
+            "DELETE /servers/{server_id}/members/{member_id}"
+        case .ban:
+            "PUT /servers/{server}/bans/{target}"
+        case .unban:
+            "DELETE /servers/{server}/bans/{target}"
+        case .timeout, .removeTimeout:
+            "PATCH /servers/{server_id}/members/{member_id}"
+        }
+    }
+
+    private func moderationSafeErrorCategory(_ error: any Error) -> String {
+        if let apiError = error as? StoatAPIError {
+            switch apiError {
+            case .missingAuthentication, .unauthorized:
+                return "authentication"
+            case .forbidden:
+                return "permission"
+            case .notFound:
+                return "notFound"
+            case .rateLimited:
+                return "rateLimited"
+            case .decodingFailed:
+                return "decode"
+            case .transport:
+                return "network"
+            case .unimplementedEndpoint:
+                return "routeUnavailable"
+            case .invalidEnvironment:
+                return "environment"
+            case .serverError:
+                return "server"
+            case .invalidURL, .unknown:
+                return "unknown"
+            }
+        }
+        return "unknown"
+    }
+
+    private func updateModerationDiagnostics(
+        action: ModerationAction?,
+        targetUserID: UserID?,
+        targetMember: ServerMember?,
+        permissionResult: String,
+        requestResult: String,
+        routeCategory: String,
+        responseShape: String = "none",
+        safeError: String = "none",
+        durationBucket: String = "none",
+        memberMutation: String,
+        elapsed: TimeInterval? = nil
+    ) {
+        let counts = moderationDashboardCounts()
+        moderationDiagnostics = ModerationDiagnostics(
+            lastActionCategory: action?.diagnosticsCategory ?? routeCategory,
+            selectedServerPresenceCategory: selectedServer == nil ? "none" : "selected",
+            targetCategory: moderationTargetCategory(userID: targetUserID, member: targetMember),
+            permissionResultCategory: permissionResult,
+            routeCategory: routeCategory,
+            requestResultCategory: requestResult,
+            responseShapeCategory: responseShape,
+            safeErrorCategory: safeError,
+            durationBucket: durationBucket,
+            memberCacheMutationCategory: memberMutation,
+            bansKnownCount: counts.knownBans,
+            bansRenderedCount: counts.renderedBans,
+            bansPendingCount: counts.pendingBans,
+            timeoutsKnownCount: counts.knownTimeouts,
+            timeoutsRenderedCount: counts.renderedTimeouts,
+            timeoutsPendingCount: counts.pendingTimeouts,
+            elapsedDurationBucket: elapsed.map(ModerationDiagnosticsFormatter.elapsedBucket) ?? "none",
+            copiedDiagnosticsRedactedReasonText: true,
+            targetIDPrefix: ModerationDiagnosticsFormatter.shortID(targetUserID?.rawValue),
+            serverIDPrefix: ModerationDiagnosticsFormatter.shortID(selectedServer?.id.rawValue)
+        )
+    }
+
+    public func moderationDashboardCounts() -> ModerationDashboardCounts {
+        let banCount: Int
+        let pendingBans: Int
+        switch banListState {
+        case let .loaded(result):
+            banCount = result.bans.count
+            pendingBans = 0
+        case .loading:
+            banCount = 0
+            pendingBans = 1
+        case .idle, .failed:
+            banCount = 0
+            pendingBans = 0
+        }
+        let timeoutCount = selectedServer.map { server in
+            serverMembers(for: server.id).filter { member in
+                guard let timeout = member.timeout else { return false }
+                return timeout > Date()
+            }.count
+        } ?? 0
+        return ModerationDashboardCounts(
+            knownBans: banCount,
+            renderedBans: banCount,
+            pendingBans: pendingBans,
+            knownTimeouts: timeoutCount,
+            renderedTimeouts: timeoutCount,
+            pendingTimeouts: 0
+        )
+    }
+
+    private func moderationTargetCategory(userID: UserID?, member: ServerMember?) -> String {
+        guard let userID else { return "unknown" }
+        if userID == currentUserID { return "self" }
+        if knownBannedUserIDs.contains(userID) { return "banned" }
+        if let member {
+            if let timeout = member.timeout, timeout > Date() {
+                return "timedOut"
+            }
+            return "member"
+        }
+        return "unknown"
+    }
+
+    private func mergeBanListIdentities(_ result: BanListResult) {
+        for banned in result.users {
+            upsertUser(User(id: banned.id, username: banned.username, discriminator: banned.discriminator ?? "0000", avatar: banned.avatar))
+        }
+    }
+
+    private func hydrateMissingBanUsersIfNeeded(_ result: BanListResult, apiClient: any StoatAPIClient) async {
+        let userIDsFromResult = Set(result.users.map(\.id))
+        let missing = result.bans
+            .map(\.id.userID)
+            .filter { !userIDsFromResult.contains($0) && snapshot.usersByID[$0] == nil }
+            .prefix(8)
+        for userID in missing {
+            if Task.isCancelled { return }
+            if let user = try? await apiClient.fetchUser(userID: userID) {
+                upsertUser(user)
+            }
+        }
+    }
+
+    private func patchBanListAfterBan(_ ban: ServerBan) {
+        guard case var .loaded(result) = banListState else { return }
+        result.bans.removeAll { $0.id == ban.id }
+        result.bans.append(ban)
+        result.bans.sort { $0.id.userID.rawValue < $1.id.userID.rawValue }
+        banListState = .loaded(result)
+    }
+
+    private func patchBanListAfterUnban(serverID: ServerID, userID: UserID) {
+        guard case var .loaded(result) = banListState else { return }
+        result.bans.removeAll { $0.id.serverID == serverID && $0.id.userID == userID }
+        result.users.removeAll { $0.id == userID }
+        banListState = .loaded(result)
     }
 
     public func permissionEditingDisabledReason() -> String? {
@@ -6064,6 +6409,16 @@ public final class MainShellViewModel {
         lastTimelineActionResult = "Copied redacted DM diagnostics"
     }
 
+    public func copyRedactedModerationDiagnostics() {
+        let text = ModerationDiagnosticsFormatter.redactedText(moderationDiagnostics)
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+        placeholderStatus = "Moderation diagnostics copied"
+        lastTimelineActionResult = "Copied redacted moderation diagnostics"
+    }
+
     public func copyRedactedParityDiagnostics() {
         let text = ParityMatrixFormatter.redactedText(phase30ParityMatrix)
         #if canImport(AppKit)
@@ -7755,7 +8110,7 @@ extension MainShellViewModel: AppCommandHandling {
             }
         case .openBanList:
             openServerOverview()
-            selectedServerSettingsTab = .members
+            selectedServerSettingsTab = .moderation
             Task { [weak self] in await self?.refreshBanList() }
         case .createRole:
             openServerOverview()
@@ -8475,6 +8830,12 @@ public struct MainShellView: View {
                 onAdd: { viewModel.addPendingDroppedAttachmentsToComposer() }
             )
         }
+        .sheet(isPresented: Binding(
+            get: { viewModel.pendingModerationConfirmation != nil },
+            set: { if !$0 { viewModel.pendingModerationConfirmation = nil } }
+        )) {
+            ModerationConfirmationSheet(viewModel: viewModel)
+        }
         .confirmationDialog(
             "Send current composer text?",
             isPresented: $viewModel.isTestSendConfirmationPresented
@@ -8683,6 +9044,179 @@ public struct MainShellView: View {
         }
     }
 
+}
+
+private struct ModerationConfirmationSheet: View {
+    @Bindable var viewModel: MainShellViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            if let pending = viewModel.pendingModerationConfirmation {
+                HStack(alignment: .top, spacing: StoatSpacing.medium) {
+                    Image(systemName: pending.action.systemImage)
+                        .font(.title2)
+                        .foregroundStyle(pending.action == .unban || pending.action == .removeTimeout ? Color.primary : Color.red)
+                    VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                        Text(pending.action.title)
+                            .font(.title3.weight(.semibold))
+                        Text(pending.displayName)
+                            .font(.headline)
+                        Text("User \(UserDisplayResolver.shortenedID(pending.targetUserID)) in \(pending.serverName)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+
+                Text(consequence(for: pending.action))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if pending.action.requiresReason {
+                    VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                        Text("Reason")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        TextField("Optional ban reason", text: Binding(
+                            get: { viewModel.pendingModerationConfirmation?.reason ?? "" },
+                            set: { newValue in
+                                if var pending = viewModel.pendingModerationConfirmation {
+                                    pending.reason = newValue
+                                    viewModel.pendingModerationConfirmation = pending
+                                }
+                            }
+                        ), axis: .vertical)
+                        .lineLimit(2...4)
+                    }
+                }
+
+                if pending.action == .timeout {
+                    VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                        Picker("Duration", selection: Binding(
+                            get: { viewModel.pendingModerationConfirmation?.timeoutPreset ?? .oneHour },
+                            set: { preset in
+                                if var pending = viewModel.pendingModerationConfirmation {
+                                    pending.timeoutPreset = preset
+                                    viewModel.pendingModerationConfirmation = pending
+                                }
+                            }
+                        )) {
+                            ForEach(ModerationTimeoutPreset.allCases) { preset in
+                                Text(preset.title).tag(preset)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        if pending.timeoutPreset == .custom {
+                            DatePicker(
+                                "Until",
+                                selection: Binding(
+                                    get: { viewModel.pendingModerationConfirmation?.customTimeoutUntil ?? Date().addingTimeInterval(60 * 60) },
+                                    set: { date in
+                                        if var pending = viewModel.pendingModerationConfirmation {
+                                            pending.customTimeoutUntil = date
+                                            viewModel.pendingModerationConfirmation = pending
+                                        }
+                                    }
+                                ),
+                                in: Date().addingTimeInterval(60)...,
+                                displayedComponents: [.date, .hourAndMinute]
+                            )
+                        }
+                    }
+                }
+
+                moderationStateMessage
+
+                HStack {
+                    Button("Cancel") {
+                        viewModel.pendingModerationConfirmation = nil
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(isLoading)
+
+                    Spacer()
+
+                    Button(role: destructiveRole(for: pending.action)) {
+                        Task { await viewModel.confirmPendingModerationAction() }
+                    } label: {
+                        if isLoading {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label(confirmTitle(for: pending.action), systemImage: pending.action.systemImage)
+                        }
+                    }
+                    .buttonStyle(GlassButtonStyle())
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isLoading)
+                }
+            } else {
+                EmptyStateView(title: "No action pending", message: "Choose a moderation action first.", systemImage: "shield")
+            }
+        }
+        .padding(StoatSpacing.xLarge)
+        .frame(width: 480, alignment: .topLeading)
+    }
+
+    @ViewBuilder private var moderationStateMessage: some View {
+        switch viewModel.moderationActionState {
+        case .idle:
+            Text("Liquid Bagel will send this request only after confirmation.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .loading:
+            ProgressView("Applying moderation action")
+        case let .failed(message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+        case let .loaded(message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var isLoading: Bool {
+        if case .loading = viewModel.moderationActionState { return true }
+        return false
+    }
+
+    private func destructiveRole(for action: ModerationAction) -> ButtonRole? {
+        switch action {
+        case .kick, .ban, .timeout:
+            .destructive
+        case .unban, .removeTimeout:
+            nil
+        }
+    }
+
+    private func confirmTitle(for action: ModerationAction) -> String {
+        switch action {
+        case .kick: "Kick Member"
+        case .ban: "Ban User"
+        case .unban: "Unban User"
+        case .timeout: "Apply Timeout"
+        case .removeTimeout: "Remove Timeout"
+        }
+    }
+
+    private func consequence(for action: ModerationAction) -> String {
+        switch action {
+        case .kick:
+            "The member is removed from this server. Existing messages and cached identity stay intact."
+        case .ban:
+            "The user is banned from this server. Existing timeline messages are not deleted."
+        case .unban:
+            "The user is removed from the ban list. They are not added back to the member list."
+        case .timeout:
+            "The member is muted until the selected time. This uses the verified member timeout field."
+        case .removeTimeout:
+            "The member timeout is cleared using the verified remove Timeout field."
+        }
+    }
 }
 
 private struct AttachmentPreviewSheet: View {
@@ -9203,6 +9737,7 @@ public struct CredentialSetupView: View {
         let freeze = viewModel.freezePerformanceDiagnostics
         let roleSort = viewModel.memberRoleSortDiagnostics
         let dmConversation = viewModel.dmDiagnostics
+        let moderation = viewModel.moderationDiagnostics
         Section("Developer Diagnostics") {
             LabeledContent("Timeline", value: "loaded \(timeline.loadedMessageCount), visible \(TimelineCopyFormatter.shortID(timeline.firstVisibleMessageID?.rawValue)) to \(TimelineCopyFormatter.shortID(timeline.lastVisibleMessageID?.rawValue))")
             LabeledContent("DM route", value: "clicked \(TimelineCopyFormatter.shortID(dm.clickedChannelID?.rawValue)), selected \(TimelineCopyFormatter.shortID(dm.selectedConversationChannelID?.rawValue)), load \(dm.messageLoadRequested ? "requested" : "idle")")
@@ -9259,6 +9794,9 @@ public struct CredentialSetupView: View {
             LabeledContent("DM merge/fallbacks", value: "duplicates \(dmConversation.duplicateMergeCount), missing users \(dmConversation.missingRecipientUserCount), raw fallbacks \(dmConversation.rawIDFallbackCount)")
             LabeledContent("DM unread/ack", value: "unread \(dmConversation.unreadChannelCount), mentions \(dmConversation.mentionCount), local clears \(dmConversation.locallyClearedUnreadCount), ack \(dmConversation.lastAckSummary ?? "-")")
             LabeledContent("DM safe errors", value: dmConversation.safeErrorCategories.map(\.rawValue).joined(separator: ", "))
+            LabeledContent("Phase 42 moderation", value: "\(moderation.lastActionCategory), \(moderation.requestResultCategory), route \(moderation.routeCategory)")
+            LabeledContent("Moderation target", value: "\(moderation.targetCategory), permission \(moderation.permissionResultCategory), error \(moderation.safeErrorCategory)")
+            LabeledContent("Moderation lists", value: "bans \(moderation.bansKnownCount)/\(moderation.bansRenderedCount)/\(moderation.bansPendingCount), timeouts \(moderation.timeoutsKnownCount)/\(moderation.timeoutsRenderedCount)/\(moderation.timeoutsPendingCount)")
             LabeledContent("Parity Matrix", value: "\(parity.count(.done)) done, \(parity.count(.partial)) partial, \(parity.count(.broken)) broken, \(parity.count(.blockedByUnverifiedAPI)) blocked, \(parity.count(.deferred)) deferred, \(parity.count(.outOfScope)) out of scope")
             if let dmParity = parity.items.first(where: { $0.section == "Core chat" && $0.name == "DMs" }) {
                 LabeledContent("DM parity", value: "\(dmParity.status.rawValue): \(dmParity.recommendedNextAction)")
@@ -9281,6 +9819,9 @@ public struct CredentialSetupView: View {
                 }
                 Button("Copy Identity Diagnostics") {
                     viewModel.copyVisibleIdentityDiagnostics()
+                }
+                Button("Copy Moderation Diagnostics") {
+                    viewModel.copyRedactedModerationDiagnostics()
                 }
                 Button("Refresh Members") {
                     Task { await viewModel.refreshSelectedServerMembers() }
@@ -11687,11 +12228,41 @@ private struct UserProfileCardView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        moderationProfileMenu
     }
 
     private var messageProfileButton: some View {
         Button("Message") { Task { await viewModel.openDirectMessage(with: user.id, source: .profilePopover) } }
             .buttonStyle(GlassButtonStyle())
+    }
+
+    @ViewBuilder private var moderationProfileMenu: some View {
+        if context.serverID != nil {
+            Menu {
+                ForEach(profileModerationActions, id: \.self) { action in
+                    Button(action.title, role: action == .kick || action == .ban ? .destructive : nil) {
+                        viewModel.requestModerationAction(action, targetUserID: user.id, member: profileServerMember)
+                    }
+                    .disabled(viewModel.moderationDisabledReasonText(for: action, targetUserID: user.id, member: profileServerMember) != nil)
+                }
+            } label: {
+                Label("Moderate", systemImage: "shield")
+            }
+            .buttonStyle(GlassButtonStyle())
+        }
+    }
+
+    private var profileServerMember: ServerMember? {
+        guard let serverID = context.serverID else { return nil }
+        return viewModel.snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: user.id)]
+    }
+
+    private var profileModerationActions: [ModerationAction] {
+        guard let member = profileServerMember else { return [.ban] }
+        if let timeout = member.timeout, timeout > Date() {
+            return [.kick, .ban, .removeTimeout]
+        }
+        return [.kick, .ban, .timeout]
     }
 
     private var displayName: String {
@@ -12134,6 +12705,8 @@ public struct ServerOverviewView: View {
                 permissions(details)
             case .members:
                 members(details)
+            case .moderation:
+                moderation(details)
             case .danger:
                 EmptyStateView(title: "Server deletion deferred", message: "Danger Zone is intentionally disabled in Phase 25.", systemImage: "lock.shield")
             }
@@ -12523,7 +13096,271 @@ public struct ServerOverviewView: View {
                 memberDetail(member, details: details)
             }
 
-            banList()
+            EmptyView()
+        }
+    }
+
+    private func moderation(_ details: ServerSettingsDetails) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    HStack {
+                        Label("Moderation", systemImage: "shield.lefthalf.filled")
+                            .font(.headline)
+                        Spacer()
+                        Button {
+                            Task { await viewModel.hydrateServerMembers(serverID: details.server.id, force: true, reason: "moderation dashboard refresh") }
+                        } label: {
+                            Label("Refresh Members", systemImage: "person.2")
+                        }
+                        Button {
+                            Task { await viewModel.refreshBanList() }
+                        } label: {
+                            Label("Refresh Bans", systemImage: "arrow.clockwise")
+                        }
+                        .disabled(!viewModel.serverManagementCapabilities().isConnectedForLiveActions)
+                        Button {
+                            viewModel.copyRedactedModerationDiagnostics()
+                        } label: {
+                            Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                        }
+                    }
+                    if moderationPermissionSummary(in: details) != nil {
+                        Text(moderationPermissionSummary(in: details) ?? "")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    stateMessage(viewModel.moderationActionState, loading: "Applying moderation action", success: "Moderation action completed")
+                }
+            }
+
+            moderationMembers(details)
+            moderationBans()
+            moderationTimeouts(details)
+        }
+    }
+
+    private func moderationMembers(_ details: ServerSettingsDetails) -> some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                HStack {
+                    Text("Members")
+                        .font(.headline)
+                    Spacer()
+                    Text("\(viewModel.memberManagementItems(for: details).count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                TextField("Search members", text: $viewModel.memberSearchText)
+                    .textFieldStyle(.roundedBorder)
+                let items = viewModel.memberManagementItems(for: details)
+                if items.isEmpty {
+                    EmptyStateView(title: "No members", message: "Refresh this server's members to moderate member-scoped actions.", systemImage: "person.2")
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
+                            ForEach(items) { item in
+                                moderationMemberRow(item)
+                            }
+                        }
+                    }
+                    .frame(minHeight: 150, maxHeight: 280)
+                }
+            }
+        }
+    }
+
+    private func moderationMemberRow(_ item: MemberManagementItem) -> some View {
+        HStack(spacing: StoatSpacing.medium) {
+            AvatarView(title: item.displayName, size: 32, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
+            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                Text(item.displayName)
+                    .lineLimit(1)
+                Text(memberSubtitle(for: item))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let timeoutSummary = item.timeoutSummary {
+                    Text(timeoutSummary)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+            Spacer()
+            Button {
+                viewModel.openMemberDetail(item.member)
+            } label: {
+                Label("Details", systemImage: "person.text.rectangle")
+            }
+            moderationActionButton(.kick, targetUserID: item.member.id.userID, member: item.member)
+            moderationActionButton(.ban, targetUserID: item.member.id.userID, member: item.member)
+            if item.timeoutSummary == nil {
+                moderationActionButton(.timeout, targetUserID: item.member.id.userID, member: item.member)
+            } else {
+                moderationActionButton(.removeTimeout, targetUserID: item.member.id.userID, member: item.member)
+            }
+        }
+        .padding(StoatSpacing.small)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+        .onAppear {
+            viewModel.loadImageResource(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar)
+        }
+        .contextMenu {
+            Button("Open Profile") {
+                viewModel.showUserProfile(item.member.id.userID, source: .memberRow, serverID: item.member.id.serverID)
+            }
+            Divider()
+            ForEach([ModerationAction.kick, .ban, .timeout, .removeTimeout], id: \.self) { action in
+                Button(action.title, role: action == .kick || action == .ban ? .destructive : nil) {
+                    viewModel.requestModerationAction(action, targetUserID: item.member.id.userID, member: item.member)
+                }
+                .disabled(viewModel.moderationDisabledReasonText(for: action, targetUserID: item.member.id.userID, member: item.member) != nil)
+            }
+        }
+    }
+
+    private func moderationActionButton(_ action: ModerationAction, targetUserID: UserID, member: ServerMember? = nil, allowNonMemberBan: Bool = false) -> some View {
+        let reason = viewModel.moderationDisabledReasonText(for: action, targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
+        return Button(role: action == .kick || action == .ban ? .destructive : nil) {
+            viewModel.requestModerationAction(action, targetUserID: targetUserID, member: member, allowNonMemberBan: allowNonMemberBan)
+        } label: {
+            Image(systemName: action.systemImage)
+                .help(reason ?? action.title)
+        }
+        .disabled(reason != nil)
+        .accessibilityLabel(action.title)
+        .accessibilityHint(reason ?? "Requires confirmation")
+    }
+
+    @ViewBuilder private func moderationBans() -> some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                HStack {
+                    Text("Bans")
+                        .font(.headline)
+                    Spacer()
+                    Button {
+                        Task { await viewModel.refreshBanList() }
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(!viewModel.serverManagementCapabilities().isConnectedForLiveActions)
+                }
+                TextField("Search bans", text: $viewModel.moderationBanSearchText)
+                    .textFieldStyle(.roundedBorder)
+                switch viewModel.banListState {
+                case .idle:
+                    EmptyStateView(title: "Ban list not loaded", message: "Refresh bans when you need the current server list.", systemImage: "hand.raised")
+                case .loading:
+                    ProgressView("Loading bans")
+                case let .failed(message):
+                    VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                        EmptyStateView(title: "Bans unavailable", message: message, systemImage: "exclamationmark.triangle")
+                        HStack {
+                            Button {
+                                Task { await viewModel.refreshBanList() }
+                            } label: {
+                                Label("Retry", systemImage: "arrow.clockwise")
+                            }
+                            Button {
+                                viewModel.copyRedactedModerationDiagnostics()
+                            } label: {
+                                Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                            }
+                        }
+                    }
+                case let .loaded(result):
+                    let bans = filteredBans(result)
+                    if bans.isEmpty {
+                        EmptyStateView(title: "No bans", message: "No bans match the current filter.", systemImage: "hand.raised.slash")
+                    } else {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
+                                ForEach(bans) { ban in
+                                    moderationBanRow(ban, result: result)
+                                }
+                            }
+                        }
+                        .frame(minHeight: 120, maxHeight: 260)
+                    }
+                }
+            }
+        }
+    }
+
+    private func moderationBanRow(_ ban: ServerBan, result: BanListResult) -> some View {
+        let user = bannedUser(for: ban, in: result)
+        return HStack(spacing: StoatSpacing.medium) {
+            AvatarView(title: banDisplayName(ban, result: result), size: 28, isOnline: false, presence: nil, imageData: viewModel.imageData(for: user?.avatar, kind: .userAvatar))
+            VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                Text(banDisplayName(ban, result: result))
+                    .lineLimit(1)
+                Text("User \(UserDisplayResolver.shortenedID(ban.id.userID))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let reason = ban.reason, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            Spacer()
+            Button {
+                viewModel.showUserProfile(ban.id.userID, source: .memberRow, serverID: ban.id.serverID)
+            } label: {
+                Label("Profile", systemImage: "person.crop.circle")
+            }
+            moderationActionButton(.unban, targetUserID: ban.id.userID)
+        }
+        .padding(StoatSpacing.small)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+        .onAppear {
+            viewModel.loadImageResource(for: user?.avatar, kind: .userAvatar)
+        }
+    }
+
+    private func moderationTimeouts(_ details: ServerSettingsDetails) -> some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                HStack {
+                    Text("Timeouts")
+                        .font(.headline)
+                    Spacer()
+                    Button {
+                        Task { await viewModel.hydrateServerMembers(serverID: details.server.id, force: true, reason: "moderation timeout refresh") }
+                    } label: {
+                        Label("Refresh Members", systemImage: "arrow.clockwise")
+                    }
+                }
+                TextField("Search timeouts", text: $viewModel.moderationTimeoutSearchText)
+                    .textFieldStyle(.roundedBorder)
+                let items = filteredTimeoutItems(details)
+                if items.isEmpty {
+                    EmptyStateView(title: "No active timeouts", message: "Active timeouts appear from refreshed member state.", systemImage: "clock")
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
+                            ForEach(items) { item in
+                                HStack(spacing: StoatSpacing.medium) {
+                                    AvatarView(title: item.displayName, size: 28, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
+                                    VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                                        Text(item.displayName)
+                                        Text(item.timeoutSummary ?? "Timed out")
+                                            .font(.caption)
+                                            .foregroundStyle(.orange)
+                                    }
+                                    Spacer()
+                                    moderationActionButton(.removeTimeout, targetUserID: item.member.id.userID, member: item.member)
+                                }
+                                .padding(StoatSpacing.small)
+                                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+                            }
+                        }
+                    }
+                    .frame(minHeight: 110, maxHeight: 220)
+                }
+            }
         }
     }
 
@@ -12653,6 +13490,68 @@ public struct ServerOverviewView: View {
                     }
                 }
             }
+        }
+    }
+
+    private func moderationPermissionSummary(in details: ServerSettingsDetails) -> String? {
+        if viewModel.currentUserID == details.server.ownerID {
+            return "Server owner actions are still confirmed before sending."
+        }
+        let permissions = details.permissionPreview.effectivePermissions
+        let moderationPermissions: Permissions = [.kickMembers, .banMembers, .timeoutMembers]
+        if permissions.intersection(moderationPermissions).isEmpty {
+            return "Moderation actions are disabled because this account has no kick, ban, or timeout permission here."
+        }
+        if !details.permissionPreview.warnings.isEmpty {
+            return "Some actions are disabled until member and role hierarchy data is hydrated."
+        }
+        return nil
+    }
+
+    private func memberSubtitle(for item: MemberManagementItem) -> String {
+        let roleLine = item.roles.map(\.name).joined(separator: ", ")
+        return "\(item.username) · \(roleLine.isEmpty ? "No roles" : roleLine)"
+    }
+
+    private func filteredBans(_ result: BanListResult) -> [ServerBan] {
+        let query = viewModel.moderationBanSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return result.bans }
+        return result.bans.filter { ban in
+            banDisplayName(ban, result: result).localizedCaseInsensitiveContains(query)
+                || UserDisplayResolver.shortenedID(ban.id.userID).localizedCaseInsensitiveContains(query)
+                || (ban.reason?.localizedCaseInsensitiveContains(query) == true)
+                || (viewModel.isDeveloperControlsEnabled && ban.id.userID.rawValue.localizedCaseInsensitiveContains(query))
+        }
+    }
+
+    private func bannedUser(for ban: ServerBan, in result: BanListResult) -> BannedUser? {
+        result.users.first { $0.id == ban.id.userID }
+    }
+
+    private func banDisplayName(_ ban: ServerBan, result: BanListResult) -> String {
+        if let user = result.users.first(where: { $0.id == ban.id.userID }) {
+            if let discriminator = user.discriminator, !discriminator.isEmpty {
+                return "\(user.username)#\(discriminator)"
+            }
+            return user.username
+        }
+        if let user = viewModel.snapshot.usersByID[ban.id.userID] {
+            return user.displayName ?? user.username
+        }
+        return UserDisplayResolver.shortenedID(ban.id.userID)
+    }
+
+    private func filteredTimeoutItems(_ details: ServerSettingsDetails) -> [MemberManagementItem] {
+        let query = viewModel.moderationTimeoutSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let items = details.members
+            .map { MemberManagementItem(member: $0, user: viewModel.snapshot.usersByID[$0.id.userID], server: details.server) }
+            .filter { $0.timeoutSummary != nil }
+        guard !query.isEmpty else { return items }
+        return items.filter { item in
+            item.displayName.localizedCaseInsensitiveContains(query)
+                || item.username.localizedCaseInsensitiveContains(query)
+                || item.roles.contains { $0.name.localizedCaseInsensitiveContains(query) }
+                || (viewModel.isDeveloperControlsEnabled && item.member.id.userID.rawValue.localizedCaseInsensitiveContains(query))
         }
     }
 

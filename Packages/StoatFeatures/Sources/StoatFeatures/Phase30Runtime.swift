@@ -327,8 +327,8 @@ public enum Phase30ParityMatrixBuilder {
             ("Server/community", "permissions preview", .done, "Backend permission model", "Read-only resolver", "Write parity separate", "Permission resolver tests", "Open preview", "Keep stable"),
             ("Server/community", "permission editing", .partial, "Verified permission routes", "Guarded writes exist", "Full official UX parity incomplete", "Permission tests", "Edit test permission", "Audit later"),
             ("Server/community", "member list", .done, "Ready members/users", "Missing/offline fallbacks kept", "No hidden member fetch", "Member tests", "Open large server", "Keep stable"),
-            ("Server/community", "member moderation", .partial, "Verified moderation routes", "Kick/ban/timeout guarded", "Full dashboard parity incomplete", "Moderation tests", "Use test server only", "Audit later"),
-            ("Server/community", "bans/timeouts", .partial, "Verified moderation routes", "Ban list/timeouts exist", "Full parity QA pending", "Moderation tests", "Use test server only", "Audit later"),
+            ("Server/community", "member moderation", .partial, "Verified moderation routes", "Phase 42 central resolver, confirmations, member/profile/settings/dashboard entry points", "Live hierarchy and destructive-action QA pending", "Moderation tests", "Use test server only", "Run Phase 42 checklist"),
+            ("Server/community", "bans/timeouts", .partial, "Verified moderation routes", "Phase 42 ban management plus member-state active timeout management", "Live QA pending; no separate verified timeout-list route", "Moderation tests", "Use test server only", "Run Phase 42 checklist"),
 
             ("Notifications", "local notifications", .partial, "UserNotifications", "Explicit opt-in with request diagnostics", "Live prompt still needs QA", "Notification tests", "Request manually", "Keep partial until live prompt works"),
             ("Notifications", "in-app banners", .done, "Local classifier", "In-app delivery exists", "None critical", "Notification tests", "Receive message", "Keep stable"),

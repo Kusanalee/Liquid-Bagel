@@ -173,6 +173,36 @@ final class StoatModelsTests: XCTestCase {
         XCTAssertEqual(Set(remove), Set(["DisplayName", "Avatar", "ProfileContent", "ProfileBackground"]))
     }
 
+    func testPhase42ModerationModelsDecodeBanListAndOptionalFields() throws {
+        let data = Data(#"{"users":[{"_id":"user-2","username":"target","discriminator":"0001"}],"bans":[{"_id":{"server":"server-1","user":"user-2"}},{"_id":{"server":"server-1","user":"user-3"},"reason":"spam"}]}"#.utf8)
+        let result = try JSONDecoder.stoat.decode(BanListResult.self, from: data)
+
+        XCTAssertEqual(result.users.first?.id, "user-2")
+        XCTAssertEqual(result.users.first?.username, "target")
+        XCTAssertNil(result.users.first?.avatar)
+        XCTAssertEqual(result.bans.count, 2)
+        XCTAssertNil(result.bans.first?.reason)
+        XCTAssertEqual(result.bans.last?.reason, "spam")
+    }
+
+    func testPhase42BanCreateDraftEncodesVerifiedCompatibilityFields() throws {
+        let object = try encodedJSONObject(BanCreateDraft(reason: "spam", deleteMessageSeconds: 3600))
+
+        XCTAssertEqual(object["reason"] as? String, "spam")
+        XCTAssertEqual(object["delete_message_seconds"] as? Int, 3600)
+    }
+
+    func testPhase42TimeoutApplyAndClearDraftsEncodeExactFields() throws {
+        let timeout = Date(timeIntervalSince1970: 1_801_440_000)
+        let apply = try encodedJSONObject(MemberEditDraft(timeout: timeout))
+        let clear = try encodedJSONObject(MemberEditDraft(remove: [.timeout]))
+
+        XCTAssertNotNil(apply["timeout"])
+        XCTAssertEqual(apply["remove"] as? [String], [])
+        XCTAssertEqual(clear["remove"] as? [String], ["Timeout"])
+        XCTAssertNil(clear["timeout"])
+    }
+
     private func decodeFixture<T: Decodable>(_ type: T.Type, named name: String) throws -> T {
         let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json"))
         let data = try Data(contentsOf: url)

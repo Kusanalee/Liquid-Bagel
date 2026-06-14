@@ -168,6 +168,13 @@ public actor MockStoatAPIClient: StoatAPIClient {
         currentUser
     }
 
+    public func fetchUser(userID: UserID) async throws -> User {
+        guard let user = users[userID] else {
+            throw StoatAPIError.notFound
+        }
+        return user
+    }
+
     public func editUser(userID: UserID, draft: UserEditDraft) async throws -> User {
         guard var user = users[userID] else {
             throw StoatAPIError.notFound

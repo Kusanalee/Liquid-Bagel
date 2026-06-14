@@ -113,6 +113,23 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
     }
 
+    func testPhase42FetchUserEndpointRequest() async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"{"_id":"user-2","username":"target","discriminator":"0001"}"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        let user = try await client.fetchUser(userID: "user-2")
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+
+        XCTAssertEqual(user.id, "user-2")
+        XCTAssertEqual(request.httpMethod, "GET")
+        XCTAssertEqual(request.url?.path, "/users/user-2")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
+    }
+
     func testSessionRenameEndpointRequest() async throws {
         let transport = RecordingHTTPTransport(data: Data(#"{"_id":"session-1","name":"Renamed"}"#.utf8))
         let client = LiveStoatAPIClient(
@@ -757,6 +774,16 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(memberRequest.url?.path, "/servers/server-1/members/user-2")
         XCTAssertTrue(memberBody?.contains(#""nickname":"Ops""#) == true)
         XCTAssertTrue(memberBody?.contains(#""remove":["Avatar"]"#) == true)
+
+        let clearTimeoutTransport = RecordingHTTPTransport(data: memberJSON)
+        let clearTimeoutClient = LiveStoatAPIClient(credentialProvider: StaticCredentialProvider(.sessionToken("secret")), transport: clearTimeoutTransport)
+        _ = try await clearTimeoutClient.editMember(serverID: "server-1", userID: "user-2", draft: MemberEditDraft(remove: [.timeout]))
+        let capturedClearTimeoutRequest = await clearTimeoutTransport.lastRequest()
+        let clearTimeoutRequest = try XCTUnwrap(capturedClearTimeoutRequest)
+        let clearTimeoutBody = String(data: try XCTUnwrap(clearTimeoutRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(clearTimeoutRequest.httpMethod, "PATCH")
+        XCTAssertEqual(clearTimeoutRequest.url?.path, "/servers/server-1/members/user-2")
+        XCTAssertTrue(clearTimeoutBody?.contains(#""remove":["Timeout"]"#) == true)
 
         let memberListJSON = Data(#"{"members":[{"_id":{"server":"server-1","user":"user-2"},"joined_at":"2026-06-02T00:00:00.000Z","roles":["role-1"]}],"users":[{"_id":"user-2","username":"ops"}]}"#.utf8)
         let memberListTransport = RecordingHTTPTransport(data: memberListJSON)
