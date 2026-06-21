@@ -336,6 +336,44 @@ public struct MessageRowActionItem: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct MessageRowReplyPreviewItem: Identifiable, Hashable, Sendable {
+    public var id: String
+    public var authorName: String?
+    public var summary: String
+    public var systemImage: String
+    public var canOpen: Bool
+    public var accessibilityLabel: String
+
+    public init(
+        id: String,
+        authorName: String? = nil,
+        summary: String,
+        systemImage: String = "arrowshape.turn.up.left",
+        canOpen: Bool = false,
+        accessibilityLabel: String? = nil
+    ) {
+        self.id = id
+        self.authorName = authorName
+        self.summary = summary
+        self.systemImage = systemImage
+        self.canOpen = canOpen
+        if let accessibilityLabel {
+            self.accessibilityLabel = accessibilityLabel
+        } else if let authorName, !authorName.isEmpty {
+            self.accessibilityLabel = "Reply to \(authorName): \(summary)"
+        } else {
+            self.accessibilityLabel = "Reply preview: \(summary)"
+        }
+    }
+
+    public var plainText: String {
+        if let authorName, !authorName.isEmpty {
+            return "\(authorName): \(summary)"
+        }
+        return summary
+    }
+}
+
 public struct MessageReactionDisplayItem: Identifiable, Hashable, Sendable {
     public var emoji: String
     public var count: Int
@@ -1302,9 +1340,11 @@ public struct MessageRow: View {
     private let isFocused: Bool
     private let isSearchHighlighted: Bool
     private let isCurrentSearchResult: Bool
+    private let isTargetHighlighted: Bool
     private let isCompactDensity: Bool
     private let searchAccessibilityStatus: String?
     private let replyPreview: String?
+    private let replyPreviewItem: MessageRowReplyPreviewItem?
     private let attachmentItems: [AttachmentDisplayItem]?
     private let customEmojiItems: [MessageInlineCustomEmojiItem]
     private let authorAvatarData: Data?
@@ -1317,6 +1357,7 @@ public struct MessageRow: View {
     private let onOpenAttachment: (AttachmentDisplayItem) -> Void
     private let onRetryAttachment: (AttachmentDisplayItem) -> Void
     private let onOpenAuthorProfile: () -> Void
+    private let onOpenReplyPreview: () -> Void
 
     public init(
         message: Message,
@@ -1329,9 +1370,11 @@ public struct MessageRow: View {
         isFocused: Bool = false,
         isSearchHighlighted: Bool = false,
         isCurrentSearchResult: Bool = false,
+        isTargetHighlighted: Bool = false,
         isCompactDensity: Bool = false,
         searchAccessibilityStatus: String? = nil,
         replyPreview: String? = nil,
+        replyPreviewItem: MessageRowReplyPreviewItem? = nil,
         attachmentItems: [AttachmentDisplayItem]? = nil,
         customEmojiItems: [MessageInlineCustomEmojiItem] = [],
         authorAvatarData: Data? = nil,
@@ -1343,7 +1386,8 @@ public struct MessageRow: View {
         onDownloadAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onOpenAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onRetryAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
-        onOpenAuthorProfile: @escaping () -> Void = {}
+        onOpenAuthorProfile: @escaping () -> Void = {},
+        onOpenReplyPreview: @escaping () -> Void = {}
     ) {
         self.message = message
         self.author = author
@@ -1355,9 +1399,11 @@ public struct MessageRow: View {
         self.isFocused = isFocused
         self.isSearchHighlighted = isSearchHighlighted
         self.isCurrentSearchResult = isCurrentSearchResult
+        self.isTargetHighlighted = isTargetHighlighted
         self.isCompactDensity = isCompactDensity
         self.searchAccessibilityStatus = searchAccessibilityStatus
         self.replyPreview = replyPreview
+        self.replyPreviewItem = replyPreviewItem
         self.attachmentItems = attachmentItems
         self.customEmojiItems = customEmojiItems
         self.authorAvatarData = authorAvatarData
@@ -1370,6 +1416,7 @@ public struct MessageRow: View {
         self.onOpenAttachment = onOpenAttachment
         self.onRetryAttachment = onRetryAttachment
         self.onOpenAuthorProfile = onOpenAuthorProfile
+        self.onOpenReplyPreview = onOpenReplyPreview
     }
 
     public var body: some View {
@@ -1425,21 +1472,8 @@ public struct MessageRow: View {
                 if let system = message.system {
                     SystemEventRow(text: system.content ?? "System event")
                 }
-                if let replyPreview {
-                    HStack(spacing: StoatSpacing.xSmall) {
-                        Image(systemName: "arrowshape.turn.up.left")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .accessibilityHidden(true)
-                        Text(replyPreview)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .padding(.horizontal, StoatSpacing.small)
-                    .padding(.vertical, StoatSpacing.xxSmall)
-                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
-                    .accessibilityLabel(StoatAccessibility.replyPreviewLabel(replyPreview))
+                if let replyPreviewItem = effectiveReplyPreviewItem {
+                    replyPreviewView(replyPreviewItem)
                 }
                 if let content = message.content, !content.isEmpty {
                     if customEmojiItems.isEmpty {
@@ -1506,9 +1540,54 @@ public struct MessageRow: View {
                 RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous)
                     .strokeBorder(Color.accentColor.opacity(0.45), lineWidth: 1)
             }
+            if isTargetHighlighted {
+                RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous)
+                    .strokeBorder(Color.accentColor.opacity(0.72), lineWidth: 2)
+            }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: reactionCount, status: statusText, isSelected: isSelected, isFocused: isFocused, searchResultStatus: searchAccessibilityStatus, replyPreview: replyPreview))
+        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: reactionCount, status: statusText, isSelected: isSelected, isFocused: isFocused || isTargetHighlighted, searchResultStatus: searchAccessibilityStatus, replyPreview: effectiveReplyPreviewItem?.plainText))
+    }
+
+    private var effectiveReplyPreviewItem: MessageRowReplyPreviewItem? {
+        if let replyPreviewItem { return replyPreviewItem }
+        return replyPreview.map {
+            MessageRowReplyPreviewItem(id: "legacy-\(message.id.rawValue)", summary: $0, canOpen: false)
+        }
+    }
+
+    @ViewBuilder private func replyPreviewView(_ item: MessageRowReplyPreviewItem) -> some View {
+        let content = HStack(spacing: StoatSpacing.xSmall) {
+            Image(systemName: item.systemImage)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            if let authorName = item.authorName, !authorName.isEmpty {
+                Text(authorName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Text(item.summary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, StoatSpacing.small)
+        .padding(.vertical, StoatSpacing.xxSmall)
+        .background(item.canOpen ? Color.accentColor.opacity(0.09) : Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+
+        if item.canOpen {
+            Button(action: onOpenReplyPreview) {
+                content
+            }
+            .buttonStyle(.plain)
+            .help("Jump to original message")
+            .accessibilityLabel(item.accessibilityLabel)
+        } else {
+            content
+                .accessibilityLabel(item.accessibilityLabel)
+        }
     }
 
     @ViewBuilder private var messageActionBar: some View {

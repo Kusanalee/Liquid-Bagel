@@ -1033,6 +1033,7 @@ private struct TimelineValidationHarnessView: View {
                 .font(.headline)
             diagnosticsGrid(diagnostics)
             routeCapabilities
+            phase44DiagnosticsSection
             warningList(diagnostics.validationWarnings)
             actionGrid
             tuningControls
@@ -1072,6 +1073,26 @@ private struct TimelineValidationHarnessView: View {
             Text(label).foregroundStyle(.secondary)
             Text(value).textSelection(.enabled)
         }
+    }
+
+    private var phase44DiagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            Text("Phase 44 Chat Interaction Diagnostics")
+                .font(.subheadline.weight(.semibold))
+            Grid(alignment: .leading, horizontalSpacing: StoatSpacing.large, verticalSpacing: StoatSpacing.xSmall) {
+                let diagnostics = viewModel.phase44Diagnostics
+                diagnosticRow("Replies", "loaded \(diagnostics.replyPreviewResolvedLoaded), unloaded \(diagnostics.replyPreviewResolvedUnloaded), unavailable \(diagnostics.replyPreviewUnavailable)")
+                diagnosticRow("Pins", "list \(diagnostics.pinnedListRequestCount)/\(diagnostics.pinnedListSuccessCount)/\(diagnostics.pinnedListFailureCount), actions \(diagnostics.pinActionSuccessCount + diagnostics.unpinActionSuccessCount)/\(diagnostics.pinActionFailureCount + diagnostics.unpinActionFailureCount)")
+                diagnosticRow("Jumps", "loaded \(diagnostics.jumpLoadedCount), unloaded \(diagnostics.jumpUnloadedCount), degraded \(diagnostics.jumpDegradedToChannelCount), unavailable \(diagnostics.jumpUnavailableCount)")
+                diagnosticRow("Typing", "cleanup \(diagnostics.typingStaleCleanupCount)")
+                diagnosticRow("Ack", "requested \(diagnostics.ackRequestedCount), sent \(diagnostics.ackSentCount), deduped \(diagnostics.ackDedupedCount), failed \(diagnostics.ackFailureCount)")
+                diagnosticRow("Notifications", "queued \(diagnostics.notificationRouteQueuedCount), replayed \(diagnostics.notificationRouteReplayedCount), degraded \(diagnostics.notificationRouteDegradedCount)")
+                diagnosticRow("Last Status", diagnostics.lastSafeStatus ?? "-")
+            }
+            .font(.caption)
+        }
+        .padding(StoatSpacing.small)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
     }
 
     @ViewBuilder private func warningList(_ warnings: [TimelineValidationWarning]) -> some View {

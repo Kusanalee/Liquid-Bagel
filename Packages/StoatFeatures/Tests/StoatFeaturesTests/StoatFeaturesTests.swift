@@ -1756,8 +1756,9 @@ final class StoatFeaturesTests: XCTestCase {
         )
 
         XCTAssertEqual(model.resolvedReplyPreview(for: reply), "Loading original message...")
+        model.prepareReplyPreview(for: reply)
         try await Task.sleep(for: .milliseconds(50))
-        XCTAssertEqual(model.resolvedReplyPreview(for: reply), "a: hello")
+        XCTAssertEqual(model.resolvedReplyPreview(for: reply), "Unknown member: hello")
 
         let diagnostics = model.timelineDiagnostics()
         XCTAssertEqual(diagnostics.pendingReferenceFetchCount, 0)
@@ -1834,7 +1835,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase12FindInLoadedMessagesIsLocalAndCreatesJumpIntent() throws {
+    func testPhase12FindInLoadedMessagesIsLocalAndCreatesJumpIntent() async throws {
         let model = MainShellViewModel(snapshot: MockShellData.snapshot)
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
@@ -1845,6 +1846,7 @@ final class StoatFeaturesTests: XCTestCase {
         let found = finder.find(query: "Phase 12", messages: [TimelineMessage(message: searchable)])
         let result = try XCTUnwrap(found.first)
         model.jumpToLoadedFindResult(result)
+        try await Task.sleep(for: .milliseconds(20))
 
         XCTAssertEqual(model.timelineViewport.selectedMessageID, result.messageID)
         XCTAssertNotNil(model.timelineViewport.pendingScrollIntent)
@@ -1942,8 +1944,8 @@ final class StoatFeaturesTests: XCTestCase {
         model.channelSearchState = .results(ChannelSearchQuery(text: "needle", mode: .liveChannel), [result])
         model.selectSearchResult(result)
 
-        XCTAssertFalse(model.canPerform(.loadAroundSelectedSearchResult))
-        XCTAssertEqual(model.disabledReason(for: .loadAroundSelectedSearchResult), "Around-message route is not verified.")
+        XCTAssertTrue(model.canPerform(.loadAroundSelectedSearchResult))
+        XCTAssertNil(model.disabledReason(for: .loadAroundSelectedSearchResult))
         XCTAssertTrue(Phase13Accessibility.channelSearchResultLabel(result, isSelected: true).contains("Outside loaded range"))
 
         model.verifyTimelineRoutes()
@@ -1967,7 +1969,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase14SearchNavigationCyclesAndScrollsLoadedResults() throws {
+    func testPhase14SearchNavigationCyclesAndScrollsLoadedResults() async throws {
         let model = MainShellViewModel(snapshot: MockShellData.snapshot)
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
@@ -1987,6 +1989,7 @@ final class StoatFeaturesTests: XCTestCase {
         model.channelSearchState = .results(ChannelSearchQuery(text: "needle", mode: .loadedOnly), results)
         model.selectedSearchResultID = results.last?.messageID
         model.selectAdjacentSearchResult(1)
+        try await Task.sleep(for: .milliseconds(20))
 
         XCTAssertEqual(model.selectedSearchResultID, results.first?.messageID)
         XCTAssertEqual(model.timelineViewport.selectedMessageID, results.first?.messageID)
@@ -2310,7 +2313,8 @@ final class StoatFeaturesTests: XCTestCase {
         await model.openNotificationRoute(NotificationRoute(serverID: channel.serverID, channelID: channel.id, messageID: "missing-message"))
 
         XCTAssertEqual(model.selection.channelID, channel.id)
-        XCTAssertEqual(model.placeholderStatus, "Notification message is not loaded.")
+        XCTAssertEqual(model.placeholderStatus, "Opened notification")
+        XCTAssertEqual(model.phase44Diagnostics.notificationRouteDegradedCount, 1)
     }
 
     @MainActor
@@ -2922,7 +2926,7 @@ final class StoatFeaturesTests: XCTestCase {
 
         XCTAssertEqual(allItems.count, 12)
         XCTAssertTrue(allItems.contains { $0.displayName == "Nickname" })
-        XCTAssertTrue(allItems.contains { $0.user == nil && $0.displayName.contains("...") })
+        XCTAssertTrue(allItems.contains { $0.user == nil && $0.displayName == "Unknown member" })
         XCTAssertEqual(model.memberListPerformanceDiagnostics.knownMemberCount, 12)
         XCTAssertEqual(model.memberListPerformanceDiagnostics.renderedMemberCount, 12)
         XCTAssertEqual(model.memberListPerformanceDiagnostics.missingUserCount, 3)
@@ -5039,6 +5043,183 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertGreaterThan(diagnostics.queuedTaskCount, 0)
     }
 
+    @MainActor
+    func testPhase44ReplyPreviewLoadedUnavailableAndNoRawFullIDs() {
+        let channelID: ChannelID = "phase44-replies"
+        let rawAuthorID: UserID = "01JPHASE44AUTHOR0000000001"
+        let original = Message(id: MessageID(rawValue: ulid(milliseconds: 1_000)), channelID: channelID, authorID: rawAuthorID, content: "reply target")
+        let reply = Message(id: MessageID(rawValue: ulid(milliseconds: 2_000)), channelID: channelID, authorID: "phase44-replier", content: "replying", replies: [original.id])
+        let missingReply = Message(id: MessageID(rawValue: ulid(milliseconds: 3_000)), channelID: channelID, authorID: "phase44-replier", content: "replying", replies: ["01JPHASE44MISSING0000000001"])
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: "phase44-server", name: "general")
+        let server = Server(id: "phase44-server", ownerID: rawAuthorID, name: "Phase44", channelIDs: [channelID])
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: channelID),
+            snapshot: RealtimeSnapshot(serversByID: [server.id: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [original, reply, missingReply]])
+        )
+
+        let loaded = model.replyPreviewState(for: reply)
+        XCTAssertEqual(loaded?.resolution, .loaded)
+        XCTAssertNotEqual(loaded?.authorDisplayName, rawAuthorID.rawValue)
+        XCTAssertFalse(loaded?.plainText.contains(rawAuthorID.rawValue) == true)
+
+        let unavailable = model.replyPreviewState(for: missingReply)
+        XCTAssertEqual(unavailable?.resolution, .loading)
+        XCTAssertEqual(unavailable?.summary, "Loading original message...")
+    }
+
+    @MainActor
+    func testPhase44ReplyPreviewClickRoutesThroughJumpCoordinatorAndHighlights() async {
+        let channelID: ChannelID = "phase44-reply-jump"
+        let original = Message(id: MessageID(rawValue: ulid(milliseconds: 1_000)), channelID: channelID, authorID: "phase44-author", content: "original")
+        let reply = Message(id: MessageID(rawValue: ulid(milliseconds: 2_000)), channelID: channelID, authorID: "phase44-replier", content: "reply", replies: [original.id])
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: "phase44-server", name: "general")
+        let server = Server(id: "phase44-server", ownerID: "phase44-author", name: "Phase44", channelIDs: [channelID])
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: channelID),
+            snapshot: RealtimeSnapshot(serversByID: [server.id: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [original, reply]])
+        )
+
+        await model.openReplyPreview(for: reply)
+
+        XCTAssertEqual(model.timelineSelection.messageID, original.id)
+        XCTAssertTrue(model.isTargetMessageHighlighted(original.id, channelID: channelID))
+        XCTAssertEqual(model.phase44Diagnostics.jumpSourceCounts[MessageNavigationSource.replyPreview.rawValue], 1)
+    }
+
+    @MainActor
+    func testPhase44ReplyComposerClearsAfterSuccessAndPersistsAfterFailure() async throws {
+        let channelID = try XCTUnwrap(MockShellData.snapshot.channelsByID.values.first { $0.kind == .textChannel }?.id)
+        let target = try XCTUnwrap(MockShellData.snapshot.messagesByChannelID[channelID]?.first)
+
+        let failingHandler = RecordingAttachmentMessageActionHandler()
+        await failingHandler.setSendError(MessageActionError.unavailable("offline"))
+        let failingModel = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: failingHandler)
+        failingModel.selectChannel(channelID)
+        failingModel.beginReply(to: TimelineMessage(message: target, status: .confirmed))
+        failingModel.updateDraft("still here", for: channelID)
+        await failingModel.sendDraft(for: channelID)
+
+        XCTAssertEqual(failingModel.replyContext(for: channelID)?.messageID, target.id)
+        XCTAssertEqual(failingModel.draft(for: channelID), "still here")
+        XCTAssertEqual(failingModel.phase44Diagnostics.replyComposerPreservedAfterFailureCount, 1)
+
+        let successHandler = RecordingAttachmentMessageActionHandler()
+        let successModel = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: successHandler)
+        successModel.selectChannel(channelID)
+        successModel.beginReply(to: TimelineMessage(message: target, status: .confirmed))
+        successModel.updateDraft("send", for: channelID)
+        await successModel.sendDraft(for: channelID)
+
+        XCTAssertNil(successModel.replyContext(for: channelID))
+        XCTAssertEqual(successModel.draft(for: channelID), "")
+        XCTAssertEqual(successModel.phase44Diagnostics.replyComposerClearedAfterSendCount, 1)
+    }
+
+    @MainActor
+    func testPhase44PinnedListUsesSelectedChannelSearchJumpAndUnpin() async throws {
+        let current = User(id: MockShellData.currentUserID, username: "me")
+        let author = User(id: "phase44-pin-author", username: "pin-author", displayName: "Pin Author")
+        let serverID: ServerID = "phase44-pin-server"
+        let channelID: ChannelID = "phase44-pin-channel"
+        let target = Message(id: MessageID(rawValue: ulid(milliseconds: 10_000)), channelID: channelID, authorID: author.id, content: "pinned target", user: author, pinned: true)
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "pins")
+        let server = Server(id: serverID, ownerID: current.id, name: "Pins", channelIDs: [channelID])
+        let snapshot = RealtimeSnapshot(usersByID: [current.id: current, author.id: author], serversByID: [serverID: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [target]])
+        let api = RecordingAPIClient(currentUser: current, messagesByChannel: [channelID: [target]])
+        let model = await phase40LiveModel(snapshot: snapshot, currentUser: current, api: api)
+        model.messageActionHandler = LiveMessageActionHandler(apiClient: api, realtimeClient: RecordingRealtimeClient())
+        model.selectChannel(channelID)
+
+        await model.refreshPinnedMessages()
+        guard case let .loaded(_, items) = model.pinnedMessagesState.loadState else {
+            return XCTFail("Expected pinned messages")
+        }
+        XCTAssertEqual(items.count, 1)
+        let searches = await api.searchedMessages
+        XCTAssertEqual(searches.last?.1.pinned, true)
+        XCTAssertEqual(searches.last?.1.includeUsers, true)
+
+        await model.openPinnedMessage(items[0])
+        XCTAssertEqual(model.timelineSelection.messageID, target.id)
+        XCTAssertTrue(model.isTargetMessageHighlighted(target.id, channelID: channelID))
+
+        await model.unpinPinnedMessage(items[0])
+        let unpinned = await api.unpinnedMessages
+        XCTAssertEqual(unpinned.last?.1, target.id)
+        XCTAssertTrue(model.pinnedMessagesState.loadState.items.isEmpty)
+    }
+
+    @MainActor
+    func testPhase44NotificationRouteDegradesToChannelWhenMessageUnavailable() async {
+        let channelID: ChannelID = "phase44-notification-channel"
+        let serverID: ServerID = "phase44-notification-server"
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        let server = Server(id: serverID, ownerID: "owner", name: "Notify", channelIDs: [channelID])
+        let model = MainShellViewModel(snapshot: RealtimeSnapshot(serversByID: [serverID: server], channelsByID: [channelID: channel]))
+
+        await model.openNotificationRoute(NotificationRoute(serverID: serverID, channelID: channelID, messageID: "phase44-missing-message"))
+
+        XCTAssertEqual(model.selectedConversationChannelID, channelID)
+        XCTAssertEqual(model.phase44Diagnostics.notificationRouteDegradedCount, 1)
+    }
+
+    @MainActor
+    func testPhase44TypingIndicatorCopyExcludesCurrentUserAndExpiresStale() {
+        let channelID: ChannelID = "phase44-typing-channel"
+        let current: UserID = "phase44-current"
+        let one: UserID = "phase44-one"
+        let two: UserID = "phase44-two"
+        var state = TypingIndicatorState(channelID: channelID, timeout: 2)
+        state.replace(channelID: channelID, typingUserIDs: [current, one], currentUserID: current, now: Date(timeIntervalSince1970: 10))
+        XCTAssertEqual(TypingIndicatorState.displayText(names: ["One"]), "One is typing...")
+        XCTAssertEqual(state.activeUserIDs, [one])
+        state.replace(channelID: channelID, typingUserIDs: [one, two], currentUserID: current, now: Date(timeIntervalSince1970: 11))
+        XCTAssertEqual(TypingIndicatorState.displayText(names: ["One", "Two"]), "One and Two are typing...")
+        state.replace(channelID: channelID, typingUserIDs: [one, two, "phase44-three"], currentUserID: current, now: Date(timeIntervalSince1970: 12))
+        XCTAssertEqual(TypingIndicatorState.displayText(names: ["One", "Two", "Three"]), "Several people are typing...")
+        XCTAssertEqual(state.removeStale(now: Date(timeIntervalSince1970: 20)), 3)
+        XCTAssertTrue(state.activeUserIDs.isEmpty)
+    }
+
+    @MainActor
+    func testPhase44AckDedupeAndClearsUnreadOnlyAfterSuccess() async throws {
+        let sender = RecordingChannelAckSender()
+        let currentUserID = MockShellData.currentUserID
+        let channelID: ChannelID = "phase44-ack-channel"
+        let message = Message(id: MessageID(rawValue: ulid(milliseconds: 1_000)), channelID: channelID, authorID: "phase44-other", content: "ack me")
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: "phase44-ack-server", name: "ack")
+        let server = Server(id: "phase44-ack-server", ownerID: currentUserID, name: "Ack", channelIDs: [channelID])
+        var snapshot = RealtimeSnapshot(serversByID: [server.id: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [message]])
+        snapshot.unreadsByChannelID[channelID] = ChannelUnread(id: ChannelCompositeKey(channelID: channelID, userID: currentUserID), lastMessageID: message.id, mentions: [])
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: channelID), snapshot: snapshot, runtimeMode: .liveManual, sessionState: .connected, currentUser: User(id: currentUserID, username: "me"), channelAckSender: sender)
+        model.timelineTuning.ackDebounceMilliseconds = 5
+
+        model.selectChannel(channelID)
+        model.updateTimelineVisibility(messageID: message.id, channelID: channelID, isVisible: true)
+        model.updateTimelineAtNewest(true)
+        try await Task.sleep(for: .milliseconds(40))
+
+        let acks = await sender.acks
+        XCTAssertEqual(acks.filter { $0.0 == channelID && $0.1 == message.id }.count, 1)
+        XCTAssertNil(model.unread(for: channelID)?.lastMessageID)
+        XCTAssertGreaterThanOrEqual(model.phase44Diagnostics.ackDedupedCount, 1)
+    }
+
+    func testPhase44DiagnosticsRedactsSensitiveValues() {
+        let diagnostics = Phase44ChatInteractionDiagnostics(
+            lastSafeStatus: #"token="secret" https://stoat.example/a /Users/enka/private raw@example.com 01JPHASE44FULLID0000000001 private moderation note"#
+        )
+
+        let text = Phase44DiagnosticsFormatter.redactedText(diagnostics)
+
+        XCTAssertTrue(text.contains("Phase 44 Chat Interaction Diagnostics"))
+        XCTAssertFalse(text.contains("secret"))
+        XCTAssertFalse(text.contains("https://stoat.example"))
+        XCTAssertFalse(text.contains("/Users/enka"))
+        XCTAssertFalse(text.contains("raw@example.com"))
+        XCTAssertFalse(text.contains("01JPHASE44FULLID0000000001"))
+    }
+
     private func ulid(milliseconds: UInt64) -> String {
         let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
         var value = milliseconds
@@ -5165,6 +5346,10 @@ private actor RecordingAPIClient: StoatAPIClient {
     private(set) var fetchCurrentUserCallCount = 0
     private(set) var editUserCallCount = 0
     private(set) var fetchMessagesCallCount = 0
+    private(set) var fetchMessageCallCount = 0
+    private(set) var searchedMessages: [(ChannelID, ChannelMessageSearchRequest)] = []
+    private(set) var pinnedMessages: [(ChannelID, MessageID)] = []
+    private(set) var unpinnedMessages: [(ChannelID, MessageID)] = []
     private(set) var fetchServerMembersCallCount = 0
     private(set) var fetchedServerMemberIDs: [ServerID] = []
     private(set) var fetchUserProfileCallCount = 0
@@ -5349,6 +5534,42 @@ private actor RecordingAPIClient: StoatAPIClient {
         throw StoatAPIError.notFound
     }
 
+    func fetchMessage(channelID: ChannelID, messageID: MessageID) async throws -> Message {
+        fetchMessageCallCount += 1
+        guard let message = messagesByChannel[channelID]?.first(where: { $0.id == messageID }) else {
+            throw StoatAPIError.notFound
+        }
+        return message
+    }
+
+    func fetchMessages(channelID: ChannelID, options: MessageFetchOptions) async throws -> [Message] {
+        fetchMessagesCallCount += 1
+        if let fetchError {
+            throw fetchError
+        }
+        var messages = messagesByChannel[channelID] ?? []
+        messages.sort { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
+        if let nearby = options.nearby,
+           let index = messages.firstIndex(where: { $0.id == nearby }) {
+            let limit = max(1, options.limit ?? 50)
+            let half = max(1, limit / 2)
+            let lower = max(messages.startIndex, index - half)
+            let upper = min(messages.endIndex, index + half + 1)
+            messages = Array(messages[lower..<upper])
+        } else {
+            if let before = options.before, let index = messages.firstIndex(where: { $0.id == before }) {
+                messages = Array(messages[..<index])
+            }
+            if let after = options.after, let index = messages.firstIndex(where: { $0.id == after }) {
+                messages = Array(messages[messages.index(after: index)...])
+            }
+            if let limit = options.limit, messages.count > limit {
+                messages = Array(messages.prefix(limit))
+            }
+        }
+        return messages
+    }
+
     func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message] {
         fetchMessagesCallCount += 1
         if let fetchError {
@@ -5363,6 +5584,22 @@ private actor RecordingAPIClient: StoatAPIClient {
             messages = Array(messages[messages.index(after: index)...])
         }
         if let limit, messages.count > limit {
+            messages = Array(messages.prefix(limit))
+        }
+        return messages
+    }
+
+    func searchMessages(channelID: ChannelID, request: ChannelMessageSearchRequest) async throws -> [Message] {
+        searchedMessages.append((channelID, request))
+        var messages = messagesByChannel[channelID] ?? []
+        if request.pinned == true {
+            messages = messages.filter { $0.isPinned }
+        }
+        if let query = request.query?.lowercased(), !query.isEmpty {
+            messages = messages.filter { ($0.content ?? "").lowercased().contains(query) }
+        }
+        messages.sort { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+        if let limit = request.limit, messages.count > limit {
             messages = Array(messages.prefix(limit))
         }
         return messages
@@ -5404,9 +5641,13 @@ private actor RecordingAPIClient: StoatAPIClient {
         removedReactions.append((channelID, messageID, emoji))
     }
 
-    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        pinnedMessages.append((channelID, messageID))
+    }
 
-    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        unpinnedMessages.append((channelID, messageID))
+    }
 
     func uploadFile(data: Data, filename: String, mimeType: String, tag: UploadTag) async throws -> UploadedFile {
         uploadedFiles.append(RecordedUpload(data: data, filename: filename, mimeType: mimeType, tag: tag))
@@ -5439,6 +5680,10 @@ private actor RecordingAttachmentMessageActionHandler: MessageActionHandling {
 
     func sentSnapshot() -> [RecordedAttachmentSend] {
         sent
+    }
+
+    func setSendError(_ error: (any Error & Sendable)?) {
+        sendError = error
     }
 
     func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?, attachments: [FileID]?) async throws -> Message {

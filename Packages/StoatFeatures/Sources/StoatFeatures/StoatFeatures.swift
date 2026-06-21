@@ -553,6 +553,11 @@ public final class MainShellViewModel {
     public var selectedSearchResultID: MessageID?
     public var searchHighlightState: TimelineSearchHighlightState?
     public var searchNavigationStatus: String?
+    public var targetMessageHighlightState: TargetMessageHighlightState?
+    public var isPinnedMessagesPresented = false
+    public var pinnedMessagesState = PinnedMessagesState()
+    public var typingIndicatorState = TypingIndicatorState()
+    public var phase44Diagnostics = Phase44ChatInteractionDiagnostics()
     public var activeCalibrationRun: TimelineCalibrationRun?
     public var calibrationCheckpointNote = ""
     public var importedCalibrationNotes = ""
@@ -689,7 +694,14 @@ public final class MainShellViewModel {
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
     @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
-    @ObservationIgnored private var ackTask: Task<Void, Never>?
+    @ObservationIgnored private var typingCleanupTask: Task<Void, Never>?
+    @ObservationIgnored private var ackTasksByChannelID: [ChannelID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var pendingAckMessageIDsByChannelID: [ChannelID: MessageID] = [:]
+    @ObservationIgnored private var lastAckRequestAtByChannelID: [ChannelID: Date] = [:]
+    @ObservationIgnored private var messageNavigationCoordinator = MessageNavigationCoordinator()
+    @ObservationIgnored private var targetHighlightClearTask: Task<Void, Never>?
+    @ObservationIgnored private var pinnedMessagesFetchTask: Task<Void, Never>?
+    @ObservationIgnored private var pinnedMessageActionTasks: [MessageID: Task<Void, Never>] = [:]
     @ObservationIgnored private var referenceFetchTasks: [MessageID: Task<Void, Never>] = [:]
     @ObservationIgnored private var attachmentLoadTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var imageResourceLoadTasks: [ImageCacheKey: Task<Void, Never>] = [:]
@@ -848,7 +860,11 @@ public final class MainShellViewModel {
         snapshotObservationTask?.cancel()
         selectedChannelLoadTask?.cancel()
         typingEndTask?.cancel()
-        ackTask?.cancel()
+        typingCleanupTask?.cancel()
+        ackTasksByChannelID.values.forEach { $0.cancel() }
+        targetHighlightClearTask?.cancel()
+        pinnedMessagesFetchTask?.cancel()
+        pinnedMessageActionTasks.values.forEach { $0.cancel() }
         transientStatusTask?.cancel()
         referenceFetchTasks.values.forEach { $0.cancel() }
         attachmentLoadTasks.values.forEach { $0.cancel() }
@@ -4665,6 +4681,7 @@ public final class MainShellViewModel {
         selection.dmChannelID = nil
         clearTimelineSelection()
         reconcileSearchHighlightsForSelectedChannel()
+        clearTypingIndicatorState()
         placeholderStatus = nil
         persistLiveSelectionIfNeeded()
     }
@@ -4677,6 +4694,7 @@ public final class MainShellViewModel {
         selection.dmChannelID = nil
         clearTimelineSelection()
         reconcileSearchHighlightsForSelectedChannel()
+        clearTypingIndicatorState()
         placeholderStatus = nil
         persistLiveSelectionIfNeeded()
     }
@@ -4708,6 +4726,7 @@ public final class MainShellViewModel {
         clearTimelineSelection()
         updateViewportForSelectedChannel()
         reconcileSearchHighlightsForSelectedChannel()
+        refreshTypingIndicatorState()
         placeholderStatus = nil
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
@@ -4744,6 +4763,7 @@ public final class MainShellViewModel {
         clearTimelineSelection()
         updateViewportForSelectedChannel()
         reconcileSearchHighlightsForSelectedChannel()
+        refreshTypingIndicatorState()
         placeholderStatus = nil
         requestFocus(.timeline)
         acknowledgeSelectedChannel()
@@ -4991,11 +5011,13 @@ public final class MainShellViewModel {
             seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
             notificationLiveConnectionGeneration = sessionCoordinator.liveConnectionGeneration
             deliveredNotificationIDs.removeAll()
+            clearTypingIndicatorState(channelID: selectedConversationChannelID)
         } else if sessionCoordinator.mode != .liveManual {
             notificationLiveConnectionGeneration = nil
             seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
             deliveredNotificationIDs.removeAll()
             notificationBanners.removeAll()
+            clearTypingIndicatorState(channelID: selectedConversationChannelID)
         }
         messageActionHandler = sessionCoordinator.messageActionHandler
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
@@ -5024,6 +5046,7 @@ public final class MainShellViewModel {
         observe(snapshotSource: sessionCoordinator.snapshotSource)
         validateSelection()
         messageController.hydrate(from: snapshot)
+        refreshTypingIndicatorState()
         quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
         scheduleSelectedChannelLoad()
         updateDockBadge()
@@ -6131,6 +6154,7 @@ public final class MainShellViewModel {
         )
         draftState.shouldMentionReplyAuthor = true
         composerDrafts[timelineMessage.message.channelID] = draftState
+        phase44Diagnostics.replyComposerSetCount += 1
         timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: source, mode: .replying)
         timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: timelineMessage.message.id, reason: .jumpCommand)
         focusComposer()
@@ -6177,12 +6201,13 @@ public final class MainShellViewModel {
             }
             return File(attachmentDraft: draft, uploadedFileID: id)
         }
-        composerDrafts[channelID] = ComposerDraftState(channelID: channelID)
         composerError = nil
         recordMessageSendDiagnostics(channelID: channelID, stage: .creatingOptimisticMessage, result: .pending, error: nil)
         recordMessageSendDiagnostics(channelID: channelID, stage: .sendingRequest, result: .pending, error: nil)
         let didSend = await messageController.sendMessage(channelID: channelID, content: content, replies: replies, attachments: attachmentIDs, attachmentFiles: attachmentFiles, handler: messageActionHandler)
         if didSend {
+            composerDrafts[channelID] = ComposerDraftState(channelID: channelID)
+            phase44Diagnostics.replyComposerClearedAfterSendCount += draftState.replyContext == nil ? 0 : 1
             recordMessageSendDiagnostics(channelID: channelID, stage: .decodingResponse, result: .pending, error: nil)
             recordMessageSendDiagnostics(channelID: channelID, stage: .reconciled, result: .succeeded, error: nil)
             messageActionStatus = nil
@@ -6197,6 +6222,7 @@ public final class MainShellViewModel {
             let error = messageController.lastErrorByChannelID[channelID] ?? "Message send failed."
             recordMessageSendDiagnostics(channelID: channelID, stage: .failed, result: .failed, error: error)
             messageActionStatus = error
+            phase44Diagnostics.replyComposerPreservedAfterFailureCount += draftState.replyContext == nil ? 0 : 1
             if snapshot.channelsByID[channelID].map(DMChannelClassifier.isDirectMessageLike) == true {
                 dmLiveTrace.composerTargetChannelID = channelID
                 dmLiveTrace.lastError = MessageSendDiagnosticsFormatter.redact(error)
@@ -6425,6 +6451,14 @@ public final class MainShellViewModel {
             placeholderStatus = "Selected message cannot be pinned."
             return
         }
+        guard !pinnedMessagesState.inFlightActionMessageIDs.contains(timelineMessage.message.id) else {
+            phase44Diagnostics.lastSafeStatus = "Duplicate pin action deduped"
+            return
+        }
+        pinnedMessagesState.inFlightActionMessageIDs.insert(timelineMessage.message.id)
+        defer {
+            pinnedMessagesState.inFlightActionMessageIDs.remove(timelineMessage.message.id)
+        }
         let shouldPin = !timelineMessage.message.isPinned
         do {
             if shouldPin {
@@ -6433,8 +6467,19 @@ public final class MainShellViewModel {
                 try await messageActionHandler.unpinMessage(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id)
             }
             messageController.applyPinState(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, isPinned: shouldPin)
+            if shouldPin {
+                phase44Diagnostics.pinActionSuccessCount += 1
+            } else {
+                phase44Diagnostics.unpinActionSuccessCount += 1
+                updatePinnedMessagesLocalState(messageID: timelineMessage.message.id, isPinned: false)
+            }
             messageActionStatus = shouldPin ? "Message pinned" : "Message unpinned"
         } catch {
+            if shouldPin {
+                phase44Diagnostics.pinActionFailureCount += 1
+            } else {
+                phase44Diagnostics.unpinActionFailureCount += 1
+            }
             messageActionStatus = "Pin action failed: \(error.userFacingMessage)"
         }
     }
@@ -6596,12 +6641,27 @@ public final class MainShellViewModel {
     }
 
     public func typingUsers(for channelID: ChannelID?) -> [User] {
-        guard let channelID else { return [] }
-        let currentUserID = currentUserID
-        return (snapshot.typingUsersByChannelID[channelID] ?? [])
-            .filter { $0 != currentUserID }
+        guard let channelID, typingIndicatorState.channelID == channelID else { return [] }
+        return typingIndicatorState.activeUserIDs
             .compactMap { snapshot.usersByID[$0] }
             .sorted { ($0.displayName ?? $0.username) < ($1.displayName ?? $1.username) }
+    }
+
+    public func typingIndicatorText(for channelID: ChannelID?) -> String? {
+        guard let channelID, typingIndicatorState.channelID == channelID else { return nil }
+        let names = typingIndicatorState.activeUserIDs.map { typingDisplayName(userID: $0, channelID: channelID) }
+        return TypingIndicatorState.displayText(names: names)
+    }
+
+    private func typingDisplayName(userID: UserID, channelID: ChannelID) -> String {
+        let serverID = snapshot.channelsByID[channelID]?.serverID
+        let display = resolvedUserDisplay(
+            for: snapshot.usersByID[userID],
+            member: member(for: userID, serverID: serverID),
+            fallbackID: userID,
+            serverID: serverID
+        )
+        return display.isFallback ? "Someone" : display.displayName
     }
 
     public func unread(for channelID: ChannelID) -> ChannelUnread? {
@@ -6821,36 +6881,260 @@ public final class MainShellViewModel {
     }
 
     public func resolvedReplyPreview(for message: Message) -> String? {
+        replyPreviewState(for: message)?.plainText
+    }
+
+    public func replyPreviewItem(for message: Message) -> MessageRowReplyPreviewItem? {
+        guard let state = replyPreviewState(for: message) else { return nil }
+        let icon: String
+        switch state.resolution {
+        case .loaded:
+            icon = "arrowshape.turn.up.left.fill"
+        case .loading:
+            icon = "arrowshape.turn.up.left"
+        case .deleted, .inaccessible, .notFound, .unavailable, .notSupported:
+            icon = "exclamationmark.bubble"
+        }
+        return MessageRowReplyPreviewItem(
+            id: state.id,
+            authorName: state.authorDisplayName,
+            summary: state.summary,
+            systemImage: icon,
+            canOpen: state.canOpenTarget,
+            accessibilityLabel: state.canOpenTarget ? "Jump to replied message, \(state.plainText)" : "Reply preview unavailable, \(state.plainText)"
+        )
+    }
+
+    public func replyPreviewState(for message: Message) -> ReplyPreviewState? {
         guard let replyID = message.replies?.first else { return nil }
         if let referenced = selectedTimelineMessages.first(where: { $0.message.id == replyID })?.message {
-            let author = snapshot.usersByID[referenced.authorID]
-            let member = member(for: referenced.authorID, serverID: snapshot.channelsByID[referenced.channelID]?.serverID)
-            let authorName = referenced.masquerade?.name ?? displayName(for: author, member: member, fallbackID: referenced.authorID)
-            return "\(authorName): \(Self.replyPreviewText(for: referenced))"
+            return replyPreviewState(message: message, referenced: referenced, canOpenTarget: true)
         }
         if let resolution = resolvedReferencesByChannelID[message.channelID]?[replyID] {
             switch resolution {
             case let .loaded(referenced):
-                let author = snapshot.usersByID[referenced.authorID]
-                let member = member(for: referenced.authorID, serverID: snapshot.channelsByID[referenced.channelID]?.serverID)
-                let authorName = referenced.masquerade?.name ?? displayName(for: author, member: member, fallbackID: referenced.authorID)
-                return "\(authorName): \(Self.replyPreviewText(for: referenced))"
+                return replyPreviewState(message: message, referenced: referenced, canOpenTarget: true)
             case .deleted:
-                return "Original message was deleted"
+                return ReplyPreviewState(channelID: message.channelID, messageID: message.id, targetMessageID: replyID, resolution: .deleted, summary: "Original message was deleted", canOpenTarget: false)
             case .forbidden:
-                return "Original message is not accessible"
+                return ReplyPreviewState(channelID: message.channelID, messageID: message.id, targetMessageID: replyID, resolution: .inaccessible, summary: "Original message is not accessible", canOpenTarget: false)
             case .notFound:
-                return "Original message was not found"
+                return ReplyPreviewState(channelID: message.channelID, messageID: message.id, targetMessageID: replyID, resolution: .notFound, summary: "Original message was not found", canOpenTarget: false)
             case .rateLimited:
-                return "Original message is rate limited"
-            case let .unavailable(message):
-                return message
+                return ReplyPreviewState(channelID: message.channelID, messageID: message.id, targetMessageID: replyID, resolution: .unavailable, summary: "Original message is temporarily unavailable", canOpenTarget: true)
+            case let .unavailable(unavailableMessage):
+                return ReplyPreviewState(channelID: message.channelID, messageID: message.id, targetMessageID: replyID, resolution: .unavailable, summary: unavailableMessage, canOpenTarget: true)
             case .notSupported:
-                return "Live reference fetching is unavailable"
+                return ReplyPreviewState(channelID: message.channelID, messageID: message.id, targetMessageID: replyID, resolution: .notSupported, summary: "Live reference fetching is unavailable", canOpenTarget: false)
             }
         }
+        return ReplyPreviewState(
+            channelID: message.channelID,
+            messageID: message.id,
+            targetMessageID: replyID,
+            resolution: .loading,
+            summary: "Loading original message...",
+            canOpenTarget: effectiveRuntimeMode == .liveManual
+        )
+    }
+
+    public func prepareReplyPreview(for message: Message) {
+        guard let replyID = message.replies?.first else { return }
+        if selectedTimelineMessages.contains(where: { $0.message.id == replyID }) {
+            phase44Diagnostics.replyPreviewResolvedLoaded += 1
+            return
+        }
+        guard resolvedReferencesByChannelID[message.channelID]?[replyID] == nil else { return }
+        phase44Diagnostics.replyPreviewResolvedUnloaded += 1
         resolveReferenceIfNeeded(channelID: message.channelID, messageID: replyID)
-        return "Loading original message..."
+    }
+
+    public func openReplyPreview(for message: Message) async {
+        guard let replyID = message.replies?.first else { return }
+        await navigateToMessage(
+            MessageNavigationRequest(
+                serverID: snapshot.channelsByID[message.channelID]?.serverID,
+                channelID: message.channelID,
+                messageID: replyID,
+                source: .replyPreview,
+                allowChannelFallback: false
+            )
+        )
+    }
+
+    private func replyPreviewState(message: Message, referenced: Message, canOpenTarget: Bool) -> ReplyPreviewState {
+        let display = resolvedUserDisplay(for: referenced)
+        let authorName = Phase44SafeSummary.safeDisplayName(referenced.masquerade?.name) ?? Phase44SafeSummary.safeDisplayName(display.displayName) ?? "Someone"
+        return ReplyPreviewState(
+            channelID: message.channelID,
+            messageID: message.id,
+            targetMessageID: referenced.id,
+            resolution: .loaded,
+            authorDisplayName: authorName,
+            avatarFile: display.avatarFile,
+            summary: Phase44SafeSummary.messageSummary(for: referenced),
+            canOpenTarget: canOpenTarget
+        )
+    }
+
+    @discardableResult
+    public func navigateToMessage(_ request: MessageNavigationRequest) async -> MessageNavigationResult {
+        recordPhase44JumpSource(request.source)
+        guard messageNavigationCoordinator.begin(request) else {
+            phase44Diagnostics.lastSafeStatus = "Duplicate message navigation deduped"
+            return .deduped
+        }
+        defer {
+            messageNavigationCoordinator.finish(request)
+        }
+
+        let started = Date()
+        guard snapshot.channelsByID[request.channelID] != nil else {
+            phase44Diagnostics.jumpUnavailableCount += 1
+            phase44Diagnostics.lastSafeStatus = "Message channel unavailable"
+            placeholderStatus = "Channel is unavailable."
+            recordPhase44Duration("jump", startedAt: started)
+            return .unavailable
+        }
+
+        if selectedConversationChannelID != request.channelID {
+            selectChannel(request.channelID)
+        }
+
+        guard let messageID = request.messageID else {
+            phase44Diagnostics.jumpDegradedToChannelCount += 1
+            phase44Diagnostics.lastSafeStatus = "Navigated to channel only"
+            placeholderStatus = nil
+            recordPhase44Duration("jump", startedAt: started)
+            return .channelOnly
+        }
+
+        if selectedTimelineMessages.contains(where: { $0.message.id == messageID }) {
+            focusTargetMessage(channelID: request.channelID, messageID: messageID, source: request.source, duration: request.highlightDuration)
+            phase44Diagnostics.jumpLoadedCount += 1
+            phase44Diagnostics.lastSafeStatus = "Navigated to loaded message"
+            recordTimelineCalibrationObservation(kind: .afterSearchJump)
+            recordPhase44Duration("jump", startedAt: started)
+            return .loaded
+        }
+
+        phase44Diagnostics.jumpUnloadedCount += 1
+        guard effectiveRuntimeMode == .liveManual,
+              effectiveSessionState == .connected,
+              sessionCoordinator?.hydrationStatus.readyReceived == true
+        else {
+            if request.allowChannelFallback {
+                phase44Diagnostics.jumpDegradedToChannelCount += 1
+                phase44Diagnostics.lastSafeStatus = "Message unavailable, degraded to channel"
+                placeholderStatus = "Opened channel; message is not loaded."
+                recordPhase44Duration("jump", startedAt: started)
+                return .channelOnly
+            }
+            phase44Diagnostics.jumpUnavailableCount += 1
+            phase44Diagnostics.lastSafeStatus = "Message unavailable without live context"
+            placeholderStatus = "Message is not loaded."
+            recordPhase44Duration("jump", startedAt: started)
+            return .unavailable
+        }
+
+        let loaded = await messageController.loadMessagesAround(channelID: request.channelID, targetMessageID: messageID)
+        if loaded, selectedTimelineMessages.contains(where: { $0.message.id == messageID }) {
+            focusTargetMessage(channelID: request.channelID, messageID: messageID, source: request.source, duration: request.highlightDuration)
+            phase44Diagnostics.jumpLoadedCount += 1
+            phase44Diagnostics.lastSafeStatus = "Loaded context and navigated to message"
+            recordTimelineCalibrationObservation(kind: .afterSearchJump)
+            recordPhase44Duration("jump", startedAt: started)
+            return .loadedAfterContextFetch
+        }
+
+        if request.allowChannelFallback {
+            phase44Diagnostics.jumpDegradedToChannelCount += 1
+            phase44Diagnostics.lastSafeStatus = "Target unavailable, degraded to channel"
+            placeholderStatus = loaded ? "Opened channel; target was not returned." : "Opened channel; target could not be loaded."
+            recordPhase44Duration("jump", startedAt: started)
+            return .channelOnly
+        }
+
+        phase44Diagnostics.jumpUnavailableCount += 1
+        phase44Diagnostics.lastSafeStatus = loaded ? "Target was not returned" : "Target could not be loaded"
+        placeholderStatus = loaded ? "Target message was not returned." : "Target message could not be loaded."
+        recordPhase44Duration("jump", startedAt: started)
+        return .unavailable
+    }
+
+    private func focusTargetMessage(channelID: ChannelID, messageID: MessageID, source: MessageNavigationSource, duration: TimeInterval) {
+        timelineSelection = TimelineSelection(channelID: channelID, messageID: messageID, source: focusSource(for: source))
+        let isVisible = timelineViewport.visibleRange?.channelID == channelID && timelineViewport.visibleRange?.visibleMessageIDs.contains(messageID) == true
+        if !isVisible || timelineViewport.selectedMessageID != messageID {
+            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: messageID, reason: .jumpCommand)
+        }
+        setTargetHighlight(channelID: channelID, messageID: messageID, source: source, duration: duration)
+        requestFocus(.timeline)
+    }
+
+    private func focusSource(for source: MessageNavigationSource) -> MessageFocusSource {
+        switch source {
+        case .notification:
+            return .notification
+        case .replyPreview, .pinnedMessage, .loadedSearch, .remoteSearch, .directRoute:
+            return .mouse
+        case .unreadMarker:
+            return .scrollJump
+        case .command:
+            return .keyboard
+        }
+    }
+
+    private func setTargetHighlight(channelID: ChannelID, messageID: MessageID, source: MessageNavigationSource, duration: TimeInterval) {
+        targetHighlightClearTask?.cancel()
+        let state = TargetMessageHighlightState(channelID: channelID, messageID: messageID, source: source, duration: duration)
+        targetMessageHighlightState = state
+        phase44Diagnostics.targetHighlightCount += 1
+        targetHighlightClearTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(state.expiresAt.timeIntervalSince(state.startedAt) * 1_000)))
+            await MainActor.run {
+                guard self?.targetMessageHighlightState == state else { return }
+                self?.targetMessageHighlightState = nil
+            }
+        }
+    }
+
+    public func isTargetMessageHighlighted(_ messageID: MessageID, channelID: ChannelID) -> Bool {
+        guard let targetMessageHighlightState,
+              targetMessageHighlightState.channelID == channelID,
+              targetMessageHighlightState.messageID == messageID,
+              targetMessageHighlightState.isActive()
+        else { return false }
+        return true
+    }
+
+    private func recordPhase44JumpSource(_ source: MessageNavigationSource) {
+        phase44Diagnostics.jumpSourceCounts[source.rawValue, default: 0] += 1
+    }
+
+    private func recordPhase44SearchBucket(remote: Bool, count: Int) {
+        let key = Phase44SafeSummary.bucket(for: count)
+        if remote {
+            phase44Diagnostics.searchRemoteResultBuckets[key, default: 0] += 1
+        } else {
+            phase44Diagnostics.searchLocalResultBuckets[key, default: 0] += 1
+        }
+    }
+
+    private func recordPhase44Duration(_ prefix: String, startedAt: Date) {
+        let elapsed = Date().timeIntervalSince(startedAt)
+        let bucket: String
+        switch elapsed {
+        case ..<0.1:
+            bucket = "\(prefix)<100ms"
+        case ..<0.5:
+            bucket = "\(prefix)<500ms"
+        case ..<1.5:
+            bucket = "\(prefix)<1500ms"
+        default:
+            bucket = "\(prefix)>=1500ms"
+        }
+        phase44Diagnostics.durationBuckets[bucket, default: 0] += 1
     }
 
     public func timelineDiagnostics() -> TimelineDiagnostics {
@@ -6957,7 +7241,8 @@ public final class MainShellViewModel {
         apiCategory: \(memberHydration.apiDiagnostics?.errorCategory ?? "-")
         apiRateRemaining: \(memberHydration.apiDiagnostics?.rateLimitInfo.remaining.map(String.init) ?? "-")
         """
-        let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText + "\n" + send + "\n" + dmTrace)))
+        let phase44 = Phase44DiagnosticsFormatter.redactedText(phase44Diagnostics)
+        let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics(AttachmentDiagnosticsFormatter.redact(timeline + "\n" + attachmentText + "\n" + send + "\n" + dmTrace + "\n" + phase44)))
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -7202,6 +7487,8 @@ public final class MainShellViewModel {
 
     public func setSelectedChannelMuted(_ isMuted: Bool) {
         guard let channelID = selectedConversationChannelID else { return }
+        phase44Diagnostics.muteSuppressionDecisionCounts[isMuted ? "localChannelMuteEnabled" : "localChannelMuteDisabled", default: 0] += 1
+        phase44Diagnostics.lastSafeStatus = "Channel mute preference is local per-channel notification preference; server-wide cloud mute is not verified"
         setNotificationPreference { preferences in
             var channel = preferences.preference(for: channelID)
             channel.isMuted = isMuted
@@ -7284,36 +7571,37 @@ public final class MainShellViewModel {
                 return
             }
         }
-        selectChannel(route.channelID)
-        guard let messageID = route.messageID else { return }
-        if selectedTimelineMessages.contains(where: { $0.message.id == messageID }) {
-            timelineSelection = TimelineSelection(channelID: route.channelID, messageID: messageID, source: .notification)
-            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: messageID, reason: .jumpCommand)
-            placeholderStatus = "Opened notification"
-            recordNotificationRouteOutcome(.opened)
-            return
-        }
-        guard effectiveRuntimeMode == .liveManual else {
-            placeholderStatus = "Notification message is not loaded."
-            recordNotificationRouteOutcome(.failed)
-            return
-        }
-        guard effectiveSessionState == .connected,
-              sessionCoordinator?.hydrationStatus.readyReceived == true
-        else {
+        let targetLoaded = route.messageID.map { messageID in
+            selectedConversationChannelID == route.channelID && selectedTimelineMessages.contains { $0.message.id == messageID }
+        } ?? true
+        if effectiveRuntimeMode == .liveManual,
+           !targetLoaded,
+           (effectiveSessionState != .connected || sessionCoordinator?.hydrationStatus.readyReceived != true) {
             queueNotificationRoute(route)
             placeholderStatus = "Reconnect to open this message."
             recordNotificationRouteOutcome(.queuedAwaitingManualConnect)
             return
         }
-        let loaded = await messageController.loadMessagesAround(channelID: route.channelID, targetMessageID: messageID)
-        if loaded, selectedTimelineMessages.contains(where: { $0.message.id == messageID }) {
-            timelineSelection = TimelineSelection(channelID: route.channelID, messageID: messageID, source: .notification)
-            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: messageID, reason: .jumpCommand)
+        let result = await navigateToMessage(
+            MessageNavigationRequest(
+                serverID: route.serverID,
+                channelID: route.channelID,
+                messageID: route.messageID,
+                source: .notification,
+                allowChannelFallback: true
+            )
+        )
+        switch result {
+        case .loaded, .loadedAfterContextFetch, .channelOnly, .deduped:
             placeholderStatus = "Opened notification"
             recordNotificationRouteOutcome(.opened)
-        } else {
-            placeholderStatus = loaded ? "Notification target was not returned." : "Notification target could not be loaded."
+            if result == .channelOnly, route.messageID != nil {
+                phase44Diagnostics.notificationRouteDegradedCount += 1
+            }
+        case .queued:
+            recordNotificationRouteOutcome(.queuedAwaitingManualConnect)
+        case .unavailable, .failed:
+            placeholderStatus = "Notification target could not be opened."
             recordNotificationRouteOutcome(.failed)
         }
     }
@@ -7441,10 +7729,11 @@ public final class MainShellViewModel {
 
     public func jumpToLoadedFindResult(_ result: LoadedMessageFindResult) {
         guard result.channelID == selectedConversationChannelID else { return }
-        timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
-        timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
-        lastTimelineActionResult = "Jumped to loaded find result"
-        recordTimelineCalibrationObservation(kind: .afterSearchJump)
+        Task { [weak self] in
+            await self?.navigateToMessage(
+                MessageNavigationRequest(channelID: result.channelID, messageID: result.messageID, source: .loadedSearch)
+            )
+        }
     }
 
     public func openChannelSearch(mode: ChannelSearchMode = .loadedOnly) {
@@ -7457,9 +7746,123 @@ public final class MainShellViewModel {
         focusTarget = .quickSwitcher
     }
 
+    public func openPinnedMessages() {
+        guard selectedConversationChannelID != nil else {
+            placeholderStatus = "Select a channel before opening pinned messages."
+            return
+        }
+        isPinnedMessagesPresented = true
+        previousFocusTarget = focusTarget
+        focusTarget = .quickSwitcher
+        Task { [weak self] in
+            await self?.refreshPinnedMessages()
+        }
+    }
+
+    public func closePinnedMessages() {
+        isPinnedMessagesPresented = false
+        focusTarget = previousFocusTarget
+    }
+
     public func closeChannelSearch() {
         isChannelSearchPresented = false
         focusTarget = previousFocusTarget
+    }
+
+    public func refreshPinnedMessages() async {
+        guard effectiveRuntimeMode == .liveManual,
+              effectiveSessionState == .connected,
+              let channelID = selectedConversationChannelID,
+              let apiClient = sessionCoordinator?.apiClient
+        else {
+            let message = "Pinned messages require a connected live session."
+            pinnedMessagesState.loadState = selectedConversationChannelID.map { .failed($0, message) } ?? .idle
+            phase44Diagnostics.pinnedListFailureCount += 1
+            phase44Diagnostics.lastSafeStatus = message
+            return
+        }
+        if case .loading(channelID) = pinnedMessagesState.loadState {
+            return
+        }
+        pinnedMessagesState.loadState = .loading(channelID)
+        phase44Diagnostics.pinnedListRequestCount += 1
+        let started = Date()
+        do {
+            let messages = try await apiClient.searchMessages(
+                channelID: channelID,
+                request: ChannelMessageSearchRequest(pinned: true, limit: 50, sort: .latest, includeUsers: true)
+            )
+            let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
+            for message in messages {
+                mergePhase43MessageIdentity(message)
+            }
+            let items = messages.map { pinnedMessageDisplayItem(from: $0, loadedIDs: loadedIDs) }
+            pinnedMessagesState.loadState = .loaded(channelID, items)
+            pinnedMessagesState.lastUpdatedAt = Date()
+            phase44Diagnostics.pinnedListSuccessCount += 1
+            phase44Diagnostics.lastSafeStatus = items.isEmpty ? "Pinned list empty" : "Pinned list loaded"
+            recordPhase44Duration("pinnedList", startedAt: started)
+        } catch {
+            let message = "Pinned messages failed: \(error.userFacingMessage)"
+            pinnedMessagesState.loadState = .failed(channelID, message)
+            phase44Diagnostics.pinnedListFailureCount += 1
+            phase44Diagnostics.lastSafeStatus = message
+            recordPhase44Duration("pinnedList", startedAt: started)
+        }
+    }
+
+    private func pinnedMessageDisplayItem(from message: Message, loadedIDs: Set<MessageID>) -> PinnedMessageDisplayItem {
+        let display = resolvedUserDisplay(for: message)
+        let authorName = Phase44SafeSummary.safeDisplayName(message.masquerade?.name) ?? Phase44SafeSummary.safeDisplayName(display.displayName) ?? "Someone"
+        return PinnedMessageDisplayItem(
+            channelID: message.channelID,
+            messageID: message.id,
+            authorID: message.authorID,
+            authorDisplayName: authorName,
+            summary: Phase44SafeSummary.messageSummary(for: message),
+            createdAt: message.createdAt,
+            isPinned: true,
+            isLoaded: loadedIDs.contains(message.id),
+            canUnpin: true,
+            status: loadedIDs.contains(message.id) ? "Loaded" : "Outside loaded range"
+        )
+    }
+
+    public func openPinnedMessage(_ item: PinnedMessageDisplayItem) async {
+        phase44Diagnostics.pinnedMessageJumpCount += 1
+        let result = await navigateToMessage(
+            MessageNavigationRequest(channelID: item.channelID, messageID: item.messageID, source: .pinnedMessage)
+        )
+        if !result.isSuccess {
+            phase44Diagnostics.pinnedMessageUnavailableCount += 1
+        }
+    }
+
+    public func unpinPinnedMessage(_ item: PinnedMessageDisplayItem) async {
+        guard !pinnedMessagesState.inFlightActionMessageIDs.contains(item.messageID) else { return }
+        pinnedMessagesState.inFlightActionMessageIDs.insert(item.messageID)
+        defer {
+            pinnedMessagesState.inFlightActionMessageIDs.remove(item.messageID)
+        }
+        do {
+            try await messageActionHandler.unpinMessage(channelID: item.channelID, messageID: item.messageID)
+            messageController.applyPinState(channelID: item.channelID, messageID: item.messageID, isPinned: false)
+            updatePinnedMessagesLocalState(messageID: item.messageID, isPinned: false)
+            messageActionStatus = "Message unpinned"
+            phase44Diagnostics.unpinActionSuccessCount += 1
+        } catch {
+            messageActionStatus = "Unpin failed: \(error.userFacingMessage)"
+            phase44Diagnostics.unpinActionFailureCount += 1
+        }
+    }
+
+    private func updatePinnedMessagesLocalState(messageID: MessageID, isPinned: Bool) {
+        guard case let .loaded(channelID, items) = pinnedMessagesState.loadState else { return }
+        if isPinned {
+            pinnedMessagesState.loadState = .loaded(channelID, items)
+        } else {
+            pinnedMessagesState.loadState = .loaded(channelID, items.filter { $0.messageID != messageID })
+        }
     }
 
     public func runChannelSearch() async {
@@ -7478,6 +7881,7 @@ public final class MainShellViewModel {
             channelSearchState = results.isEmpty ? .empty(query) : .results(query, results)
             selectedSearchResultID = results.first?.messageID
             refreshSearchHighlightState()
+            recordPhase44SearchBucket(remote: false, count: results.count)
         case .liveChannel, .pinned:
             guard effectiveRuntimeMode == .liveManual,
                   effectiveSessionState == .connected,
@@ -7503,7 +7907,8 @@ public final class MainShellViewModel {
                         query: query.mode == .pinned ? nil : trimmed,
                         pinned: query.mode == .pinned ? true : (query.pinnedOnly ? true : nil),
                         limit: 25,
-                        sort: query.mode == .pinned ? .latest : .relevance
+                        sort: query.mode == .pinned ? .latest : .relevance,
+                        includeUsers: true
                     )
                 )
                 let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
@@ -7517,6 +7922,7 @@ public final class MainShellViewModel {
                     LoadedMessageFindResult(messageID: $0.messageID, channelID: $0.channelID, authorID: $0.authorID, createdAt: $0.createdAt, snippet: $0.snippet)
                 }
                 remoteSearchStatus = results.isEmpty ? "No selected-channel results." : "\(results.count) selected-channel result(s)."
+                recordPhase44SearchBucket(remote: query.mode != .loadedOnly, count: results.count)
                 lastTimelineActionResult = "Selected-channel search completed"
             } catch {
                 let message = "Selected-channel search failed: \(error.userFacingMessage)"
@@ -7603,8 +8009,7 @@ public final class MainShellViewModel {
 
     private func scrollToSearchResult(_ result: ChannelSearchResult) {
         guard result.channelID == selectedConversationChannelID else { return }
-        timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
-        timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
+        focusTargetMessage(channelID: result.channelID, messageID: result.messageID, source: navigationSource(for: result), duration: 2)
     }
 
     public func selectSearchResult(_ result: ChannelSearchResult) {
@@ -7613,7 +8018,11 @@ public final class MainShellViewModel {
         let isLoadedNow = selectedTimelineMessages.contains { $0.message.id == result.messageID }
         searchNavigationStatus = isLoadedNow ? nil : "Result outside loaded range."
         if isLoadedNow {
-            scrollToSearchResult(result)
+            Task { [weak self] in
+                await self?.navigateToMessage(
+                    MessageNavigationRequest(channelID: result.channelID, messageID: result.messageID, source: self?.navigationSource(for: result) ?? .loadedSearch)
+                )
+            }
         }
     }
 
@@ -7629,14 +8038,13 @@ public final class MainShellViewModel {
         guard let result = selectedSearchResult else { return }
         selectSearchResult(result)
         guard result.channelID == selectedConversationChannelID else { return }
-        if selectedTimelineMessages.contains(where: { $0.message.id == result.messageID }) {
-            scrollToSearchResult(result)
-            searchNavigationStatus = "Jumped to search result"
-            lastTimelineActionResult = "Jumped to search result"
-            recordTimelineCalibrationObservation(kind: .afterSearchJump)
-        } else {
-            searchNavigationStatus = "Result outside loaded range."
-            lastTimelineActionResult = "Search result outside loaded range"
+        Task { [weak self] in
+            guard let self else { return }
+            let navigationResult = await self.navigateToMessage(
+                MessageNavigationRequest(channelID: result.channelID, messageID: result.messageID, source: self.navigationSource(for: result))
+            )
+            self.searchNavigationStatus = navigationResult.isSuccess ? "Jumped to search result" : "Result unavailable."
+            self.lastTimelineActionResult = navigationResult.isSuccess ? "Jumped to search result" : "Search result unavailable"
         }
     }
 
@@ -7647,23 +8055,21 @@ public final class MainShellViewModel {
 
     public func loadAroundSearchResult(_ result: ChannelSearchResult) async {
         guard result.channelID == selectedConversationChannelID else { return }
-        guard routeVerificationResult.aroundMessageFetch == .supported || lastRouteVerificationResult != nil else {
-            searchNavigationStatus = "Around-message route is not verified."
-            return
-        }
-        let loaded = await messageController.loadMessagesAround(channelID: result.channelID, targetMessageID: result.messageID)
-        if loaded, selectedTimelineMessages.contains(where: { $0.message.id == result.messageID }) {
-            timelineSelection = TimelineSelection(channelID: result.channelID, messageID: result.messageID, source: .quickSwitcher)
-            timelineViewport = viewportReducer.keepVisible(timelineViewport, messageID: result.messageID, reason: .jumpCommand)
+        let navigationResult = await navigateToMessage(
+            MessageNavigationRequest(channelID: result.channelID, messageID: result.messageID, source: navigationSource(for: result))
+        )
+        switch navigationResult {
+        case .loaded, .loadedAfterContextFetch, .deduped:
             searchNavigationStatus = "Loaded around result"
             lastTimelineActionResult = "Loaded around search result"
             markSearchResultLoaded(result.messageID)
             refreshSearchHighlightState()
-            recordTimelineCalibrationObservation(kind: .afterSearchJump)
-        } else if loaded {
-            searchNavigationStatus = "Loaded around result, but target was not returned."
-            lastTimelineActionResult = "Around-message fetch did not include target"
-        } else {
+        case .channelOnly:
+            searchNavigationStatus = "Opened channel; target was not returned."
+            lastTimelineActionResult = "Search result degraded to channel"
+        case .queued:
+            searchNavigationStatus = "Navigation queued."
+        case .unavailable, .failed:
             searchNavigationStatus = "Load around result failed."
             lastTimelineActionResult = "Load around search result failed"
         }
@@ -7707,7 +8113,8 @@ public final class MainShellViewModel {
                     query: remoteSearchPinnedOnly ? nil : query,
                     pinned: remoteSearchPinnedOnly ? true : nil,
                     limit: 25,
-                    sort: remoteSearchPinnedOnly ? .latest : .relevance
+                    sort: remoteSearchPinnedOnly ? .latest : .relevance,
+                    includeUsers: true
                 )
             )
             let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
@@ -7721,6 +8128,7 @@ public final class MainShellViewModel {
                 )
             }
             remoteSearchStatus = messages.isEmpty ? "No selected-channel results." : "\(messages.count) selected-channel result(s)."
+            recordPhase44SearchBucket(remote: true, count: messages.count)
             lastTimelineActionResult = "Selected-channel search completed"
             channelSearchQuery = ChannelSearchQuery(text: remoteSearchQuery, mode: remoteSearchPinnedOnly ? .pinned : .liveChannel, pinnedOnly: remoteSearchPinnedOnly)
             let phase13Results = messages.map { channelSearchResult(from: $0, mode: remoteSearchPinnedOnly ? .pinned : .liveChannel, matching: query, loadedIDs: loadedIDs) }
@@ -7764,6 +8172,17 @@ public final class MainShellViewModel {
             isLoaded: isLoaded,
             safeStatus: isLoaded ? nil : "Result outside loaded range"
         )
+    }
+
+    private func navigationSource(for result: ChannelSearchResult) -> MessageNavigationSource {
+        switch result.mode {
+        case .loadedOnly:
+            return .loadedSearch
+        case .liveChannel:
+            return .remoteSearch
+        case .pinned:
+            return .pinnedMessage
+        }
     }
 
     private func resolvedDisplayName(userID: UserID, channelID: ChannelID) -> String {
@@ -7957,6 +8376,7 @@ public final class MainShellViewModel {
         processNotificationDiff(previous: oldSnapshot, current: mergedSnapshot)
         previousSnapshot = mergedSnapshot
         restoreOrValidateSelection()
+        refreshTypingIndicatorState()
         acknowledgeSelectedChannel()
         scheduleSelectedChannelLoad()
         reconcileTimelineSelection()
@@ -8049,9 +8469,11 @@ public final class MainShellViewModel {
             diagnostics.suppressedCount += 1
             diagnostics.lastSuppressionReason = reason
             notificationDiagnostics = diagnostics
+            phase44Diagnostics.muteSuppressionDecisionCounts[reason.rawValue, default: 0] += 1
         case let .deliver(event):
             guard !deliveredNotificationIDs.contains(event.id) else { return }
             deliveredNotificationIDs.insert(event.id)
+            phase44Diagnostics.muteSuppressionDecisionCounts["delivered", default: 0] += 1
             diagnostics.deliveredCount += 1
             diagnostics.lastEventKind = event.kind
             notificationDiagnostics = diagnostics
@@ -8107,6 +8529,7 @@ public final class MainShellViewModel {
         queuedNotificationRoutes.removeAll { $0.id == queued.id }
         queuedNotificationRoutes.append(queued)
         queuedNotificationRoutes = Array(queuedNotificationRoutes.suffix(10))
+        phase44Diagnostics.notificationRouteQueuedCount += 1
         updateNotificationDiagnostics()
     }
 
@@ -8131,6 +8554,7 @@ public final class MainShellViewModel {
         queuedNotificationRoutes.removeAll()
         updateNotificationDiagnostics()
         for queued in routes {
+            phase44Diagnostics.notificationRouteReplayedCount += 1
             Task { @MainActor [weak self] in
                 await self?.openNotificationRoute(queued.route)
             }
@@ -8282,9 +8706,19 @@ public final class MainShellViewModel {
             lastAckResult = "Skipped: selected channel missing"
             return
         }
+        phase44Diagnostics.ackRequestedCount += 1
+        if effectiveRuntimeMode == .liveManual {
+            scheduleLiveAckIfNeeded(channelID: channelID)
+            return
+        }
+        clearLocalUnreadState(channelID: channelID, source: "mock")
+    }
+
+    private func clearLocalUnreadState(channelID: ChannelID, source: String) {
         let unread = snapshot.unreadsByChannelID[channelID]
         let currentMessages = messageController.state(for: channelID).timelineMessages
         let firstUnread = localReadStates[channelID]?.firstUnreadMessageID ?? unread?.lastMessageID
+        let mentionCount = source == "mock" ? (localReadStates[channelID]?.mentionCount ?? unread?.mentions.count ?? 0) : 0
         let newest = timelineViewport.isAtNewest
             ? (timelineViewport.visibleRange?.lastVisibleMessageID ?? currentMessages.last?.message.id ?? unread?.lastMessageID)
             : (timelineViewport.visibleRange?.lastVisibleMessageID ?? localReadStates[channelID]?.lastReadMessageID)
@@ -8293,12 +8727,12 @@ public final class MainShellViewModel {
             firstUnreadMessageID: firstUnread,
             lastReadMessageID: newest,
             unreadCount: 0,
-            mentionCount: unread?.mentions.count ?? localReadStates[channelID]?.mentionCount ?? 0
+            mentionCount: mentionCount
         )
         messageController.moveUnreadMarker(channelID: channelID, messageID: firstUnread)
         messageController.markRead(channelID: channelID, lastReadMessageID: newest)
         locallyClearedUnreadChannelIDs.insert(channelID)
-        scheduleLiveAckIfNeeded(channelID: channelID)
+        phase44Diagnostics.unreadLocalClearSources[source, default: 0] += 1
         updateDockBadge()
         updateNotificationDiagnostics()
         refreshDMDiagnosticsSnapshot()
@@ -8308,31 +8742,41 @@ public final class MainShellViewModel {
         let decision = readAckDecision(channelID: channelID)
         lastAckResult = decision.diagnostic
         guard case let .send(messageID) = decision else {
+            if decision.diagnostic.localizedCaseInsensitiveContains("duplicate") {
+                phase44Diagnostics.ackDedupedCount += 1
+            }
+            return
+        }
+        if pendingAckMessageIDsByChannelID[channelID] == messageID {
+            lastAckResult = "Deduped: pending"
+            phase44Diagnostics.ackDedupedCount += 1
             return
         }
         lastAckTargetMessageID = messageID
         lastAckResult = "Scheduled"
-        ackTask?.cancel()
-        ackTask = Task { [weak self, sender = channelAckSender] in
+        pendingAckMessageIDsByChannelID[channelID] = messageID
+        ackTasksByChannelID[channelID]?.cancel()
+        ackTasksByChannelID[channelID] = Task { [weak self, sender = channelAckSender] in
             let delay = await MainActor.run { self?.timelineTuning.ackDebounceMilliseconds ?? TimelineTuningConfiguration.defaults.ackDebounceMilliseconds }
             try? await Task.sleep(for: .milliseconds(delay))
+            guard !Task.isCancelled else { return }
             do {
                 try await sender.ackChannel(channelID: channelID, messageID: messageID)
                 await MainActor.run {
                     self?.lastAckedMessageByChannelID[channelID] = messageID
+                    self?.pendingAckMessageIDsByChannelID[channelID] = nil
+                    self?.ackTasksByChannelID[channelID] = nil
                     self?.lastAckResult = "Sent"
+                    self?.phase44Diagnostics.ackSentCount += 1
                     self?.recordTimelineCalibrationObservation(kind: .afterAck)
-                    if var state = self?.localReadStates[channelID] {
-                        state.mentionCount = 0
-                        self?.localReadStates[channelID] = state
-                    }
-                    self?.updateDockBadge()
-                    self?.updateNotificationDiagnostics()
-                    self?.refreshDMDiagnosticsSnapshot()
+                    self?.clearLocalUnreadState(channelID: channelID, source: "liveAckSuccess")
                 }
             } catch {
                 await MainActor.run {
+                    self?.pendingAckMessageIDsByChannelID[channelID] = nil
+                    self?.ackTasksByChannelID[channelID] = nil
                     self?.lastAckResult = "Failed: \(error.userFacingMessage)"
+                    self?.phase44Diagnostics.ackFailureCount += 1
                     self?.refreshDMDiagnosticsSnapshot()
                 }
             }
@@ -8358,6 +8802,7 @@ public final class MainShellViewModel {
         guard let messageID = visibleMessageID ?? candidates.last?.message.id else {
             return .skip("no normal message")
         }
+        guard pendingAckMessageIDsByChannelID[channelID] != messageID else { return .skip("duplicate pending") }
         guard lastAckedMessageByChannelID[channelID] != messageID else { return .skip("duplicate") }
         return .send(messageID)
     }
@@ -8382,13 +8827,46 @@ public final class MainShellViewModel {
                 channelReferences[messageID] = resolution
                 self.resolvedReferencesByChannelID[channelID] = channelReferences
                 switch resolution {
-                case .loaded:
+                case let .loaded(message):
+                    self.mergePhase43MessageIdentity(message)
+                    self.phase44Diagnostics.replyPreviewResolvedLoaded += 1
                     self.failedReferenceFetchMessageIDs.remove(messageID)
                 default:
+                    self.phase44Diagnostics.replyPreviewUnavailable += 1
                     self.failedReferenceFetchMessageIDs.insert(messageID)
                 }
                 self.referenceFetchTasks[messageID] = nil
                 self.messageController.markReferenceFetchFinished(channelID: channelID, messageID: messageID)
+            }
+        }
+    }
+
+    private func refreshTypingIndicatorState(now: Date = Date()) {
+        let channelID = selectedConversationChannelID
+        let typingUserIDs = channelID.flatMap { snapshot.typingUsersByChannelID[$0] } ?? []
+        typingIndicatorState.replace(channelID: channelID, typingUserIDs: typingUserIDs, currentUserID: currentUserID, now: now)
+        phase44Diagnostics.typingActiveUsersBuckets[Phase44SafeSummary.bucket(for: typingIndicatorState.entriesByUserID.count), default: 0] += 1
+        scheduleTypingCleanupIfNeeded()
+    }
+
+    private func clearTypingIndicatorState(channelID: ChannelID? = nil) {
+        typingCleanupTask?.cancel()
+        typingIndicatorState.clear(channelID: channelID)
+    }
+
+    private func scheduleTypingCleanupIfNeeded() {
+        typingCleanupTask?.cancel()
+        guard !typingIndicatorState.entriesByUserID.isEmpty else { return }
+        let channelID = typingIndicatorState.channelID
+        typingCleanupTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            await MainActor.run {
+                guard let self, self.typingIndicatorState.channelID == channelID else { return }
+                let removed = self.typingIndicatorState.removeStale()
+                if removed > 0 {
+                    self.phase44Diagnostics.typingStaleCleanupCount += removed
+                }
+                self.scheduleTypingCleanupIfNeeded()
             }
         }
     }
@@ -8467,7 +8945,7 @@ extension MainShellViewModel: AppCommandHandling {
         case .loadAroundSelectedSearchResult:
             return selectedSearchResult.map { result in
                 selectedTimelineMessages.contains { $0.message.id == result.messageID } == false
-            } == true && routeVerificationResult.aroundMessageFetch == .supported
+            } == true
         case .clearSearchHighlights:
             return searchHighlightState != nil || !channelSearchState.results.isEmpty
         case .startTimelineCalibration:
@@ -8585,7 +9063,7 @@ extension MainShellViewModel: AppCommandHandling {
         case .selectNextSearchResult, .selectPreviousSearchResult, .jumpToSelectedSearchResult:
             return "No search result is selected."
         case .loadAroundSelectedSearchResult:
-            return routeVerificationResult.aroundMessageFetch == .supported ? "Selected result is already loaded." : "Around-message route is not verified."
+            return "Selected result is already loaded."
         case .clearSearchHighlights:
             return "No search highlights are active."
         case .startTimelineCalibration, .addTimelineCalibrationCheckpoint, .applyTimelineCalibrationRecommendation, .importCalibrationNotes, .copyTimelineCalibration, .copyTimelineDiagnostics:
@@ -8727,7 +9205,7 @@ extension MainShellViewModel: AppCommandHandling {
         case .openLiveChannelSearch:
             openChannelSearch(mode: .liveChannel)
         case .openPinnedChannelSearch:
-            openChannelSearch(mode: .pinned)
+            openPinnedMessages()
         case .selectNextSearchResult:
             selectAdjacentSearchResult(1)
         case .selectPreviousSearchResult:
@@ -8781,6 +9259,8 @@ extension MainShellViewModel: AppCommandHandling {
                 closeQuickSwitcher()
             } else if isChannelSearchPresented {
                 closeChannelSearch()
+            } else if isPinnedMessagesPresented {
+                closePinnedMessages()
             } else if inlineEditState != nil {
                 cancelInlineEdit()
             } else if searchHighlightState != nil {
@@ -9364,6 +9844,9 @@ public struct MainShellView: View {
         }
         .sheet(isPresented: $viewModel.isChannelSearchPresented) {
             ChannelSearchPanel(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.isPinnedMessagesPresented) {
+            PinnedMessagesPanel(viewModel: viewModel)
         }
         .sheet(isPresented: $viewModel.isCredentialSetupPresented) {
             AccountConnectionSettingsView(viewModel: viewModel)
@@ -10990,7 +11473,7 @@ public struct ChatPlaceholderView: View {
                     }
                     Spacer()
                     GlassIconButton("Pinned in this channel", systemImage: "pin") {
-                        viewModel.openChannelSearch(mode: .pinned)
+                        viewModel.openPinnedMessages()
                     }
                     GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
                         viewModel.openChannelSearch(mode: .loadedOnly)
@@ -11380,21 +11863,12 @@ public struct MessageTimelineView: View {
     }
 
     @ViewBuilder private var typingIndicator: some View {
-        let users = viewModel.typingUsers(for: viewModel.selectedConversationChannelID)
-        if !users.isEmpty {
-            Text(typingText(users))
+        if let text = viewModel.typingIndicatorText(for: viewModel.selectedConversationChannelID) {
+            Text(text)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.top, StoatSpacing.small)
         }
-    }
-
-    private func typingText(_ users: [User]) -> String {
-        let names = users.map { $0.displayName ?? $0.username }
-        if names.count == 1 {
-            return "\(names[0]) is typing..."
-        }
-        return "\(names.prefix(2).joined(separator: ", ")) are typing..."
     }
 
     @ViewBuilder private var unreadSeparator: some View {
@@ -11496,9 +11970,10 @@ public struct TimelineMessageGroupView: View {
                             isFocused: viewModel.timelineSelection.focus.messageID == timelineMessage.message.id && viewModel.timelineSelection.focus.mode != .none,
                             isSearchHighlighted: viewModel.isSearchHighlighted(timelineMessage.message.id),
                             isCurrentSearchResult: viewModel.isCurrentSearchResult(timelineMessage.message.id),
+                            isTargetHighlighted: viewModel.isTargetMessageHighlighted(timelineMessage.message.id, channelID: timelineMessage.message.channelID),
                             isCompactDensity: viewModel.messageDensity == .compact,
                             searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
-                            replyPreview: viewModel.resolvedReplyPreview(for: timelineMessage.message),
+                            replyPreviewItem: viewModel.replyPreviewItem(for: timelineMessage.message),
                             attachmentItems: viewModel.attachmentDisplayItems(for: timelineMessage.message),
                             customEmojiItems: viewModel.inlineCustomEmojiItems(for: timelineMessage.message),
                             authorAvatarData: viewModel.imageData(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
@@ -11527,6 +12002,9 @@ public struct TimelineMessageGroupView: View {
                             onOpenAuthorProfile: {
                                 let display = viewModel.resolvedUserDisplay(for: timelineMessage.message)
                                 viewModel.showUserProfile(display.userID, source: .messageName, serverID: display.serverContextID)
+                            },
+                            onOpenReplyPreview: {
+                                Task { await viewModel.openReplyPreview(for: timelineMessage.message) }
                             }
                         )
                         .id(timelineMessage.message.id)
@@ -11543,6 +12021,7 @@ public struct TimelineMessageGroupView: View {
                             viewModel.loadInlineImagePreviews(for: timelineMessage.message)
                             viewModel.loadImageResource(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar)
                             viewModel.loadCustomEmojiImages(for: timelineMessage.message)
+                            viewModel.prepareReplyPreview(for: timelineMessage.message)
                         }
                         .onDisappear {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
@@ -14408,6 +14887,140 @@ public struct ChannelSettingsView: View {
             Text("Channel updated")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+public struct PinnedMessagesPanel: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            HStack {
+                Text("Pinned messages")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    Task { await viewModel.refreshPinnedMessages() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Refresh pinned messages")
+                Button("Done") { viewModel.closePinnedMessages() }
+            }
+            pinnedStatus
+            pinnedContent
+        }
+        .padding(StoatSpacing.large)
+        .frame(minWidth: 560, minHeight: 420, alignment: .topLeading)
+        .onAppear {
+            if viewModel.pinnedMessagesState.loadState.items.isEmpty {
+                Task { await viewModel.refreshPinnedMessages() }
+            }
+        }
+    }
+
+    @ViewBuilder private var pinnedStatus: some View {
+        switch viewModel.pinnedMessagesState.loadState {
+        case .idle:
+            Text("Pinned messages load only when this sheet is opened or refreshed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .loading:
+            Text("Loading pinned messages...")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case let .loaded(_, items):
+            Text(items.isEmpty ? "No pinned messages in this channel." : "\(items.count) pinned message(s).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case let .failed(_, message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+    }
+
+    @ViewBuilder private var pinnedContent: some View {
+        switch viewModel.pinnedMessagesState.loadState {
+        case .idle:
+            ContentUnavailableView("Pinned messages", systemImage: "pin", description: Text("Open or refresh pinned messages for the selected channel."))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .loading:
+            LoadingStateView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case let .failed(_, message):
+            ErrorStateView(message)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case let .loaded(_, items):
+            if items.isEmpty {
+                ContentUnavailableView("No pinned messages", systemImage: "pin.slash", description: Text("Pinned-message list uses selected-channel search and is not global."))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                        ForEach(items) { item in
+                            pinnedRow(item)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func pinnedRow(_ item: PinnedMessageDisplayItem) -> some View {
+        let isBusy = viewModel.pinnedMessagesState.inFlightActionMessageIDs.contains(item.messageID)
+        return HStack(alignment: .top, spacing: StoatSpacing.small) {
+            Button {
+                Task { await viewModel.openPinnedMessage(item) }
+            } label: {
+                HStack(alignment: .top, spacing: StoatSpacing.small) {
+                    Image(systemName: item.isLoaded ? "pin.fill" : "arrow.down.message")
+                        .frame(width: 20)
+                        .foregroundStyle(item.isLoaded ? .primary : .secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(item.authorDisplayName)
+                                .font(.caption.weight(.semibold))
+                            if let createdAt = item.createdAt {
+                                Text(createdAt.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(item.status ?? (item.isLoaded ? "Loaded" : "Outside range"))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(item.summary)
+                            .font(.caption)
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                    }
+                }
+                .padding(StoatSpacing.small)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Pinned message by \(item.authorDisplayName), \(item.summary)")
+            Button {
+                Task { await viewModel.unpinPinnedMessage(item) }
+            } label: {
+                Image(systemName: "pin.slash")
+            }
+            .buttonStyle(.borderless)
+            .disabled(isBusy || !item.canUnpin)
+            .help("Unpin message")
+            .accessibilityLabel("Unpin pinned message")
+        }
+        .onAppear {
+            viewModel.noteVisibleIdentity(userID: item.authorID, source: .visibleSearchResult)
         }
     }
 }
