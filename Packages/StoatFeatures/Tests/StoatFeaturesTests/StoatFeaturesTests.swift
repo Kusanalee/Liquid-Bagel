@@ -4695,6 +4695,145 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase46CachedModerationLookupDoesNotComputeDuringRender() async {
+        let current: UserID = "phase46-current"
+        let target: UserID = "phase46-target"
+        let serverID: ServerID = "phase46-server"
+        let roleID: RoleID = "phase46-mod-role"
+        let memberRoleID: RoleID = "phase46-member-role"
+        let channelID: ChannelID = "phase46-general"
+        let role = Role(id: roleID, name: "Moderator", permissions: PermissionOverride(allow: [.kickMembers, .banMembers, .timeoutMembers]), rank: 10)
+        let memberRole = Role(id: memberRoleID, name: "Member", permissions: PermissionOverride(), rank: 50)
+        let server = Server(id: serverID, ownerID: "phase46-owner", name: "Phase 46", channelIDs: [channelID], roles: [roleID: role, memberRoleID: memberRole], defaultPermissions: [.viewChannel, .readMessageHistory])
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        let currentMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: current), joinedAt: Date(), roles: [roleID])
+        let targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [memberRoleID])
+        let snapshot = RealtimeSnapshot(
+            usersByID: [
+                current: User(id: current, username: "current"),
+                target: User(id: target, username: "target")
+            ],
+            serversByID: [serverID: server],
+            channelsByID: [channelID: channel],
+            membersByServerAndUserID: [
+                ServerMemberKey(currentMember.id): currentMember,
+                ServerMemberKey(targetMember.id): targetMember
+            ]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            currentUser: snapshot.usersByID[current]
+        )
+
+        let beforeRenderLookup = model.moderationCacheDiagnostics
+        let preparing = model.cachedMemberModerationMenuState(targetUserID: target, member: targetMember)
+        XCTAssertTrue(preparing[.ban].isDisabled)
+        XCTAssertEqual(preparing[.ban].disabledReasonText, "Preparing moderation state")
+        XCTAssertEqual(model.moderationCacheDiagnostics, beforeRenderLookup)
+
+        await model.memberPanelBecameVisibleForModerationPrewarm()
+        XCTAssertEqual(model.phase46MemberPanelPrewarmState.lastResult, .prepared)
+        XCTAssertEqual(model.phase46MemberPanelPrewarmState.preparedMemberCount, 2)
+
+        let afterPrewarmDiagnostics = model.moderationCacheDiagnostics
+        let cached = model.cachedMemberModerationMenuState(targetUserID: target, member: targetMember)
+        XCTAssertFalse(cached[.ban].isDisabled)
+        XCTAssertEqual(model.moderationCacheDiagnostics, afterPrewarmDiagnostics)
+    }
+
+    @MainActor
+    func testPhase46MemberPanelPrewarmDedupesForSameRevisionKey() async {
+        let current: UserID = "phase46-dedupe-current"
+        let target: UserID = "phase46-dedupe-target"
+        let serverID: ServerID = "phase46-dedupe-server"
+        let roleID: RoleID = "phase46-dedupe-mod-role"
+        let memberRoleID: RoleID = "phase46-dedupe-member-role"
+        let channelID: ChannelID = "phase46-dedupe-general"
+        let role = Role(id: roleID, name: "Moderator", permissions: PermissionOverride(allow: [.kickMembers, .banMembers, .timeoutMembers]), rank: 10)
+        let memberRole = Role(id: memberRoleID, name: "Member", permissions: PermissionOverride(), rank: 50)
+        let server = Server(id: serverID, ownerID: "phase46-dedupe-owner", name: "Phase 46 Dedupe", channelIDs: [channelID], roles: [roleID: role, memberRoleID: memberRole], defaultPermissions: [.viewChannel, .readMessageHistory])
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        let currentMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: current), joinedAt: Date(), roles: [roleID])
+        let targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [memberRoleID])
+        let snapshot = RealtimeSnapshot(
+            usersByID: [
+                current: User(id: current, username: "current"),
+                target: User(id: target, username: "target")
+            ],
+            serversByID: [serverID: server],
+            channelsByID: [channelID: channel],
+            membersByServerAndUserID: [
+                ServerMemberKey(currentMember.id): currentMember,
+                ServerMemberKey(targetMember.id): targetMember
+            ]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            currentUser: snapshot.usersByID[current]
+        )
+
+        await model.memberPanelBecameVisibleForModerationPrewarm()
+        let afterFirstPrewarm = model.phase46FreezePreventionDiagnostics
+        let afterFirstDiagnostics = model.moderationCacheDiagnostics
+        XCTAssertEqual(afterFirstPrewarm.lastResult, .prepared)
+
+        await model.memberPanelBecameVisibleForModerationPrewarm()
+        XCTAssertEqual(model.phase46FreezePreventionDiagnostics.lastResult, .deduped)
+        XCTAssertEqual(model.phase46FreezePreventionDiagnostics.lifecyclePrewarmDedupes, afterFirstPrewarm.lifecyclePrewarmDedupes + 1)
+        XCTAssertEqual(model.moderationCacheDiagnostics, afterFirstDiagnostics)
+    }
+
+    @MainActor
+    func testPhase46MessageOnlySnapshotUpdateDoesNotInvalidateModerationPrewarm() async {
+        let current: UserID = "phase46-message-current"
+        let target: UserID = "phase46-message-target"
+        let serverID: ServerID = "phase46-message-server"
+        let roleID: RoleID = "phase46-message-mod-role"
+        let memberRoleID: RoleID = "phase46-message-member-role"
+        let channelID: ChannelID = "phase46-message-general"
+        let role = Role(id: roleID, name: "Moderator", permissions: PermissionOverride(allow: [.kickMembers, .banMembers, .timeoutMembers]), rank: 10)
+        let memberRole = Role(id: memberRoleID, name: "Member", permissions: PermissionOverride(), rank: 50)
+        let server = Server(id: serverID, ownerID: "phase46-message-owner", name: "Phase 46 Message", channelIDs: [channelID], roles: [roleID: role, memberRoleID: memberRole], defaultPermissions: [.viewChannel, .readMessageHistory])
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        let currentMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: current), joinedAt: Date(), roles: [roleID])
+        let targetMember = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: target), joinedAt: Date(), roles: [memberRoleID])
+        var snapshot = RealtimeSnapshot(
+            usersByID: [
+                current: User(id: current, username: "current"),
+                target: User(id: target, username: "target")
+            ],
+            serversByID: [serverID: server],
+            channelsByID: [channelID: channel],
+            membersByServerAndUserID: [
+                ServerMemberKey(currentMember.id): currentMember,
+                ServerMemberKey(targetMember.id): targetMember
+            ]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            currentUser: snapshot.usersByID[current]
+        )
+        await model.memberPanelBecameVisibleForModerationPrewarm()
+        let preparedKey = model.phase46MemberPanelPrewarmState.preparedKey
+        let token = model.memberPanelModerationPrewarmToken
+
+        snapshot.messagesByChannelID[channelID] = [
+            Message(id: "phase46-message-1", channelID: channelID, authorID: current, content: "hello")
+        ]
+        model.snapshot = snapshot
+
+        XCTAssertEqual(model.memberPanelModerationPrewarmToken, token)
+        XCTAssertEqual(model.phase46MemberPanelPrewarmState.preparedKey, preparedKey)
+        XCTAssertFalse(model.cachedMemberModerationMenuState(targetUserID: target, member: targetMember)[.ban].isDisabled)
+    }
+
+    @MainActor
     func testPhase42BanAndUnbanPatchListsWithoutReaddingMember() async {
         let snapshot = MockShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!

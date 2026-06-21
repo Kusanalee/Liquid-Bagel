@@ -30,6 +30,7 @@ Timeout apply uses `DataMemberEdit.timeout` as an absolute timestamp. Timeout cl
 - Added `Server Settings -> Moderation` with members, bans, and timeouts sections.
 - Added a central `ModerationActionResolver` for allowed actions, disabled reasons, hierarchy checks, route availability, and confirmation requirements.
 - Added cached `MemberModerationMenuState` availability so member rows, profile menus, and moderation dashboard rows do not walk channels or resolve permissions while SwiftUI builds context menus.
+- Phase 46 hardened this cache path so SwiftUI member-panel, profile, and moderation settings view construction reads cache-only menu state while event-driven lifecycle hooks prepare revision-keyed moderation state outside `body`.
 - Routed kick, ban, unban, timeout, and remove-timeout through one native confirmation sheet.
 - Kept member-list row context menus, profile popover actions, server settings member rows, ban rows, and timeout rows on the same coordinator path.
 - Ban confirmation supports the verified optional reason field. Kick, timeout, remove-timeout, and unban do not expose reason fields.
@@ -84,6 +85,7 @@ Developer Verification includes Phase 42 Moderation Diagnostics with:
 - Elapsed duration bucket.
 - Reason-redaction flag.
 - Moderation availability cache hit/miss counts for base context, permission resolution, member menu state, and context lookup.
+- Phase 46 prewarm trigger/result, attempt/dedupe counters, and prepared member count.
 
 Copied diagnostics redact session tokens, raw payloads, full IDs, local paths, URLs, emails, password-like strings, MFA strings, and user-entered moderation reason text.
 

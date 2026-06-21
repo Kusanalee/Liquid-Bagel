@@ -23,6 +23,7 @@ public struct ModerationDiagnostics: Hashable, Sendable {
     public var targetIDPrefix: String
     public var serverIDPrefix: String
     public var cacheDiagnostics: ModerationCacheDiagnostics
+    public var phase46Diagnostics: Phase46FreezePreventionDiagnostics
 
     public init(
         lastActionCategory: String = "none",
@@ -45,7 +46,8 @@ public struct ModerationDiagnostics: Hashable, Sendable {
         copiedDiagnosticsRedactedReasonText: Bool = true,
         targetIDPrefix: String = "-",
         serverIDPrefix: String = "-",
-        cacheDiagnostics: ModerationCacheDiagnostics = ModerationCacheDiagnostics()
+        cacheDiagnostics: ModerationCacheDiagnostics = ModerationCacheDiagnostics(),
+        phase46Diagnostics: Phase46FreezePreventionDiagnostics = Phase46FreezePreventionDiagnostics()
     ) {
         self.lastActionCategory = lastActionCategory
         self.selectedServerPresenceCategory = selectedServerPresenceCategory
@@ -68,6 +70,7 @@ public struct ModerationDiagnostics: Hashable, Sendable {
         self.targetIDPrefix = targetIDPrefix
         self.serverIDPrefix = serverIDPrefix
         self.cacheDiagnostics = cacheDiagnostics
+        self.phase46Diagnostics = phase46Diagnostics
     }
 }
 
@@ -90,6 +93,7 @@ public enum ModerationDiagnosticsFormatter {
         timeouts: known \(diagnostics.timeoutsKnownCount), rendered \(diagnostics.timeoutsRenderedCount), pending \(diagnostics.timeoutsPendingCount)
         elapsed: \(diagnostics.elapsedDurationBucket)
         cache: base \(diagnostics.cacheDiagnostics.moderationBaseContextCacheHits)/\(diagnostics.cacheDiagnostics.moderationBaseContextCacheMisses), permission \(diagnostics.cacheDiagnostics.permissionResolutionCacheHits)/\(diagnostics.cacheDiagnostics.permissionResolutionCacheMisses), memberMenu \(diagnostics.cacheDiagnostics.memberMenuStateCacheHits)/\(diagnostics.cacheDiagnostics.memberMenuStateCacheMisses), context \(diagnostics.cacheDiagnostics.moderationContextLookupHits)/\(diagnostics.cacheDiagnostics.moderationContextLookupMisses)
+        phase46: trigger \(diagnostics.phase46Diagnostics.lastTrigger.rawValue), result \(diagnostics.phase46Diagnostics.lastResult.rawValue), attempts \(diagnostics.phase46Diagnostics.lifecyclePrewarmAttempts), dedupes \(diagnostics.phase46Diagnostics.lifecyclePrewarmDedupes), prepared \(diagnostics.phase46Diagnostics.lastPreparedMemberCount)
         reasonRedacted: \(diagnostics.copiedDiagnosticsRedactedReasonText ? "yes" : "no")
         """
         return redactModerationOnly(
