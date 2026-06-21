@@ -33,9 +33,13 @@ public struct MemberManagementItem: Hashable, Sendable, Identifiable {
     public var timeoutSummary: String?
 
     public init(member: ServerMember, user: User?, server: Server) {
+        let display = UserDisplayResolver.resolved(userID: member.id.userID, user: user, member: member, server: server)
+        self.init(member: member, user: user, display: display, server: server)
+    }
+
+    public init(member: ServerMember, user: User?, display: ResolvedUserDisplay, server: Server) {
         self.member = member
         self.user = user
-        let display = UserDisplayResolver.resolved(userID: member.id.userID, user: user, member: member, server: server)
         self.displayName = display.displayName
         self.username = display.subtitle ?? UserDisplayResolver.usernameLine(user: user, fallbackID: member.id.userID)
         self.roles = member.roles.compactMap { server.roles[$0] }.sorted(by: RoleColorResolver.nativeRolePriority)

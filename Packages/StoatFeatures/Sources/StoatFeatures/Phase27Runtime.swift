@@ -48,7 +48,16 @@ public struct Phase27Diagnostics: Hashable, Sendable {
 public enum Phase27SystemEventPresenter {
     public static func profileTarget(for message: Message) -> UserID? {
         guard let system = message.system else { return nil }
-        let candidate = system.by ?? system.from ?? system.to ?? message.authorID
+        let candidate: UserID?
+        switch system.kind {
+        case .userJoined, .userLeft:
+            candidate = userID(fromSystemID: system.id) ?? system.by ?? system.from ?? system.to ?? message.authorID
+        case .userAdded, .userRemove, .userKicked, .userBanned, .channelOwnershipChanged:
+            candidate = userID(fromSystemID: system.id) ?? system.to ?? system.by ?? system.from ?? message.authorID
+        default:
+            candidate = system.by ?? system.from ?? system.to ?? message.authorID
+        }
+        guard let candidate else { return nil }
         guard !isSystemActor(candidate) else { return nil }
         return candidate
     }
@@ -118,6 +127,100 @@ public enum Phase27SystemEventPresenter {
         }
     }
 
+    public static func presentation(
+        for message: Message,
+        participantResolver: (UserID, SystemEventParticipantRole) -> SystemEventParticipant?
+    ) -> SystemEventPresentation {
+        guard let system = message.system else {
+            return .text(message.content ?? "Message")
+        }
+
+        func participant(_ id: UserID?, role: SystemEventParticipantRole) -> SystemEventPresentationPiece? {
+            guard let id, !isSystemActor(id),
+                  let resolved = participantResolver(id, role),
+                  !resolved.display.isFallback
+            else { return nil }
+            return .participant(resolved)
+        }
+
+        func actorPieces(actorID: UserID?, fallback: String, action: String, targetID: UserID?, targetFallback: String) -> SystemEventPresentation {
+            var fallbackCount = 0
+            var pieces: [SystemEventPresentationPiece] = []
+            if let actor = participant(actorID, role: .actor) {
+                pieces.append(actor)
+            } else {
+                pieces.append(.text(fallback))
+                fallbackCount += 1
+            }
+            pieces.append(.text(action))
+            if let target = participant(targetID, role: .target) {
+                pieces.append(target)
+            } else {
+                pieces.append(.text(targetFallback))
+                fallbackCount += 1
+            }
+            return SystemEventPresentation(pieces: pieces, fallbackCount: fallbackCount)
+        }
+
+        func affectedPieces(_ id: UserID?, action: String, fallback: String = "A member") -> SystemEventPresentation {
+            if let affected = participant(id, role: .affected) {
+                return SystemEventPresentation(pieces: [affected, .text(action)])
+            }
+            return SystemEventPresentation(pieces: [.text("\(fallback)\(action)")], fallbackCount: 1)
+        }
+
+        let actorID = system.by ?? system.from
+        let affectedID = userID(fromSystemID: system.id) ?? actorID ?? system.to ?? message.authorID
+        let targetID = userID(fromSystemID: system.id) ?? system.to
+        let named = system.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch system.kind {
+        case .text:
+            return .text(nonEmpty(system.content) ?? "System event")
+        case .userAdded:
+            return actorPieces(actorID: actorID ?? message.authorID, fallback: "Someone", action: " added ", targetID: targetID, targetFallback: "a member")
+        case .userRemove:
+            return actorPieces(actorID: actorID ?? message.authorID, fallback: "Someone", action: " removed ", targetID: targetID, targetFallback: "a member")
+        case .userJoined:
+            return affectedPieces(affectedID, action: " joined")
+        case .userLeft:
+            return affectedPieces(affectedID, action: " left")
+        case .userKicked:
+            return actorPieces(actorID: actorID ?? message.authorID, fallback: "Someone", action: " kicked ", targetID: targetID, targetFallback: "a member")
+        case .userBanned:
+            return actorPieces(actorID: actorID ?? message.authorID, fallback: "Someone", action: " banned ", targetID: targetID, targetFallback: "a member")
+        case .channelRenamed:
+            if let named, !named.isEmpty { return .text("Channel renamed to \(named)") }
+            return .text("Channel renamed")
+        case .channelDescriptionChanged:
+            return .text("Channel description changed")
+        case .channelIconChanged:
+            return .text("Channel icon changed")
+        case .channelOwnershipChanged:
+            if let target = participant(targetID, role: .target) {
+                return SystemEventPresentation(pieces: [.text("Channel ownership transferred to "), target])
+            }
+            return .text("Channel ownership changed", fallbackCount: 1)
+        case .messagePinned:
+            if let actor = participant(actorID ?? message.authorID, role: .actor) {
+                return SystemEventPresentation(pieces: [actor, .text(" pinned a message")])
+            }
+            return .text("Someone pinned a message", fallbackCount: 1)
+        case .messageUnpinned:
+            if let actor = participant(actorID ?? message.authorID, role: .actor) {
+                return SystemEventPresentation(pieces: [actor, .text(" unpinned a message")])
+            }
+            return .text("Someone unpinned a message", fallbackCount: 1)
+        case .callStarted:
+            if let actor = participant(actorID ?? message.authorID, role: .actor) {
+                return SystemEventPresentation(pieces: [actor, .text(" started a call")])
+            }
+            return .text("Someone started a call", fallbackCount: 1)
+        case let .unknown(value):
+            return .text("Unsupported system event: \(value)")
+        }
+    }
+
     private static func displayName(
         _ id: UserID?,
         usersByID: [UserID: User],
@@ -136,6 +239,13 @@ public enum Phase27SystemEventPresenter {
     private static func nonEmpty(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    private static func userID(fromSystemID value: String?) -> UserID? {
+        guard let trimmed = nonEmpty(value) else { return nil }
+        let userID = UserID(rawValue: trimmed)
+        guard !isSystemActor(userID) else { return nil }
+        return userID
     }
 
     private static func isSystemActor(_ id: UserID) -> Bool {

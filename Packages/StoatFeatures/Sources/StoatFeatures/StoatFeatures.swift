@@ -490,6 +490,7 @@ public final class MainShellViewModel {
     public var snapshot: RealtimeSnapshot {
         didSet {
             snapshotRevision &+= 1
+            mergePhase43SnapshotIdentities(snapshot, source: .readyUser)
             invalidateCapabilityCache()
         }
     }
@@ -502,7 +503,12 @@ public final class MainShellViewModel {
         didSet { invalidateCapabilityCache() }
     }
     public var currentUser: User? {
-        didSet { invalidateCapabilityCache() }
+        didSet {
+            if let currentUser {
+                mergePhase43User(currentUser, source: .readyUser)
+            }
+            invalidateCapabilityCache()
+        }
     }
     public var sessionCoordinator: AppSessionCoordinator?
     public var messageController: ChannelMessageController
@@ -575,6 +581,8 @@ public final class MainShellViewModel {
     public var memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics()
     public var memberRoleSortDiagnostics = RoleSortDiagnostics()
     public var visibleIdentityDiagnostics = VisibleIdentityDiagnostics()
+    public var phase43IdentitySnapshots = Phase43IdentitySnapshotStore()
+    public var phase43IdentityGeneration = 0
     public var freezePerformanceDiagnostics = FreezePerformanceDiagnostics()
     public var memberHydrationDiagnostics = MemberHydrationDiagnostics()
     public var memberHydrationLoadingServerIDs: Set<ServerID> = []
@@ -686,8 +694,14 @@ public final class MainShellViewModel {
     @ObservationIgnored private var attachmentLoadTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var imageResourceLoadTasks: [ImageCacheKey: Task<Void, Never>] = [:]
     @ObservationIgnored private var queuedImageResourceRequests: [ImageCacheKey: ImageResourceRequest] = [:]
+    @ObservationIgnored private var imageResourceFailureDates: [ImageCacheKey: Date] = [:]
     @ObservationIgnored private let maxConcurrentImageResourceLoads = 6
     @ObservationIgnored private let maxConcurrentInlinePreviewLoads = 4
+    @ObservationIgnored public var phase43HydrationPolicy = Phase43HydrationPolicy()
+    @ObservationIgnored private var phase43IdentityHydrationTasks: [UserID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var phase43QueuedIdentityHydration: [UserID: Phase43IdentityHydrationSource] = [:]
+    @ObservationIgnored private var phase43IdentityHydrationFailuresByUserID: [UserID: (count: Int, cooldownUntil: Date)] = [:]
+    @ObservationIgnored private var phase43Now: () -> Date = Date.init
     @ObservationIgnored private var memberHydrationTasks: [ServerID: Task<Void, Never>] = [:]
     @ObservationIgnored private var memberHydrationGenerations: [ServerID: Int] = [:]
     @ObservationIgnored private var hydratedMemberServerIDs: Set<ServerID> = []
@@ -740,6 +754,14 @@ public final class MainShellViewModel {
     @ObservationIgnored private var diagnosticsPublishCount = 0
     @ObservationIgnored private var profileFetchMergeCount = 0
     @ObservationIgnored private var memberWrapperUserMergeCount = 0
+    @ObservationIgnored private var phase43IdentityHydrationSuccessCount = 0
+    @ObservationIgnored private var phase43IdentityHydrationFailureCount = 0
+    @ObservationIgnored private var phase43IdentityHydrationDedupeHits = 0
+    @ObservationIgnored private var phase43IdentityHydrationCooldownSkips = 0
+    @ObservationIgnored private var phase43AvatarMetadataPreservedAfterMemberRemovalCount = 0
+    @ObservationIgnored private var phase43ProfileOpensFromSystemEventsCount = 0
+    @ObservationIgnored private var phase43CurrentUserEditSnapshotMergeCount = 0
+    @ObservationIgnored private var phase43MemberRemovalIdentityPreservationCount = 0
     @ObservationIgnored private var transientStatusTask: Task<Void, Never>?
     @ObservationIgnored private var openingDirectMessageUserIDs: Set<UserID> = []
 
@@ -807,6 +829,10 @@ public final class MainShellViewModel {
             canPerform: { [weak self] command in self?.canPerform(command) ?? false },
             disabledReason: { [weak self] command in self?.disabledReason(for: command) }
         )
+        mergePhase43SnapshotIdentities(snapshot, source: .readyUser)
+        if let currentUser = self.currentUser {
+            mergePhase43User(currentUser, source: .readyUser)
+        }
         validateSelection()
         invalidateCapabilityCache()
         self.messageController.hydrate(from: snapshot)
@@ -828,6 +854,8 @@ public final class MainShellViewModel {
         attachmentLoadTasks.values.forEach { $0.cancel() }
         imageResourceLoadTasks.values.forEach { $0.cancel() }
         queuedImageResourceRequests.removeAll()
+        phase43IdentityHydrationTasks.values.forEach { $0.cancel() }
+        phase43QueuedIdentityHydration.removeAll()
         memberHydrationTasks.values.forEach { $0.cancel() }
     }
 
@@ -904,7 +932,9 @@ public final class MainShellViewModel {
             ids = ordered
         }
         return ids.map { userID in
-            MemberListItem(userID: userID, user: snapshot.usersByID[userID] ?? (userID == currentUser?.id ? currentUser : nil), member: nil)
+            let user = snapshot.usersByID[userID] ?? (userID == currentUser?.id ? currentUser : nil)
+            let display = phase43IdentitySnapshots.resolvedDisplay(userID: userID, user: user, member: nil, server: nil)
+            return MemberListItem(userID: userID, user: user, member: nil, display: display)
         }
     }
 
@@ -1015,8 +1045,11 @@ public final class MainShellViewModel {
         if profileUserID == currentUser?.id {
             return currentUser
         }
-        let fallback = UserDisplayResolver.shortenedID(profileUserID)
-        return User(id: profileUserID, username: fallback, displayName: fallback)
+        if let identity = phase43IdentitySnapshots.snapshot(for: profileUserID) {
+            let username = identity.username ?? identity.displayName ?? "unknown"
+            return User(id: profileUserID, username: username, displayName: identity.displayName ?? identity.username, avatar: identity.avatarFile, bot: identity.isBot ? BotInformation(ownerID: identity.botOwnerID) : nil)
+        }
+        return User(id: profileUserID, username: "unknown", displayName: "Unknown member")
     }
 
     public func profileContext(userID: UserID, serverID: ServerID?, source: ProfileOpenSource) -> ProfilePresentationContext {
@@ -1042,11 +1075,207 @@ public final class MainShellViewModel {
             roles: roles,
             mutualGroups: mutualGroups,
             mutualServers: mutualServers,
-            botOwnerID: user?.bot?.ownerID
+            botOwnerID: user?.bot?.ownerID ?? phase43IdentitySnapshots.snapshot(for: userID)?.botOwnerID
         )
+    }
+
+    public func setPhase43NowProvider(_ provider: @escaping () -> Date) {
+        phase43Now = provider
+    }
+
+    public func phase43IdentitySnapshot(for userID: UserID) -> Phase43IdentitySnapshot? {
+        phase43IdentitySnapshots.snapshot(for: userID)
+    }
+
+    public func noteVisibleIdentity(
+        userID: UserID,
+        user: User? = nil,
+        member: ServerMember? = nil,
+        serverID: ServerID? = nil,
+        source: Phase43IdentityHydrationSource
+    ) {
+        if let user {
+            mergePhase43User(user, source: source == .visibleMember ? .readyUser : .messageUser)
+        }
+        if let member {
+            mergePhase43Member(member, user: user, source: source == .visibleMember ? .readyMember : .messageMember)
+        }
+        let server = serverID.flatMap { snapshot.serversByID[$0] }
+        let resolved = phase43IdentitySnapshots.resolvedDisplay(userID: userID, user: user ?? snapshot.usersByID[userID], member: member, server: server)
+        if resolved.isFallback {
+            enqueuePhase43IdentityHydrationIfNeeded(userID, source: source)
+        }
     }
     
     // MARK: - Private Helper Methods
+
+    private func mergePhase43SnapshotIdentities(_ snapshot: RealtimeSnapshot, source: Phase43IdentitySource) {
+        for user in snapshot.usersByID.values {
+            mergePhase43User(user, source: source)
+        }
+        for member in snapshot.membersByServerAndUserID.values {
+            mergePhase43Member(member, user: snapshot.usersByID[member.id.userID], source: source == .readyUser ? .readyMember : source)
+        }
+    }
+
+    private func mergePhase43User(_ user: User, source: Phase43IdentitySource) {
+        let previousAvatar = phase43IdentitySnapshots.snapshot(for: user.id)?.avatarFile
+        if previousAvatar?.id != user.avatar?.id {
+            invalidatePhase43AvatarCache(old: previousAvatar, new: user.avatar)
+        }
+        if phase43IdentitySnapshots.merge(user: user, source: source, now: phase43Now()) {
+            phase43IdentityGeneration = phase43IdentitySnapshots.generation
+        }
+    }
+
+    private func mergePhase43Member(_ member: ServerMember, user: User?, source: Phase43IdentitySource) {
+        let previousAvatar = phase43IdentitySnapshots.snapshot(for: member.id.userID)?.avatarFile
+        if let memberAvatar = member.avatar, previousAvatar?.id != memberAvatar.id {
+            invalidatePhase43AvatarCache(old: previousAvatar, new: memberAvatar)
+        }
+        if phase43IdentitySnapshots.merge(member: member, user: user, source: source, now: phase43Now()) {
+            phase43IdentityGeneration = phase43IdentitySnapshots.generation
+        }
+    }
+
+    private func mergePhase43MessageIdentity(_ message: Message) {
+        if let user = message.user {
+            mergePhase43User(user, source: .messageUser)
+        }
+        if let member = message.member {
+            mergePhase43Member(member, user: message.user ?? snapshot.usersByID[message.authorID], source: .messageMember)
+        }
+    }
+
+    private func mergePhase43Profile(_ profile: UserProfile, userID: UserID) {
+        if phase43IdentitySnapshots.merge(profile: profile, userID: userID, now: phase43Now()) {
+            phase43IdentityGeneration = phase43IdentitySnapshots.generation
+        }
+    }
+
+    private func preservePhase43IdentityBeforeMemberRemoval(serverID: ServerID, userID: UserID) {
+        let member = snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)]
+        let user = snapshot.usersByID[userID] ?? (userID == currentUser?.id ? currentUser : nil)
+        if let user {
+            mergePhase43User(user, source: .moderationAction)
+        }
+        if let member {
+            let beforeAvatar = phase43IdentitySnapshots.snapshot(for: userID)?.avatarFile
+            mergePhase43Member(member, user: user, source: .moderationAction)
+            if beforeAvatar == nil, phase43IdentitySnapshots.snapshot(for: userID)?.avatarFile != nil {
+                phase43AvatarMetadataPreservedAfterMemberRemovalCount += 1
+            }
+        }
+        if phase43IdentitySnapshots.markMemberRemoved(userID: userID, serverID: serverID, now: phase43Now()) {
+            phase43MemberRemovalIdentityPreservationCount += 1
+            phase43IdentityGeneration = phase43IdentitySnapshots.generation
+        }
+    }
+
+    private func preserveRemovedRealtimeMemberIdentities(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
+        let previousKeys = Set(previous.membersByServerAndUserID.keys)
+        let currentKeys = Set(current.membersByServerAndUserID.keys)
+        for key in previousKeys.subtracting(currentKeys) {
+            if let member = previous.membersByServerAndUserID[key] {
+                mergePhase43Member(member, user: previous.usersByID[key.userID], source: .realtimeMemberUpdate)
+            }
+            if phase43IdentitySnapshots.markMemberRemoved(userID: key.userID, serverID: key.serverID, now: phase43Now()) {
+                phase43MemberRemovalIdentityPreservationCount += 1
+                phase43IdentityGeneration = phase43IdentitySnapshots.generation
+            }
+        }
+    }
+
+    private func invalidatePhase43AvatarCache(old: File?, new: File?) {
+        let files = [old, new].compactMap { $0 }
+        for file in files {
+            let key = ImageCacheKey(id: file.id.rawValue, kind: .userAvatar)
+            loadedImageResources.removeValue(forKey: key)
+            imageResourceStates.removeValue(forKey: key)
+            imageResourceFailureDates.removeValue(forKey: key)
+            queuedImageResourceRequests.removeValue(forKey: key)
+            imageResourceLoadTasks[key]?.cancel()
+            imageResourceLoadTasks.removeValue(forKey: key)
+            Task { await imageMemoryCache.remove(key) }
+        }
+    }
+
+    public func enqueuePhase43IdentityHydration(userID: UserID, source: Phase43IdentityHydrationSource = .visibleMessage) {
+        enqueuePhase43IdentityHydrationIfNeeded(userID, source: source)
+    }
+
+    private func enqueuePhase43IdentityHydrationIfNeeded(_ userID: UserID, source: Phase43IdentityHydrationSource) {
+        guard !phase43IdentitySnapshots.hasReadableIdentity(for: userID),
+              snapshot.usersByID[userID] == nil,
+              currentUser?.id != userID,
+              sessionCoordinator?.currentUser?.id != userID
+        else { return }
+        if phase43QueuedIdentityHydration[userID] != nil || phase43IdentityHydrationTasks[userID] != nil {
+            phase43IdentityHydrationDedupeHits += 1
+            updateVisibleIdentityDiagnostics()
+            return
+        }
+        if let failure = phase43IdentityHydrationFailuresByUserID[userID],
+           failure.cooldownUntil > phase43Now() {
+            phase43IdentityHydrationCooldownSkips += 1
+            updateVisibleIdentityDiagnostics()
+            return
+        }
+        guard phase43QueuedIdentityHydration.count < phase43HydrationPolicy.maxBatchEnqueue else {
+            phase43IdentityHydrationDedupeHits += 1
+            updateVisibleIdentityDiagnostics()
+            return
+        }
+        phase43QueuedIdentityHydration[userID] = source
+        updateVisibleIdentityDiagnostics()
+        drainPhase43IdentityHydrationQueue()
+    }
+
+    private func drainPhase43IdentityHydrationQueue() {
+        while phase43IdentityHydrationTasks.count < phase43HydrationPolicy.maxConcurrentFetches,
+              let next = phase43QueuedIdentityHydration.first {
+            phase43QueuedIdentityHydration.removeValue(forKey: next.key)
+            let userID = next.key
+            phase43IdentityHydrationTasks[userID] = Task { [weak self] in
+                await self?.loadPhase43Identity(userID: userID)
+            }
+        }
+        updateVisibleIdentityDiagnostics()
+    }
+
+    private func loadPhase43Identity(userID: UserID) async {
+        defer {
+            phase43IdentityHydrationTasks[userID] = nil
+            drainPhase43IdentityHydrationQueue()
+        }
+        guard let apiClient = apiClientForPhase43IdentityHydration() else {
+            recordPhase43IdentityHydrationFailure(userID: userID)
+            return
+        }
+        do {
+            let user = try await apiClient.fetchUser(userID: userID)
+            upsertUser(user, source: .hydrationFetch)
+            phase43IdentityHydrationFailuresByUserID.removeValue(forKey: userID)
+            phase43IdentityHydrationSuccessCount += 1
+        } catch is CancellationError {
+            return
+        } catch {
+            recordPhase43IdentityHydrationFailure(userID: userID)
+        }
+    }
+
+    private func recordPhase43IdentityHydrationFailure(userID: UserID) {
+        let previous = phase43IdentityHydrationFailuresByUserID[userID]?.count ?? 0
+        let count = previous + 1
+        let cooldown = phase43HydrationPolicy.cooldownInterval(afterFailureCount: count)
+        phase43IdentityHydrationFailuresByUserID[userID] = (count, phase43Now().addingTimeInterval(cooldown))
+        phase43IdentityHydrationFailureCount += 1
+        updateVisibleIdentityDiagnostics()
+    }
+
+    private func apiClientForPhase43IdentityHydration() -> (any StoatAPIClient)? {
+        sessionCoordinator?.apiClient ?? (effectiveRuntimeMode == .mock ? communityAPIClient : nil)
+    }
 
     private func serverContextForProfile(userID: UserID) -> ServerID? {
         if case let .serverMembers(serverID, _) = rightSidebarContext,
@@ -1129,7 +1358,21 @@ public final class MainShellViewModel {
         let started = Date()
         memberGroupingCount += 1
         let result = MemberListDeriver.result(server: server, snapshot: snapshot, query: query)
-        let groups = result.groups
+        let groups = result.groups.map { group in
+            MemberListGroup(
+                id: group.id,
+                title: group.title,
+                items: group.items.map { item in
+                    let display = phase43IdentitySnapshots.resolvedDisplay(
+                        userID: item.userID,
+                        user: item.user,
+                        member: item.member,
+                        server: server
+                    )
+                    return MemberListItem(userID: item.userID, user: item.user, member: item.member, display: display, server: server)
+                }
+            )
+        }
         memberListGroupCacheKey = key
         memberListGroupCache = groups
         memberListDiagnosticsCache = result.diagnostics
@@ -1342,7 +1585,7 @@ public final class MainShellViewModel {
 
         var returnedByKey: [ServerMemberKey: ServerMember] = [:]
         for user in response.users {
-            upsertUser(user)
+            upsertUser(user, source: .memberRESTUser)
         }
         memberWrapperUserMergeCount += response.users.count
         for member in response.members {
@@ -1515,17 +1758,22 @@ public final class MainShellViewModel {
     private func missingVisibleUserIDs() -> Set<UserID> {
         var ids = Set<UserID>()
         for message in selectedTimelineMessages {
-            if snapshot.usersByID[message.message.authorID] == nil {
+            if message.message.system != nil {
+                if let target = Phase27SystemEventPresenter.profileTarget(for: message.message),
+                   systemEventProfileTarget(for: message.message) == nil {
+                    ids.insert(target)
+                }
+            } else if resolvedUserDisplay(for: message.message).isFallback {
                 ids.insert(message.message.authorID)
             }
         }
         if let channel = selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
-            for id in channel.recipients where snapshot.usersByID[id] == nil {
+            for id in channel.recipients where resolvedUserDisplay(for: snapshot.usersByID[id], fallbackID: id).isFallback {
                 ids.insert(id)
             }
         }
         if let serverID = selection.serverID {
-            for member in snapshot.membersByServerAndUserID.values where member.id.serverID == serverID && snapshot.usersByID[member.id.userID] == nil {
+            for member in snapshot.membersByServerAndUserID.values where member.id.serverID == serverID && resolvedUserDisplay(for: snapshot.usersByID[member.id.userID], member: member, fallbackID: member.id.userID, serverID: serverID).isFallback {
                 ids.insert(member.id.userID)
             }
         }
@@ -1545,7 +1793,9 @@ public final class MainShellViewModel {
     public func memberManagementItems(for details: ServerSettingsDetails) -> [MemberManagementItem] {
         let query = memberSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let items = details.members.map { member in
-            MemberManagementItem(member: member, user: snapshot.usersByID[member.id.userID], server: details.server)
+            let user = snapshot.usersByID[member.id.userID]
+            let display = resolvedUserDisplay(for: user, member: member, fallbackID: member.id.userID, serverID: member.id.serverID)
+            return MemberManagementItem(member: member, user: user, display: display, server: details.server)
         }
         guard !query.isEmpty else { return items }
         return items.filter { item in
@@ -1614,6 +1864,10 @@ public final class MainShellViewModel {
 
     public func showUserProfile(_ userID: UserID, source: ProfileOpenSource = .unknown, serverID explicitServerID: ServerID? = nil) {
         let serverID = explicitServerID ?? serverContextForProfile(userID: userID)
+        if source == .systemEventParticipant {
+            phase43ProfileOpensFromSystemEventsCount += 1
+        }
+        enqueuePhase43IdentityHydrationIfNeeded(userID, source: .profileOpen)
         profilePresentationContext = profileContext(userID: userID, serverID: serverID, source: source)
         profileSelectedTab = .profile
         profileUserID = userID
@@ -1669,6 +1923,7 @@ public final class MainShellViewModel {
         do {
             let profile = try await apiClient.fetchUserProfile(userID: userID)
             userProfilesByID[userID] = profile
+            mergePhase43Profile(profile, userID: userID)
             profileFetchMergeCount += 1
             updateVisibleIdentityDiagnostics()
             if profilePresentationContext?.userID == userID {
@@ -1892,7 +2147,7 @@ public final class MainShellViewModel {
 
         do {
             let updated = try await apiClient.editUser(userID: userID, draft: mutationDraft)
-            upsertUser(updated)
+            upsertUser(updated, source: .currentUserEdit)
             let overlayProfile = overlayProfileAfterEdit(
                 userID: userID,
                 original: originalProfile,
@@ -1904,6 +2159,7 @@ public final class MainShellViewModel {
             if stagedDraft.editedFieldCategories.contains(.profileContent) || stagedDraft.editedFieldCategories.contains(.profileBackground) {
                 userProfilesByID[userID] = overlayProfile
             }
+            mergePhase43Profile(overlayProfile, userID: userID)
             let invalidationCount = await invalidateProfileEditImageCaches(
                 oldUser: originalUser,
                 oldProfile: originalProfile,
@@ -1958,6 +2214,7 @@ public final class MainShellViewModel {
         let key = ImageCacheKey(id: file.id.rawValue, kind: kind)
         loadedImageResources.removeValue(forKey: key)
         imageResourceStates.removeValue(forKey: key)
+        imageResourceFailureDates.removeValue(forKey: key)
         queuedImageResourceRequests.removeValue(forKey: key)
         imageResourceLoadTasks[key]?.cancel()
         imageResourceLoadTasks.removeValue(forKey: key)
@@ -2094,6 +2351,7 @@ public final class MainShellViewModel {
         for key in keys {
             loadedImageResources.removeValue(forKey: key)
             imageResourceStates.removeValue(forKey: key)
+            imageResourceFailureDates.removeValue(forKey: key)
             queuedImageResourceRequests.removeValue(forKey: key)
             imageResourceLoadTasks[key]?.cancel()
             imageResourceLoadTasks.removeValue(forKey: key)
@@ -2196,7 +2454,7 @@ public final class MainShellViewModel {
         guard let apiClient = availableRelationshipAPIClient() else { return }
         do {
             let user = try await apiClient.sendFriendRequest(username: username)
-            upsertUser(user)
+            upsertUser(user, source: .relationship)
             addFriendText = ""
             relationshipActionStatus = "Friend request sent"
         } catch {
@@ -2242,7 +2500,7 @@ public final class MainShellViewModel {
             case .unblock:
                 user = try await apiClient.unblockUser(userID: userID)
             }
-            upsertUser(user)
+            upsertUser(user, source: .relationship)
             relationshipActionStatus = relationshipSuccessMessage(for: kind)
         } catch {
             relationshipActionStatus = "Relationship action failed."
@@ -2549,6 +2807,7 @@ public final class MainShellViewModel {
         guard var user = snapshot.usersByID[userID] else { return }
         user.relationship = status
         snapshot.usersByID[userID] = user
+        mergePhase43User(user, source: .relationship)
         guard var currentUser else { return }
         currentUser.relations.removeAll { $0.id == userID }
         if status != .none {
@@ -2559,19 +2818,24 @@ public final class MainShellViewModel {
 
     private func applyRelationshipUser(_ user: User) {
         currentUser = user
-        upsertUser(user)
+        upsertUser(user, source: .relationship)
         for relation in user.relations {
             if var related = snapshot.usersByID[relation.id] {
                 related.relationship = relation.status
                 snapshot.usersByID[relation.id] = related
+                mergePhase43User(related, source: .relationship)
             }
         }
     }
 
-    private func upsertUser(_ user: User) {
+    private func upsertUser(_ user: User, source: Phase43IdentitySource = .hydrationFetch) {
         snapshot.usersByID[user.id] = user
         if currentUserID == user.id {
             currentUser = user
+        }
+        mergePhase43User(user, source: source)
+        if source == .currentUserEdit {
+            phase43CurrentUserEditSnapshotMergeCount += 1
         }
         invalidateIdentityPresentationCaches()
     }
@@ -2597,12 +2861,34 @@ public final class MainShellViewModel {
                 return false
             }()
         }.count
+        let systemEventPresentations = selectedTimelineMessages
+            .filter { $0.message.system != nil }
+            .map { systemEventPresentation(for: $0.message) }
+        let phase43 = Phase43IdentityDiagnostics(
+            knownIdentitySnapshotsCount: phase43IdentitySnapshots.knownCount,
+            historicalOnlySnapshotsCount: phase43IdentitySnapshots.historicalOnlyCount,
+            unresolvedVisibleUserIDsCount: missingVisibleUserIDs().count,
+            systemEventClickableParticipantCount: systemEventPresentations.reduce(0) { $0 + $1.clickableParticipantCount },
+            systemEventNonclickableFallbackCount: systemEventPresentations.reduce(0) { $0 + $1.fallbackCount },
+            identityHydrationQueuedCount: phase43QueuedIdentityHydration.count,
+            identityHydrationInFlightCount: phase43IdentityHydrationTasks.count,
+            identityHydrationSuccessCount: phase43IdentityHydrationSuccessCount,
+            identityHydrationFailureCount: phase43IdentityHydrationFailureCount,
+            identityHydrationDedupeHits: phase43IdentityHydrationDedupeHits,
+            identityHydrationCooldownSkips: phase43IdentityHydrationCooldownSkips,
+            avatarMetadataPreservedAfterMemberRemovalCount: phase43AvatarMetadataPreservedAfterMemberRemovalCount,
+            avatarLoadFailureCount: failedAvatars,
+            profileOpensFromSystemEventsCount: phase43ProfileOpensFromSystemEventsCount,
+            currentUserEditSnapshotMergeCount: phase43CurrentUserEditSnapshotMergeCount,
+            memberRemovalIdentityPreservationCount: phase43MemberRemovalIdentityPreservationCount
+        )
         visibleIdentityDiagnostics = VisibleIdentityDiagnostics(
             unresolvedVisibleUserCount: missingVisibleUserIDs().count,
             shortenedVisibleIDCount: visibleDisplays.filter(\.isFallback).count,
             avatarFailureCacheCount: failedAvatars,
             profileFetchMergeCount: profileFetchMergeCount,
-            memberWrapperUserMergeCount: memberWrapperUserMergeCount
+            memberWrapperUserMergeCount: memberWrapperUserMergeCount,
+            phase43: phase43
         )
     }
 
@@ -3306,6 +3592,7 @@ public final class MainShellViewModel {
     }
 
     public func openMemberDetail(_ member: ServerMember) {
+        mergePhase43Member(member, user: snapshot.usersByID[member.id.userID], source: .readyMember)
         selectedMemberDetailID = member.id
         memberNicknameDraft = member.nickname ?? ""
         memberTimeoutHours = 1
@@ -4042,7 +4329,7 @@ public final class MainShellViewModel {
 
     private func mergeBanListIdentities(_ result: BanListResult) {
         for banned in result.users {
-            upsertUser(User(id: banned.id, username: banned.username, discriminator: banned.discriminator ?? "0000", avatar: banned.avatar))
+            upsertUser(User(id: banned.id, username: banned.username, discriminator: banned.discriminator ?? "0000", avatar: banned.avatar), source: .banList)
         }
     }
 
@@ -4055,7 +4342,7 @@ public final class MainShellViewModel {
         for userID in missing {
             if Task.isCancelled { return }
             if let user = try? await apiClient.fetchUser(userID: userID) {
-                upsertUser(user)
+                upsertUser(user, source: .banList)
             }
         }
     }
@@ -4183,6 +4470,7 @@ public final class MainShellViewModel {
     }
 
     private func removeMember(serverID: ServerID, userID: UserID) {
+        preservePhase43IdentityBeforeMemberRemoval(serverID: serverID, userID: userID)
         snapshot.membersByServerAndUserID.removeValue(forKey: ServerMemberKey(serverID: serverID, userID: userID))
         invalidateIdentityPresentationCaches()
         updateVisibleIdentityDiagnostics()
@@ -5365,7 +5653,14 @@ public final class MainShellViewModel {
               queuedImageResourceRequests[key] == nil
         else { return }
         if case .failed = imageResourceStates[key] {
-            return
+            if kind == .userAvatar,
+               let failedAt = imageResourceFailureDates[key],
+               phase43Now().timeIntervalSince(failedAt) >= 60 {
+                imageResourceStates.removeValue(forKey: key)
+                imageResourceFailureDates.removeValue(forKey: key)
+            } else {
+                return
+            }
         }
         imageResourceStates[key] = .loading
         queuedImageResourceRequests[key] = request
@@ -5376,6 +5671,7 @@ public final class MainShellViewModel {
         await imageMemoryCache.removeAll()
         loadedImageResources.removeAll()
         imageResourceStates.removeAll()
+        imageResourceFailureDates.removeAll()
         queuedImageResourceRequests.removeAll()
         lastImageResourceAction = "Cleared image memory cache"
     }
@@ -5431,6 +5727,7 @@ public final class MainShellViewModel {
             await MainActor.run {
             self.loadedImageResources[request.cacheKey] = loaded.data
             self.imageResourceStates[request.cacheKey] = .readyRemote
+                self.imageResourceFailureDates.removeValue(forKey: request.cacheKey)
                 self.imageCompletedCount += 1
             self.lastImageResourceAction = loaded.fromCache ? "Loaded image from memory cache" : "Loaded image"
                 self.updateFreezePerformanceDiagnostics(marker: self.lastImageResourceAction)
@@ -5446,6 +5743,7 @@ public final class MainShellViewModel {
             let message = AttachmentSafety.safeErrorMessage(error)
             await MainActor.run {
                 self.imageResourceStates[request.cacheKey] = .failed(message)
+                self.imageResourceFailureDates[request.cacheKey] = self.phase43Now()
                 self.lastImageResourceAction = "Image load failed"
                 self.updateVisibleIdentityDiagnostics()
                 self.updateFreezePerformanceDiagnostics(marker: self.lastImageResourceAction)
@@ -5478,7 +5776,7 @@ public final class MainShellViewModel {
         }
         if let channel = selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
             for userID in channel.recipients.prefix(12) {
-                loadImageResource(for: snapshot.usersByID[userID]?.avatar, kind: .userAvatar)
+                loadImageResource(for: resolvedUserDisplay(for: snapshot.usersByID[userID], fallbackID: userID).avatarFile, kind: .userAvatar)
             }
         } else if let serverID = selection.serverID {
             for group in memberListGroups(for: serverID).prefix(4) {
@@ -5535,8 +5833,9 @@ public final class MainShellViewModel {
     }
 
     public func resolvedUserDisplay(for user: User?, member: ServerMember? = nil, fallbackID: UserID? = nil, serverID: ServerID? = nil) -> ResolvedUserDisplay {
-        UserDisplayResolver.resolved(
-            userID: fallbackID ?? user?.id ?? member?.id.userID,
+        let userID = fallbackID ?? user?.id ?? member?.id.userID ?? UserID(rawValue: "unknown")
+        return phase43IdentitySnapshots.resolvedDisplay(
+            userID: userID,
             user: user,
             member: member,
             server: serverID.flatMap { snapshot.serversByID[$0] }
@@ -6167,19 +6466,43 @@ public final class MainShellViewModel {
     }
 
     public func systemEventText(for message: Message) -> String {
-        Phase27SystemEventPresenter.text(
-            for: message,
-            usersByID: snapshot.usersByID,
-            membersByServerAndUserID: snapshot.membersByServerAndUserID,
-            channel: snapshot.channelsByID[message.channelID]
-        )
+        systemEventPresentation(for: message).plainText
     }
 
     public func systemEventProfileTarget(for message: Message) -> UserID? {
         guard let target = Phase27SystemEventPresenter.profileTarget(for: message),
-              snapshot.usersByID[target] != nil || member(for: target, serverID: snapshot.channelsByID[message.channelID]?.serverID) != nil
+              !resolvedUserDisplay(for: snapshot.usersByID[target], member: member(for: target, serverID: snapshot.channelsByID[message.channelID]?.serverID), fallbackID: target, serverID: snapshot.channelsByID[message.channelID]?.serverID).isFallback
         else { return nil }
         return target
+    }
+
+    public func systemEventPresentation(for message: Message) -> SystemEventPresentation {
+        let channel = snapshot.channelsByID[message.channelID]
+        let serverID = channel?.serverID
+        return Phase27SystemEventPresenter.presentation(for: message) { [weak self] userID, role in
+            guard let self else { return nil }
+            let member = serverID.flatMap { self.snapshot.membersByServerAndUserID[ServerMemberKey(serverID: $0, userID: userID)] }
+            let user = self.snapshot.usersByID[userID] ?? (userID == self.currentUser?.id ? self.currentUser : nil)
+            let display = self.resolvedUserDisplay(for: user, member: member, fallbackID: userID, serverID: serverID)
+            guard !display.isFallback else { return nil }
+            let confidence: SystemEventParticipantConfidence = member != nil || user != nil ? .high : .medium
+            return SystemEventParticipant(userID: userID, role: role, display: display, confidence: confidence)
+        }
+    }
+
+    public func noteVisibleSystemEvent(_ message: Message) {
+        mergePhase43MessageIdentity(message)
+        let presentation = systemEventPresentation(for: message)
+        if let target = Phase27SystemEventPresenter.profileTarget(for: message),
+           systemEventProfileTarget(for: message) == nil {
+            enqueuePhase43IdentityHydrationIfNeeded(target, source: .systemEvent)
+        }
+        for piece in presentation.pieces {
+            if case let .participant(participant) = piece {
+                enqueuePhase43IdentityHydrationIfNeeded(participant.userID, source: .systemEvent)
+            }
+        }
+        updateVisibleIdentityDiagnostics()
     }
 
     public func reactionSummaries(for message: Message) -> [ReactionSummary] {
@@ -6698,6 +7021,7 @@ public final class MainShellViewModel {
         avatarFailuresCached: \(identity.avatarFailureCacheCount)
         profileFetchMerges: \(identity.profileFetchMergeCount)
         memberWrapperUserMerges: \(identity.memberWrapperUserMergeCount)
+        \(Phase43IdentityDiagnosticsFormatter.redactedText(identity.phase43))
         roleSortMode: \(roles.sortMode)
         roleGroupOrder: \(roles.groupOrder.joined(separator: ","))
         duplicateSuppression: \(roles.duplicateSuppressionCount)
@@ -7625,6 +7949,7 @@ public final class MainShellViewModel {
     private func applySnapshot(_ snapshot: RealtimeSnapshot) {
         let oldSnapshot = self.snapshot
         let mergedSnapshot = snapshotWithHydratedMemberOverlay(snapshot)
+        preserveRemovedRealtimeMemberIdentities(previous: oldSnapshot, current: mergedSnapshot)
         updateMemberSourceDiagnostics(previous: oldSnapshot, current: mergedSnapshot)
         self.snapshot = mergedSnapshot
         messageController.hydrate(from: mergedSnapshot)
@@ -10012,6 +10337,10 @@ public struct CredentialSetupView: View {
             }
             LabeledContent("Visible identity", value: "unresolved \(identity.unresolvedVisibleUserCount), shortened \(identity.shortenedVisibleIDCount), avatar failures \(identity.avatarFailureCacheCount)")
             LabeledContent("Identity merges", value: "profiles \(identity.profileFetchMergeCount), member wrapper users \(identity.memberWrapperUserMergeCount)")
+            LabeledContent("Phase 43 identities", value: "known \(identity.phase43.knownIdentitySnapshotsCount), historical \(identity.phase43.historicalOnlySnapshotsCount), unresolved \(identity.phase43.unresolvedVisibleUserIDsCount)")
+            LabeledContent("Phase 43 system events", value: "clickable \(identity.phase43.systemEventClickableParticipantCount), fallback \(identity.phase43.systemEventNonclickableFallbackCount), profile opens \(identity.phase43.profileOpensFromSystemEventsCount)")
+            LabeledContent("Phase 43 hydration", value: "queued \(identity.phase43.identityHydrationQueuedCount), in-flight \(identity.phase43.identityHydrationInFlightCount), success/fail \(identity.phase43.identityHydrationSuccessCount)/\(identity.phase43.identityHydrationFailureCount), dedupe \(identity.phase43.identityHydrationDedupeHits), cooldown \(identity.phase43.identityHydrationCooldownSkips)")
+            LabeledContent("Phase 43 preservation", value: "avatar \(identity.phase43.avatarMetadataPreservedAfterMemberRemovalCount), removals \(identity.phase43.memberRemovalIdentityPreservationCount), current edits \(identity.phase43.currentUserEditSnapshotMergeCount)")
             LabeledContent("Freeze markers", value: freeze.lastMainThreadMarker ?? "-")
             LabeledContent("Freeze counts", value: "timeline \(freeze.timelineRenderPassCount), grouping \(freeze.memberGroupingCount), grouping cache \(freeze.memberGroupingCacheHitCount), visible \(freeze.visibleRangeUpdateCount), capability cache \(freeze.capabilityCacheUpdateCount)")
             LabeledContent("Markdown cache", value: "parsed \(freeze.markdownParseCount), hits \(freeze.markdownCacheHitCount)")
@@ -11084,6 +11413,55 @@ public struct MessageTimelineView: View {
     }
 }
 
+private struct Phase43SystemEventRow: View {
+    let presentation: SystemEventPresentation
+    let onOpenParticipant: (SystemEventParticipant) -> Void
+
+    var body: some View {
+        HStack(spacing: StoatSpacing.small) {
+            Rectangle()
+                .fill(Color.secondary.opacity(0.35))
+                .frame(height: 1)
+            HStack(spacing: 2) {
+                ForEach(Array(presentation.pieces.enumerated()), id: \.offset) { _, piece in
+                    switch piece {
+                    case let .text(value):
+                        Text(value)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    case let .participant(participant):
+                        Button {
+                            onOpenParticipant(participant)
+                        } label: {
+                            Text(participant.display.displayName)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(roleForeground(participant.display.roleColor))
+                                .underline()
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open Profile")
+                        .accessibilityLabel(participant.accessibilityLabel)
+                    }
+                }
+            }
+            .lineLimit(nil)
+            .multilineTextAlignment(.center)
+            Rectangle()
+                .fill(Color.secondary.opacity(0.35))
+                .frame(height: 1)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, StoatSpacing.xSmall)
+        .accessibilityLabel(presentation.plainText)
+    }
+
+    private func roleForeground(_ roleColor: ResolvedRoleColor?) -> Color {
+        guard let roleColor else { return .secondary }
+        return Color(red: roleColor.red, green: roleColor.green, blue: roleColor.blue)
+    }
+}
+
 public struct TimelineMessageGroupView: View {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     private let group: TimelineMessageGroup
@@ -11154,6 +11532,14 @@ public struct TimelineMessageGroupView: View {
                         .id(timelineMessage.message.id)
                         .onAppear {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
+                            let display = viewModel.resolvedUserDisplay(for: timelineMessage.message)
+                            viewModel.noteVisibleIdentity(
+                                userID: display.userID,
+                                user: timelineMessage.message.user,
+                                member: timelineMessage.message.member,
+                                serverID: display.serverContextID,
+                                source: .visibleMessage
+                            )
                             viewModel.loadInlineImagePreviews(for: timelineMessage.message)
                             viewModel.loadImageResource(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar)
                             viewModel.loadCustomEmojiImages(for: timelineMessage.message)
@@ -11189,31 +11575,23 @@ public struct TimelineMessageGroupView: View {
     }
 
     @ViewBuilder private func systemEventRow(_ timelineMessage: TimelineMessage) -> some View {
-        let row = SystemEventRow(text: viewModel.systemEventText(for: timelineMessage.message))
-        if let target = viewModel.systemEventProfileTarget(for: timelineMessage.message) {
-            Button {
-                viewModel.showUserProfile(target, source: .systemEventActor, serverID: viewModel.snapshot.channelsByID[timelineMessage.message.channelID]?.serverID)
-            } label: {
-                row
+        Phase43SystemEventRow(
+            presentation: viewModel.systemEventPresentation(for: timelineMessage.message),
+            onOpenParticipant: { participant in
+                viewModel.showUserProfile(
+                    participant.userID,
+                    source: .systemEventParticipant,
+                    serverID: viewModel.snapshot.channelsByID[timelineMessage.message.channelID]?.serverID
+                )
             }
-            .buttonStyle(.plain)
-            .help("Open Profile")
-            .id(timelineMessage.message.id)
-            .onAppear {
-                viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
-            }
-            .onDisappear {
-                viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
-            }
-        } else {
-            row
-                .id(timelineMessage.message.id)
-                .onAppear {
-                    viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
-                }
-                .onDisappear {
-                    viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
-                }
+        )
+        .id(timelineMessage.message.id)
+        .onAppear {
+            viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
+            viewModel.noteVisibleSystemEvent(timelineMessage.message)
+        }
+        .onDisappear {
+            viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
         }
     }
 
@@ -11535,7 +11913,10 @@ public struct MemberPanelView: View {
                                 .foregroundStyle(.secondary)
                             ForEach(group.items) { item in
                                 memberListRow(item)
-                                    .onAppear { viewModel.loadImageResource(for: item.avatar, kind: .userAvatar) }
+                                    .onAppear {
+                                        viewModel.noteVisibleIdentity(userID: item.userID, user: item.user, member: item.member, serverID: item.member?.id.serverID, source: .visibleMember)
+                                        viewModel.loadImageResource(for: item.avatar, kind: .userAvatar)
+                                    }
                             }
                         }
                     }
@@ -11571,7 +11952,10 @@ public struct MemberPanelView: View {
                 LazyVStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
                     ForEach(items) { item in
                         memberListRow(item)
-                            .onAppear { viewModel.loadImageResource(for: item.avatar, kind: .userAvatar) }
+                            .onAppear {
+                                viewModel.noteVisibleIdentity(userID: item.userID, user: item.user, member: item.member, serverID: item.member?.id.serverID, source: .visibleMember)
+                                viewModel.loadImageResource(for: item.avatar, kind: .userAvatar)
+                            }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -13441,10 +13825,11 @@ public struct ServerOverviewView: View {
 
     private func moderationMemberRow(_ item: MemberManagementItem) -> some View {
         let moderationState = viewModel.memberModerationMenuState(targetUserID: item.member.id.userID, member: item.member)
+        let display = viewModel.resolvedUserDisplay(for: item.user, member: item.member, fallbackID: item.member.id.userID, serverID: item.member.id.serverID)
         return HStack(spacing: StoatSpacing.medium) {
-            AvatarView(title: item.displayName, size: 32, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
+            AvatarView(title: display.displayName, size: 32, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: display.avatarFile, kind: .userAvatar))
             VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
-                Text(item.displayName)
+                Text(display.displayName)
                     .lineLimit(1)
                 Text(memberSubtitle(for: item))
                     .font(.caption)
@@ -13473,7 +13858,8 @@ public struct ServerOverviewView: View {
         .padding(StoatSpacing.small)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
         .onAppear {
-            viewModel.loadImageResource(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar)
+            viewModel.noteVisibleIdentity(userID: item.member.id.userID, user: item.user, member: item.member, serverID: item.member.id.serverID, source: .visibleMember)
+            viewModel.loadImageResource(for: display.avatarFile, kind: .userAvatar)
         }
         .contextMenu {
             Button("Open Profile") {
@@ -13562,13 +13948,14 @@ public struct ServerOverviewView: View {
 
     private func moderationBanRow(_ ban: ServerBan, result: BanListResult) -> some View {
         let user = bannedUser(for: ban, in: result)
+        let display = bannedResolvedDisplay(ban, result: result)
         let moderationState = viewModel.memberModerationMenuState(targetUserID: ban.id.userID)
         return HStack(spacing: StoatSpacing.medium) {
-            AvatarView(title: banDisplayName(ban, result: result), size: 28, isOnline: false, presence: nil, imageData: viewModel.imageData(for: user?.avatar, kind: .userAvatar))
+            AvatarView(title: display.displayName, size: 28, isOnline: false, presence: nil, imageData: viewModel.imageData(for: display.avatarFile, kind: .userAvatar))
             VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
-                Text(banDisplayName(ban, result: result))
+                Text(display.displayName)
                     .lineLimit(1)
-                Text("User \(UserDisplayResolver.shortenedID(ban.id.userID))")
+                Text(display.subtitle ?? "Banned user")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let reason = ban.reason, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -13589,7 +13976,8 @@ public struct ServerOverviewView: View {
         .padding(StoatSpacing.small)
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
         .onAppear {
-            viewModel.loadImageResource(for: user?.avatar, kind: .userAvatar)
+            viewModel.noteVisibleIdentity(userID: ban.id.userID, user: user.map { User(id: $0.id, username: $0.username, discriminator: $0.discriminator ?? "0000", avatar: $0.avatar) }, serverID: ban.id.serverID, source: .banList)
+            viewModel.loadImageResource(for: display.avatarFile, kind: .userAvatar)
         }
     }
 
@@ -13616,10 +14004,11 @@ public struct ServerOverviewView: View {
                         LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
                             ForEach(items) { item in
                                 let moderationState = viewModel.memberModerationMenuState(targetUserID: item.member.id.userID, member: item.member)
+                                let display = viewModel.resolvedUserDisplay(for: item.user, member: item.member, fallbackID: item.member.id.userID, serverID: item.member.id.serverID)
                                 HStack(spacing: StoatSpacing.medium) {
-                                    AvatarView(title: item.displayName, size: 28, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
+                                    AvatarView(title: display.displayName, size: 28, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: display.avatarFile, kind: .userAvatar))
                                     VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
-                                        Text(item.displayName)
+                                        Text(display.displayName)
                                         Text(item.timeoutSummary ?? "Timed out")
                                             .font(.caption)
                                             .foregroundStyle(.orange)
@@ -13643,13 +14032,14 @@ public struct ServerOverviewView: View {
             VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                 let user = viewModel.snapshot.usersByID[member.id.userID]
                 let moderationState = viewModel.memberModerationMenuState(targetUserID: member.id.userID, member: member)
+                let display = viewModel.resolvedUserDisplay(for: user, member: member, fallbackID: member.id.userID, serverID: member.id.serverID)
                 HStack {
-                    Text(member.nickname ?? user?.displayName ?? user?.username ?? "Member")
+                    Text(display.displayName)
                         .font(.headline)
                     Spacer()
                     Button("Close") { viewModel.closeMemberDetail() }
                 }
-                Text(user.map { "@\($0.username)#\($0.discriminator)" } ?? "Unknown user")
+                Text(display.subtitle ?? "Unknown member")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if viewModel.isDeveloperControlsEnabled {
@@ -13692,7 +14082,7 @@ public struct ServerOverviewView: View {
                     Divider()
                     Text("Confirm \(pending.action.rawValue)")
                         .font(.headline)
-                    Text("This action affects \(user?.username ?? UserDisplayResolver.shortenedID(pending.member.id.userID)).")
+                    Text("This action affects \(viewModel.resolvedUserDisplay(for: user, member: pending.member, fallbackID: pending.member.id.userID, serverID: pending.member.id.serverID).displayName).")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     HStack {
@@ -13758,7 +14148,7 @@ public struct ServerOverviewView: View {
                     }
                     ForEach(result.bans) { ban in
                         HStack {
-                            Text(result.users.first { $0.id == ban.id.userID }?.username ?? UserDisplayResolver.shortenedID(ban.id.userID))
+                            Text(banDisplayName(ban, result: result))
                             Spacer()
                             Button("Unban") { Task { await viewModel.unban(userID: ban.id.userID) } }
                         }
@@ -13804,22 +14194,24 @@ public struct ServerOverviewView: View {
     }
 
     private func banDisplayName(_ ban: ServerBan, result: BanListResult) -> String {
+        bannedResolvedDisplay(ban, result: result).displayName
+    }
+
+    private func bannedResolvedDisplay(_ ban: ServerBan, result: BanListResult) -> ResolvedUserDisplay {
         if let user = result.users.first(where: { $0.id == ban.id.userID }) {
-            if let discriminator = user.discriminator, !discriminator.isEmpty {
-                return "\(user.username)#\(discriminator)"
-            }
-            return user.username
+            return viewModel.resolvedUserDisplay(for: User(id: user.id, username: user.username, discriminator: user.discriminator ?? "0000", avatar: user.avatar), fallbackID: user.id, serverID: ban.id.serverID)
         }
-        if let user = viewModel.snapshot.usersByID[ban.id.userID] {
-            return user.displayName ?? user.username
-        }
-        return UserDisplayResolver.shortenedID(ban.id.userID)
+        return viewModel.resolvedUserDisplay(for: viewModel.snapshot.usersByID[ban.id.userID], fallbackID: ban.id.userID, serverID: ban.id.serverID)
     }
 
     private func filteredTimeoutItems(_ details: ServerSettingsDetails) -> [MemberManagementItem] {
         let query = viewModel.moderationTimeoutSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let items = details.members
-            .map { MemberManagementItem(member: $0, user: viewModel.snapshot.usersByID[$0.id.userID], server: details.server) }
+            .map { member in
+                let user = viewModel.snapshot.usersByID[member.id.userID]
+                let display = viewModel.resolvedUserDisplay(for: user, member: member, fallbackID: member.id.userID, serverID: member.id.serverID)
+                return MemberManagementItem(member: member, user: user, display: display, server: details.server)
+            }
             .filter { $0.timeoutSummary != nil }
         guard !query.isEmpty else { return items }
         return items.filter { item in
@@ -14138,7 +14530,7 @@ public struct ChannelSearchPanel: View {
                     .foregroundStyle(result.isLoaded ? .primary : .secondary)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack {
-                        Text(result.authorDisplayName ?? UserDisplayResolver.shortenedID(result.authorID))
+                        Text(result.authorDisplayName ?? viewModel.resolvedUserDisplay(for: viewModel.snapshot.usersByID[result.authorID], fallbackID: result.authorID).displayName)
                             .font(.caption.weight(.semibold))
                         if let createdAt = result.createdAt {
                             Text(createdAt.formatted(date: .abbreviated, time: .shortened))
@@ -14162,6 +14554,9 @@ public struct ChannelSearchPanel: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(Phase13Accessibility.channelSearchResultLabel(result, isSelected: selected))
+        .onAppear {
+            viewModel.noteVisibleIdentity(userID: result.authorID, source: .visibleSearchResult)
+        }
     }
 
     private var navigationControls: some View {

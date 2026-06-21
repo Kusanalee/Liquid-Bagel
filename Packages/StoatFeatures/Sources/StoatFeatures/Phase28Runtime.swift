@@ -317,6 +317,10 @@ public struct MemberListItem: Hashable, Sendable, Identifiable {
 
     public init(userID: UserID, user: User?, member: ServerMember?, server: Server? = nil) {
         let display = UserDisplayResolver.resolved(userID: userID, user: user, member: member, server: server)
+        self.init(userID: userID, user: user, member: member, display: display, server: server)
+    }
+
+    public init(userID: UserID, user: User?, member: ServerMember?, display: ResolvedUserDisplay, server: Server? = nil) {
         self.userID = userID
         self.user = user
         self.member = member
@@ -680,19 +684,22 @@ public struct VisibleIdentityDiagnostics: Hashable, Sendable {
     public var avatarFailureCacheCount: Int
     public var profileFetchMergeCount: Int
     public var memberWrapperUserMergeCount: Int
+    public var phase43: Phase43IdentityDiagnostics
 
     public init(
         unresolvedVisibleUserCount: Int = 0,
         shortenedVisibleIDCount: Int = 0,
         avatarFailureCacheCount: Int = 0,
         profileFetchMergeCount: Int = 0,
-        memberWrapperUserMergeCount: Int = 0
+        memberWrapperUserMergeCount: Int = 0,
+        phase43: Phase43IdentityDiagnostics = Phase43IdentityDiagnostics()
     ) {
         self.unresolvedVisibleUserCount = unresolvedVisibleUserCount
         self.shortenedVisibleIDCount = shortenedVisibleIDCount
         self.avatarFailureCacheCount = avatarFailureCacheCount
         self.profileFetchMergeCount = profileFetchMergeCount
         self.memberWrapperUserMergeCount = memberWrapperUserMergeCount
+        self.phase43 = phase43
     }
 }
 
@@ -812,6 +819,7 @@ public enum ProfileOpenSource: String, Hashable, Sendable {
     case friendRow
     case currentUser
     case systemEventActor
+    case systemEventParticipant
     case mention
     case unknown
 }
