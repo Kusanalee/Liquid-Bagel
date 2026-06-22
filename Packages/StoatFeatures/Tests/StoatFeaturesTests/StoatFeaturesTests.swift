@@ -1293,6 +1293,10 @@ final class StoatFeaturesTests: XCTestCase {
         model.perform(.focusComposer)
         XCTAssertEqual(model.focusTarget, .composer)
         XCTAssertEqual(model.composerFocusRequestID, 1)
+
+        model.perform(.openAppearanceSettings)
+        XCTAssertEqual(model.selectedSettingsTab, .appearance)
+        XCTAssertTrue(model.isCredentialSetupPresented)
     }
 
     @MainActor
@@ -1325,6 +1329,24 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testAppearancePreferencesSyncFromSessionCoordinator() async throws {
+        var preferences = AppPreferences.defaults
+        preferences.messageDensity = .compact
+        preferences.liquidGlassTransparency = 0.55
+        let session = AppSessionCoordinator(
+            preferencesStore: InMemoryAppPreferencesStore(preferences: preferences),
+            apiClientFactory: { _, _ in RecordingAPIClient() }
+        )
+        await session.startMockSession()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, sessionCoordinator: session)
+
+        model.syncFromSessionCoordinator()
+
+        XCTAssertEqual(model.messageDensity, .compact)
+        XCTAssertEqual(model.liquidGlassTransparency, 0.55)
+    }
+
+    @MainActor
     func testQuickSwitcherIndexesFiltersAndActivatesLocalResults() {
         let model = MainShellViewModel(snapshot: MockShellData.snapshot)
         model.perform(.openQuickSwitcher)
@@ -1342,6 +1364,9 @@ final class StoatFeaturesTests: XCTestCase {
 
         XCTAssertEqual(model.selectedChannel?.displayName, "macos-native")
         XCTAssertFalse(model.quickSwitcherViewModel.results.contains { $0.accessibilityLabel.localizedCaseInsensitiveContains("token") })
+
+        model.quickSwitcherViewModel.query = "appearance"
+        XCTAssertTrue(model.quickSwitcherViewModel.results.contains { $0.title == "Appearance Settings" })
     }
 
     @MainActor

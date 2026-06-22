@@ -43,6 +43,14 @@ final class StoatDesignSystemTests: XCTestCase {
 
         let reducedGlass = StoatMaterialStyle.resolved(reduceTransparency: false, increaseContrast: false, reduceGlassIntensity: true)
         XCTAssertFalse(reducedGlass.usesMaterial)
+
+        let fullGlass = StoatMaterialStyle.resolved(reduceTransparency: false, increaseContrast: false, liquidGlassTransparency: 1.0)
+        let lowGlass = StoatMaterialStyle.resolved(reduceTransparency: false, increaseContrast: false, liquidGlassTransparency: 0.25)
+        XCTAssertTrue(fullGlass.usesMaterial)
+        XCTAssertFalse(lowGlass.usesMaterial)
+        XCTAssertGreaterThan(lowGlass.backgroundOpacity, fullGlass.backgroundOpacity)
+        XCTAssertEqual(StoatLiquidGlassTransparency.clamped(-1), StoatLiquidGlassTransparency.minimum)
+        XCTAssertEqual(StoatLiquidGlassTransparency.clamped(2), StoatLiquidGlassTransparency.maximum)
     }
 
     func testPhase9AccessibilityHelperText() {

@@ -82,6 +82,8 @@ public struct GlassPanel<Content: View>: View {
 
 public struct GlassSidebar<Content: View>: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.stoatLiquidGlassTransparency) private var liquidGlassTransparency
     private let content: Content
 
     public init(@ViewBuilder content: () -> Content) {
@@ -89,13 +91,30 @@ public struct GlassSidebar<Content: View>: View {
     }
 
     public var body: some View {
+        let style = StoatMaterialStyle.resolved(
+            reduceTransparency: reduceTransparency,
+            increaseContrast: colorSchemeContrast == .increased,
+            liquidGlassTransparency: liquidGlassTransparency
+        )
         content
-            .background(reduceTransparency ? AnyShapeStyle(Color(nsColor: .controlBackgroundColor)) : AnyShapeStyle(.thinMaterial))
+            .background(sidebarBackgroundStyle(style))
+    }
+
+    private func sidebarBackgroundStyle(_ style: StoatMaterialStyle) -> AnyShapeStyle {
+        if reduceTransparency {
+            return AnyShapeStyle(Color(nsColor: .controlBackgroundColor))
+        }
+        if style.usesMaterial {
+            return AnyShapeStyle(.thinMaterial)
+        }
+        return AnyShapeStyle(Color(nsColor: .controlBackgroundColor).opacity(0.96))
     }
 }
 
 public struct GlassToolbar<Content: View>: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.stoatLiquidGlassTransparency) private var liquidGlassTransparency
     private let content: Content
 
     public init(@ViewBuilder content: () -> Content) {
@@ -103,10 +122,25 @@ public struct GlassToolbar<Content: View>: View {
     }
 
     public var body: some View {
+        let style = StoatMaterialStyle.resolved(
+            reduceTransparency: reduceTransparency,
+            increaseContrast: colorSchemeContrast == .increased,
+            liquidGlassTransparency: liquidGlassTransparency
+        )
         content
             .frame(height: 52)
             .padding(.horizontal, StoatSpacing.large)
-            .background(reduceTransparency ? AnyShapeStyle(Color(nsColor: .windowBackgroundColor)) : AnyShapeStyle(.bar))
+            .background(toolbarBackgroundStyle(style))
+    }
+
+    private func toolbarBackgroundStyle(_ style: StoatMaterialStyle) -> AnyShapeStyle {
+        if reduceTransparency {
+            return AnyShapeStyle(Color(nsColor: .windowBackgroundColor))
+        }
+        if style.usesMaterial {
+            return AnyShapeStyle(.bar)
+        }
+        return AnyShapeStyle(Color(nsColor: .windowBackgroundColor).opacity(0.96))
     }
 }
 

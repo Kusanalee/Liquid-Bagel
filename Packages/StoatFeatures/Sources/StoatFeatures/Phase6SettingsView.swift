@@ -51,6 +51,10 @@ public struct AccountConnectionSettingsView: View {
             .tabItem { Label("Connection", systemImage: "network") }
             .tag(SettingsSectionTab.connection)
 
+            AppearanceSettingsTab(viewModel: viewModel, connectionViewModel: connectionViewModel)
+                .tabItem { Label("Appearance", systemImage: "circle.lefthalf.filled") }
+                .tag(SettingsSectionTab.appearance)
+
             NotificationSettingsTab(viewModel: viewModel)
                 .tabItem { Label("Notifications", systemImage: "bell.badge") }
                 .tag(SettingsSectionTab.notifications)
@@ -61,6 +65,7 @@ public struct AccountConnectionSettingsView: View {
         }
         .padding()
         .frame(width: 760, height: 780)
+        .environment(\.stoatLiquidGlassTransparency, viewModel.liquidGlassTransparency)
         .task {
             await connectionViewModel.load()
             accountViewModel.syncFromCoordinator()
@@ -716,18 +721,27 @@ private struct ConnectionSettingsTab: View {
                 }
             }
 
-            Section("Safe UI Preferences") {
-                Toggle("Show developer runtime controls", isOn: Binding(
-                    get: { connectionViewModel.preferences.showDeveloperRuntimeControls },
-                    set: { connectionViewModel.preferences.showDeveloperRuntimeControls = $0 }
-                ))
-                Toggle("Member panel visible", isOn: Binding(
-                    get: { connectionViewModel.preferences.memberPanelVisible },
-                    set: { value in
-                        connectionViewModel.preferences.memberPanelVisible = value
-                        viewModel.selection.isMemberPanelVisible = value
-                    }
-                ))
+            if let error = connectionViewModel.errorMessage ?? viewModel.sessionCoordinator?.preferenceErrorMessage {
+                Section("Status") {
+                    Text(error).foregroundStyle(.red)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var currentWarnings: [String] {
+        (try? ConnectionSettingsViewModel.makeEnvironment(apiURL: apiURL, eventsURL: eventsURL, mediaURL: mediaURL).securityWarnings()) ?? []
+    }
+}
+
+private struct AppearanceSettingsTab: View {
+    @Bindable var viewModel: MainShellViewModel
+    @Bindable var connectionViewModel: ConnectionSettingsViewModel
+
+    var body: some View {
+        Form {
+            Section("Appearance") {
                 Picker("Message density", selection: Binding(
                     get: { connectionViewModel.preferences.messageDensity },
                     set: { value in
@@ -738,13 +752,31 @@ private struct ConnectionSettingsTab: View {
                     Text("Comfortable").tag(MessageDensityPreference.comfortable)
                     Text("Compact").tag(MessageDensityPreference.compact)
                 }
-                Toggle("Reduce glass intensity", isOn: Binding(
-                    get: { connectionViewModel.preferences.reduceGlassIntensity },
-                    set: { value in
-                        connectionViewModel.preferences.reduceGlassIntensity = value
-                        viewModel.reduceGlassIntensity = value
+
+                VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                    LabeledContent("Liquid Glass transparency", value: transparencyPercent)
+                    Slider(
+                        value: Binding(
+                            get: { connectionViewModel.preferences.liquidGlassTransparency },
+                            set: { value in
+                                let clamped = AppPreferences.clampedLiquidGlassTransparency(value)
+                                connectionViewModel.preferences.liquidGlassTransparency = clamped
+                                connectionViewModel.preferences.reduceGlassIntensity = clamped <= 0.35
+                                viewModel.liquidGlassTransparency = clamped
+                                viewModel.reduceGlassIntensity = clamped <= 0.35
+                            }
+                        ),
+                        in: 0.25...1.0,
+                        step: 0.05
+                    ) {
+                        Text("Liquid Glass transparency")
+                    } minimumValueLabel: {
+                        Text("Solid")
+                    } maximumValueLabel: {
+                        Text("Clear")
                     }
-                ))
+                }
+
                 Picker("Inline image previews", selection: Binding(
                     get: { connectionViewModel.preferences.inlineImagePreviewPolicy },
                     set: { value in
@@ -756,7 +788,24 @@ private struct ConnectionSettingsTab: View {
                     Text("Explicit click only").tag(InlineImagePreviewPolicy.explicitClickOnly)
                     Text("Disabled").tag(InlineImagePreviewPolicy.disabled)
                 }
-                Button("Save Preferences") {
+            }
+
+            Section("Interface") {
+                Toggle("Show developer runtime controls", isOn: Binding(
+                    get: { connectionViewModel.preferences.showDeveloperRuntimeControls },
+                    set: { connectionViewModel.preferences.showDeveloperRuntimeControls = $0 }
+                ))
+                Toggle("Member panel visible", isOn: Binding(
+                    get: { connectionViewModel.preferences.memberPanelVisible },
+                    set: { value in
+                        connectionViewModel.preferences.memberPanelVisible = value
+                        viewModel.selection.isMemberPanelVisible = value
+                    }
+                ))
+            }
+
+            Section {
+                Button("Save Appearance") {
                     Task {
                         await connectionViewModel.save()
                         viewModel.syncFromSessionCoordinator()
@@ -773,8 +822,8 @@ private struct ConnectionSettingsTab: View {
         .formStyle(.grouped)
     }
 
-    private var currentWarnings: [String] {
-        (try? ConnectionSettingsViewModel.makeEnvironment(apiURL: apiURL, eventsURL: eventsURL, mediaURL: mediaURL).securityWarnings()) ?? []
+    private var transparencyPercent: String {
+        "\(Int((connectionViewModel.preferences.liquidGlassTransparency * 100).rounded()))%"
     }
 }
 

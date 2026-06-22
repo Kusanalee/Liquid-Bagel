@@ -249,21 +249,55 @@ public struct StoatMaterialStyle: Hashable, Sendable {
         self.strokeOpacity = strokeOpacity
     }
 
-    public static func resolved(reduceTransparency: Bool, increaseContrast: Bool, reduceGlassIntensity: Bool) -> StoatMaterialStyle {
+    public static func resolved(reduceTransparency: Bool, increaseContrast: Bool, liquidGlassTransparency: Double) -> StoatMaterialStyle {
         if reduceTransparency {
             return StoatMaterialStyle(usesMaterial: false, backgroundOpacity: 1, strokeOpacity: increaseContrast ? 0.42 : 0.24)
         }
+        let transparency = StoatLiquidGlassTransparency.clamped(liquidGlassTransparency)
+        let opacityProgress = 1 - transparency
         return StoatMaterialStyle(
-            usesMaterial: !reduceGlassIntensity,
-            backgroundOpacity: reduceGlassIntensity ? 0.12 : 0.04,
-            strokeOpacity: increaseContrast ? 0.38 : 0.18
+            usesMaterial: transparency > StoatLiquidGlassTransparency.materialCutoff,
+            backgroundOpacity: 0.04 + (opacityProgress * 0.16),
+            strokeOpacity: increaseContrast ? 0.38 : 0.14 + (opacityProgress * 0.12)
         )
+    }
+
+    public static func resolved(reduceTransparency: Bool, increaseContrast: Bool, reduceGlassIntensity: Bool) -> StoatMaterialStyle {
+        resolved(
+            reduceTransparency: reduceTransparency,
+            increaseContrast: increaseContrast,
+            liquidGlassTransparency: reduceGlassIntensity ? StoatLiquidGlassTransparency.legacyReducedValue : StoatLiquidGlassTransparency.defaultValue
+        )
+    }
+}
+
+public enum StoatLiquidGlassTransparency {
+    public static let minimum: Double = 0.25
+    public static let maximum: Double = 1.0
+    public static let defaultValue: Double = 1.0
+    public static let legacyReducedValue: Double = 0.35
+    public static let materialCutoff: Double = 0.35
+
+    public static func clamped(_ value: Double) -> Double {
+        min(max(value, minimum), maximum)
+    }
+}
+
+private struct StoatLiquidGlassTransparencyKey: EnvironmentKey {
+    static let defaultValue = StoatLiquidGlassTransparency.defaultValue
+}
+
+public extension EnvironmentValues {
+    var stoatLiquidGlassTransparency: Double {
+        get { self[StoatLiquidGlassTransparencyKey.self] }
+        set { self[StoatLiquidGlassTransparencyKey.self] = StoatLiquidGlassTransparency.clamped(newValue) }
     }
 }
 
 public struct GlassBackground: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.stoatLiquidGlassTransparency) private var liquidGlassTransparency
 
     private let material: StoatGlassMaterial
     private let radius: CGFloat
@@ -279,13 +313,13 @@ public struct GlassBackground: ViewModifier {
         let style = StoatMaterialStyle.resolved(
             reduceTransparency: reduceTransparency,
             increaseContrast: colorSchemeContrast == .increased,
-            reduceGlassIntensity: false
+            liquidGlassTransparency: liquidGlassTransparency
         )
         content
             .background {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
                     .fill(reduceTransparency ? Color(nsColor: .controlBackgroundColor) : Color.primary.opacity(style.backgroundOpacity))
-                    .modifier(MaterialFallback(material: material, radius: radius, reduceTransparency: reduceTransparency))
+                    .modifier(MaterialFallback(material: material, radius: radius, usesMaterial: style.usesMaterial))
             }
             .overlay {
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
@@ -297,13 +331,13 @@ public struct GlassBackground: ViewModifier {
 private struct MaterialFallback: ViewModifier {
     let material: StoatGlassMaterial
     let radius: CGFloat
-    let reduceTransparency: Bool
+    let usesMaterial: Bool
 
     func body(content: Content) -> some View {
-        if reduceTransparency {
-            content
-        } else {
+        if usesMaterial {
             content.background(material.material, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        } else {
+            content
         }
     }
 }

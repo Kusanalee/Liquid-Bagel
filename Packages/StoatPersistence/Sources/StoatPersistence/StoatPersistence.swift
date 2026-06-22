@@ -313,6 +313,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public var memberPanelVisible: Bool
     public var messageDensity: MessageDensityPreference
     public var reduceGlassIntensity: Bool
+    public var liquidGlassTransparency: Double
     public var inlineImagePreviewPolicy: InlineImagePreviewPolicy
     public var timelineTuning: TimelineTuningConfiguration
     public var notificationPreferences: NotificationPreferences
@@ -327,6 +328,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         case memberPanelVisible
         case messageDensity
         case reduceGlassIntensity
+        case liquidGlassTransparency
         case inlineImagePreviewPolicy
         case timelineTuning
         case notificationPreferences
@@ -342,6 +344,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         memberPanelVisible: Bool = true,
         messageDensity: MessageDensityPreference = .comfortable,
         reduceGlassIntensity: Bool = false,
+        liquidGlassTransparency: Double = 1.0,
         inlineImagePreviewPolicy: InlineImagePreviewPolicy = .automaticSmallImages,
         timelineTuning: TimelineTuningConfiguration = .defaults,
         notificationPreferences: NotificationPreferences = .defaults
@@ -355,6 +358,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.memberPanelVisible = memberPanelVisible
         self.messageDensity = messageDensity
         self.reduceGlassIntensity = reduceGlassIntensity
+        self.liquidGlassTransparency = Self.clampedLiquidGlassTransparency(reduceGlassIntensity && liquidGlassTransparency == 1.0 ? 0.35 : liquidGlassTransparency)
         self.inlineImagePreviewPolicy = inlineImagePreviewPolicy
         self.timelineTuning = timelineTuning.validated()
         self.notificationPreferences = notificationPreferences.validated()
@@ -362,6 +366,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let legacyReduceGlassIntensity = try container.decodeIfPresent(Bool.self, forKey: .reduceGlassIntensity) ?? false
         self.init(
             lastSelectedEnvironmentID: try container.decodeIfPresent(String.self, forKey: .lastSelectedEnvironmentID),
             environmentProfiles: try container.decodeIfPresent([EnvironmentProfile].self, forKey: .environmentProfiles) ?? [EnvironmentProfile.production()],
@@ -371,7 +376,8 @@ public struct AppPreferences: Codable, Hashable, Sendable {
             lastSelectedChannelID: try container.decodeIfPresent(ChannelID.self, forKey: .lastSelectedChannelID),
             memberPanelVisible: try container.decodeIfPresent(Bool.self, forKey: .memberPanelVisible) ?? true,
             messageDensity: try container.decodeIfPresent(MessageDensityPreference.self, forKey: .messageDensity) ?? .comfortable,
-            reduceGlassIntensity: try container.decodeIfPresent(Bool.self, forKey: .reduceGlassIntensity) ?? false,
+            reduceGlassIntensity: legacyReduceGlassIntensity,
+            liquidGlassTransparency: try container.decodeIfPresent(Double.self, forKey: .liquidGlassTransparency) ?? (legacyReduceGlassIntensity ? 0.35 : 1.0),
             inlineImagePreviewPolicy: try container.decodeIfPresent(InlineImagePreviewPolicy.self, forKey: .inlineImagePreviewPolicy) ?? .automaticSmallImages,
             timelineTuning: try container.decodeIfPresent(TimelineTuningConfiguration.self, forKey: .timelineTuning) ?? .defaults,
             notificationPreferences: try container.decodeIfPresent(NotificationPreferences.self, forKey: .notificationPreferences) ?? .defaults
@@ -389,6 +395,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         try container.encode(memberPanelVisible, forKey: .memberPanelVisible)
         try container.encode(messageDensity, forKey: .messageDensity)
         try container.encode(reduceGlassIntensity, forKey: .reduceGlassIntensity)
+        try container.encode(Self.clampedLiquidGlassTransparency(liquidGlassTransparency), forKey: .liquidGlassTransparency)
         try container.encode(inlineImagePreviewPolicy, forKey: .inlineImagePreviewPolicy)
         try container.encode(timelineTuning.validated(), forKey: .timelineTuning)
         try container.encode(notificationPreferences.validated(), forKey: .notificationPreferences)
@@ -424,6 +431,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
             }
         }
         var copy = self
+        copy.liquidGlassTransparency = Self.clampedLiquidGlassTransparency(liquidGlassTransparency)
         copy.timelineTuning = timelineTuning.validated()
         copy.notificationPreferences = notificationPreferences.validated()
         return copy
@@ -472,6 +480,10 @@ public struct AppPreferences: Codable, Hashable, Sendable {
             if lhs.isProduction != rhs.isProduction { return lhs.isProduction }
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
+    }
+
+    public static func clampedLiquidGlassTransparency(_ value: Double) -> Double {
+        min(max(value, 0.25), 1.0)
     }
 }
 

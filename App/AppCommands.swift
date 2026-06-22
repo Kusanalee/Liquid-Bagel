@@ -231,6 +231,11 @@ struct AppCommands: Commands {
                 commandHandler?.perform(.openNotificationSettings)
             }
             .disabled(commandHandler?.canPerform(.openNotificationSettings) == false)
+
+            Button("Appearance Settings…") {
+                commandHandler?.perform(.openAppearanceSettings)
+            }
+            .disabled(commandHandler?.canPerform(.openAppearanceSettings) == false)
         }
 
         CommandMenu("Servers") {

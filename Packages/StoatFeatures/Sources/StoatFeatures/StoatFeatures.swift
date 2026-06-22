@@ -63,6 +63,7 @@ public enum SettingsSectionTab: String, Codable, Hashable, Sendable, CaseIterabl
     case account
     case sessions
     case connection
+    case appearance
     case notifications
     case developer
 }
@@ -531,6 +532,7 @@ public final class MainShellViewModel {
     public var selectedSettingsTab: SettingsSectionTab = .account
     public var messageDensity: MessageDensityPreference = .comfortable
     public var reduceGlassIntensity = false
+    public var liquidGlassTransparency = AppPreferences.clampedLiquidGlassTransparency(1.0)
     public var timelineTuning: TimelineTuningConfiguration = .defaults
     public var timelineValidationWarnings: [TimelineValidationWarning] = []
     public var routeVerificationResult = TimelineRouteVerificationResult()
@@ -5036,6 +5038,11 @@ public final class MainShellViewModel {
         refreshNotificationPermissionStatus()
     }
 
+    public func showAppearanceSettings() {
+        selectedSettingsTab = .appearance
+        isCredentialSetupPresented = true
+    }
+
     public func showAccountSessions() {
         selectedSettingsTab = .account
         isCredentialSetupPresented = true
@@ -5121,6 +5128,7 @@ public final class MainShellViewModel {
         selection.isMemberPanelVisible = sessionCoordinator.preferences.memberPanelVisible
         messageDensity = sessionCoordinator.preferences.messageDensity
         reduceGlassIntensity = sessionCoordinator.preferences.reduceGlassIntensity
+        liquidGlassTransparency = AppPreferences.clampedLiquidGlassTransparency(sessionCoordinator.preferences.liquidGlassTransparency)
         inlineImagePreviewPolicy = sessionCoordinator.preferences.inlineImagePreviewPolicy
         timelineTuning = sessionCoordinator.preferences.timelineTuning.validated()
         snapshot = snapshotWithHydratedMemberOverlay(sessionCoordinator.snapshot)
@@ -9126,7 +9134,7 @@ public final class MainShellViewModel {
 extension MainShellViewModel: AppCommandHandling {
     public func canPerform(_ command: AppCommand) -> Bool {
         switch command {
-        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .openJoinInvite, .openCreateServer, .openDiscoverInBrowser, .focusTimeline, .resetTimelineTuningDefault:
+        case .openQuickSwitcher, .closeTransientUI, .refresh, .openAccountSettings, .openConnectionSettings, .openAppearanceSettings, .openNotificationSettings, .toggleMemberPanel, .jumpToHome, .jumpToFriends, .jumpToAddFriend, .jumpToDiscover, .openJoinInvite, .openCreateServer, .openDiscoverInBrowser, .focusTimeline, .resetTimelineTuningDefault:
             return true
         case .pasteAttachment:
             return selectedConversationChannelID != nil
@@ -9321,6 +9329,8 @@ extension MainShellViewModel: AppCommandHandling {
             showAccountSessions()
         case .openConnectionSettings:
             showConnectionSettings()
+        case .openAppearanceSettings:
+            showAppearanceSettings()
         case .openNotificationSettings:
             showNotificationSettings()
         case .toggleMemberPanel:
@@ -10055,6 +10065,7 @@ public struct MainShellView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .environment(\.stoatLiquidGlassTransparency, viewModel.liquidGlassTransparency)
         .sheet(isPresented: $viewModel.isQuickSwitcherPresented) {
             QuickSwitcherView(viewModel: viewModel)
         }
@@ -15633,6 +15644,7 @@ public typealias PhaseFourStatus = PhaseOneStatus
 private func phase30DMPreviewModel(reduceGlass: Bool = false) -> MainShellViewModel {
     let model = MainShellViewModel(snapshot: MockShellData.snapshot)
     model.reduceGlassIntensity = reduceGlass
+    model.liquidGlassTransparency = reduceGlass ? 0.35 : 1.0
     if let item = model.directMessageItems.first {
         model.selectDirectMessageItem(item)
     }
@@ -15669,6 +15681,7 @@ private func phase37PreviewModel(reduceGlass: Bool = false, highContrast: Bool =
 
     let model = MainShellViewModel(snapshot: snapshot)
     model.reduceGlassIntensity = reduceGlass
+    model.liquidGlassTransparency = reduceGlass ? 0.35 : 1.0
     model.selectServer(serverID)
     model.userProfilesByID[botID] = UserProfile(content: "### About\nAutomation helper for **member hydration** and _safe media_ checks.", background: File(id: "phase37-profile-background", tag: "backgrounds", filename: "banner.png", metadata: .image(width: 1200, height: 360, thumbhash: nil, animated: false), contentType: "image/png", size: 128_000, userID: botID))
     model.showUserProfile(botID, source: .memberRow, serverID: serverID)

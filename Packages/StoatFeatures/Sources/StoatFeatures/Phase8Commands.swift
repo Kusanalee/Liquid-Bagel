@@ -14,6 +14,7 @@ public enum AppCommand: Hashable, Sendable {
     case resetToMock
     case openAccountSettings
     case openConnectionSettings
+    case openAppearanceSettings
     case openNotificationSettings
     case toggleMemberPanel
     case toggleDeveloperControls
@@ -366,6 +367,7 @@ public final class QuickSwitcherViewModel {
             commandResult(.toggleMemberPanel, title: "Toggle Member Panel", subtitle: "Show or hide the member panel"),
             commandResult(.openAccountSettings, title: "Account Settings", subtitle: "Open Account & Connection settings"),
             commandResult(.openConnectionSettings, title: "Connection Settings", subtitle: "Open connection settings"),
+            commandResult(.openAppearanceSettings, title: "Appearance Settings", subtitle: "Adjust Liquid Glass and message density"),
             commandResult(.openNotificationSettings, title: "Notification Settings", subtitle: "Open notification settings")
         ]
     }

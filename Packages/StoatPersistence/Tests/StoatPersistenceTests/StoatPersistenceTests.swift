@@ -17,6 +17,7 @@ final class StoatPersistenceTests: XCTestCase {
         XCTAssertEqual(preferences.preferredLaunchMode, .mock)
         XCTAssertEqual(preferences.selectedEnvironmentProfile.id, "production")
         XCTAssertTrue(preferences.environmentProfiles.contains { $0.isProduction && $0.environment == .production })
+        XCTAssertEqual(preferences.liquidGlassTransparency, 1.0)
     }
 
     func testPreferencesRoundTripThroughUserDefaultsStore() async throws {
@@ -34,6 +35,19 @@ final class StoatPersistenceTests: XCTestCase {
 
         XCTAssertEqual(loaded.lastSelectedEnvironmentID, custom.id)
         XCTAssertEqual(loaded.environmentProfiles.first { $0.id == custom.id }?.name, "Local")
+    }
+
+    func testLiquidGlassTransparencyClampsAndRoundTrips() async throws {
+        let store = UserDefaultsAppPreferencesStore(suiteName: "LiquidBagelTests.\(UUID().uuidString)")
+        var preferences = AppPreferences.defaults
+        preferences.liquidGlassTransparency = 0.55
+
+        try await store.savePreferences(preferences)
+        let loaded = try await store.loadPreferences()
+
+        XCTAssertEqual(loaded.liquidGlassTransparency, 0.55)
+        XCTAssertEqual(AppPreferences(liquidGlassTransparency: -1).liquidGlassTransparency, 0.25)
+        XCTAssertEqual(AppPreferences(liquidGlassTransparency: 2).liquidGlassTransparency, 1.0)
     }
 
     func testResetPreferencesRestoresDefaults() async throws {
@@ -160,6 +174,37 @@ final class StoatPersistenceTests: XCTestCase {
         let decoded = try JSONDecoder.stoat.decode(AppPreferences.self, from: Data(json.utf8))
 
         XCTAssertEqual(decoded.notificationPreferences, .defaults)
+        XCTAssertEqual(decoded.liquidGlassTransparency, 1.0)
+    }
+
+    func testLegacyReducedGlassPreferenceMigratesToLowTransparency() throws {
+        let json = """
+        {
+          "environmentProfiles": [
+            {
+              "id": "production",
+              "name": "Stoat Production",
+              "environment": {
+                "apiBaseURL": "https://api.stoat.chat",
+                "eventsURL": "wss://events.stoat.chat"
+              },
+              "isProduction": true,
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "updatedAt": "2026-01-01T00:00:00.000Z"
+            }
+          ],
+          "preferredLaunchMode": "mock",
+          "showDeveloperRuntimeControls": true,
+          "memberPanelVisible": true,
+          "messageDensity": "comfortable",
+          "reduceGlassIntensity": true
+        }
+        """
+
+        let decoded = try JSONDecoder.stoat.decode(AppPreferences.self, from: Data(json.utf8))
+
+        XCTAssertTrue(decoded.reduceGlassIntensity)
+        XCTAssertEqual(decoded.liquidGlassTransparency, 0.35)
     }
 
     func testPhase18ChannelNotificationOverridesValidateAndRoundTrip() async throws {
