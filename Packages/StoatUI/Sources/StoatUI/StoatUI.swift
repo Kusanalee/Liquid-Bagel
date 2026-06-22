@@ -405,6 +405,121 @@ public struct MessageInlineCustomEmojiItem: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct MessageEmbedDisplayItem: Identifiable, Hashable, Sendable {
+    public var id: String
+    public var embed: Embed
+    public var label: String
+    public var title: String?
+    public var description: String?
+    public var siteName: String?
+    public var displayURL: String?
+    public var externalURL: URL?
+    public var mediaItem: AttachmentDisplayItem?
+    public var mediaPreviewData: Data?
+    public var accessibilityLabel: String
+
+    public init(
+        id: String = UUID().uuidString,
+        embed: Embed,
+        mediaItem: AttachmentDisplayItem? = nil,
+        mediaPreviewData: Data? = nil,
+        accessibilityLabel: String? = nil
+    ) {
+        self.id = id
+        self.embed = embed
+        self.label = Self.label(for: embed.kind)
+        self.title = Self.safeText(embed.title, limit: 120)
+        self.description = Self.safeText(embed.description, limit: 500)
+        self.siteName = Self.safeText(embed.siteName, limit: 80)
+        self.displayURL = Self.safeDisplayURL(embed.url ?? embed.originalURL)
+        self.externalURL = Self.safeExternalURL(embed.url ?? embed.originalURL)
+        self.mediaItem = mediaItem
+        self.mediaPreviewData = mediaPreviewData
+        self.accessibilityLabel = accessibilityLabel ?? Self.makeAccessibilityLabel(
+            label: self.label,
+            title: self.title,
+            siteName: self.siteName,
+            displayURL: self.displayURL,
+            mediaItem: mediaItem,
+            hasExternalImage: embed.image != nil,
+            hasExternalVideo: embed.video != nil
+        )
+    }
+
+    public static func label(for kind: EmbedKind) -> String {
+        switch kind {
+        case .website:
+            return "Link"
+        case .image:
+            return "Image"
+        case .video:
+            return "Video"
+        case .text, .none:
+            return "Embed"
+        case let .unknown(value):
+            let trimmed = safeText(value, limit: 32)
+            return trimmed.map { "Embed \($0)" } ?? "Embed"
+        }
+    }
+
+    public static func safeText(_ value: String?, limit: Int = 180) -> String? {
+        guard let value else { return nil }
+        let scalars = value
+            .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+            .unicodeScalars
+            .filter { !CharacterSet.controlCharacters.contains($0) }
+        let trimmed = String(String.UnicodeScalarView(scalars))
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed.count > limit else { return trimmed }
+        let index = trimmed.index(trimmed.startIndex, offsetBy: max(0, limit - 3))
+        return String(trimmed[..<index]).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+    }
+
+    public static func safeExternalURL(_ raw: String?) -> URL? {
+        guard let raw,
+              let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              components.host?.isEmpty == false
+        else { return nil }
+        return components.url
+    }
+
+    public static func safeDisplayURL(_ raw: String?) -> String? {
+        guard var components = raw.flatMap(URLComponents.init(string:)),
+              components.host?.isEmpty == false
+        else { return nil }
+        components.query = nil
+        components.fragment = nil
+        return components.string
+    }
+
+    private static func makeAccessibilityLabel(
+        label: String,
+        title: String?,
+        siteName: String?,
+        displayURL: String?,
+        mediaItem: AttachmentDisplayItem?,
+        hasExternalImage: Bool,
+        hasExternalVideo: Bool
+    ) -> String {
+        var parts = [label]
+        if let title { parts.append(title) }
+        if let siteName { parts.append(siteName) }
+        if let displayURL { parts.append(displayURL) }
+        if let mediaItem {
+            parts.append("media \(mediaItem.displayName)")
+        } else if hasExternalImage {
+            parts.append("external image preview available")
+        } else if hasExternalVideo {
+            parts.append("external video preview available")
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
 public struct EmojiPickerSection: Identifiable, Hashable, Sendable {
     public var id: String
     public var title: String
@@ -808,6 +923,10 @@ private struct EmojiPickerPopover: View {
         case "🙏": return ["pray", "thanks", "please"]
         case "🔥": return ["fire", "hot"]
         case "✨": return ["sparkles", "magic"]
+        case "💬": return ["message", "chat", "comment"]
+        case "📌": return ["pin", "pinned"]
+        case "⭐": return ["star", "favorite"]
+        case "❌": return ["x", "cancel", "no"]
         case "😄": return ["smile", "happy"]
         case "😅": return ["sweat", "relief"]
         case "😎": return ["cool", "sunglasses"]
@@ -822,6 +941,12 @@ private struct EmojiPickerPopover: View {
         case "😆": return ["laugh", "grin"]
         case "😋": return ["yum", "tasty"]
         case "😴": return ["sleep", "tired"]
+        case "😭": return ["sob", "cry"]
+        case "😬": return ["grimace", "awkward"]
+        case "😤": return ["frustrated", "triumph"]
+        case "🥳": return ["party", "celebrate"]
+        case "🤝": return ["handshake", "deal"]
+        case "🫶": return ["heart hands", "support"]
         default: return []
         }
     }
@@ -1347,6 +1472,7 @@ public struct MessageRow: View {
     private let replyPreviewItem: MessageRowReplyPreviewItem?
     private let attachmentItems: [AttachmentDisplayItem]?
     private let customEmojiItems: [MessageInlineCustomEmojiItem]
+    private let embedItems: [MessageEmbedDisplayItem]?
     private let authorAvatarData: Data?
     private let actionItems: [MessageRowActionItem]
     private let reactionItems: [MessageReactionDisplayItem]
@@ -1356,6 +1482,10 @@ public struct MessageRow: View {
     private let onDownloadAttachment: (AttachmentDisplayItem) -> Void
     private let onOpenAttachment: (AttachmentDisplayItem) -> Void
     private let onRetryAttachment: (AttachmentDisplayItem) -> Void
+    private let onPreviewEmbedMedia: (AttachmentDisplayItem) -> Void
+    private let onDownloadEmbedMedia: (AttachmentDisplayItem) -> Void
+    private let onOpenEmbedMedia: (AttachmentDisplayItem) -> Void
+    private let onRetryEmbedMedia: (AttachmentDisplayItem) -> Void
     private let onOpenAuthorProfile: () -> Void
     private let onOpenReplyPreview: () -> Void
 
@@ -1377,6 +1507,7 @@ public struct MessageRow: View {
         replyPreviewItem: MessageRowReplyPreviewItem? = nil,
         attachmentItems: [AttachmentDisplayItem]? = nil,
         customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        embedItems: [MessageEmbedDisplayItem]? = nil,
         authorAvatarData: Data? = nil,
         actionItems: [MessageRowActionItem] = [],
         reactionItems: [MessageReactionDisplayItem] = [],
@@ -1386,6 +1517,10 @@ public struct MessageRow: View {
         onDownloadAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onOpenAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onRetryAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onPreviewEmbedMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onDownloadEmbedMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onOpenEmbedMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onRetryEmbedMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onOpenAuthorProfile: @escaping () -> Void = {},
         onOpenReplyPreview: @escaping () -> Void = {}
     ) {
@@ -1406,6 +1541,7 @@ public struct MessageRow: View {
         self.replyPreviewItem = replyPreviewItem
         self.attachmentItems = attachmentItems
         self.customEmojiItems = customEmojiItems
+        self.embedItems = embedItems
         self.authorAvatarData = authorAvatarData
         self.actionItems = actionItems
         self.reactionItems = reactionItems
@@ -1415,6 +1551,10 @@ public struct MessageRow: View {
         self.onDownloadAttachment = onDownloadAttachment
         self.onOpenAttachment = onOpenAttachment
         self.onRetryAttachment = onRetryAttachment
+        self.onPreviewEmbedMedia = onPreviewEmbedMedia
+        self.onDownloadEmbedMedia = onDownloadEmbedMedia
+        self.onOpenEmbedMedia = onOpenEmbedMedia
+        self.onRetryEmbedMedia = onRetryEmbedMedia
         self.onOpenAuthorProfile = onOpenAuthorProfile
         self.onOpenReplyPreview = onOpenReplyPreview
     }
@@ -1476,11 +1616,7 @@ public struct MessageRow: View {
                     replyPreviewView(replyPreviewItem)
                 }
                 if let content = message.content, !content.isEmpty {
-                    if customEmojiItems.isEmpty {
-                        MarkdownMessageContent(content)
-                    } else {
-                        InlineCustomEmojiMessageContent(source: content, customEmojiItems: customEmojiItems)
-                    }
+                    MarkdownMessageContent(content, customEmojiItems: customEmojiItems)
                 }
                 let renderedAttachments = attachmentItems ?? message.attachments?.map { AttachmentDisplayItem(file: $0) } ?? []
                 if !renderedAttachments.isEmpty {
@@ -1495,9 +1631,17 @@ public struct MessageRow: View {
                         )
                     }
                 }
-                if let embeds = message.embeds, !embeds.isEmpty {
-                    ForEach(Array(embeds.enumerated()), id: \.offset) { _, embed in
-                        EmbedTimelineCard(embed: embed, isCompact: isCompactDensity)
+                let renderedEmbeds = embedItems ?? fallbackEmbedItems
+                if !renderedEmbeds.isEmpty {
+                    ForEach(renderedEmbeds) { embed in
+                        EmbedTimelineCard(
+                            item: embed,
+                            isCompact: isCompactDensity,
+                            onPreviewMedia: { onPreviewEmbedMedia($0) },
+                            onDownloadMedia: { onDownloadEmbedMedia($0) },
+                            onOpenMedia: { onOpenEmbedMedia($0) },
+                            onRetryMedia: { onRetryEmbedMedia($0) }
+                        )
                     }
                 }
                 let renderedReactions = reactionItems.isEmpty ? fallbackReactionItems : reactionItems
@@ -1651,6 +1795,16 @@ public struct MessageRow: View {
                 if lhs.count == rhs.count { return lhs.emoji < rhs.emoji }
                 return lhs.count > rhs.count
             }
+    }
+
+    private var fallbackEmbedItems: [MessageEmbedDisplayItem] {
+        (message.embeds ?? []).enumerated().map { index, embed in
+            MessageEmbedDisplayItem(
+                id: "embed-\(message.id.rawValue)-\(index)",
+                embed: embed,
+                mediaItem: embed.media.map { AttachmentDisplayItem(file: $0) }
+            )
+        }
     }
 
     private var reactionCount: Int {
@@ -2018,10 +2172,12 @@ public struct SystemEventRow: View {
 public struct MarkdownMessageContent: View {
     private let source: String
     private let parsedBlocks: [MarkdownBlock]
+    private let customEmojiItems: [MessageInlineCustomEmojiItem]
 
-    public init(_ source: String) {
+    public init(_ source: String, customEmojiItems: [MessageInlineCustomEmojiItem] = []) {
         self.source = source
         self.parsedBlocks = MarkdownBlockCache.shared.blocks(for: source)
+        self.customEmojiItems = customEmojiItems
     }
 
     public var body: some View {
@@ -2036,17 +2192,15 @@ public struct MarkdownMessageContent: View {
                         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
                         .textSelection(.enabled)
                 case let .quote(quote):
-                    Text(attributed(quote))
-                        .font(StoatTypography.messageBody)
-                        .foregroundStyle(.secondary)
+                    MarkdownInlineContent(source: quote, customEmojiItems: customEmojiItems, font: StoatTypography.messageBody)
                         .padding(.leading, StoatSpacing.small)
                         .overlay(alignment: .leading) {
                             Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 2)
                         }
+                        .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 case let .heading(level, text):
-                    Text(attributed(text))
-                        .font(level <= 1 ? .title3.weight(.semibold) : .headline)
+                    MarkdownInlineContent(source: text, customEmojiItems: customEmojiItems, font: level <= 1 ? .title3.weight(.semibold) : .headline)
                         .textSelection(.enabled)
                 case let .listItem(marker, text):
                     HStack(alignment: .firstTextBaseline, spacing: StoatSpacing.small) {
@@ -2054,23 +2208,16 @@ public struct MarkdownMessageContent: View {
                             .font(StoatTypography.messageBody)
                             .foregroundStyle(.secondary)
                             .frame(minWidth: 18, alignment: .trailing)
-                        Text(attributed(text))
-                            .font(StoatTypography.messageBody)
+                        MarkdownInlineContent(source: text, customEmojiItems: customEmojiItems, font: StoatTypography.messageBody)
                             .textSelection(.enabled)
                     }
                 case let .text(text):
-                    Text(attributed(text))
-                        .font(StoatTypography.messageBody)
+                    MarkdownInlineContent(source: text, customEmojiItems: customEmojiItems, font: StoatTypography.messageBody)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
-    }
-
-    private func attributed(_ value: String) -> AttributedString {
-        let sanitized = value.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
-        return (try? AttributedString(markdown: sanitized, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(sanitized)
     }
 }
 
@@ -2123,6 +2270,14 @@ extension MarkdownMessageContent {
     public static func cacheDiagnostics() -> MarkdownCacheDiagnostics {
         MarkdownBlockCache.shared.diagnostics()
     }
+
+    nonisolated static func _testBlockDescriptions(for source: String) -> [String] {
+        MarkdownBlock.parse(source).map(\.testDescription)
+    }
+
+    nonisolated static func _testInlineTokenDescriptions(for source: String, customEmojiItems: [MessageInlineCustomEmojiItem]) -> [String] {
+        InlineCustomEmojiToken.tokenize(source: source, items: customEmojiItems).map(\.testDescription)
+    }
 }
 
 private struct InlineCustomEmojiMessageContent: View {
@@ -2130,12 +2285,22 @@ private struct InlineCustomEmojiMessageContent: View {
     let customEmojiItems: [MessageInlineCustomEmojiItem]
 
     var body: some View {
+        MarkdownMessageContent(source, customEmojiItems: customEmojiItems)
+    }
+}
+
+private struct MarkdownInlineContent: View {
+    let source: String
+    let customEmojiItems: [MessageInlineCustomEmojiItem]
+    let font: Font
+
+    var body: some View {
         HStack(alignment: .center, spacing: StoatSpacing.xxSmall) {
             ForEach(tokens.indices, id: \.self) { index in
                 switch tokens[index] {
                 case let .text(value):
-                    Text(value)
-                        .font(StoatTypography.messageBody)
+                    Text(Self.attributed(value))
+                        .font(font)
                         .textSelection(.enabled)
                 case let .emoji(item):
                     inlineEmoji(item)
@@ -2167,6 +2332,11 @@ private struct InlineCustomEmojiMessageContent: View {
     private var tokens: [InlineCustomEmojiToken] {
         InlineCustomEmojiToken.tokenize(source: source, items: customEmojiItems)
     }
+
+    private static func attributed(_ value: String) -> AttributedString {
+        let sanitized = value.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+        return (try? AttributedString(markdown: sanitized, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(sanitized)
+    }
 }
 
 private enum InlineCustomEmojiToken: Hashable {
@@ -2193,6 +2363,15 @@ private enum InlineCustomEmojiToken: Hashable {
         let tail = String(remaining)
         if !tail.isEmpty { result.append(.text(tail)) }
         return result.isEmpty ? [.text(source)] : result
+    }
+
+    var testDescription: String {
+        switch self {
+        case let .text(value):
+            return "text::\(value)"
+        case let .emoji(item):
+            return "emoji::\(item.shortcode)"
+        }
     }
 }
 
@@ -2279,54 +2458,96 @@ private enum MarkdownBlock: Hashable {
         let text = String(line[match.upperBound...])
         return .listItem(marker, text)
     }
+
+    var testDescription: String {
+        switch self {
+        case let .text(value):
+            return "text::\(value)"
+        case let .code(value):
+            return "code::\(value)"
+        case let .quote(value):
+            return "quote::\(value)"
+        case let .heading(level, value):
+            return "heading\(level)::\(value)"
+        case let .listItem(marker, value):
+            return "list\(marker)::\(value)"
+        }
+    }
 }
 
 public struct EmbedTimelineCard: View {
-    private let embed: Embed
+    private let item: MessageEmbedDisplayItem
     private let isCompact: Bool
+    private let onPreviewMedia: (AttachmentDisplayItem) -> Void
+    private let onDownloadMedia: (AttachmentDisplayItem) -> Void
+    private let onOpenMedia: (AttachmentDisplayItem) -> Void
+    private let onRetryMedia: (AttachmentDisplayItem) -> Void
 
     public init(embed: Embed, isCompact: Bool = false) {
-        self.embed = embed
+        self.init(
+            item: MessageEmbedDisplayItem(
+                embed: embed,
+                mediaItem: embed.media.map { AttachmentDisplayItem(file: $0) }
+            ),
+            isCompact: isCompact
+        )
+    }
+
+    public init(
+        item: MessageEmbedDisplayItem,
+        isCompact: Bool = false,
+        onPreviewMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onDownloadMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onOpenMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in },
+        onRetryMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in }
+    ) {
+        self.item = item
         self.isCompact = isCompact
+        self.onPreviewMedia = onPreviewMedia
+        self.onDownloadMedia = onDownloadMedia
+        self.onOpenMedia = onOpenMedia
+        self.onRetryMedia = onRetryMedia
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
             HStack(spacing: StoatSpacing.small) {
-                Text(label)
+                Text(item.label)
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
-                if let provider = safeText(embed.siteName) {
+                if let provider = item.siteName {
                     Text(provider)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                 }
             }
-            if let title = safeText(embed.title) {
-                if let url = SafeEmbedURL.externalURL(embed.url ?? embed.originalURL) {
+            if let title = item.title {
+                if let url = item.externalURL {
                     Link(title, destination: url)
                         .font(.caption.weight(.semibold))
                 } else {
                     Text(title).font(.caption.weight(.semibold))
                 }
             }
-            if let description = safeText(embed.description) {
+            if let description = item.description {
                 MarkdownMessageContent(description)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
             }
-            if embed.image != nil || embed.media != nil {
-                Label(embed.media?.filename ?? "Image preview available", systemImage: "photo")
+            if let mediaItem = renderedMediaItem {
+                embedMedia(mediaItem)
+            } else if item.embed.image != nil {
+                Label("External image preview available", systemImage: "photo")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else if embed.video != nil {
-                Label("Video preview", systemImage: "play.rectangle")
+            } else if item.embed.video != nil {
+                Label("External video preview available", systemImage: "play.rectangle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if let displayURL = SafeEmbedURL.display(embed.url ?? embed.originalURL) {
+            if let displayURL = item.displayURL {
                 Text(displayURL)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -2334,27 +2555,121 @@ public struct EmbedTimelineCard: View {
             }
         }
         .padding(isCompact ? StoatSpacing.small : StoatSpacing.medium)
-        .frame(maxWidth: 340, alignment: .leading)
+        .frame(maxWidth: isCompact ? 320 : 420, alignment: .leading)
         .overlay(alignment: .leading) {
             Rectangle().fill(accentColor).frame(width: 3)
         }
         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
-        .accessibilityLabel(accessibilityLabel)
+        .accessibilityLabel(item.accessibilityLabel)
     }
 
-    private var label: String {
-        switch embed.kind {
-        case .website: "Link"
-        case .image: "Image"
-        case .video: "Video"
-        case .text: "Embed"
-        case .none: "Embed"
-        case let .unknown(value): value.isEmpty ? "Embed" : "Embed \(value)"
+    @ViewBuilder private func embedMedia(_ mediaItem: AttachmentDisplayItem) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+            mediaPreview(mediaItem)
+            HStack(spacing: StoatSpacing.xSmall) {
+                Image(systemName: mediaItem.kind.systemImage)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(mediaItem.displayName)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                    Text("\(mediaItem.kind.label) · \(AttachmentDisplayFormatting.formattedSize(mediaItem.byteCount))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            mediaControls(mediaItem)
         }
     }
 
+    @ViewBuilder private func mediaPreview(_ mediaItem: AttachmentDisplayItem) -> some View {
+        #if canImport(AppKit)
+        if mediaItem.kind == .image,
+           mediaItem.previewState.isReady,
+           let data = mediaItem.previewData,
+           let image = NSImage(data: data) {
+            Button {
+                onPreviewMedia(mediaItem)
+            } label: {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(maxWidth: isCompact ? 280 : 360, maxHeight: isCompact ? 180 : 240, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open embed image \(mediaItem.displayName)")
+        } else if case .loading = mediaItem.previewState {
+            HStack(spacing: StoatSpacing.small) {
+                ProgressView().controlSize(.small)
+                Text("Loading embed media")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        #else
+        if case .loading = mediaItem.previewState {
+            Text("Loading embed media")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        #endif
+    }
+
+    @ViewBuilder private func mediaControls(_ mediaItem: AttachmentDisplayItem) -> some View {
+        HStack(spacing: StoatSpacing.xSmall) {
+            if mediaItem.kind.isPreviewable {
+                Button {
+                    onPreviewMedia(mediaItem)
+                } label: {
+                    Label(mediaItem.previewState.isReady ? "Preview" : "Load Preview", systemImage: "eye")
+                }
+                .buttonStyle(.borderless)
+            }
+            if mediaItem.source.isRemoteLoadable {
+                Button {
+                    onDownloadMedia(mediaItem)
+                } label: {
+                    Label("Save As", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.borderless)
+            }
+            if mediaItem.previewState.isReady {
+                Button {
+                    onOpenMedia(mediaItem)
+                } label: {
+                    Label("Open", systemImage: "arrow.up.forward.app")
+                }
+                .buttonStyle(.borderless)
+            }
+            if case .failed = mediaItem.previewState {
+                Button {
+                    onRetryMedia(mediaItem)
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .font(.caption)
+    }
+
+    private var renderedMediaItem: AttachmentDisplayItem? {
+        guard var mediaItem = item.mediaItem else { return nil }
+        if let mediaPreviewData = item.mediaPreviewData {
+            mediaItem.previewData = mediaPreviewData
+            if !mediaItem.previewState.isReady {
+                mediaItem.previewState = .readyRemote
+            }
+        }
+        return mediaItem
+    }
+
     private var accentColor: Color {
-        guard let colour = embed.colour?.trimmingCharacters(in: .whitespacesAndNewlines), !colour.isEmpty else {
+        guard let colour = item.embed.colour?.trimmingCharacters(in: .whitespacesAndNewlines), !colour.isEmpty else {
             return Color.accentColor
         }
         #if canImport(AppKit)
@@ -2370,40 +2685,6 @@ public struct EmbedTimelineCard: View {
         #else
         return Color.accentColor
         #endif
-    }
-
-    private var accessibilityLabel: String {
-        [label, safeText(embed.title), safeText(embed.siteName), SafeEmbedURL.display(embed.url ?? embed.originalURL)]
-            .compactMap { $0 }
-            .joined(separator: ", ")
-    }
-
-    private func safeText(_ value: String?) -> String? {
-        let trimmed = value?
-            .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed?.isEmpty == false ? trimmed : nil
-    }
-}
-
-private enum SafeEmbedURL {
-    static func externalURL(_ raw: String?) -> URL? {
-        guard let raw,
-              let components = URLComponents(string: raw),
-              let scheme = components.scheme?.lowercased(),
-              scheme == "https" || scheme == "http",
-              components.host?.isEmpty == false
-        else { return nil }
-        return components.url
-    }
-
-    static func display(_ raw: String?) -> String? {
-        guard var components = raw.flatMap(URLComponents.init(string:)),
-              components.host?.isEmpty == false
-        else { return nil }
-        components.query = nil
-        components.fragment = nil
-        return components.string
     }
 }
 

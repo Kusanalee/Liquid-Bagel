@@ -5359,6 +5359,65 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertFalse(text.contains("01JPHASE44FULLID0000000001"))
     }
 
+    @MainActor
+    func testPhase47EmbedDisplayItemsUseModeledMediaAndImageResourceQueue() async throws {
+        let data = Data("embed-image".utf8)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let serverID: ServerID = "phase47-embed-server"
+        let channelID: ChannelID = "phase47-embed-channel"
+        let file = File(id: "phase47-embed-media", tag: "attachments", filename: "embed.png", metadata: .image(width: 64, height: 64, thumbhash: nil, animated: false), contentType: "image/png", size: 512)
+        let message = Message(
+            id: "01J00000000000000000470001",
+            channelID: channelID,
+            authorID: MockShellData.currentUserID,
+            embeds: [Embed(kind: .image, title: "Modeled image", media: file)]
+        )
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "embeds")
+        let server = Server(id: serverID, ownerID: MockShellData.currentUserID, name: "Embeds", channelIDs: [channelID])
+        let snapshot = RealtimeSnapshot(serversByID: [serverID: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [message]])
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, runtimeMode: .mock, imageResourceLoader: loader)
+
+        var items = model.embedDisplayItems(for: message)
+        XCTAssertEqual(items.first?.title, "Modeled image")
+        XCTAssertEqual(items.first?.mediaItem?.displayName, "embed.png")
+        XCTAssertNil(items.first?.mediaPreviewData)
+
+        model.loadModeledEmbedMediaPreviews(for: message)
+        try await Task.sleep(for: .milliseconds(50))
+
+        let callCount = await loader.callCount()
+        XCTAssertEqual(callCount, 1)
+        items = model.embedDisplayItems(for: message)
+        XCTAssertEqual(items.first?.mediaPreviewData, data)
+        XCTAssertEqual(items.first?.mediaItem?.previewState, .readyRemote)
+
+        let media = try XCTUnwrap(items.first?.mediaItem)
+        await model.previewEmbedMedia(media)
+        XCTAssertEqual(model.attachmentPreview?.data, data)
+    }
+
+    func testPhase47EmbedOnlySummaryUsesSafeEmbedText() {
+        let channelID: ChannelID = "phase47-summary-channel"
+        let website = Message(
+            id: "01J00000000000000000470002",
+            channelID: channelID,
+            authorID: MockShellData.currentUserID,
+            embeds: [Embed(kind: .website, url: "https://example.com/private?token=secret", title: "<b>Launch notes</b>", siteName: "Example")]
+        )
+
+        XCTAssertEqual(Phase44SafeSummary.messageSummary(for: website), "Launch notes")
+
+        let file = File(id: "phase47-summary-image", tag: "attachments", filename: "image.png", metadata: .image(width: 20, height: 20, thumbhash: nil, animated: false), contentType: "image/png", size: 64)
+        let imageOnly = Message(
+            id: "01J00000000000000000470003",
+            channelID: channelID,
+            authorID: MockShellData.currentUserID,
+            embeds: [Embed(kind: .image, media: file)]
+        )
+
+        XCTAssertEqual(Phase44SafeSummary.messageSummary(for: imageOnly), "Image embed")
+    }
+
     private func ulid(milliseconds: UInt64) -> String {
         let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
         var value = milliseconds

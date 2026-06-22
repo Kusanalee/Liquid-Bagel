@@ -88,4 +88,62 @@ final class StoatUITests: XCTestCase {
         let capped = ComposerTextSizing.height(for: String(repeating: "long message wraps ", count: 80), approximateCharactersPerLine: 24)
         XCTAssertEqual(capped, ComposerTextSizing.maximumHeight)
     }
+
+    func testPhase47MarkdownCustomEmojiKeepsCodeBlocksLiteral() {
+        let emoji = MessageInlineCustomEmojiItem(shortcode: ":bagel:", name: "bagel")
+
+        let inlineTokens = MarkdownMessageContent._testInlineTokenDescriptions(
+            for: "**Bold** :bagel:",
+            customEmojiItems: [emoji]
+        )
+        XCTAssertEqual(inlineTokens, ["text::**Bold** ", "emoji:::bagel:"])
+
+        let codeBlocks = MarkdownMessageContent._testBlockDescriptions(for: "```\nlet value = \":bagel:\"\n```")
+        XCTAssertEqual(codeBlocks, ["code::let value = \":bagel:\""])
+    }
+
+    func testPhase47EmbedDisplayItemSanitizesURLsAndLabelsVariants() {
+        let website = Embed(
+            kind: .website,
+            url: "https://example.com/path?token=secret#fragment",
+            title: "<b>Launch</b>",
+            description: "A safe description",
+            siteName: " Example "
+        )
+        let item = MessageEmbedDisplayItem(id: "embed", embed: website)
+
+        XCTAssertEqual(item.label, "Link")
+        XCTAssertEqual(item.title, "Launch")
+        XCTAssertEqual(item.displayURL, "https://example.com/path")
+        XCTAssertNotNil(item.externalURL)
+        XCTAssertTrue(item.accessibilityLabel.contains("Launch"))
+
+        let unsafeImage = Embed(kind: .image, url: "file:///Users/enka/private.png", image: EmbedImage(url: "file:///Users/enka/private.png", width: 20, height: 20))
+        let imageItem = MessageEmbedDisplayItem(id: "image", embed: unsafeImage)
+        XCTAssertEqual(imageItem.label, "Image")
+        XCTAssertNil(imageItem.externalURL)
+        XCTAssertNil(imageItem.displayURL)
+        XCTAssertTrue(imageItem.accessibilityLabel.contains("external image preview available"))
+
+        XCTAssertEqual(MessageEmbedDisplayItem.label(for: .video), "Video")
+        XCTAssertEqual(MessageEmbedDisplayItem.label(for: .unknown("Poll")), "Embed Poll")
+    }
+
+    func testPhase47EmbedDisplayItemCarriesModeledMediaPreviewData() {
+        let file = File(id: "embed-media", tag: "attachments", filename: "/tmp/private/embed.png", metadata: .image(width: 40, height: 40, thumbhash: nil, animated: false), contentType: "image/png", size: 128)
+        let data = Data("png".utf8)
+        var mediaItem = AttachmentDisplayItem(file: file, previewState: .readyRemote)
+        mediaItem.previewData = data
+
+        let item = MessageEmbedDisplayItem(
+            id: "embed",
+            embed: Embed(kind: .image, title: "Modeled image", media: file),
+            mediaItem: mediaItem,
+            mediaPreviewData: data
+        )
+
+        XCTAssertEqual(item.mediaItem?.displayName, "embed.png")
+        XCTAssertEqual(item.mediaPreviewData, data)
+        XCTAssertTrue(item.accessibilityLabel.contains("media embed.png"))
+    }
 }

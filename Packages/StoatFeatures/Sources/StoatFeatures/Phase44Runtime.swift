@@ -446,7 +446,7 @@ public enum Phase44SafeSummary {
     }
 
     public static func messageSummary(_ value: String, limit: Int = 96) -> String {
-        var output = value
+        var output = value.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
         let regexReplacements: [(String, String)] = [
             (#"https?://[^\s,;)"]+"#, "[link]"),
             (#"file://[^\s,;)"]+"#, "[path]"),
@@ -474,6 +474,9 @@ public enum Phase44SafeSummary {
             return attachments.count == 1 ? "1 attachment" : "\(attachments.count) attachments"
         }
         if let embeds = message.embeds, !embeds.isEmpty {
+            if let summary = embedSummary(for: embeds) {
+                return summary
+            }
             return embeds.count == 1 ? "1 embed" : "\(embeds.count) embeds"
         }
         if message.system != nil {
@@ -495,5 +498,42 @@ public enum Phase44SafeSummary {
 
     private static func looksLikeFullID(_ value: String) -> Bool {
         value.range(of: #"^[A-Za-z0-9_-]{20,}$"#, options: .regularExpression) != nil
+    }
+
+    private static func embedSummary(for embeds: [Embed]) -> String? {
+        for embed in embeds {
+            let candidates = [
+                embed.title,
+                embed.description,
+                embed.siteName,
+                embed.url.flatMap(safeURLHost),
+                embed.originalURL.flatMap(safeURLHost)
+            ]
+            for candidate in candidates {
+                guard let candidate else { continue }
+                let summary = messageSummary(candidate)
+                if summary != "Message" {
+                    return summary
+                }
+            }
+            if embed.media != nil {
+                return embed.kind == .video ? "Video embed" : "Image embed"
+            }
+            if embed.image != nil {
+                return "Image embed"
+            }
+            if embed.video != nil {
+                return "Video embed"
+            }
+        }
+        return nil
+    }
+
+    private static func safeURLHost(_ value: String) -> String? {
+        guard let components = URLComponents(string: value),
+              let host = components.host,
+              !host.isEmpty
+        else { return nil }
+        return host
     }
 }

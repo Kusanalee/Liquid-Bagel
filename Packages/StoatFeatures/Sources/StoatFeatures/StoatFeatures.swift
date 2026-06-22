@@ -5211,12 +5211,10 @@ public final class MainShellViewModel {
     }
 
     public var composerEmojiSections: [EmojiPickerSection] {
-        let common = ["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏", "🔥", "✨"]
-        let smileys = ["😄", "😅", "😎", "😢", "😮", "🤔", "🫡", "👋", "🙌", "😆", "😋", "😴"]
+        let common = Self.dedupedEmojiItems(["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏", "🔥", "✨", "🚀", "💯", "💬", "📌", "⭐", "❌"])
+        let smileys = Self.dedupedEmojiItems(["😄", "😅", "😎", "😢", "😮", "🤔", "🫡", "👋", "🙌", "😆", "😋", "😴", "😭", "😬", "😤", "🥳", "🤝", "🫶"])
         let serverID = selectedConversationChannelID.flatMap { snapshot.channelsByID[$0]?.serverID } ?? selection.serverID
-        let custom = snapshot.emojisByID.values.map(CustomEmojiDisplayItem.init(emoji:)).sorted {
-            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-        }
+        let custom = Self.dedupedCustomEmojiItems(snapshot.emojisByID.values.map(CustomEmojiDisplayItem.init(emoji:)))
         let currentServer = custom.filter { item in
             guard let serverID else { return false }
             return item.serverID == serverID
@@ -5231,6 +5229,25 @@ public final class MainShellViewModel {
             EmojiPickerSection(id: "current-server", title: "Current Server", items: Array(currentServer)),
             EmojiPickerSection(id: "other-servers", title: "Other Servers", items: Array(otherServers))
         ].filter { !$0.items.isEmpty }
+    }
+
+    private static func dedupedEmojiItems(_ items: [String]) -> [String] {
+        var seen: Set<String> = []
+        var result: [String] = []
+        for item in items where seen.insert(item).inserted {
+            result.append(item)
+        }
+        return result
+    }
+
+    private static func dedupedCustomEmojiItems(_ items: [CustomEmojiDisplayItem]) -> [CustomEmojiDisplayItem] {
+        var seen: Set<String> = []
+        return items
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            .filter { item in
+                let key = item.shortcode.lowercased()
+                return seen.insert(key).inserted
+            }
     }
 
     public func insertEmoji(_ emoji: String, in channelID: ChannelID?) {
@@ -5704,6 +5721,37 @@ public final class MainShellViewModel {
         }
     }
 
+    public func embedDisplayItems(for message: Message) -> [MessageEmbedDisplayItem] {
+        (message.embeds ?? []).enumerated().map { index, embed in
+            let mediaItem = embed.media.map { embedMediaDisplayItem(for: $0) }
+            return MessageEmbedDisplayItem(
+                id: "embed-\(message.id.rawValue)-\(index)",
+                embed: embed,
+                mediaItem: mediaItem,
+                mediaPreviewData: mediaItem?.previewData
+            )
+        }
+    }
+
+    private func embedMediaDisplayItem(for file: File) -> AttachmentDisplayItem {
+        let imageKey = ImageCacheKey(id: file.id.rawValue, kind: .attachmentPreview)
+        var item = AttachmentDisplayItem(
+            file: file,
+            previewState: attachmentPreviewStates["file-\(file.id.rawValue)"] ?? imageResourceStates[imageKey] ?? .notLoaded
+        )
+        if let loaded = loadedAttachmentData[item.id] {
+            item.previewState = .readyRemote
+            item.previewData = loaded.data
+        } else if let data = imageData(for: file, kind: .attachmentPreview) {
+            item.previewState = .readyRemote
+            item.previewData = data
+        }
+        if attachmentLocalFiles[item.id] != nil {
+            item.previewState = .readyLocal
+        }
+        return item
+    }
+
     public func loadInlineImagePreviews(for message: Message) {
         guard inlineImagePreviewPolicy == .automaticSmallImages else { return }
         guard effectiveRuntimeMode == .liveManual || effectiveRuntimeMode == .mock else { return }
@@ -5716,6 +5764,17 @@ public final class MainShellViewModel {
             attachmentLoadTasks[item.id] = Task { [weak self] in
                 await self?.loadInlineImagePreview(item)
             }
+        }
+    }
+
+    public func loadModeledEmbedMediaPreviews(for message: Message) {
+        guard effectiveRuntimeMode == .liveManual || effectiveRuntimeMode == .mock else { return }
+        for embed in message.embeds ?? [] {
+            guard let media = embed.media else { continue }
+            let item = AttachmentDisplayItem(file: media)
+            guard item.kind == .image else { continue }
+            guard item.byteCount.map({ $0 <= 8 * 1024 * 1024 }) ?? true else { continue }
+            loadImageResource(for: media, kind: .attachmentPreview)
         }
     }
 
@@ -5820,6 +5879,7 @@ public final class MainShellViewModel {
     public func reloadVisibleImages() {
         for message in selectedTimelineMessages.map(\.message) {
             loadInlineImagePreviews(for: message)
+            loadModeledEmbedMediaPreviews(for: message)
             loadImageResource(for: avatarFile(for: message), kind: .userAvatar)
         }
         loadVisibleIdentityImagesForCurrentSelection()
@@ -6082,6 +6142,11 @@ public final class MainShellViewModel {
         }
     }
 
+    public func previewEmbedMedia(_ item: AttachmentDisplayItem) async {
+        seedAttachmentPreviewDataIfPresent(item)
+        await previewAttachment(item)
+    }
+
     public func downloadAttachment(_ item: AttachmentDisplayItem) async {
         let current = itemWithCurrentPreviewState(item)
         do {
@@ -6108,6 +6173,11 @@ public final class MainShellViewModel {
         }
     }
 
+    public func downloadEmbedMedia(_ item: AttachmentDisplayItem) async {
+        seedAttachmentPreviewDataIfPresent(item)
+        await downloadAttachment(item)
+    }
+
     public func openAttachmentExternally(_ item: AttachmentDisplayItem) async {
         var current = itemWithCurrentPreviewState(item)
         do {
@@ -6131,10 +6201,25 @@ public final class MainShellViewModel {
         }
     }
 
+    public func openEmbedMediaExternally(_ item: AttachmentDisplayItem) async {
+        seedAttachmentPreviewDataIfPresent(item)
+        await openAttachmentExternally(item)
+    }
+
     public func retryAttachmentPreview(_ item: AttachmentDisplayItem) async {
         attachmentPreviewStates[item.id] = .notLoaded
         loadedAttachmentData[item.id] = nil
         await previewAttachment(item)
+    }
+
+    public func retryEmbedMediaPreview(_ item: AttachmentDisplayItem) async {
+        if let fileID = item.fileID {
+            let key = ImageCacheKey(id: fileID.rawValue, kind: .attachmentPreview)
+            loadedImageResources[key] = nil
+            imageResourceStates[key] = nil
+            imageResourceFailureDates[key] = nil
+        }
+        await retryAttachmentPreview(item)
     }
 
     public func closeAttachmentPreview() {
@@ -6183,6 +6268,18 @@ public final class MainShellViewModel {
             current.previewState = .readyLocal
         }
         return current
+    }
+
+    private func seedAttachmentPreviewDataIfPresent(_ item: AttachmentDisplayItem) {
+        guard let data = item.previewData, loadedAttachmentData[item.id] == nil else { return }
+        loadedAttachmentData[item.id] = RemoteAttachmentData(
+            fileID: item.fileID,
+            filename: item.displayName,
+            contentType: item.contentType,
+            byteCount: data.count,
+            data: data
+        )
+        attachmentPreviewStates[item.id] = .readyRemote
     }
 
     private func writeTemporaryAttachmentFile(data: Data, filename: String) throws -> URL {
@@ -12097,6 +12194,7 @@ public struct TimelineMessageGroupView: View {
                             replyPreviewItem: viewModel.replyPreviewItem(for: timelineMessage.message),
                             attachmentItems: viewModel.attachmentDisplayItems(for: timelineMessage.message),
                             customEmojiItems: viewModel.inlineCustomEmojiItems(for: timelineMessage.message),
+                            embedItems: viewModel.embedDisplayItems(for: timelineMessage.message),
                             authorAvatarData: viewModel.imageData(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
                             actionItems: rowActionItems(for: timelineMessage),
                             reactionItems: rowReactionItems(for: timelineMessage),
@@ -12120,6 +12218,18 @@ public struct TimelineMessageGroupView: View {
                             onRetryAttachment: { item in
                                 Task { await viewModel.retryAttachmentPreview(item) }
                             },
+                            onPreviewEmbedMedia: { item in
+                                Task { await viewModel.previewEmbedMedia(item) }
+                            },
+                            onDownloadEmbedMedia: { item in
+                                Task { await viewModel.downloadEmbedMedia(item) }
+                            },
+                            onOpenEmbedMedia: { item in
+                                Task { await viewModel.openEmbedMediaExternally(item) }
+                            },
+                            onRetryEmbedMedia: { item in
+                                Task { await viewModel.retryEmbedMediaPreview(item) }
+                            },
                             onOpenAuthorProfile: {
                                 let display = viewModel.resolvedUserDisplay(for: timelineMessage.message)
                                 viewModel.showUserProfile(display.userID, source: .messageName, serverID: display.serverContextID)
@@ -12140,6 +12250,7 @@ public struct TimelineMessageGroupView: View {
                                 source: .visibleMessage
                             )
                             viewModel.loadInlineImagePreviews(for: timelineMessage.message)
+                            viewModel.loadModeledEmbedMediaPreviews(for: timelineMessage.message)
                             viewModel.loadImageResource(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar)
                             viewModel.loadCustomEmojiImages(for: timelineMessage.message)
                             viewModel.prepareReplyPreview(for: timelineMessage.message)
