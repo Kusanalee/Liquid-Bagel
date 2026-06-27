@@ -4,6 +4,8 @@ Phase 49 is an evidence-led account and profile parity pass. It focuses on real 
 
 This repository implementation pass did not capture live dogfood evidence. No runtime defect was proven locally, no new routes were added, and all live-sensitive rows remain conservative until the checklist below is completed with real accounts.
 
+Phase 51 now supplies the freeze-proof presentation and decoded-image gate that must pass before this live audit. It does not replace the two-account evidence below, so no Phase 49 row is promoted from automated Phase 51 coverage alone.
+
 ## Scope And Route Boundaries
 
 - Use the existing Phase 38/39 `AppSessionCoordinator` login, MFA, token import, saved credential, startup, retry, forget, and current-session revoke paths.

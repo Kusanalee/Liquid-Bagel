@@ -207,12 +207,15 @@ public struct ShellNavigationHelper: Sendable {
 @Observable
 public final class QuickSwitcherViewModel {
     public var query: String = "" {
-        didSet { selectedIndex = results.isEmpty ? 0 : min(selectedIndex, results.count - 1) }
+        didSet { rebuildFilteredResults() }
     }
     public var selectedIndex: Int = 0
+    public private(set) var results: [QuickSwitcherResult] = []
 
     @ObservationIgnored private var snapshot: RealtimeSnapshot
     @ObservationIgnored private var selection: ShellSelection
+    @ObservationIgnored private var indexedResultsCache: [QuickSwitcherResult] = []
+    @ObservationIgnored private var normalizedSearchTextByID: [String: String] = [:]
     @ObservationIgnored private let navigation = ShellNavigationHelper()
     @ObservationIgnored private let canPerform: (AppCommand) -> Bool
     @ObservationIgnored private let disabledReason: (AppCommand) -> String?
@@ -227,15 +230,8 @@ public final class QuickSwitcherViewModel {
         self.selection = selection
         self.canPerform = canPerform
         self.disabledReason = disabledReason
-    }
-
-    public var results: [QuickSwitcherResult] {
-        let all = indexedResults()
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return Array(all.prefix(16)) }
-        return all.filter { result in
-            [result.title, result.subtitle, result.badgeText].compactMap { $0 }.contains { $0.localizedCaseInsensitiveContains(needle) }
-        }
+        rebuildIndex()
+        rebuildFilteredResults()
     }
 
     public var selectedResult: QuickSwitcherResult? {
@@ -247,7 +243,8 @@ public final class QuickSwitcherViewModel {
     public func update(snapshot: RealtimeSnapshot, selection: ShellSelection) {
         self.snapshot = snapshot
         self.selection = selection
-        selectedIndex = results.isEmpty ? 0 : min(selectedIndex, results.count - 1)
+        rebuildIndex()
+        rebuildFilteredResults()
     }
 
     public func moveSelection(_ delta: Int) {
@@ -317,6 +314,33 @@ public final class QuickSwitcherViewModel {
 
         output.append(contentsOf: commandResults())
         return output
+    }
+
+    private func rebuildIndex() {
+        indexedResultsCache = indexedResults()
+        normalizedSearchTextByID = Dictionary(
+            uniqueKeysWithValues: indexedResultsCache.map { result in
+                let text = [result.title, result.subtitle, result.badgeText]
+                    .compactMap { $0 }
+                    .joined(separator: " ")
+                    .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                return (result.id, text)
+            }
+        )
+    }
+
+    private func rebuildFilteredResults() {
+        let needle = query
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        if needle.isEmpty {
+            results = Array(indexedResultsCache.prefix(16))
+        } else {
+            results = Array(indexedResultsCache.lazy.filter {
+                self.normalizedSearchTextByID[$0.id]?.contains(needle) == true
+            }.prefix(50))
+        }
+        selectedIndex = results.isEmpty ? 0 : min(selectedIndex, results.count - 1)
     }
 
     private func commandResults() -> [QuickSwitcherResult] {

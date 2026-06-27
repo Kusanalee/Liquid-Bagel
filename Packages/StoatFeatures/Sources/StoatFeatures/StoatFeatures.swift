@@ -479,6 +479,11 @@ public final class MainShellViewModel {
             else { return }
             phase46ModerationVersions.bumpSelectionVersions()
             invalidateCapabilityCache()
+            phase51SelectionRevision &+= 1
+            schedulePhase51ShellPresentationRefresh()
+            if isServerOverviewPresented {
+                schedulePhase51ServerSettingsPreparation()
+            }
         }
     }
     public var snapshot: RealtimeSnapshot {
@@ -488,6 +493,10 @@ public final class MainShellViewModel {
             mergePhase43SnapshotIdentities(snapshot, source: .readyUser)
             if moderationRelevantChange {
                 invalidateCapabilityCache()
+            }
+            schedulePhase51ShellPresentationRefresh()
+            if isServerOverviewPresented {
+                schedulePhase51ServerSettingsPreparation()
             }
         }
     }
@@ -506,6 +515,7 @@ public final class MainShellViewModel {
             }
             phase46ModerationVersions.bumpMemberVersion()
             invalidateCapabilityCache()
+            schedulePhase51ShellPresentationRefresh()
         }
     }
     public var sessionCoordinator: AppSessionCoordinator?
@@ -525,7 +535,9 @@ public final class MainShellViewModel {
     public var pendingDeletion: TimelineMessage?
     public var timelineSelection = TimelineSelection()
     public var timelineViewport = TimelineViewportState()
-    public var localReadStates: [ChannelID: LocalReadState] = [:]
+    public var localReadStates: [ChannelID: LocalReadState] = [:] {
+        didSet { schedulePhase51ShellPresentationRefresh() }
+    }
     public var messageActionStatus: String?
     public var isCredentialSetupPresented = false
     public var isTestSendConfirmationPresented = false
@@ -588,6 +600,9 @@ public final class MainShellViewModel {
     public var phase43IdentitySnapshots = Phase43IdentitySnapshotStore()
     public var phase43IdentityGeneration = 0
     public var freezePerformanceDiagnostics = FreezePerformanceDiagnostics()
+    public private(set) var phase51PerformanceDiagnostics = Phase51PerformanceDiagnostics()
+    public private(set) var shellPresentationSnapshot = ShellPresentationSnapshot()
+    public private(set) var serverSettingsPresentationState: ManagementActionState<ServerSettingsPresentationSnapshot> = .idle
     public var memberHydrationDiagnostics = MemberHydrationDiagnostics()
     public var memberHydrationLoadingServerIDs: Set<ServerID> = []
     public var memberHydrationErrorsByServerID: [ServerID: String] = [:]
@@ -622,7 +637,16 @@ public final class MainShellViewModel {
     public var inviteManagementState: InviteManagementState = .idle
     public var pendingInviteDeletion: PendingInviteDeletion?
     public var phase23Status: String?
-    public var isServerOverviewPresented = false
+    public var isServerOverviewPresented = false {
+        didSet {
+            if isServerOverviewPresented {
+                schedulePhase51ServerSettingsPreparation()
+            } else {
+                phase51ServerSettingsTask?.cancel()
+                phase51ServerSettingsTask = nil
+            }
+        }
+    }
     public var serverOverviewState: ManagementActionState<ServerOverviewDetails> = .idle
     public var isCreateChannelPresented = false
     public var channelCreateForm = ChannelCreateForm()
@@ -643,7 +667,12 @@ public final class MainShellViewModel {
     public var roleEditorForm: RoleEditorForm?
     public var roleEditorState: ManagementActionState<Role> = .idle
     public var pendingRoleDeletion: Role?
-    public var memberSearchText: String = ""
+    public var memberSearchText: String = "" {
+        didSet {
+            guard oldValue != memberSearchText, isServerOverviewPresented else { return }
+            schedulePhase51ServerSettingsPreparation(debounce: true)
+        }
+    }
     public var selectedMemberDetailID: MemberCompositeKey?
     public var memberRoleDraft: MemberRoleAssignmentDraft?
     public var memberRoleSaveRequiresConfirmation = false
@@ -691,6 +720,10 @@ public final class MainShellViewModel {
     @ObservationIgnored public var notificationRouteCenter: NotificationRouteCenter
     @ObservationIgnored public var appLifecycleCenter: AppLifecycleCenter
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
+    @ObservationIgnored private var phase51ShellPresentationTask: Task<Void, Never>?
+    @ObservationIgnored private var phase51ServerSettingsTask: Task<Void, Never>?
+    @ObservationIgnored private var phase51TimelinePresentationTask: Task<Void, Never>?
+    @ObservationIgnored private var phase51DiagnosticsPublishTask: Task<Void, Never>?
     @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
     @ObservationIgnored private var typingCleanupTask: Task<Void, Never>?
@@ -741,10 +774,19 @@ public final class MainShellViewModel {
     @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
     @ObservationIgnored private var selectedTimelineGroupCacheKey: String?
     @ObservationIgnored private var selectedTimelineGroupCache: [TimelineMessageGroup] = []
+    @ObservationIgnored private var timelineRowPresentationCache: [MessageID: TimelineRowPresentation] = [:]
     @ObservationIgnored private var memberListGroupCacheKey: MemberListCacheKey?
     @ObservationIgnored private var memberListGroupCache: [MemberListGroup] = []
     @ObservationIgnored private var memberListDiagnosticsCache = RoleSortDiagnostics()
     @ObservationIgnored private var snapshotRevision: Int = 0
+    @ObservationIgnored private var phase51SelectionRevision: Int = 0
+    @ObservationIgnored private var phase51MediaRevision: Int = 0
+    @ObservationIgnored private var phase51ShellGeneration: Int = 0
+    @ObservationIgnored private var phase51ServerSettingsGeneration: Int = 0
+    @ObservationIgnored private var phase51LastDiagnosticsPublishAt = Date.distantPast
+    @ObservationIgnored private var freezeDiagnosticsPublishTask: Task<Void, Never>?
+    @ObservationIgnored private var freezeDiagnosticsLastPublishAt = Date.distantPast
+    @ObservationIgnored private var pendingFreezeDiagnosticsMarker: String?
     @ObservationIgnored private var memberDiagnosticsPublishPending = false
     @ObservationIgnored private var memberListLastCacheHit = false
     @ObservationIgnored private var memberListLastGroupingElapsed: TimeInterval = 0
@@ -854,6 +896,19 @@ public final class MainShellViewModel {
         refreshDMDiagnosticsSnapshot()
         installNotificationRouteHandler()
         installAppLifecycleHandler()
+        // Bootstrap once so command routing and tests have a coherent snapshot before the
+        // first SwiftUI frame. Subsequent revisions are prepared off-main and swapped atomically.
+        self.shellPresentationSnapshot = Phase51PresentationBuilder.shell(
+            revision: Phase51PresentationRevision(),
+            snapshot: snapshot,
+            selection: selection,
+            currentUserID: self.currentUserID,
+            currentUser: self.currentUser,
+            localReadStates: [:],
+            locallyClearedUnreadChannelIDs: [],
+            notificationPreferences: self.notificationPreferences
+        )
+        self.phase51PerformanceDiagnostics.shellBuildCount = 1
         if let snapshotSource {
             observe(snapshotSource: snapshotSource)
         }
@@ -861,6 +916,11 @@ public final class MainShellViewModel {
 
     deinit {
         snapshotObservationTask?.cancel()
+        phase51ShellPresentationTask?.cancel()
+        phase51ServerSettingsTask?.cancel()
+        phase51TimelinePresentationTask?.cancel()
+        phase51DiagnosticsPublishTask?.cancel()
+        freezeDiagnosticsPublishTask?.cancel()
         selectedChannelLoadTask?.cancel()
         typingEndTask?.cancel()
         typingCleanupTask?.cancel()
@@ -879,7 +939,160 @@ public final class MainShellViewModel {
     }
 
     public var servers: [Server] {
-        snapshot.serversByID.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        shellPresentationSnapshot.servers
+    }
+
+    public func serverRailPresentation(for serverID: ServerID) -> ServerRailPresentationItem? {
+        shellPresentationSnapshot.serverRailItemsByID[serverID]
+    }
+
+    private func schedulePhase51ShellPresentationRefresh() {
+        phase51ShellGeneration &+= 1
+        let generation = phase51ShellGeneration
+        let revision = Phase51PresentationRevision(
+            snapshot: snapshotRevision,
+            selection: phase51SelectionRevision,
+            identity: phase43IdentityGeneration,
+            media: phase51MediaRevision
+        )
+        let snapshot = snapshot
+        let selection = selection
+        let currentUserID = currentUserID
+        let currentUser = currentUser
+        let localReadStates = localReadStates
+        let locallyCleared = locallyClearedUnreadChannelIDs
+        let preferences = notificationPreferences
+        phase51ShellPresentationTask?.cancel()
+        phase51ShellPresentationTask = Task { [weak self] in
+            let started = ContinuousClock.now
+            let worker = Task.detached(priority: .userInitiated) {
+                Phase51PresentationBuilder.shell(
+                    revision: revision,
+                    snapshot: snapshot,
+                    selection: selection,
+                    currentUserID: currentUserID,
+                    currentUser: currentUser,
+                    localReadStates: localReadStates,
+                    locallyClearedUnreadChannelIDs: locallyCleared,
+                    notificationPreferences: preferences
+                )
+            }
+            let result = await worker.value
+            guard !Task.isCancelled, let self, generation == self.phase51ShellGeneration else { return }
+            self.shellPresentationSnapshot = result
+            self.quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+            self.phase51PerformanceDiagnostics.shellBuildCount += 1
+            self.recordPhase51Operation("shell-presentation", started: started)
+        }
+    }
+
+    private func schedulePhase51ServerSettingsPreparation(debounce: Bool = false) {
+        phase51ServerSettingsGeneration &+= 1
+        let generation = phase51ServerSettingsGeneration
+        phase51ServerSettingsTask?.cancel()
+        guard isServerOverviewPresented, let serverID = selection.serverID else {
+            serverSettingsPresentationState = .failed("Select a server before opening server settings.")
+            return
+        }
+        serverSettingsPresentationState = .loading
+        let revision = Phase51PresentationRevision(
+            snapshot: snapshotRevision,
+            selection: phase51SelectionRevision,
+            identity: phase43IdentityGeneration,
+            media: phase51MediaRevision
+        )
+        let snapshot = snapshot
+        let selectedChannelID = selection.channelID
+        let currentUserID = currentUserID
+        let runtimeLine = runtimeSubtitleForManagement
+        let capabilities = cachedServerCapabilities
+        let identitySnapshots = phase43IdentitySnapshots
+        let normalizedQuery = memberSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        phase51ServerSettingsTask = Task { [weak self] in
+            if debounce {
+                do {
+                    try await Task.sleep(for: .milliseconds(150))
+                } catch {
+                    return
+                }
+            }
+            let started = ContinuousClock.now
+            let worker = Task.detached(priority: .userInitiated) {
+                Phase51PresentationBuilder.serverSettings(
+                    revision: revision,
+                    snapshot: snapshot,
+                    serverID: serverID,
+                    selectedChannelID: selectedChannelID,
+                    currentUserID: currentUserID,
+                    runtimeLine: runtimeLine,
+                    capabilities: capabilities,
+                    identitySnapshots: identitySnapshots,
+                    normalizedMemberQuery: normalizedQuery
+                )
+            }
+            let result = await worker.value
+            guard !Task.isCancelled, let self, generation == self.phase51ServerSettingsGeneration else {
+                if let self {
+                    self.phase51PerformanceDiagnostics.serverSettingsCancellationCount += 1
+                }
+                return
+            }
+            guard let result else {
+                self.serverSettingsPresentationState = .failed("Selected server is no longer available.")
+                return
+            }
+            self.serverSettingsPresentationState = .loaded(result)
+            self.serverSettingsState = .loaded(result.details)
+            self.serverSettingsForm = self.serverSettingsForm ?? ServerSettingsForm(server: result.details.server)
+            self.categoryEditorForm = self.categoryEditorForm ?? CategoryEditorForm(server: result.details.server)
+            self.serverOverviewState = .loaded(
+                ServerOverviewDetails(
+                    server: result.details.server,
+                    channels: result.details.channels,
+                    memberCount: result.details.members.count,
+                    runtimeLine: result.details.runtimeLine,
+                    capabilities: result.details.capabilities
+                )
+            )
+            self.phase51PerformanceDiagnostics.serverSettingsBuildCount += 1
+            self.recordPhase51Operation("server-settings-presentation", started: started)
+        }
+    }
+
+    private func recordPhase51Operation(_ category: String, started: ContinuousClock.Instant) {
+        let duration = started.duration(to: .now)
+        let milliseconds = Int(duration.components.seconds * 1_000)
+            + Int(duration.components.attoseconds / 1_000_000_000_000_000)
+        phase51PerformanceDiagnostics.lastOperationCategory = category
+        phase51PerformanceDiagnostics.lastOperationMilliseconds = milliseconds
+        if milliseconds > 50, Thread.isMainThread {
+            phase51PerformanceDiagnostics.mainThreadBudgetViolationCount += 1
+        }
+        schedulePhase51DiagnosticsPublish()
+    }
+
+    private func schedulePhase51DiagnosticsPublish() {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(phase51LastDiagnosticsPublishAt)
+        if elapsed >= 0.25 {
+            phase51LastDiagnosticsPublishAt = now
+            phase51PerformanceDiagnostics.diagnosticsPublishCount += 1
+            return
+        }
+        phase51PerformanceDiagnostics.diagnosticsThrottleCount += 1
+        guard phase51DiagnosticsPublishTask == nil else { return }
+        let delay = max(0, 0.25 - elapsed)
+        phase51DiagnosticsPublishTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard let self else { return }
+            self.phase51LastDiagnosticsPublishAt = Date()
+            self.phase51PerformanceDiagnostics.diagnosticsPublishCount += 1
+            self.phase51DiagnosticsPublishTask = nil
+        }
     }
 
     public var selectedServer: Server? {
@@ -981,6 +1194,52 @@ public final class MainShellViewModel {
 
     public var selectedTimelineMessageGroups: [TimelineMessageGroup] {
         cachedSelectedTimelineMessageGroups()
+    }
+
+    public var selectedTimelinePresentationRevision: Int {
+        messageController.presentationRevision(for: selectedConversationChannelID)
+    }
+
+    public func prepareSelectedTimelinePresentation() async {
+        let messages = selectedTimelineMessages
+        let key = timelineGroupCacheKey(messages: messages)
+        if key == selectedTimelineGroupCacheKey {
+            phase51PerformanceDiagnostics.timelineCacheHitCount += 1
+            return
+        }
+        let snapshot = snapshot
+        let identitySnapshots = phase43IdentitySnapshots
+        let worker = Task.detached(priority: .userInitiated) {
+            let groups = TimelineMessageGrouping.group(messages)
+            let rows = Dictionary(uniqueKeysWithValues: messages.map { timelineMessage in
+                let message = timelineMessage.message
+                let server = snapshot.channelsByID[message.channelID]?.serverID.flatMap { snapshot.serversByID[$0] }
+                let display = identitySnapshots.resolvedDisplay(
+                    userID: message.authorID,
+                    user: message.user ?? snapshot.usersByID[message.authorID],
+                    member: message.member,
+                    server: server
+                )
+                let row = TimelineRowPresentation(
+                    messageID: message.id,
+                    authorDisplay: display,
+                    isSystemEvent: message.system != nil
+                )
+                return (message.id, row)
+            })
+            return (groups, rows)
+        }
+        let result = await worker.value
+        guard !Task.isCancelled, key == timelineGroupCacheKey(messages: selectedTimelineMessages) else { return }
+        selectedTimelineGroupCacheKey = key
+        selectedTimelineGroupCache = result.0
+        timelineRowPresentationCache = result.1
+        phase51PerformanceDiagnostics.timelineBuildCount += 1
+        schedulePhase51DiagnosticsPublish()
+    }
+
+    public func timelineRowPresentation(for messageID: MessageID) -> TimelineRowPresentation? {
+        timelineRowPresentationCache[messageID]
     }
 
     public var selectedChannelMessageState: ChannelMessageState {
@@ -1724,25 +1983,14 @@ public final class MainShellViewModel {
         let messages = selectedTimelineMessages
         let key = timelineGroupCacheKey(messages: messages)
         if key == selectedTimelineGroupCacheKey {
-            updateTimelinePerformanceDiagnostics(messages: messages, groups: selectedTimelineGroupCache)
-            updateFreezePerformanceDiagnostics(marker: "timeline grouping cache hit")
             return selectedTimelineGroupCache
         }
-        let started = Date()
-        let groups = TimelineMessageGrouping.group(messages)
-        selectedTimelineGroupCacheKey = key
-        selectedTimelineGroupCache = groups
-        freezePerformanceDiagnostics.timelineRenderPassCount += 1
-        updateTimelinePerformanceDiagnostics(messages: messages, groups: groups, elapsed: Date().timeIntervalSince(started))
-        return groups
+        return []
     }
 
     private func timelineGroupCacheKey(messages: [TimelineMessage]) -> String {
         guard let channelID = selectedConversationChannelID else { return "none" }
-        let newest = messages.last?.message.id.rawValue ?? "-"
-        let oldest = messages.first?.message.id.rawValue ?? "-"
-        let pending = messages.filter { $0.status != .confirmed }.map { $0.id.rawValue }.joined(separator: ",")
-        return "\(channelID.rawValue)|\(messages.count)|\(oldest)|\(newest)|\(pending)"
+        return "\(channelID.rawValue)|\(messageController.presentationRevision(for: channelID))"
     }
 
     private struct MemberListCacheKey: Hashable {
@@ -1826,36 +2074,30 @@ public final class MainShellViewModel {
     }
 
     public var friendItems: [FriendListItem] {
-        Phase22Derivations.friendItems(
-            for: friendsTab,
-            snapshot: snapshot,
-            currentUserID: currentUserID,
-            currentUser: currentUser,
-            localReadStates: localReadStates
-        )
+        switch friendsTab {
+        case .online:
+            shellPresentationSnapshot.allFriendItems.filter { $0.relationshipStatus == .friend && $0.isOnline }
+        case .all:
+            shellPresentationSnapshot.allFriendItems.filter { $0.relationshipStatus == .friend }
+        case .pending:
+            shellPresentationSnapshot.allFriendItems.filter { $0.relationshipStatus == .incoming || $0.relationshipStatus == .outgoing }
+        case .blocked:
+            shellPresentationSnapshot.allFriendItems.filter { $0.relationshipStatus == .blocked }
+        case .addFriend:
+            []
+        }
     }
 
     public var allFriendItems: [FriendListItem] {
-        Phase22Derivations.friendItems(
-            snapshot: snapshot,
-            currentUserID: currentUserID,
-            currentUser: currentUser,
-            localReadStates: localReadStates
-        )
+        shellPresentationSnapshot.allFriendItems
     }
 
     public var directMessageItems: [DirectMessageListItem] {
-        Phase22Derivations.directMessageItems(
-            snapshot: snapshot,
-            currentUserID: currentUserID,
-            localReadStates: localReadStates,
-            notificationPreferences: notificationPreferences,
-            selectedChannelID: selectedConversationChannelID
-        )
+        shellPresentationSnapshot.directMessageItems
     }
 
     public var incomingFriendRequestCount: Int {
-        Phase22Derivations.pendingIncomingCount(snapshot: snapshot, currentUserID: currentUserID, currentUser: currentUser)
+        shellPresentationSnapshot.allFriendItems.filter { $0.relationshipStatus == .incoming }.count
     }
 
     public var canRefreshDMs: Bool {
@@ -2912,6 +3154,33 @@ public final class MainShellViewModel {
     }
 
     private func updateFreezePerformanceDiagnostics(marker: String? = nil) {
+        if let marker {
+            pendingFreezeDiagnosticsMarker = marker
+        }
+        let now = Date()
+        let elapsed = now.timeIntervalSince(freezeDiagnosticsLastPublishAt)
+        if elapsed >= 0.25 {
+            freezeDiagnosticsLastPublishAt = now
+            publishFreezePerformanceDiagnostics(marker: pendingFreezeDiagnosticsMarker)
+            pendingFreezeDiagnosticsMarker = nil
+            return
+        }
+        guard freezeDiagnosticsPublishTask == nil else { return }
+        freezeDiagnosticsPublishTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(max(0, 0.25 - elapsed)))
+            } catch {
+                return
+            }
+            guard let self else { return }
+            self.freezeDiagnosticsLastPublishAt = Date()
+            self.publishFreezePerformanceDiagnostics(marker: self.pendingFreezeDiagnosticsMarker)
+            self.pendingFreezeDiagnosticsMarker = nil
+            self.freezeDiagnosticsPublishTask = nil
+        }
+    }
+
+    private func publishFreezePerformanceDiagnostics(marker: String? = nil) {
         diagnosticsPublishCount += 1
         let failedImages = imageResourceStates.values.filter {
             if case .failed = $0 { return true }
@@ -3342,17 +3611,10 @@ public final class MainShellViewModel {
 
     public func openServerOverview() {
         lastServerSettingsButtonAction = selectedServer.map { "opened \($0.id.rawValue)" } ?? "blocked: no selected server"
-        isServerOverviewPresented = true
         selectedServerSettingsTab = .overview
-        if let details = serverSettingsDetails() {
-            serverSettingsState = .loaded(details)
-            serverSettingsForm = ServerSettingsForm(server: details.server)
-            categoryEditorForm = CategoryEditorForm(server: details.server)
-            serverOverviewState = serverOverviewDetails().map { .loaded($0) } ?? .failed("Select a server before opening server overview.")
-        } else {
-            serverSettingsState = .failed("Select a server before opening server settings.")
-            serverOverviewState = .failed("Select a server before opening server overview.")
-        }
+        serverSettingsState = .loading
+        serverSettingsPresentationState = .loading
+        isServerOverviewPresented = true
         phase24Status = nil
         phase25Status = nil
     }
@@ -7522,6 +7784,7 @@ public final class MainShellViewModel {
         updateFreezePerformanceDiagnostics(marker: "copied identity diagnostics")
         let identity = visibleIdentityDiagnostics
         let freeze = freezePerformanceDiagnostics
+        let phase51 = phase51PerformanceDiagnostics
         let roles = memberRoleSortDiagnostics
         let text = Phase17MessageActions.redactedDiagnosticText(Phase6UIHelpers.safeDiagnostics("""
         Visible identity diagnostics
@@ -7543,6 +7806,12 @@ public final class MainShellViewModel {
         mediaSafeMode: \(freeze.mediaSafeModeEnabled ? "yes" : "no")
         visibleRangeUpdates: \(freeze.visibleRangeUpdateCount)
         lastMarker: \(freeze.lastMainThreadMarker ?? "-")
+        phase51ShellBuilds: \(phase51.shellBuildCount)
+        phase51TimelineBuilds/cacheHits: \(phase51.timelineBuildCount)/\(phase51.timelineCacheHitCount)
+        phase51ServerSettingsBuilds/cancellations: \(phase51.serverSettingsBuildCount)/\(phase51.serverSettingsCancellationCount)
+        phase51DiagnosticsPublished/throttled: \(phase51.diagnosticsPublishCount)/\(phase51.diagnosticsThrottleCount)
+        phase51MainThreadBudgetViolations: \(phase51.mainThreadBudgetViolationCount)
+        phase51LastOperation: \(phase51.lastOperationCategory ?? "-") \(phase51.lastOperationMilliseconds.map(String.init) ?? "-")ms
         """))
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
@@ -10583,9 +10852,8 @@ private struct AttachmentPreviewSheet: View {
 
     @ViewBuilder private var previewBody: some View {
         #if canImport(AppKit)
-        if let data = preview.data, let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
+        if let data = preview.data {
+            DecodedDataImage(data: data, pixelSize: 1600)
                 .scaledToFit()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let url = preview.localFile,
@@ -10719,9 +10987,8 @@ private struct AttachmentDropReviewSheet: View {
 
     @ViewBuilder private func itemPreview(_ item: AttachmentDropReviewItem) -> some View {
         #if canImport(AppKit)
-        if let data = item.draft?.previewData, let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
+        if let data = item.draft?.previewData {
+            DecodedDataImage(data: data, pixelSize: 88)
                 .scaledToFill()
                 .frame(width: 44, height: 44)
                 .clipShape(RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
@@ -11026,6 +11293,7 @@ public struct CredentialSetupView: View {
         let parity = viewModel.phase30ParityMatrix
         let identity = viewModel.visibleIdentityDiagnostics
         let freeze = viewModel.freezePerformanceDiagnostics
+        let phase51 = viewModel.phase51PerformanceDiagnostics
         let roleSort = viewModel.memberRoleSortDiagnostics
         let dmConversation = viewModel.dmDiagnostics
         let moderation = viewModel.moderationDiagnostics
@@ -11053,6 +11321,8 @@ public struct CredentialSetupView: View {
             LabeledContent("Phase 43 preservation", value: "avatar \(identity.phase43.avatarMetadataPreservedAfterMemberRemovalCount), removals \(identity.phase43.memberRemovalIdentityPreservationCount), current edits \(identity.phase43.currentUserEditSnapshotMergeCount)")
             LabeledContent("Freeze markers", value: freeze.lastMainThreadMarker ?? "-")
             LabeledContent("Freeze counts", value: "timeline \(freeze.timelineRenderPassCount), grouping \(freeze.memberGroupingCount), grouping cache \(freeze.memberGroupingCacheHitCount), visible \(freeze.visibleRangeUpdateCount), capability cache \(freeze.capabilityCacheUpdateCount)")
+            LabeledContent("Phase 51 presentations", value: "shell \(phase51.shellBuildCount), timeline \(phase51.timelineBuildCount), cache \(phase51.timelineCacheHitCount), settings \(phase51.serverSettingsBuildCount), cancelled \(phase51.serverSettingsCancellationCount)")
+            LabeledContent("Phase 51 diagnostics", value: "published \(phase51.diagnosticsPublishCount), throttled \(phase51.diagnosticsThrottleCount), budget violations \(phase51.mainThreadBudgetViolationCount)")
             LabeledContent("Markdown cache", value: "parsed \(freeze.markdownParseCount), hits \(freeze.markdownCacheHitCount)")
             LabeledContent("Image queue", value: "active \(freeze.imageActiveCount), queued \(freeze.imageQueuedCount), completed \(freeze.imageCompletedCount), failed \(freeze.imageFailedCount), safe \(freeze.mediaSafeModeEnabled ? "yes" : "no")")
             LabeledContent("Member source", value: "\(memberHydration.source.rawValue), server \(TimelineCopyFormatter.shortID(memberHydration.lastMemberFetchServerID?.rawValue))")
@@ -11256,13 +11526,12 @@ public struct ServerRailView: View {
             ScrollView {
                 LazyVStack(spacing: StoatSpacing.small) {
                     ForEach(viewModel.servers) { server in
-                        let unread = unreadCount(for: server)
-                        let mentions = mentionCount(for: server)
+                        let presentation = viewModel.serverRailPresentation(for: server.id)
                         ServerRailItem(
                             title: server.name,
                             isSelected: viewModel.selection.serverID == server.id,
-                            unreadCount: unread,
-                            mentionCount: mentions,
+                            unreadCount: presentation?.unreadCount ?? 0,
+                            mentionCount: presentation?.mentionCount ?? 0,
                             imageData: viewModel.imageData(for: server.icon, kind: .serverIcon)
                         ) {
                             viewModel.selectServer(server.id)
@@ -11343,18 +11612,6 @@ public struct ServerRailView: View {
         }
     }
 
-    private func unreadCount(for server: Server) -> Int {
-        server.channelIDs.reduce(0) { count, channelID in
-            let unread = viewModel.unread(for: channelID)
-            return count + (unread?.lastMessageID == nil ? 0 : 1)
-        }
-    }
-
-    private func mentionCount(for server: Server) -> Int {
-        server.channelIDs.reduce(0) { count, channelID in
-            count + (viewModel.unread(for: channelID)?.mentions.count ?? 0)
-        }
-    }
 }
 
 public struct ChannelListView: View {
@@ -11432,10 +11689,8 @@ public struct ChannelListView: View {
         if let server = viewModel.selectedServer,
            let banner = server.banner {
             ZStack(alignment: .bottomLeading) {
-                if let data = viewModel.imageData(for: banner, kind: .serverBanner),
-                   let image = NSImage(data: data) {
-                    Image(nsImage: image)
-                        .resizable()
+                if let data = viewModel.imageData(for: banner, kind: .serverBanner) {
+                    DecodedDataImage(data: data, pixelSize: 1200)
                         .scaledToFill()
                 } else {
                     Rectangle()
@@ -11836,6 +12091,9 @@ public struct MessageTimelineView: View {
                 viewModel.consumeScrollIntent()
             }
         }
+        .task(id: "\(viewModel.selectedConversationChannelID?.rawValue ?? "none")-\(viewModel.selectedTimelinePresentationRevision)") {
+            await viewModel.prepareSelectedTimelinePresentation()
+        }
     }
 
     private func performScroll(_ intent: TimelineScrollIntent, proxy: ScrollViewProxy) {
@@ -12188,10 +12446,11 @@ public struct TimelineMessageGroupView: View {
                     } else if timelineMessage.message.system != nil {
                         systemEventRow(timelineMessage)
                     } else {
+                        let rowPresentation = viewModel.timelineRowPresentation(for: timelineMessage.message.id)
                         MessageRow(
                             message: timelineMessage.message,
                             author: author,
-                            authorDisplayNameOverride: viewModel.resolvedUserDisplay(for: timelineMessage.message).displayName,
+                            authorDisplayNameOverride: rowPresentation?.authorDisplay.displayName ?? viewModel.resolvedUserDisplay(for: timelineMessage.message).displayName,
                             authorDisplayColor: roleColor(for: timelineMessage.message),
                             showsHeader: index == 0,
                             statusText: accessibilityStatus(for: timelineMessage),
@@ -12206,7 +12465,7 @@ public struct TimelineMessageGroupView: View {
                             attachmentItems: viewModel.attachmentDisplayItems(for: timelineMessage.message),
                             customEmojiItems: viewModel.inlineCustomEmojiItems(for: timelineMessage.message),
                             embedItems: viewModel.embedDisplayItems(for: timelineMessage.message),
-                            authorAvatarData: viewModel.imageData(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
+                            authorAvatarData: viewModel.imageData(for: rowPresentation?.authorDisplay.avatarFile ?? viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
                             actionItems: rowActionItems(for: timelineMessage),
                             reactionItems: rowReactionItems(for: timelineMessage),
                             onMessageAction: { actionID in
@@ -12242,7 +12501,7 @@ public struct TimelineMessageGroupView: View {
                                 Task { await viewModel.retryEmbedMediaPreview(item) }
                             },
                             onOpenAuthorProfile: {
-                                let display = viewModel.resolvedUserDisplay(for: timelineMessage.message)
+                                let display = rowPresentation?.authorDisplay ?? viewModel.resolvedUserDisplay(for: timelineMessage.message)
                                 viewModel.showUserProfile(display.userID, source: .messageName, serverID: display.serverContextID)
                             },
                             onOpenReplyPreview: {
@@ -13658,15 +13917,12 @@ private struct UserProfileCardView: View {
         if let background = viewModel.userProfilesByID[user.id]?.background,
            let data = viewModel.imageData(for: background, kind: .profileBackground) {
             #if canImport(AppKit)
-            if let image = NSImage(data: data) {
-                Image(nsImage: image)
-                    .resizable()
+            DecodedDataImage(data: data, pixelSize: 780)
                     .scaledToFill()
                     .frame(height: 96)
                     .frame(maxWidth: .infinity)
                     .clipped()
                     .accessibilityLabel("Profile banner")
-            }
             #endif
         } else {
             LinearGradient(colors: [Color.accentColor.opacity(0.22), Color.primary.opacity(0.08)], startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -14038,33 +14294,27 @@ public struct ServerOverviewView: View {
                     Button("Close") { viewModel.isServerOverviewPresented = false }
                 }
 
-                switch viewModel.serverSettingsState {
+                switch viewModel.serverSettingsPresentationState {
                 case .idle:
                     EmptyStateView(title: "No server selected", message: "Select a server to review settings.", systemImage: "server.rack")
                 case .loading:
                     ProgressView("Loading server details")
                 case let .failed(message):
                     EmptyStateView(title: "Server settings unavailable", message: message, systemImage: "exclamationmark.triangle")
-                case let .loaded(details):
-                    settings(details)
+                case let .loaded(presentation):
+                    settings(presentation)
                 }
             }
             .padding(StoatSpacing.xLarge)
         }
         .frame(width: 680)
         .frame(minHeight: 620)
-        .onAppear {
-            if let details = viewModel.serverSettingsDetails() {
-                viewModel.serverSettingsState = .loaded(details)
-                viewModel.serverSettingsForm = viewModel.serverSettingsForm ?? ServerSettingsForm(server: details.server)
-                viewModel.categoryEditorForm = viewModel.categoryEditorForm ?? CategoryEditorForm(server: details.server)
-            }
-        }
         .accessibilityLabel("Server settings")
     }
 
-    private func settings(_ details: ServerSettingsDetails) -> some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+    private func settings(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
+        let details = presentation.details
+        return VStack(alignment: .leading, spacing: StoatSpacing.large) {
             Picker("Section", selection: $viewModel.selectedServerSettingsTab) {
                 ForEach(ServerSettingsTab.allCases, id: \.self) { tab in
                     Text(tab.title).tag(tab)
@@ -14081,13 +14331,13 @@ public struct ServerOverviewView: View {
             case .categories:
                 categories(details)
             case .roles:
-                roles(details)
+                roles(presentation)
             case .permissions:
-                permissions(details)
+                permissions(presentation)
             case .members:
-                members(details)
+                members(presentation)
             case .moderation:
-                moderation(details)
+                moderation(presentation)
             case .danger:
                 EmptyStateView(title: "Server deletion deferred", message: "Danger Zone is intentionally disabled in Phase 25.", systemImage: "lock.shield")
             }
@@ -14233,8 +14483,8 @@ public struct ServerOverviewView: View {
         }
     }
 
-    private func roles(_ details: ServerSettingsDetails) -> some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+    private func roles(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
+        return VStack(alignment: .leading, spacing: StoatSpacing.medium) {
             GlassPanel {
                 VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                     HStack {
@@ -14244,7 +14494,7 @@ public struct ServerOverviewView: View {
                         Button { viewModel.openCreateRole() } label: { Label("Create Role", systemImage: "plus") }
                             .disabled(viewModel.roleManagementDisabledReason() != nil)
                     }
-                    ForEach(details.server.roles.values.sorted { $0.rank < $1.rank }) { role in
+                    ForEach(presentation.orderedRoles) { role in
                         HStack {
                             Circle()
                                 .fill(roleColor(role.colour))
@@ -14297,8 +14547,9 @@ public struct ServerOverviewView: View {
         }
     }
 
-    private func permissions(_ details: ServerSettingsDetails) -> some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+    private func permissions(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
+        let details = presentation.details
+        return VStack(alignment: .leading, spacing: StoatSpacing.medium) {
             GlassPanel {
                 VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                     HStack {
@@ -14328,7 +14579,7 @@ public struct ServerOverviewView: View {
                         .font(.headline)
                     Button { viewModel.openPermissionEditor(scope: .serverDefault(serverID: details.server.id)) } label: { Label("Server defaults", systemImage: "server.rack") }
                         .disabled(viewModel.permissionEditingDisabledReason() != nil)
-                    ForEach(details.server.roles.values.sorted { $0.rank < $1.rank }) { role in
+                    ForEach(presentation.orderedRoles) { role in
                         HStack {
                             Text(role.name)
                             Spacer()
@@ -14336,7 +14587,7 @@ public struct ServerOverviewView: View {
                                 .disabled(viewModel.permissionEditingDisabledReason() != nil || !Phase25PermissionResolver.isRoleEditable(role, currentMember: viewModel.selectedServerMember, server: details.server, currentUserID: viewModel.currentUserID))
                         }
                     }
-                    ForEach(details.channels.filter { $0.kind == .textChannel }) { channel in
+                    ForEach(presentation.textChannels) { channel in
                         HStack {
                             Text(channel.displayName)
                             Spacer()
@@ -14348,12 +14599,12 @@ public struct ServerOverviewView: View {
             }
 
             if let draft = viewModel.permissionEditDraft {
-                permissionEditor(draft)
+                permissionEditor(draft, groups: presentation.permissionGroups)
             }
         }
     }
 
-    private func permissionEditor(_ draft: PermissionEditDraft) -> some View {
+    private func permissionEditor(_ draft: PermissionEditDraft, groups: [String]) -> some View {
         GlassPanel {
             VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                 HStack {
@@ -14364,7 +14615,7 @@ public struct ServerOverviewView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                ForEach(Dictionary(grouping: Phase26Permissions.editableKeys, by: \.group).keys.sorted(), id: \.self) { group in
+                ForEach(groups, id: \.self) { group in
                     Text(group)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
@@ -14422,8 +14673,9 @@ public struct ServerOverviewView: View {
         }
     }
 
-    private func members(_ details: ServerSettingsDetails) -> some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+    private func members(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
+        let details = presentation.details
+        return VStack(alignment: .leading, spacing: StoatSpacing.medium) {
             GlassPanel {
                 VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                     HStack {
@@ -14441,7 +14693,7 @@ public struct ServerOverviewView: View {
                     }
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
-                            ForEach(viewModel.memberManagementItems(for: details)) { item in
+                            ForEach(presentation.memberItems) { item in
                                 HStack {
                                     AvatarView(title: item.displayName, size: 32, isOnline: item.user?.online == true, presence: item.user?.status?.presence, imageData: viewModel.imageData(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar))
                                     VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
@@ -14481,8 +14733,9 @@ public struct ServerOverviewView: View {
         }
     }
 
-    private func moderation(_ details: ServerSettingsDetails) -> some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+    private func moderation(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
+        let details = presentation.details
+        return VStack(alignment: .leading, spacing: StoatSpacing.medium) {
             GlassPanel {
                 VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                     HStack {
@@ -14515,29 +14768,29 @@ public struct ServerOverviewView: View {
                 }
             }
 
-            moderationMembers(details)
+            moderationMembers(presentation)
             moderationBans()
-            moderationTimeouts(details)
+            moderationTimeouts(presentation)
         }
         .task(id: viewModel.memberPanelModerationPrewarmToken) {
             await viewModel.serverSettingsModerationBecameVisibleForPrewarm()
         }
     }
 
-    private func moderationMembers(_ details: ServerSettingsDetails) -> some View {
-        GlassPanel {
+    private func moderationMembers(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
+        return GlassPanel {
             VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                 HStack {
                     Text("Members")
                         .font(.headline)
                     Spacer()
-                    Text("\(viewModel.memberManagementItems(for: details).count)")
+                    Text("\(presentation.memberItems.count)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 TextField("Search members", text: $viewModel.memberSearchText)
                     .textFieldStyle(.roundedBorder)
-                let items = viewModel.memberManagementItems(for: details)
+                let items = presentation.memberItems
                 if items.isEmpty {
                     EmptyStateView(title: "No members", message: "Refresh this server's members to moderate member-scoped actions.", systemImage: "person.2")
                 } else {
@@ -14712,8 +14965,9 @@ public struct ServerOverviewView: View {
         }
     }
 
-    private func moderationTimeouts(_ details: ServerSettingsDetails) -> some View {
-        GlassPanel {
+    private func moderationTimeouts(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
+        let details = presentation.details
+        return GlassPanel {
             VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                 HStack {
                     Text("Timeouts")
@@ -14727,7 +14981,7 @@ public struct ServerOverviewView: View {
                 }
                 TextField("Search timeouts", text: $viewModel.moderationTimeoutSearchText)
                     .textFieldStyle(.roundedBorder)
-                let items = filteredTimeoutItems(details)
+                let items = presentation.timeoutItems
                 if items.isEmpty {
                     EmptyStateView(title: "No active timeouts", message: "Active timeouts appear from refreshed member state.", systemImage: "clock")
                 } else {

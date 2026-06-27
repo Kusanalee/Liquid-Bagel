@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 
 #if canImport(AppKit)
 import AppKit
+import ImageIO
 #endif
 
 private enum StoatUILayoutDiagnostics {
@@ -20,6 +21,172 @@ private enum StoatUILayoutDiagnostics {
             logger.debug("\(name) body: \(detail)")
         }
         #endif
+    }
+}
+
+public struct DecodedImageKey: Hashable, Sendable {
+    public var id: String
+    public var pixelSize: Int
+    public var revision: Int
+
+    public init(id: String, pixelSize: Int, revision: Int = 0) {
+        self.id = id
+        self.pixelSize = max(1, pixelSize)
+        self.revision = revision
+    }
+
+    public init(data: Data, pixelSize: Int, revision: Int = 0) {
+        let prefix = data.prefix(8).reduce(into: UInt64(0)) { value, byte in
+            value = (value << 8) | UInt64(byte)
+        }
+        let suffix = data.suffix(8).reduce(into: UInt64(0)) { value, byte in
+            value = (value << 8) | UInt64(byte)
+        }
+        self.init(id: "\(data.count)-\(prefix)-\(suffix)", pixelSize: pixelSize, revision: revision)
+    }
+}
+
+public struct DecodedImageDiagnostics: Hashable, Sendable {
+    public var cacheCount: Int
+    public var decodeCount: Int
+    public var cacheHitCount: Int
+    public var dedupeCount: Int
+
+    public init(cacheCount: Int, decodeCount: Int, cacheHitCount: Int, dedupeCount: Int) {
+        self.cacheCount = cacheCount
+        self.decodeCount = decodeCount
+        self.cacheHitCount = cacheHitCount
+        self.dedupeCount = dedupeCount
+    }
+}
+
+#if canImport(AppKit)
+private actor DecodedImageStore {
+    static let shared = DecodedImageStore()
+
+    private var images: [DecodedImageKey: CGImage] = [:]
+    private var order: [DecodedImageKey] = []
+    private var inFlight: [DecodedImageKey: Task<CGImage?, Never>] = [:]
+    private var decodeCount = 0
+    private var cacheHitCount = 0
+    private var dedupeCount = 0
+    private let maxEntries = 192
+
+    func image(for key: DecodedImageKey, data: Data) async -> CGImage? {
+        if let image = images[key] {
+            cacheHitCount += 1
+            return image
+        }
+        if let task = inFlight[key] {
+            dedupeCount += 1
+            return await task.value
+        }
+        let task = Task.detached(priority: .userInitiated) {
+            Self.downsample(data: data, pixelSize: key.pixelSize)
+        }
+        inFlight[key] = task
+        let image = await task.value
+        inFlight[key] = nil
+        decodeCount += 1
+        if let image {
+            images[key] = image
+            order.removeAll { $0 == key }
+            order.append(key)
+            while order.count > maxEntries, let oldest = order.first {
+                order.removeFirst()
+                images.removeValue(forKey: oldest)
+            }
+        }
+        return image
+    }
+
+    func diagnostics() -> DecodedImageDiagnostics {
+        DecodedImageDiagnostics(
+            cacheCount: images.count,
+            decodeCount: decodeCount,
+            cacheHitCount: cacheHitCount,
+            dedupeCount: dedupeCount
+        )
+    }
+
+    func reset() {
+        images.removeAll()
+        order.removeAll()
+        inFlight.values.forEach { $0.cancel() }
+        inFlight.removeAll()
+        decodeCount = 0
+        cacheHitCount = 0
+        dedupeCount = 0
+    }
+
+    nonisolated private static func downsample(data: Data, pixelSize: Int) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, pixelSize),
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    }
+}
+#endif
+
+public enum DecodedImagePipeline {
+    @discardableResult
+    public static func prepare(data: Data, key: DecodedImageKey) async -> Bool {
+        #if canImport(AppKit)
+        return await DecodedImageStore.shared.image(for: key, data: data) != nil
+        #else
+        return false
+        #endif
+    }
+
+    public static func diagnostics() async -> DecodedImageDiagnostics {
+        #if canImport(AppKit)
+        await DecodedImageStore.shared.diagnostics()
+        #else
+        DecodedImageDiagnostics(cacheCount: 0, decodeCount: 0, cacheHitCount: 0, dedupeCount: 0)
+        #endif
+    }
+
+    public static func reset() async {
+        #if canImport(AppKit)
+        await DecodedImageStore.shared.reset()
+        #endif
+    }
+}
+
+public struct DecodedDataImage: View {
+    private let data: Data
+    private let key: DecodedImageKey
+    #if canImport(AppKit)
+    @State private var decodedImage: CGImage?
+    #endif
+
+    public init(data: Data, key: DecodedImageKey? = nil, pixelSize: Int = 256) {
+        self.data = data
+        self.key = key ?? DecodedImageKey(data: data, pixelSize: pixelSize)
+    }
+
+    public var body: some View {
+        Group {
+            #if canImport(AppKit)
+            if let decodedImage {
+                Image(decorative: decodedImage, scale: 1)
+                    .resizable()
+            } else {
+                Color.clear
+            }
+            #else
+            Color.clear
+            #endif
+        }
+        .task(id: key) {
+            #if canImport(AppKit)
+            decodedImage = await DecodedImageStore.shared.image(for: key, data: data)
+            #endif
+        }
     }
 }
 
@@ -1027,9 +1194,8 @@ private struct ComposerAttachmentChipView: View {
 
     @ViewBuilder private var preview: some View {
         #if canImport(AppKit)
-        if let data = attachment.previewData, let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
+        if let data = attachment.previewData {
+            DecodedDataImage(data: data, pixelSize: 68)
                 .scaledToFill()
                 .frame(width: 34, height: 34)
                 .clipShape(RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
@@ -1285,9 +1451,8 @@ public struct AvatarView: View {
 
     @ViewBuilder private var avatarContent: some View {
         #if canImport(AppKit)
-        if let imageData, let image = NSImage(data: imageData) {
-            Image(nsImage: image)
-                .resizable()
+        if let imageData {
+            DecodedDataImage(data: imageData, pixelSize: Int(max(64, size * 2)))
                 .scaledToFill()
                 .frame(width: size, height: size)
                 .clipShape(RoundedRectangle(cornerRadius: min(StoatRadius.avatar, size / 4), style: .continuous))
@@ -1328,9 +1493,8 @@ public struct ServerIconView: View {
 
     @ViewBuilder private var content: some View {
         #if canImport(AppKit)
-        if let imageData, let image = NSImage(data: imageData) {
-            Image(nsImage: image)
-                .resizable()
+        if let imageData {
+            DecodedDataImage(data: imageData, pixelSize: Int(StoatSize.serverIcon * 2))
                 .scaledToFill()
                 .clipShape(RoundedRectangle(cornerRadius: isSelected ? 15 : StoatRadius.avatar, style: .continuous))
         } else {
@@ -1872,9 +2036,7 @@ public struct MessageRow: View {
 
     private var timestampText: String {
         guard let date = message.createdAt else { return "now" }
-        let formatter = DateFormatter()
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
+        return date.formatted(date: .omitted, time: .shortened)
     }
 }
 
@@ -1883,9 +2045,8 @@ private struct ReactionEmojiLabel: View {
 
     var body: some View {
         #if canImport(AppKit)
-        if let data = reaction.customEmojiImageData, let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
+        if let data = reaction.customEmojiImageData {
+            DecodedDataImage(data: data, pixelSize: 32)
                 .scaledToFit()
                 .frame(width: 16, height: 16)
                 .accessibilityLabel(reaction.customEmojiName ?? reaction.emoji)
@@ -1992,12 +2153,9 @@ public struct AttachmentTimelineCard: View {
         #if canImport(AppKit)
         if item.kind == .image,
            item.previewState.isReady,
-           let data = item.previewData,
-           let image = NSImage(data: data) {
+           let data = item.previewData {
             Button(action: onPreview) {
-                Image(nsImage: image)
-                    .resizable()
-                    .interpolation(.high)
+                DecodedDataImage(data: data, pixelSize: isCompact ? 860 : 1160)
                     .scaledToFit()
                     .frame(maxWidth: isCompact ? 430 : 580, maxHeight: isCompact ? 260 : 380, alignment: .leading)
                     .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
@@ -2029,10 +2187,8 @@ public struct AttachmentTimelineCard: View {
     @ViewBuilder private var thumbnailContent: some View {
         #if canImport(AppKit)
         if item.kind == .image,
-           let data = item.previewData,
-           let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
+           let data = item.previewData {
+            DecodedDataImage(data: data, pixelSize: isCompact ? 68 : 88)
                 .scaledToFill()
                 .frame(width: isCompact ? 34 : 44, height: isCompact ? 34 : 44)
                 .clipShape(RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
@@ -2327,6 +2483,14 @@ private struct MarkdownInlineContent: View {
     let source: String
     let customEmojiItems: [MessageInlineCustomEmojiItem]
     let font: Font
+    private let tokens: [InlineCustomEmojiToken]
+
+    init(source: String, customEmojiItems: [MessageInlineCustomEmojiItem], font: Font) {
+        self.source = source
+        self.customEmojiItems = customEmojiItems
+        self.font = font
+        self.tokens = MarkdownInlineCache.shared.tokens(source: source, items: customEmojiItems)
+    }
 
     var body: some View {
         HStack(alignment: .center, spacing: StoatSpacing.xxSmall) {
@@ -2347,9 +2511,8 @@ private struct MarkdownInlineContent: View {
 
     @ViewBuilder private func inlineEmoji(_ item: MessageInlineCustomEmojiItem) -> some View {
         #if canImport(AppKit)
-        if let data = item.imageData, let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
+        if let data = item.imageData {
+            DecodedDataImage(data: data, pixelSize: 44)
                 .scaledToFit()
                 .frame(width: 22, height: 22)
                 .accessibilityLabel(item.name)
@@ -2363,13 +2526,8 @@ private struct MarkdownInlineContent: View {
         #endif
     }
 
-    private var tokens: [InlineCustomEmojiToken] {
-        InlineCustomEmojiToken.tokenize(source: source, items: customEmojiItems)
-    }
-
     private static func attributed(_ value: String) -> AttributedString {
-        let sanitized = value.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
-        return (try? AttributedString(markdown: sanitized, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(sanitized)
+        MarkdownInlineCache.shared.attributed(value)
     }
 }
 
@@ -2405,6 +2563,69 @@ private enum InlineCustomEmojiToken: Hashable {
             return "text::\(value)"
         case let .emoji(item):
             return "emoji::\(item.shortcode)"
+        }
+    }
+}
+
+private final class MarkdownInlineCache: @unchecked Sendable {
+    static let shared = MarkdownInlineCache()
+
+    private struct TokenKey: Hashable {
+        var source: String
+        var items: [MessageInlineCustomEmojiItem]
+    }
+
+    private let lock = NSLock()
+    private var tokensByKey: [TokenKey: [InlineCustomEmojiToken]] = [:]
+    private var attributedBySource: [String: AttributedString] = [:]
+    private var tokenOrder: [TokenKey] = []
+    private var attributedOrder: [String] = []
+    private let maxEntries = 800
+
+    func tokens(source: String, items: [MessageInlineCustomEmojiItem]) -> [InlineCustomEmojiToken] {
+        let key = TokenKey(source: source, items: items)
+        lock.lock()
+        if let cached = tokensByKey[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        let parsed = InlineCustomEmojiToken.tokenize(source: source, items: items)
+        lock.lock()
+        tokensByKey[key] = parsed
+        tokenOrder.append(key)
+        trimTokens()
+        lock.unlock()
+        return parsed
+    }
+
+    func attributed(_ source: String) -> AttributedString {
+        lock.lock()
+        if let cached = attributedBySource[source] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        let sanitized = source.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+        let parsed = (try? AttributedString(
+            markdown: sanitized,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )) ?? AttributedString(sanitized)
+        lock.lock()
+        attributedBySource[source] = parsed
+        attributedOrder.append(source)
+        while attributedOrder.count > maxEntries, let oldest = attributedOrder.first {
+            attributedOrder.removeFirst()
+            attributedBySource.removeValue(forKey: oldest)
+        }
+        lock.unlock()
+        return parsed
+    }
+
+    private func trimTokens() {
+        while tokenOrder.count > maxEntries, let oldest = tokenOrder.first {
+            tokenOrder.removeFirst()
+            tokensByKey.removeValue(forKey: oldest)
         }
     }
 }
@@ -2622,14 +2843,11 @@ public struct EmbedTimelineCard: View {
         #if canImport(AppKit)
         if mediaItem.kind == .image,
            mediaItem.previewState.isReady,
-           let data = mediaItem.previewData,
-           let image = NSImage(data: data) {
+           let data = mediaItem.previewData {
             Button {
                 onPreviewMedia(mediaItem)
             } label: {
-                Image(nsImage: image)
-                    .resizable()
-                    .interpolation(.high)
+                DecodedDataImage(data: data, pixelSize: isCompact ? 560 : 720)
                     .scaledToFit()
                     .frame(maxWidth: isCompact ? 280 : 360, maxHeight: isCompact ? 180 : 240, alignment: .leading)
                     .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))

@@ -4,6 +4,8 @@ Phase 48 is the live-first audit layer on top of Phase 47 core chat polish. It i
 
 This repository pass did not capture live dogfood evidence. The preflight test slice passed, no repo-proven rendering or routing defect was found, and all live-sensitive parity rows remain `partial` until the checklist below is completed with real accounts.
 
+Phase 51 now supplies the freeze-proof presentation and decoded-image gate that must pass before this live audit. It does not replace the two-account evidence below, so no Phase 48 row is promoted from automated Phase 51 coverage alone.
+
 ## Scope And Route Boundaries
 
 - Use only the already verified message fetch, around-message fetch, selected-channel search, pin, unpin, reaction, ack, and media routes.

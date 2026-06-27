@@ -6556,6 +6556,117 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         XCTAssertFalse(summary.contains("secret-ticket"))
         XCTAssertTrue(summary.contains("[redacted"))
     }
+
+    func testPhase51ServerSettingsPresentationBuildsLargeSnapshotOnce() {
+        let serverID: ServerID = "phase51-large-server"
+        let currentUserID: UserID = "phase51-current"
+        var roles: [RoleID: Role] = [:]
+        for index in 0..<200 {
+            let id = RoleID(rawValue: "phase51-role-\(index)")
+            roles[id] = Role(id: id, name: "Role \(index)", permissions: PermissionOverride(), rank: Int64(index))
+        }
+        let channelIDs = (0..<200).map { ChannelID(rawValue: "phase51-channel-\($0)") }
+        let server = Server(
+            id: serverID,
+            ownerID: currentUserID,
+            name: "Large Phase 51",
+            channelIDs: channelIDs,
+            roles: roles
+        )
+        var users: [UserID: User] = [:]
+        var members: [ServerMemberKey: ServerMember] = [:]
+        for index in 0..<2_000 {
+            let userID = UserID(rawValue: "phase51-user-\(index)")
+            users[userID] = User(id: userID, username: "user\(index)")
+            let member = ServerMember(
+                id: MemberCompositeKey(serverID: serverID, userID: userID),
+                joinedAt: Date(),
+                roles: [RoleID(rawValue: "phase51-role-\(index % 200)")]
+            )
+            members[ServerMemberKey(member.id)] = member
+        }
+        users[currentUserID] = User(id: currentUserID, username: "current")
+        members[ServerMemberKey(serverID: serverID, userID: currentUserID)] = ServerMember(
+            id: MemberCompositeKey(serverID: serverID, userID: currentUserID),
+            joinedAt: Date()
+        )
+        let channels = Dictionary(uniqueKeysWithValues: channelIDs.map {
+            ($0, Channel(id: $0, kind: .textChannel, serverID: serverID, name: $0.rawValue))
+        })
+        let snapshot = RealtimeSnapshot(
+            usersByID: users,
+            serversByID: [serverID: server],
+            channelsByID: channels,
+            membersByServerAndUserID: members
+        )
+
+        let presentation = Phase51PresentationBuilder.serverSettings(
+            revision: Phase51PresentationRevision(snapshot: 1),
+            snapshot: snapshot,
+            serverID: serverID,
+            selectedChannelID: channelIDs.first,
+            currentUserID: currentUserID,
+            runtimeLine: "mock",
+            capabilities: ServerManagementCapabilities(canManageServer: true, canManageChannels: true, canInvite: true, isConnectedForLiveActions: true),
+            identitySnapshots: Phase43IdentitySnapshotStore(),
+            normalizedMemberQuery: ""
+        )
+
+        XCTAssertEqual(presentation?.orderedRoles.count, 200)
+        XCTAssertEqual(presentation?.textChannels.count, 200)
+        XCTAssertEqual(presentation?.memberItems.count, 2_001)
+    }
+
+    @MainActor
+    func testPhase51QuickSwitcherCapsFiveThousandIndexedChannels() {
+        let serverID: ServerID = "phase51-index-server"
+        let channels = (0..<5_000).map { index in
+            Channel(id: ChannelID(rawValue: "phase51-index-\(index)"), kind: .textChannel, serverID: serverID, name: "indexed channel \(index)")
+        }
+        let server = Server(id: serverID, ownerID: "owner", name: "Index", channelIDs: channels.map(\.id))
+        let snapshot = RealtimeSnapshot(
+            serversByID: [serverID: server],
+            channelsByID: Dictionary(uniqueKeysWithValues: channels.map { ($0.id, $0) })
+        )
+        let switcher = QuickSwitcherViewModel(snapshot: snapshot)
+
+        switcher.query = "indexed channel"
+
+        XCTAssertEqual(switcher.results.count, 50)
+        XCTAssertEqual(Set(switcher.results.map(\.id)).count, 50)
+    }
+
+    @MainActor
+    func testPhase51TimelinePresentationUsesRevisionCache() async {
+        let channelID: ChannelID = "phase51-timeline"
+        let authorID: UserID = "phase51-author"
+        let messages = (0..<250).map { index in
+            Message(
+                id: MessageID(rawValue: String(format: "01J%023d", index)),
+                channelID: channelID,
+                authorID: authorID,
+                content: "Message \(index)"
+            )
+        }
+        let channel = Channel(id: channelID, kind: .directMessage, recipients: [authorID])
+        let snapshot = RealtimeSnapshot(
+            usersByID: [authorID: User(id: authorID, username: "author")],
+            channelsByID: [channelID: channel],
+            messagesByChannelID: [channelID: messages]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
+            snapshot: snapshot
+        )
+
+        await model.prepareSelectedTimelinePresentation()
+        let firstBuildCount = model.phase51PerformanceDiagnostics.timelineBuildCount
+        await model.prepareSelectedTimelinePresentation()
+
+        XCTAssertFalse(model.selectedTimelineMessageGroups.isEmpty)
+        XCTAssertEqual(model.phase51PerformanceDiagnostics.timelineBuildCount, firstBuildCount)
+        XCTAssertGreaterThanOrEqual(model.phase51PerformanceDiagnostics.timelineCacheHitCount, 1)
+    }
 }
 
 // MARK: - Phase 38 Support Types

@@ -464,9 +464,8 @@ private struct ProfileEditorSection: View {
     @ViewBuilder private func backgroundPreview(for user: User) -> some View {
         let data = backgroundPreviewData(for: user)
         #if canImport(AppKit)
-        if let data, let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
+        if let data {
+            DecodedDataImage(data: data, pixelSize: 1200)
                 .scaledToFill()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipped()

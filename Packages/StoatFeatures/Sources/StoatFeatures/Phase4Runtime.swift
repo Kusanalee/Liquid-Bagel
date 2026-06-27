@@ -934,6 +934,7 @@ public final class ChannelMessageController {
     @ObservationIgnored private let messageCapPerChannel: Int
     @ObservationIgnored private var reducer: ChannelMessageHistoryReducer
     @ObservationIgnored private var loadTokens: [ChannelID: UUID] = [:]
+    @ObservationIgnored private var presentationRevisionsByChannelID: [ChannelID: Int] = [:]
 
     public init(
         runtimeMode: AppRuntimeMode = .mock,
@@ -968,6 +969,12 @@ public final class ChannelMessageController {
         retryingMessageIDs.removeAll()
         lastErrorByChannelID.removeAll()
         loadTokens.removeAll()
+        presentationRevisionsByChannelID.removeAll()
+    }
+
+    public func presentationRevision(for channelID: ChannelID?) -> Int {
+        guard let channelID else { return 0 }
+        return presentationRevisionsByChannelID[channelID, default: 0]
     }
 
     public func state(for channelID: ChannelID?) -> ChannelMessageState {
@@ -1258,6 +1265,7 @@ public final class ChannelMessageController {
     private func setHistory(_ history: ChannelMessageHistory) {
         historiesByChannelID[history.channelID] = history
         statesByChannelID[history.channelID] = history.state
+        presentationRevisionsByChannelID[history.channelID, default: 0] &+= 1
     }
 
     private func apply(_ event: ChannelMessageHistoryEvent, channelID: ChannelID) {

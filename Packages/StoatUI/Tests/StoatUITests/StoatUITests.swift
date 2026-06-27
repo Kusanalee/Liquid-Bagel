@@ -146,4 +146,23 @@ final class StoatUITests: XCTestCase {
         XCTAssertEqual(item.mediaPreviewData, data)
         XCTAssertTrue(item.accessibilityLabel.contains("media embed.png"))
     }
+
+    func testPhase51DecodedImagePipelineDedupesIdenticalResources() async throws {
+        let png = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")!
+        let key = DecodedImageKey(id: "phase51-pixel", pixelSize: 32)
+        await DecodedImagePipeline.reset()
+
+        async let first = DecodedImagePipeline.prepare(data: png, key: key)
+        async let second = DecodedImagePipeline.prepare(data: png, key: key)
+        let firstResult = await first
+        let secondResult = await second
+        XCTAssertTrue(firstResult)
+        XCTAssertTrue(secondResult)
+        _ = await DecodedImagePipeline.prepare(data: png, key: key)
+        let diagnostics = await DecodedImagePipeline.diagnostics()
+
+        XCTAssertEqual(diagnostics.decodeCount, 1)
+        XCTAssertGreaterThanOrEqual(diagnostics.dedupeCount + diagnostics.cacheHitCount, 2)
+        XCTAssertEqual(diagnostics.cacheCount, 1)
+    }
 }
