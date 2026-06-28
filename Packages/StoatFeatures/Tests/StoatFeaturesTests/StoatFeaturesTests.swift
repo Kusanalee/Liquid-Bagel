@@ -6708,3 +6708,69 @@ private actor StubLoginAPIClient: StoatAPIClient {
         return continueResponse
     }
 }
+
+// MARK: - BoundedCacheTracker Tests
+
+final class BoundedCacheTrackerTests: XCTestCase {
+
+    func testEvictsLRUEntryWhenOverCap() {
+        var tracker = BoundedCacheTracker<String>(maxBytes: 100)
+        // Insert three 40-byte entries (total = 120 > 100)
+        _ = tracker.insert(key: "a", byteCount: 40)
+        _ = tracker.insert(key: "b", byteCount: 40)
+        tracker.recordAccess(for: "a")  // "a" is now MRU; "b" is LRU
+        let evicted = tracker.insert(key: "c", byteCount: 40)
+        XCTAssertEqual(evicted, ["b"], "LRU entry 'b' should be evicted")
+        XCTAssertLessThanOrEqual(tracker.totalBytes, 100)
+        XCTAssertEqual(tracker.count, 2)
+    }
+
+    func testRemoveDecreasesBytes() {
+        var tracker = BoundedCacheTracker<String>(maxBytes: 1000)
+        _ = tracker.insert(key: "x", byteCount: 300)
+        tracker.remove(key: "x")
+        XCTAssertEqual(tracker.totalBytes, 0)
+        XCTAssertEqual(tracker.count, 0)
+    }
+
+    func testRemoveAllResetsState() {
+        var tracker = BoundedCacheTracker<String>(maxBytes: 1000)
+        _ = tracker.insert(key: "a", byteCount: 200)
+        _ = tracker.insert(key: "b", byteCount: 300)
+        tracker.removeAll()
+        XCTAssertEqual(tracker.totalBytes, 0)
+        XCTAssertEqual(tracker.count, 0)
+    }
+
+    func testOverwriteUpdatesBytes() {
+        var tracker = BoundedCacheTracker<String>(maxBytes: 1000)
+        _ = tracker.insert(key: "k", byteCount: 80)
+        _ = tracker.insert(key: "k", byteCount: 30)
+        XCTAssertEqual(tracker.totalBytes, 30)
+        XCTAssertEqual(tracker.count, 1)
+    }
+
+    func testProtectedKeyIsNotEvicted() {
+        var tracker = BoundedCacheTracker<String>(maxBytes: 100)
+        _ = tracker.insert(key: "protected", byteCount: 60)   // inserted first → LRU
+        _ = tracker.insert(key: "evictable", byteCount: 20)
+        // This insert tips total (60+20+40=120) over the 100-byte cap.
+        // Without protection, "protected" (LRU) would go. With protection it must survive.
+        let evicted = tracker.insert(key: "new", byteCount: 40, protecting: ["protected"])
+        XCTAssertFalse(evicted.contains("protected"))
+        XCTAssertTrue(evicted.contains("evictable"))
+    }
+}
+
+// MARK: - MainShellViewModel Cache Eviction Tests
+
+final class MainShellViewModelCacheEvictionTests: XCTestCase {
+
+    @MainActor
+    func testClearImageMemoryCacheResetsTracker() async {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        await model.clearImageMemoryCache()
+        XCTAssertEqual(model.imageResourceCacheTrackerTotalBytes, 0)
+        XCTAssertTrue(model.loadedImageResources.isEmpty)
+    }
+}

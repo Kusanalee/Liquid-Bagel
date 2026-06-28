@@ -740,6 +740,15 @@ public final class MainShellViewModel {
     @ObservationIgnored private var queuedImageResourceRequests: [ImageCacheKey: ImageResourceRequest] = [:]
     @ObservationIgnored private var imageResourceFailureDates: [ImageCacheKey: Date] = [:]
     @ObservationIgnored private let maxConcurrentImageResourceLoads = 6
+    static let imageResourceCacheMaxBytes      = 100 * 1_000_000
+    static let attachmentDataCacheMaxBytes     =  50 * 1_000_000
+    static let attachmentOriginalCacheMaxBytes =  50 * 1_000_000
+    @ObservationIgnored private var imageResourceCacheTracker =
+        BoundedCacheTracker<ImageCacheKey>(maxBytes: 100 * 1_000_000)
+    @ObservationIgnored private var attachmentDataCacheTracker =
+        BoundedCacheTracker<String>(maxBytes: 50 * 1_000_000)
+    @ObservationIgnored private var attachmentOriginalCacheTracker =
+        BoundedCacheTracker<String>(maxBytes: 50 * 1_000_000)
     @ObservationIgnored private let maxConcurrentInlinePreviewLoads = 4
     @ObservationIgnored public var phase43HydrationPolicy = Phase43HydrationPolicy()
     @ObservationIgnored private var phase43IdentityHydrationTasks: [UserID: Task<Void, Never>] = [:]
@@ -1469,6 +1478,7 @@ public final class MainShellViewModel {
         for file in files {
             let key = ImageCacheKey(id: file.id.rawValue, kind: .userAvatar)
             loadedImageResources.removeValue(forKey: key)
+            imageResourceCacheTracker.remove(key: key)
             imageResourceStates.removeValue(forKey: key)
             imageResourceFailureDates.removeValue(forKey: key)
             queuedImageResourceRequests.removeValue(forKey: key)
@@ -2474,6 +2484,7 @@ public final class MainShellViewModel {
         guard let file else { return 0 }
         let key = ImageCacheKey(id: file.id.rawValue, kind: kind)
         loadedImageResources.removeValue(forKey: key)
+        imageResourceCacheTracker.remove(key: key)
         imageResourceStates.removeValue(forKey: key)
         imageResourceFailureDates.removeValue(forKey: key)
         queuedImageResourceRequests.removeValue(forKey: key)
@@ -2611,6 +2622,7 @@ public final class MainShellViewModel {
         add(newProfile.background, .profileBackground)
         for key in keys {
             loadedImageResources.removeValue(forKey: key)
+            imageResourceCacheTracker.remove(key: key)
             imageResourceStates.removeValue(forKey: key)
             imageResourceFailureDates.removeValue(forKey: key)
             queuedImageResourceRequests.removeValue(forKey: key)
@@ -2619,10 +2631,16 @@ public final class MainShellViewModel {
             await imageMemoryCache.remove(key)
         }
         if let uploadedAvatar, let avatar = newUser.avatar {
-            loadedImageResources[ImageCacheKey(id: avatar.id.rawValue, kind: .userAvatar)] = uploadedAvatar.draft.previewData ?? uploadedAvatar.draft.data
+            let avatarKey = ImageCacheKey(id: avatar.id.rawValue, kind: .userAvatar)
+            let avatarData = uploadedAvatar.draft.previewData ?? uploadedAvatar.draft.data
+            loadedImageResources[avatarKey] = avatarData
+            applyImageResourceEviction(for: imageResourceCacheTracker.insert(key: avatarKey, byteCount: avatarData.count))
         }
         if let uploadedBackground, let background = newProfile.background {
-            loadedImageResources[ImageCacheKey(id: background.id.rawValue, kind: .profileBackground)] = uploadedBackground.draft.previewData ?? uploadedBackground.draft.data
+            let bgKey = ImageCacheKey(id: background.id.rawValue, kind: .profileBackground)
+            let bgData = uploadedBackground.draft.previewData ?? uploadedBackground.draft.data
+            loadedImageResources[bgKey] = bgData
+            applyImageResourceEviction(for: imageResourceCacheTracker.insert(key: bgKey, byteCount: bgData.count))
         }
         return keys.count
     }
@@ -6074,6 +6092,8 @@ public final class MainShellViewModel {
             let loaded = try await remoteAttachmentLoader.load(item, purpose: .preview)
             await MainActor.run {
                 self.loadedAttachmentData[item.id] = loaded
+                self.applyAttachmentDataEviction(for: self.attachmentDataCacheTracker.insert(
+                    key: item.id, byteCount: loaded.data.count))
                 self.attachmentPreviewStates[item.id] = .readyRemote
                 self.lastAttachmentAction = "Loaded inline image preview"
             }
@@ -6106,7 +6126,9 @@ public final class MainShellViewModel {
 
     public func imageData(for file: File?, kind: ImageResourceKind) -> Data? {
         guard let file else { return nil }
-        return loadedImageResources[ImageCacheKey(id: file.id.rawValue, kind: kind)]
+        let key = ImageCacheKey(id: file.id.rawValue, kind: kind)
+        imageResourceCacheTracker.recordAccess(for: key)
+        return loadedImageResources[key]
     }
 
     public func loadImageResource(for file: File?, kind: ImageResourceKind) {
@@ -6143,8 +6165,34 @@ public final class MainShellViewModel {
         imageResourceStates.removeAll()
         imageResourceFailureDates.removeAll()
         queuedImageResourceRequests.removeAll()
+        imageResourceCacheTracker.removeAll()
         lastImageResourceAction = "Cleared image memory cache"
     }
+
+    private func applyImageResourceEviction(for evicted: Set<ImageCacheKey>) {
+        for key in evicted {
+            loadedImageResources.removeValue(forKey: key)
+            if case .readyRemote = imageResourceStates[key] {
+                imageResourceStates[key] = .notLoaded
+            }
+        }
+    }
+
+    private func applyAttachmentDataEviction(for evicted: Set<String>) {
+        let activeID = attachmentPreview?.id
+        for key in evicted where key != activeID {
+            loadedAttachmentData.removeValue(forKey: key)
+        }
+    }
+
+    private func applyAttachmentOriginalEviction(for evicted: Set<String>) {
+        let activeID = attachmentPreview?.id
+        for key in evicted where key != activeID {
+            loadedAttachmentOriginalData.removeValue(forKey: key)
+        }
+    }
+
+    var imageResourceCacheTrackerTotalBytes: Int { imageResourceCacheTracker.totalBytes }
 
     public func reloadVisibleImages() {
         for message in selectedTimelineMessages.map(\.message) {
@@ -6196,12 +6244,14 @@ public final class MainShellViewModel {
         do {
             let loaded = try await imageResourceLoader.loadImage(request)
             await MainActor.run {
-            self.loadedImageResources[request.cacheKey] = loaded.data
-            self.imageResourceStates[request.cacheKey] = .readyRemote
+                self.loadedImageResources[request.cacheKey] = loaded.data
+                self.imageResourceStates[request.cacheKey] = .readyRemote
                 self.imageResourceFailureDates.removeValue(forKey: request.cacheKey)
                 self.imageCompletedCount += 1
-            self.lastImageResourceAction = loaded.fromCache ? "Loaded image from memory cache" : "Loaded image"
+                self.lastImageResourceAction = loaded.fromCache ? "Loaded image from memory cache" : "Loaded image"
                 self.updateFreezePerformanceDiagnostics(marker: self.lastImageResourceAction)
+                self.applyImageResourceEviction(for: self.imageResourceCacheTracker.insert(
+                    key: request.cacheKey, byteCount: loaded.data.count))
             }
         } catch is CancellationError {
             await MainActor.run {
@@ -6363,6 +6413,7 @@ public final class MainShellViewModel {
         }
         if let data {
             loadedAttachmentData[item.id] = RemoteAttachmentData(fileID: item.fileID, filename: item.displayName, contentType: item.contentType, byteCount: data.count, data: data)
+            applyAttachmentDataEviction(for: attachmentDataCacheTracker.insert(key: item.id, byteCount: data.count))
         }
         if let localFile {
             attachmentLocalFiles[item.id] = localFile
@@ -6399,6 +6450,8 @@ public final class MainShellViewModel {
         do {
             let loaded = try await remoteAttachmentLoader.load(current, purpose: .preview)
             loadedAttachmentData[current.id] = loaded
+            applyAttachmentDataEviction(for: attachmentDataCacheTracker.insert(
+                key: current.id, byteCount: loaded.data.count))
             current.previewState = .readyRemote
             attachmentPreviewStates[current.id] = .readyRemote
             attachmentPreview = AttachmentPreviewSheetItem(item: current, data: loaded.data, localFile: attachmentLocalFiles[current.id], debugFileID: current.fileID?.rawValue)
@@ -6426,6 +6479,8 @@ public final class MainShellViewModel {
             } else if current.source.isRemoteLoadable {
                 data = try await remoteAttachmentLoader.load(current, purpose: .original)
                 loadedAttachmentOriginalData[current.id] = data
+                applyAttachmentOriginalEviction(for: attachmentOriginalCacheTracker.insert(
+                    key: current.id, byteCount: data.data.count))
             } else if let loaded = loadedAttachmentData[current.id] {
                 data = loaded
             } else {
@@ -6478,14 +6533,16 @@ public final class MainShellViewModel {
 
     public func retryAttachmentPreview(_ item: AttachmentDisplayItem) async {
         attachmentPreviewStates[item.id] = .notLoaded
-        loadedAttachmentData[item.id] = nil
+        loadedAttachmentData.removeValue(forKey: item.id)
+        attachmentDataCacheTracker.remove(key: item.id)
         await previewAttachment(item)
     }
 
     public func retryEmbedMediaPreview(_ item: AttachmentDisplayItem) async {
         if let fileID = item.fileID {
             let key = ImageCacheKey(id: fileID.rawValue, kind: .attachmentPreview)
-            loadedImageResources[key] = nil
+            loadedImageResources.removeValue(forKey: key)
+            imageResourceCacheTracker.remove(key: key)
             imageResourceStates[key] = nil
             imageResourceFailureDates[key] = nil
         }
@@ -6549,6 +6606,7 @@ public final class MainShellViewModel {
             byteCount: data.count,
             data: data
         )
+        applyAttachmentDataEviction(for: attachmentDataCacheTracker.insert(key: item.id, byteCount: data.count))
         attachmentPreviewStates[item.id] = .readyRemote
     }
 
@@ -6683,6 +6741,7 @@ public final class MainShellViewModel {
             if draft.kind == .image,
                let previewData = localImagePreviewData(for: draft) {
                 loadedAttachmentData[itemID] = RemoteAttachmentData(fileID: id, filename: draft.filename, contentType: draft.mimeType, byteCount: previewData.count, data: previewData)
+                applyAttachmentDataEviction(for: attachmentDataCacheTracker.insert(key: itemID, byteCount: previewData.count))
             }
             return File(attachmentDraft: draft, uploadedFileID: id)
         }
