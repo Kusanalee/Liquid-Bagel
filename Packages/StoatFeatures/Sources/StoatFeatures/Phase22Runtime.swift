@@ -152,20 +152,58 @@ public enum Phase22Derivations {
         return user.relationship
     }
 
+    /// O(1) variant used by bulk derivations: looks up the precomputed relationship map
+    /// instead of scanning `currentUser.relations` per user.
+    private static func relationshipStatus(
+        for user: User,
+        currentUserID: UserID?,
+        relationshipByUserID: [UserID: RelationshipStatus]
+    ) -> RelationshipStatus {
+        if let currentUserID, user.id == currentUserID { return .user }
+        if let status = relationshipByUserID[user.id] { return status }
+        return user.relationship
+    }
+
+    /// Builds a `[UserID: RelationshipStatus]` from `currentUser.relations` once so callers
+    /// avoid an O(relations) scan per user. Mirrors `first(where:)` precedence (first wins).
+    private static func relationshipStatusMap(currentUser: User?) -> [UserID: RelationshipStatus] {
+        guard let relations = currentUser?.relations else { return [:] }
+        return Dictionary(relations.map { ($0.id, $0.status) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    /// Indexes direct-message channels by the *other* recipient once, replacing the
+    /// per-user O(channels) scan in `directMessageChannel(containing:)`. First match wins,
+    /// matching the previous `.first { … }` semantics for the common one-channel-per-pair case.
+    private static func directMessageChannelsByRecipient(
+        currentUserID: UserID?,
+        snapshot: RealtimeSnapshot
+    ) -> [UserID: Channel] {
+        var map: [UserID: Channel] = [:]
+        for channel in snapshot.channelsByID.values where channel.kind == .directMessage {
+            if let currentUserID, !channel.recipients.contains(currentUserID) { continue }
+            for recipient in channel.recipients where recipient != currentUserID {
+                if map[recipient] == nil { map[recipient] = channel }
+            }
+        }
+        return map
+    }
+
     public static func friendItems(
         snapshot: RealtimeSnapshot,
         currentUserID: UserID?,
         currentUser: User?,
         localReadStates: [ChannelID: LocalReadState] = [:]
     ) -> [FriendListItem] {
-        snapshot.usersByID.values
+        let dmChannelsByRecipient = directMessageChannelsByRecipient(currentUserID: currentUserID, snapshot: snapshot)
+        let relationshipByUserID = relationshipStatusMap(currentUser: currentUser)
+        let items: [FriendListItem] = snapshot.usersByID.values
             .filter { user in currentUserID.map { user.id != $0 } ?? true }
             .map { user in
-                let dm = directMessageChannel(containing: user.id, currentUserID: currentUserID, snapshot: snapshot)
+                let dm = dmChannelsByRecipient[user.id]
                 let counts = unreadCounts(channelID: dm?.id, snapshot: snapshot, localReadStates: localReadStates)
                 return FriendListItem(
                     user: user,
-                    relationshipStatus: relationshipStatus(for: user, currentUserID: currentUserID, currentUser: currentUser),
+                    relationshipStatus: relationshipStatus(for: user, currentUserID: currentUserID, relationshipByUserID: relationshipByUserID),
                     dmChannelID: dm?.id,
                     lastMessagePreview: lastMessagePreview(channelID: dm?.id, snapshot: snapshot),
                     unreadCount: counts.unread,
@@ -173,9 +211,11 @@ public enum Phase22Derivations {
                     isOnline: user.online
                 )
             }
-            .sorted { lhs, rhs in
-                displayName(lhs.user).localizedCaseInsensitiveCompare(displayName(rhs.user)) == .orderedAscending
-            }
+        // Decorate-sort-undecorate: compute each display name once instead of twice per comparison.
+        let decorated: [(item: FriendListItem, sortKey: String)] = items.map { ($0, displayName($0.user)) }
+        return decorated
+            .sorted { $0.sortKey.localizedCaseInsensitiveCompare($1.sortKey) == .orderedAscending }
+            .map(\.item)
     }
 
     public static func friendItems(
@@ -270,17 +310,6 @@ public enum Phase22Derivations {
         return "Message"
     }
 
-    private static func directMessageChannel(containing userID: UserID, currentUserID: UserID?, snapshot: RealtimeSnapshot) -> Channel? {
-        snapshot.channelsByID.values.first { channel in
-            guard channel.kind == .directMessage else { return false }
-            guard channel.recipients.contains(userID) else { return false }
-            if let currentUserID {
-                return channel.recipients.contains(currentUserID)
-            }
-            return true
-        }
-    }
-
     private static func visibleRecipientIDs(for channel: Channel, currentUserID: UserID?) -> [UserID] {
         if channel.kind == .savedMessages {
             return [currentUserID ?? channel.userID].compactMap { $0 }
@@ -334,22 +363,31 @@ public enum Phase22Derivations {
 
     private static func lastMessagePreview(channelID: ChannelID?, snapshot: RealtimeSnapshot) -> String? {
         guard let channelID,
-              let message = snapshot.messagesByChannelID[channelID]?.sorted(by: { lhs, rhs in
+              let message = snapshot.messagesByChannelID[channelID]?.max(by: { lhs, rhs in
                   ChannelMessageHistoryReducer.messageIDChronologicalSort(lhs.id, rhs.id)
-              }).last
+              })
         else { return nil }
         return safePreview(message)
     }
 
-    private static func sanitize(_ value: String) -> String {
-        var output = value
-        let replacements = [
+    /// Precompiled once at first use instead of recompiling three regexes on every preview.
+    private static let sanitizeRules: [(regex: NSRegularExpression, template: String)] = {
+        let specs: [(pattern: String, template: String)] = [
             (#"https?://\S+"#, "[redacted-url]"),
             (#"/(?:Users|tmp|var|private|Volumes)/[^\s,;\)]+"#, "[redacted-path]"),
             (#"(?i)(authorization|token|session|password|secret|auth)[\s:=]+"?[^"\s]+"?"#, "$1=[redacted]")
         ]
-        for (pattern, replacement) in replacements {
-            output = output.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
+        return specs.compactMap { spec in
+            guard let regex = try? NSRegularExpression(pattern: spec.pattern) else { return nil }
+            return (regex, spec.template)
+        }
+    }()
+
+    private static func sanitize(_ value: String) -> String {
+        var output = value
+        for rule in sanitizeRules {
+            let range = NSRange(output.startIndex..., in: output)
+            output = rule.regex.stringByReplacingMatches(in: output, options: [], range: range, withTemplate: rule.template)
         }
         return output.trimmingCharacters(in: .whitespacesAndNewlines)
     }

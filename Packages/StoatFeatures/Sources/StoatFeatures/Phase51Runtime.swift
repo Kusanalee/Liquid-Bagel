@@ -155,7 +155,8 @@ public enum Phase51PresentationBuilder {
         localReadStates: [ChannelID: LocalReadState],
         locallyClearedUnreadChannelIDs: Set<ChannelID>,
         notificationPreferences: NotificationPreferences
-    ) -> ShellPresentationSnapshot {
+    ) throws -> ShellPresentationSnapshot {
+        try Task.checkCancellation()
         let railItems = snapshot.serversByID.values
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             .map { server in
@@ -173,12 +174,14 @@ public enum Phase51PresentationBuilder {
                 }
                 return ServerRailPresentationItem(server: server, unreadCount: unreadCount, mentionCount: mentionCount)
             }
+        try Task.checkCancellation()
         let friends = Phase22Derivations.friendItems(
             snapshot: snapshot,
             currentUserID: currentUserID,
             currentUser: currentUser,
             localReadStates: localReadStates
         )
+        try Task.checkCancellation()
         let directMessages = Phase22Derivations.directMessageItems(
             snapshot: snapshot,
             currentUserID: currentUserID,

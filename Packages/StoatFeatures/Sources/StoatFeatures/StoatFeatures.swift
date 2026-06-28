@@ -898,7 +898,9 @@ public final class MainShellViewModel {
         installAppLifecycleHandler()
         // Bootstrap once so command routing and tests have a coherent snapshot before the
         // first SwiftUI frame. Subsequent revisions are prepared off-main and swapped atomically.
-        self.shellPresentationSnapshot = Phase51PresentationBuilder.shell(
+        // The builder only throws on cancellation, which cannot happen during this synchronous
+        // bootstrap, so an empty snapshot is a safe fallback.
+        self.shellPresentationSnapshot = (try? Phase51PresentationBuilder.shell(
             revision: Phase51PresentationRevision(),
             snapshot: snapshot,
             selection: selection,
@@ -907,7 +909,7 @@ public final class MainShellViewModel {
             localReadStates: [:],
             locallyClearedUnreadChannelIDs: [],
             notificationPreferences: self.notificationPreferences
-        )
+        )) ?? ShellPresentationSnapshot()
         self.phase51PerformanceDiagnostics.shellBuildCount = 1
         if let snapshotSource {
             observe(snapshotSource: snapshotSource)
@@ -966,7 +968,7 @@ public final class MainShellViewModel {
         phase51ShellPresentationTask = Task { [weak self] in
             let started = ContinuousClock.now
             let worker = Task.detached(priority: .userInitiated) {
-                Phase51PresentationBuilder.shell(
+                try Phase51PresentationBuilder.shell(
                     revision: revision,
                     snapshot: snapshot,
                     selection: selection,
@@ -977,7 +979,18 @@ public final class MainShellViewModel {
                     notificationPreferences: preferences
                 )
             }
-            let result = await worker.value
+            // Cancelling this task (on supersede) also cancels the detached worker so a stale
+            // build stops at its next checkpoint instead of running to completion.
+            let result: ShellPresentationSnapshot
+            do {
+                result = try await withTaskCancellationHandler {
+                    try await worker.value
+                } onCancel: {
+                    worker.cancel()
+                }
+            } catch {
+                return
+            }
             guard !Task.isCancelled, let self, generation == self.phase51ShellGeneration else { return }
             self.shellPresentationSnapshot = result
             self.quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
@@ -1030,7 +1043,11 @@ public final class MainShellViewModel {
                     normalizedMemberQuery: normalizedQuery
                 )
             }
-            let result = await worker.value
+            let result = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
             guard !Task.isCancelled, let self, generation == self.phase51ServerSettingsGeneration else {
                 if let self {
                     self.phase51PerformanceDiagnostics.serverSettingsCancellationCount += 1
@@ -1229,7 +1246,11 @@ public final class MainShellViewModel {
             })
             return (groups, rows)
         }
-        let result = await worker.value
+        let result = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
         guard !Task.isCancelled, key == timelineGroupCacheKey(messages: selectedTimelineMessages) else { return }
         selectedTimelineGroupCacheKey = key
         selectedTimelineGroupCache = result.0
