@@ -5489,6 +5489,94 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(Phase44SafeSummary.messageSummary(for: imageOnly), "Image embed")
     }
 
+    // MARK: - Phase 25 CategoryEditorForm reorder tests
+
+    func testCategoryEditorFormMoveCategoriesChangesOrder() {
+        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        var form = CategoryEditorForm(server: server)
+        XCTAssertEqual(form.categories.map(\.id), ["cat-text", "cat-voice"])
+
+        form.moveCategories(fromOffsets: IndexSet(integer: 0), toOffset: 2)
+        XCTAssertEqual(form.categories.map(\.id), ["cat-voice", "cat-text"])
+    }
+
+    func testCategoryEditorFormMoveCategoriesNoOpLeavesUnchanged() {
+        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        var form = CategoryEditorForm(server: server)
+        let original = form.categories.map(\.id)
+
+        form.moveCategories(fromOffsets: IndexSet(integer: 0), toOffset: 1)
+        XCTAssertEqual(form.categories.map(\.id), original)
+    }
+
+    func testCategoryEditorFormMoveChannelsChangesOrderWithinCategory() {
+        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        var form = CategoryEditorForm(server: server)
+        let general: ChannelID = "01HX0000000000000000000101"
+        let api: ChannelID = "01HX0000000000000000000102"
+        let native: ChannelID = "01HX0000000000000000000103"
+        XCTAssertEqual(form.categories.first(where: { $0.id == "cat-text" })?.channels, [general, api, native])
+
+        form.moveChannels(inCategory: "cat-text", fromOffsets: IndexSet(integer: 0), toOffset: 3)
+        XCTAssertEqual(form.categories.first(where: { $0.id == "cat-text" })?.channels, [api, native, general])
+    }
+
+    func testCategoryEditorFormMoveChannelsNoOpLeavesUnchanged() {
+        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        var form = CategoryEditorForm(server: server)
+        let general: ChannelID = "01HX0000000000000000000101"
+        let api: ChannelID = "01HX0000000000000000000102"
+        let native: ChannelID = "01HX0000000000000000000103"
+
+        form.moveChannels(inCategory: "cat-text", fromOffsets: IndexSet(integer: 0), toOffset: 1)
+        XCTAssertEqual(form.categories.first(where: { $0.id == "cat-text" })?.channels, [general, api, native])
+    }
+
+    func testCategoryEditorFormMoveChannelsUnknownCategoryIsNoop() {
+        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        var form = CategoryEditorForm(server: server)
+        let before = form
+
+        form.moveChannels(inCategory: "nonexistent", fromOffsets: IndexSet(integer: 0), toOffset: 2)
+        XCTAssertEqual(form, before)
+    }
+
+    // MARK: - openNewDirectMessage command tests
+
+    @MainActor
+    func testOpenNewDirectMessageCanPerformInMockMode() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        XCTAssertTrue(model.canPerform(.openNewDirectMessage))
+    }
+
+    @MainActor
+    func testOpenNewDirectMessagePerformSetsPresentationFlag() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        XCTAssertFalse(model.isPresentingNewDirectMessage)
+
+        model.perform(.openNewDirectMessage)
+
+        XCTAssertTrue(model.isPresentingNewDirectMessage)
+    }
+
+    @MainActor
+    func testOpenNewDirectMessageResetsSearchBeforePresenting() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.newDirectMessageSearch = "old query"
+
+        model.openNewDirectMessage()
+
+        XCTAssertEqual(model.newDirectMessageSearch, "")
+        XCTAssertTrue(model.isPresentingNewDirectMessage)
+    }
+
+    @MainActor
+    func testNewDirectMessageCandidatesEmptyForNonMatchingSearch() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.newDirectMessageSearch = "zzznonexistentxxx"
+        XCTAssertTrue(model.newDirectMessageCandidates.isEmpty)
+    }
+
     private func ulid(milliseconds: UInt64) -> String {
         let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
         var value = milliseconds

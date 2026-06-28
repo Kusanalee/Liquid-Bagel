@@ -14875,7 +14875,9 @@ public struct ServerOverviewView: View {
     }
 
     private func categories(_ details: ServerSettingsDetails) -> some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+        let cats = viewModel.categoryEditorForm?.categories ?? []
+        let canManage = viewModel.channelManagementDisabledReason() == nil
+        return VStack(alignment: .leading, spacing: StoatSpacing.medium) {
             GlassPanel {
                 VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                     Text("Categories")
@@ -14883,28 +14885,70 @@ public struct ServerOverviewView: View {
                     HStack {
                         TextField("New category", text: $newCategoryTitle)
                         Button { viewModel.createCategoryDraft(title: newCategoryTitle); newCategoryTitle = "" } label: { Label("Add", systemImage: "plus") }
-                            .disabled(newCategoryTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.channelManagementDisabledReason() != nil)
+                            .disabled(newCategoryTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !canManage)
                     }
-                    ForEach(viewModel.categoryEditorForm?.categories ?? []) { category in
-                        HStack {
-                            TextField("Category title", text: Binding(
-                                get: { viewModel.categoryEditorForm?.categories.first(where: { $0.id == category.id })?.title ?? category.title },
-                                set: { viewModel.categoryEditorForm?.renameCategory(id: category.id, title: $0) }
-                            ))
-                            Text("\(category.channels.count)")
-                                .foregroundStyle(.secondary)
-                            Button(role: .destructive) { viewModel.categoryEditorForm?.deleteCategory(id: category.id) } label: { Image(systemName: "trash") }
-                                .accessibilityHint("Deletes this category draft; channels become uncategorized after Apply")
+                    ForEach(Array(zip(cats.indices, cats)), id: \.1.id) { index, category in
+                        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                            HStack {
+                                VStack(spacing: 0) {
+                                    Button {
+                                        viewModel.categoryEditorForm?.moveCategories(fromOffsets: IndexSet(integer: index), toOffset: index - 1)
+                                    } label: { Image(systemName: "chevron.up") }
+                                    .disabled(index == 0 || !canManage)
+                                    .accessibilityLabel("Move category up")
+                                    Button {
+                                        viewModel.categoryEditorForm?.moveCategories(fromOffsets: IndexSet(integer: index), toOffset: index + 2)
+                                    } label: { Image(systemName: "chevron.down") }
+                                    .disabled(index == cats.count - 1 || !canManage)
+                                    .accessibilityLabel("Move category down")
+                                }
+                                .buttonStyle(.borderless)
+                                TextField("Category title", text: Binding(
+                                    get: { viewModel.categoryEditorForm?.categories.first(where: { $0.id == category.id })?.title ?? category.title },
+                                    set: { viewModel.categoryEditorForm?.renameCategory(id: category.id, title: $0) }
+                                ))
+                                Text("\(category.channels.count)")
+                                    .foregroundStyle(.secondary)
+                                Button(role: .destructive) { viewModel.categoryEditorForm?.deleteCategory(id: category.id) } label: { Image(systemName: "trash") }
+                                    .accessibilityHint("Deletes this category draft; channels become uncategorized after Apply")
+                            }
+                            ForEach(Array(zip(category.channels.indices, category.channels)), id: \.1) { chIdx, channelID in
+                                if let channel = details.channels.first(where: { $0.id == channelID }) {
+                                    HStack {
+                                        Button {
+                                            viewModel.categoryEditorForm?.moveChannels(inCategory: category.id, fromOffsets: IndexSet(integer: chIdx), toOffset: chIdx - 1)
+                                        } label: { Image(systemName: "chevron.up") }
+                                        .disabled(chIdx == 0 || !canManage)
+                                        .accessibilityLabel("Move channel up within category")
+                                        Button {
+                                            viewModel.categoryEditorForm?.moveChannels(inCategory: category.id, fromOffsets: IndexSet(integer: chIdx), toOffset: chIdx + 2)
+                                        } label: { Image(systemName: "chevron.down") }
+                                        .disabled(chIdx == category.channels.count - 1 || !canManage)
+                                        .accessibilityLabel("Move channel down within category")
+                                        Text(channel.displayName)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .padding(.leading, StoatSpacing.medium)
+                                }
+                            }
                         }
                     }
-                    ForEach(details.channels) { channel in
-                        Picker(channel.displayName, selection: Binding(
-                            get: { categoryID(containing: channel.id) },
-                            set: { viewModel.categoryEditorForm?.move(channelID: channel.id, toCategory: $0) }
-                        )) {
-                            Text("Uncategorized").tag(String?.none)
-                            ForEach(viewModel.categoryEditorForm?.categories ?? []) { category in
-                                Text(category.title).tag(Optional(category.id))
+                    if !details.channels.isEmpty {
+                        Divider()
+                        Text("Assign channels to categories")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        ForEach(details.channels) { channel in
+                            Picker(channel.displayName, selection: Binding(
+                                get: { categoryID(containing: channel.id) },
+                                set: { viewModel.categoryEditorForm?.move(channelID: channel.id, toCategory: $0) }
+                            )) {
+                                Text("Uncategorized").tag(String?.none)
+                                ForEach(viewModel.categoryEditorForm?.categories ?? []) { category in
+                                    Text(category.title).tag(Optional(category.id))
+                                }
                             }
                         }
                     }
@@ -14913,7 +14957,7 @@ public struct ServerOverviewView: View {
                         Spacer()
                         Button { Task { await viewModel.applyCategoryChanges() } } label: { Label("Apply Categories", systemImage: "checkmark") }
                             .buttonStyle(GlassButtonStyle())
-                            .disabled(viewModel.channelManagementDisabledReason() != nil)
+                            .disabled(!canManage)
                     }
                 }
             }
