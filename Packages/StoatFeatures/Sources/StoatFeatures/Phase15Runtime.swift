@@ -317,13 +317,15 @@ public actor LiveAttachmentUploadHandler: AttachmentUploadHandling {
         case let .inMemory(memoryData):
             data = memoryData
         case let .fileURL(url):
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer {
-                if scoped {
-                    url.stopAccessingSecurityScopedResource()
+            data = try await Task.detached(priority: .userInitiated) {
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer {
+                    if scoped {
+                        url.stopAccessingSecurityScopedResource()
+                    }
                 }
-            }
-            data = try Data(contentsOf: url, options: [.mappedIfSafe])
+                return try Data(contentsOf: url, options: [.mappedIfSafe])
+            }.value
         }
         return try await apiClient.uploadFile(data: data, filename: attachment.filename, mimeType: attachment.mimeType, tag: .attachments)
     }

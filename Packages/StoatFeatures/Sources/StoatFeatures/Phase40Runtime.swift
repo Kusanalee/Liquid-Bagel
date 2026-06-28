@@ -21,6 +21,7 @@ public enum DMOpenSource: String, Codable, Hashable, Sendable, CaseIterable {
     case savedNotes
     case directList
     case directCall
+    case newMessagePicker
     case notification
     case unknown
 }

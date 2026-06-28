@@ -29,6 +29,7 @@ public enum AppCommand: Hashable, Sendable {
     case jumpToHome
     case jumpToFriends
     case jumpToAddFriend
+    case openNewDirectMessage
     case jumpToDiscover
     case openJoinInvite
     case openCreateServer
@@ -207,7 +208,7 @@ public struct ShellNavigationHelper: Sendable {
 @Observable
 public final class QuickSwitcherViewModel {
     public var query: String = "" {
-        didSet { rebuildFilteredResults() }
+        didSet { scheduleFilteredResults() }
     }
     public var selectedIndex: Int = 0
     public private(set) var results: [QuickSwitcherResult] = []
@@ -219,6 +220,10 @@ public final class QuickSwitcherViewModel {
     @ObservationIgnored private let navigation = ShellNavigationHelper()
     @ObservationIgnored private let canPerform: (AppCommand) -> Bool
     @ObservationIgnored private let disabledReason: (AppCommand) -> String?
+    @ObservationIgnored private var indexTask: Task<Void, Never>?
+    @ObservationIgnored private var filterTask: Task<Void, Never>?
+    @ObservationIgnored private var indexGeneration = 0
+    @ObservationIgnored private var filterGeneration = 0
 
     public init(
         snapshot: RealtimeSnapshot,
@@ -234,6 +239,11 @@ public final class QuickSwitcherViewModel {
         rebuildFilteredResults()
     }
 
+    deinit {
+        indexTask?.cancel()
+        filterTask?.cancel()
+    }
+
     public var selectedResult: QuickSwitcherResult? {
         let current = results
         guard current.indices.contains(selectedIndex) else { return current.first }
@@ -243,8 +253,7 @@ public final class QuickSwitcherViewModel {
     public func update(snapshot: RealtimeSnapshot, selection: ShellSelection) {
         self.snapshot = snapshot
         self.selection = selection
-        rebuildIndex()
-        rebuildFilteredResults()
+        scheduleRebuildIndex()
     }
 
     public func moveSelection(_ delta: Int) {
@@ -282,13 +291,17 @@ public final class QuickSwitcherViewModel {
         }
     }
 
-    private func indexedResults() -> [QuickSwitcherResult] {
+    nonisolated private static func indexedEntityResults(
+        snapshot: RealtimeSnapshot,
+        selection: ShellSelection
+    ) -> [QuickSwitcherResult] {
         var output: [QuickSwitcherResult] = [
             QuickSwitcherResult(id: "route-home", title: "Home", subtitle: "Open home", kind: .route(.home), badgeText: "Route"),
             QuickSwitcherResult(id: "route-friends", title: "Friends", subtitle: "Open friends", kind: .route(.friends), badgeText: "Route"),
             QuickSwitcherResult(id: "route-discover", title: "Discover", subtitle: "Open server discovery placeholder", kind: .route(.discover), badgeText: "Route")
         ]
 
+        let navigation = ShellNavigationHelper()
         for server in navigation.orderedServers(in: snapshot) {
             output.append(QuickSwitcherResult(
                 id: "server-\(server.id.rawValue)",
@@ -300,7 +313,7 @@ public final class QuickSwitcherViewModel {
         }
 
         let serversByID = snapshot.serversByID
-        for channel in snapshot.channelsByID.values.sorted(by: channelSort) where navigation.isSelectable(channel) {
+        for channel in snapshot.channelsByID.values.sorted(by: Self.channelSort) where navigation.isSelectable(channel) {
             let serverName = channel.serverID.flatMap { serversByID[$0]?.name }
             let isDM = DMChannelClassifier.isDirectMessageLike(channel)
             output.append(QuickSwitcherResult(
@@ -312,12 +325,11 @@ public final class QuickSwitcherViewModel {
             ))
         }
 
-        output.append(contentsOf: commandResults())
         return output
     }
 
     private func rebuildIndex() {
-        indexedResultsCache = indexedResults()
+        indexedResultsCache = Self.indexedEntityResults(snapshot: snapshot, selection: selection) + commandResults()
         normalizedSearchTextByID = Dictionary(
             uniqueKeysWithValues: indexedResultsCache.map { result in
                 let text = [result.title, result.subtitle, result.badgeText]
@@ -329,10 +341,76 @@ public final class QuickSwitcherViewModel {
         )
     }
 
+    private func scheduleRebuildIndex() {
+        indexGeneration &+= 1
+        let generation = indexGeneration
+        indexTask?.cancel()
+        let snapshot = snapshot
+        let selection = selection
+        let commands = commandResults()
+        indexTask = Task { [weak self] in
+            let worker = Task.detached(priority: .userInitiated) {
+                let indexed = Self.indexedEntityResults(snapshot: snapshot, selection: selection) + commands
+                let normalized = Dictionary(
+                    uniqueKeysWithValues: indexed.map { result in
+                        let text = [result.title, result.subtitle, result.badgeText]
+                            .compactMap { $0 }
+                            .joined(separator: " ")
+                            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                        return (result.id, text)
+                    }
+                )
+                return (indexed, normalized)
+            }
+            let prepared = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled, let self, generation == self.indexGeneration else { return }
+            self.indexedResultsCache = prepared.0
+            self.normalizedSearchTextByID = prepared.1
+            self.scheduleFilteredResults()
+            self.indexTask = nil
+        }
+    }
+
+    private func scheduleFilteredResults() {
+        filterGeneration &+= 1
+        let generation = filterGeneration
+        filterTask?.cancel()
+        let needle = normalizedQuery
+        if needle.isEmpty || indexedResultsCache.count <= 500 {
+            rebuildFilteredResults()
+            return
+        }
+        let indexed = indexedResultsCache
+        let normalized = normalizedSearchTextByID
+        filterTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(35))
+            } catch {
+                return
+            }
+            let worker = Task.detached(priority: .userInitiated) {
+                Array(indexed.lazy.filter {
+                    normalized[$0.id]?.contains(needle) == true
+                }.prefix(50))
+            }
+            let filtered = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled, let self, generation == self.filterGeneration else { return }
+            self.results = filtered
+            self.selectedIndex = filtered.isEmpty ? 0 : min(self.selectedIndex, filtered.count - 1)
+            self.filterTask = nil
+        }
+    }
+
     private func rebuildFilteredResults() {
-        let needle = query
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        let needle = normalizedQuery
         if needle.isEmpty {
             results = Array(indexedResultsCache.prefix(16))
         } else {
@@ -341,6 +419,12 @@ public final class QuickSwitcherViewModel {
             }.prefix(50))
         }
         selectedIndex = results.isEmpty ? 0 : min(selectedIndex, results.count - 1)
+    }
+
+    private var normalizedQuery: String {
+        query
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
     }
 
     private func commandResults() -> [QuickSwitcherResult] {
@@ -408,7 +492,7 @@ public final class QuickSwitcherViewModel {
         )
     }
 
-    private func channelSort(_ lhs: Channel, _ rhs: Channel) -> Bool {
+    nonisolated private static func channelSort(_ lhs: Channel, _ rhs: Channel) -> Bool {
         let leftServer = lhs.serverID?.rawValue ?? ""
         let rightServer = rhs.serverID?.rawValue ?? ""
         if leftServer != rightServer { return leftServer < rightServer }

@@ -51,12 +51,16 @@ public struct DecodedImageDiagnostics: Hashable, Sendable {
     public var decodeCount: Int
     public var cacheHitCount: Int
     public var dedupeCount: Int
+    public var byteCount: Int
+    public var evictionCount: Int
 
-    public init(cacheCount: Int, decodeCount: Int, cacheHitCount: Int, dedupeCount: Int) {
+    public init(cacheCount: Int, decodeCount: Int, cacheHitCount: Int, dedupeCount: Int, byteCount: Int = 0, evictionCount: Int = 0) {
         self.cacheCount = cacheCount
         self.decodeCount = decodeCount
         self.cacheHitCount = cacheHitCount
         self.dedupeCount = dedupeCount
+        self.byteCount = byteCount
+        self.evictionCount = evictionCount
     }
 }
 
@@ -65,12 +69,16 @@ private actor DecodedImageStore {
     static let shared = DecodedImageStore()
 
     private var images: [DecodedImageKey: CGImage] = [:]
+    private var costs: [DecodedImageKey: Int] = [:]
     private var order: [DecodedImageKey] = []
     private var inFlight: [DecodedImageKey: Task<CGImage?, Never>] = [:]
     private var decodeCount = 0
     private var cacheHitCount = 0
     private var dedupeCount = 0
-    private let maxEntries = 192
+    private var byteCount = 0
+    private var evictionCount = 0
+    private let maxEntries = 96
+    private let maxBytes = 128 * 1024 * 1024
 
     func image(for key: DecodedImageKey, data: Data) async -> CGImage? {
         if let image = images[key] {
@@ -89,12 +97,17 @@ private actor DecodedImageStore {
         inFlight[key] = nil
         decodeCount += 1
         if let image {
+            let cost = image.bytesPerRow * image.height
             images[key] = image
+            costs[key] = cost
+            byteCount += cost
             order.removeAll { $0 == key }
             order.append(key)
-            while order.count > maxEntries, let oldest = order.first {
+            while (order.count > maxEntries || byteCount > maxBytes), let oldest = order.first {
                 order.removeFirst()
                 images.removeValue(forKey: oldest)
+                byteCount -= costs.removeValue(forKey: oldest) ?? 0
+                evictionCount += 1
             }
         }
         return image
@@ -105,18 +118,23 @@ private actor DecodedImageStore {
             cacheCount: images.count,
             decodeCount: decodeCount,
             cacheHitCount: cacheHitCount,
-            dedupeCount: dedupeCount
+            dedupeCount: dedupeCount,
+            byteCount: byteCount,
+            evictionCount: evictionCount
         )
     }
 
     func reset() {
         images.removeAll()
+        costs.removeAll()
         order.removeAll()
         inFlight.values.forEach { $0.cancel() }
         inFlight.removeAll()
         decodeCount = 0
         cacheHitCount = 0
         dedupeCount = 0
+        byteCount = 0
+        evictionCount = 0
     }
 
     nonisolated private static func downsample(data: Data, pixelSize: Int) -> CGImage? {
@@ -1437,7 +1455,6 @@ public struct AvatarView: View {
     }
 
     public var body: some View {
-        let _ = StoatUILayoutDiagnostics.body("AvatarView", detail: "size=\(size)")
         ZStack(alignment: .bottomTrailing) {
             avatarContent
             if presence != nil || isOnline != nil {
@@ -1670,6 +1687,7 @@ public struct MessageRow: View {
     private let replyPreviewItem: MessageRowReplyPreviewItem?
     private let attachmentItems: [AttachmentDisplayItem]?
     private let customEmojiItems: [MessageInlineCustomEmojiItem]
+    private let preparedMarkdownContent: PreparedMarkdownContent?
     private let embedItems: [MessageEmbedDisplayItem]?
     private let authorAvatarData: Data?
     private let actionItems: [MessageRowActionItem]
@@ -1705,6 +1723,7 @@ public struct MessageRow: View {
         replyPreviewItem: MessageRowReplyPreviewItem? = nil,
         attachmentItems: [AttachmentDisplayItem]? = nil,
         customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        preparedMarkdownContent: PreparedMarkdownContent? = nil,
         embedItems: [MessageEmbedDisplayItem]? = nil,
         authorAvatarData: Data? = nil,
         actionItems: [MessageRowActionItem] = [],
@@ -1739,6 +1758,7 @@ public struct MessageRow: View {
         self.replyPreviewItem = replyPreviewItem
         self.attachmentItems = attachmentItems
         self.customEmojiItems = customEmojiItems
+        self.preparedMarkdownContent = preparedMarkdownContent
         self.embedItems = embedItems
         self.authorAvatarData = authorAvatarData
         self.actionItems = actionItems
@@ -1758,7 +1778,6 @@ public struct MessageRow: View {
     }
 
     public var body: some View {
-        let _ = StoatUILayoutDiagnostics.body("MessageRow", detail: "id=\(message.id.rawValue)")
         let searchStyle = SearchHighlightStyle(
             isHighlighted: isSearchHighlighted,
             isCurrent: isCurrentSearchResult,
@@ -1814,7 +1833,14 @@ public struct MessageRow: View {
                     replyPreviewView(replyPreviewItem)
                 }
                 if let content = message.content, !content.isEmpty {
-                    MarkdownMessageContent(content, customEmojiItems: customEmojiItems)
+                    if let preparedMarkdownContent {
+                        MarkdownMessageContent(
+                            prepared: preparedMarkdownContent,
+                            customEmojiItems: customEmojiItems
+                        )
+                    } else {
+                        MarkdownMessageContent(content, customEmojiItems: customEmojiItems)
+                    }
                 }
                 let renderedAttachments = attachmentItems ?? message.attachments?.map { AttachmentDisplayItem(file: $0) } ?? []
                 if !renderedAttachments.isEmpty {
@@ -2359,18 +2385,87 @@ public struct SystemEventRow: View {
     }
 }
 
+public struct PreparedMarkdownContent: Hashable, Sendable {
+    public var source: String
+    fileprivate var blocks: [MarkdownBlock]
+
+    fileprivate init(source: String, blocks: [MarkdownBlock]) {
+        self.source = source
+        self.blocks = blocks
+    }
+}
+
+public enum MarkdownContentPreparer {
+    nonisolated public static func prepare(
+        _ source: String,
+        customEmojiItems: [MessageInlineCustomEmojiItem] = []
+    ) -> PreparedMarkdownContent {
+        let blocks = MarkdownBlockCache.shared.blocks(for: source)
+        for block in blocks {
+            let inlineSource: String?
+            switch block {
+            case let .text(value), let .quote(value), let .heading(_, value), let .listItem(_, value):
+                inlineSource = value
+            case .code:
+                inlineSource = nil
+            }
+            guard let inlineSource else { continue }
+            let tokens = MarkdownInlineCache.shared.tokens(source: inlineSource, items: customEmojiItems)
+            for token in tokens {
+                if case let .text(value) = token {
+                    _ = MarkdownInlineCache.shared.attributed(value)
+                }
+            }
+        }
+        return PreparedMarkdownContent(source: source, blocks: blocks)
+    }
+}
+
 public struct MarkdownMessageContent: View {
     private let source: String
-    private let parsedBlocks: [MarkdownBlock]
+    private let preparedContent: PreparedMarkdownContent?
     private let customEmojiItems: [MessageInlineCustomEmojiItem]
+    @State private var asynchronouslyPreparedContent: PreparedMarkdownContent?
 
     public init(_ source: String, customEmojiItems: [MessageInlineCustomEmojiItem] = []) {
         self.source = source
-        self.parsedBlocks = MarkdownBlockCache.shared.blocks(for: source)
+        self.preparedContent = nil
         self.customEmojiItems = customEmojiItems
+        _asynchronouslyPreparedContent = State(initialValue: nil)
+    }
+
+    public init(
+        prepared: PreparedMarkdownContent,
+        customEmojiItems: [MessageInlineCustomEmojiItem] = []
+    ) {
+        self.source = prepared.source
+        self.preparedContent = prepared
+        self.customEmojiItems = customEmojiItems
+        _asynchronouslyPreparedContent = State(initialValue: nil)
     }
 
     public var body: some View {
+        Group {
+            if let content = preparedContent ?? asynchronouslyPreparedContent {
+                blocks(content.blocks)
+            } else {
+                Text(source)
+                    .font(StoatTypography.messageBody)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .task(id: source) {
+            guard preparedContent == nil else { return }
+            let source = source
+            let customEmojiItems = customEmojiItems
+            asynchronouslyPreparedContent = await Task.detached(priority: .userInitiated) {
+                MarkdownContentPreparer.prepare(source, customEmojiItems: customEmojiItems)
+            }.value
+        }
+    }
+
+    @ViewBuilder private func blocks(_ parsedBlocks: [MarkdownBlock]) -> some View {
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
             ForEach(parsedBlocks.indices, id: \.self) { index in
                 switch parsedBlocks[index] {
@@ -2422,9 +2517,11 @@ private final class MarkdownBlockCache: @unchecked Sendable {
     private let lock = NSLock()
     private var blocksBySource: [String: [MarkdownBlock]] = [:]
     private var order: [String] = []
+    private var byteCount = 0
     private(set) var parseCount = 0
     private(set) var cacheHitCount = 0
     private let maxEntries = 400
+    private let maxBytes = 4 * 1024 * 1024
 
     func blocks(for source: String) -> [MarkdownBlock] {
         lock.lock()
@@ -2440,10 +2537,12 @@ private final class MarkdownBlockCache: @unchecked Sendable {
         lock.lock()
         parseCount += 1
         blocksBySource[source] = parsed
+        byteCount += source.utf8.count
         order.append(source)
-        while order.count > maxEntries, let oldest = order.first {
+        while (order.count > maxEntries || byteCount > maxBytes), let oldest = order.first {
             order.removeFirst()
             blocksBySource.removeValue(forKey: oldest)
+            byteCount -= oldest.utf8.count
         }
         lock.unlock()
         return parsed
@@ -2580,7 +2679,10 @@ private final class MarkdownInlineCache: @unchecked Sendable {
     private var attributedBySource: [String: AttributedString] = [:]
     private var tokenOrder: [TokenKey] = []
     private var attributedOrder: [String] = []
+    private var tokenByteCount = 0
+    private var attributedByteCount = 0
     private let maxEntries = 800
+    private let maxBytes = 4 * 1024 * 1024
 
     func tokens(source: String, items: [MessageInlineCustomEmojiItem]) -> [InlineCustomEmojiToken] {
         let key = TokenKey(source: source, items: items)
@@ -2593,6 +2695,7 @@ private final class MarkdownInlineCache: @unchecked Sendable {
         let parsed = InlineCustomEmojiToken.tokenize(source: source, items: items)
         lock.lock()
         tokensByKey[key] = parsed
+        tokenByteCount += source.utf8.count + items.reduce(0) { $0 + $1.shortcode.utf8.count }
         tokenOrder.append(key)
         trimTokens()
         lock.unlock()
@@ -2613,24 +2716,28 @@ private final class MarkdownInlineCache: @unchecked Sendable {
         )) ?? AttributedString(sanitized)
         lock.lock()
         attributedBySource[source] = parsed
+        attributedByteCount += source.utf8.count
         attributedOrder.append(source)
-        while attributedOrder.count > maxEntries, let oldest = attributedOrder.first {
+        while (attributedOrder.count > maxEntries || attributedByteCount > maxBytes), let oldest = attributedOrder.first {
             attributedOrder.removeFirst()
             attributedBySource.removeValue(forKey: oldest)
+            attributedByteCount -= oldest.utf8.count
         }
         lock.unlock()
         return parsed
     }
 
     private func trimTokens() {
-        while tokenOrder.count > maxEntries, let oldest = tokenOrder.first {
+        while (tokenOrder.count > maxEntries || tokenByteCount > maxBytes), let oldest = tokenOrder.first {
             tokenOrder.removeFirst()
             tokensByKey.removeValue(forKey: oldest)
+            tokenByteCount -= oldest.source.utf8.count
+                + oldest.items.reduce(0) { $0 + $1.shortcode.utf8.count }
         }
     }
 }
 
-private enum MarkdownBlock: Hashable {
+private enum MarkdownBlock: Hashable, Sendable {
     case text(String)
     case code(String)
     case quote(String)
@@ -3077,7 +3184,6 @@ public struct MemberRow: View {
     }
 
     public var body: some View {
-        let _ = StoatUILayoutDiagnostics.body("MemberRow", detail: "id=\(user.id.rawValue)")
         let name = displayName ?? user.displayName ?? user.username
         HStack(spacing: StoatSpacing.medium) {
             AvatarView(title: name, size: StoatSize.compactAvatar, isOnline: user.online, presence: user.status?.presence, imageData: imageData)

@@ -436,16 +436,22 @@ public struct AppKitAttachmentSaver: AttachmentSaving {
 
     public func save(data: Data, suggestedFilename: String) async throws {
         #if canImport(AppKit)
-        let destination: URL? = await MainActor.run {
-            let panel = NSSavePanel()
-            panel.nameFieldStringValue = AttachmentDisplayFormatting.safeFilename(suggestedFilename)
-            panel.canCreateDirectories = true
-            return panel.runModal() == .OK ? panel.url : nil
+        let destination: URL? = await withCheckedContinuation { continuation in
+            Task { @MainActor in
+                let panel = NSSavePanel()
+                panel.nameFieldStringValue = AttachmentDisplayFormatting.safeFilename(suggestedFilename)
+                panel.canCreateDirectories = true
+                panel.begin { response in
+                    continuation.resume(returning: response == .OK ? panel.url : nil)
+                }
+            }
         }
         guard let destination else {
             throw AttachmentActionError.cancelled
         }
-        try data.write(to: destination, options: [.atomic])
+        try await Task.detached(priority: .utility) {
+            try data.write(to: destination, options: [.atomic])
+        }.value
         #else
         throw AttachmentActionError.unavailable("Save As is unavailable on this platform.")
         #endif

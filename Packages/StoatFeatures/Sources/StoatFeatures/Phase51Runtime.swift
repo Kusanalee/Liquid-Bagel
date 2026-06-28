@@ -2,6 +2,7 @@ import Foundation
 import StoatModels
 import StoatPersistence
 import StoatRealtime
+import StoatUI
 
 public struct Phase51PresentationRevision: Hashable, Sendable {
     public var snapshot: Int
@@ -97,11 +98,27 @@ public struct TimelineRowPresentation: Hashable, Sendable, Identifiable {
     public var messageID: MessageID
     public var authorDisplay: ResolvedUserDisplay
     public var isSystemEvent: Bool
+    public var preparedMarkdownContent: PreparedMarkdownContent?
+    public var attachmentItems: [AttachmentDisplayItem]
+    public var customEmojiItems: [MessageInlineCustomEmojiItem]
+    public var embedItems: [MessageEmbedDisplayItem]
 
-    public init(messageID: MessageID, authorDisplay: ResolvedUserDisplay, isSystemEvent: Bool) {
+    public init(
+        messageID: MessageID,
+        authorDisplay: ResolvedUserDisplay,
+        isSystemEvent: Bool,
+        preparedMarkdownContent: PreparedMarkdownContent? = nil,
+        attachmentItems: [AttachmentDisplayItem] = [],
+        customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        embedItems: [MessageEmbedDisplayItem] = []
+    ) {
         self.messageID = messageID
         self.authorDisplay = authorDisplay
         self.isSystemEvent = isSystemEvent
+        self.preparedMarkdownContent = preparedMarkdownContent
+        self.attachmentItems = attachmentItems
+        self.customEmojiItems = customEmojiItems
+        self.embedItems = embedItems
     }
 }
 

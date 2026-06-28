@@ -544,10 +544,10 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     func testMockSnapshotSourceEmitsInitialSnapshot() async {
-        var iterator = MockShellSnapshotSource(snapshot: MockShellData.snapshot).snapshots.makeAsyncIterator()
-        let snapshot = await iterator.next()
+        var iterator = MockShellSnapshotSource(snapshot: MockShellData.snapshot).updates.makeAsyncIterator()
+        let update = await iterator.next()
 
-        XCTAssertEqual(snapshot, MockShellData.snapshot)
+        XCTAssertEqual(update?.snapshot, MockShellData.snapshot)
     }
 
     @MainActor
@@ -2846,7 +2846,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase28TimelineDiagnosticsAvoidNoOpVisibleRangeSpam() throws {
+    func testPhase28TimelineDiagnosticsAvoidNoOpVisibleRangeSpam() async throws {
         let model = MainShellViewModel(snapshot: MockShellData.snapshot)
         let server = try XCTUnwrap(model.servers.first)
         model.selectServer(server.id)
@@ -2854,12 +2854,15 @@ final class StoatFeaturesTests: XCTestCase {
         let messageID = try XCTUnwrap(model.selectedTimelineMessages.first?.message.id)
 
         model.updateTimelineVisibility(messageID: messageID, channelID: channelID, isVisible: true)
-        _ = model.selectedTimelineMessageGroups
-        let firstCount = model.timelinePerformanceDiagnostics.visibleRangeUpdateCount
+        await model.prepareSelectedTimelinePresentation()
+        for _ in 0..<20 {
+            if model.timelinePerformanceDiagnostics.loadedMessageCount > 0 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         model.updateTimelineVisibility(messageID: messageID, channelID: channelID, isVisible: true)
 
-        _ = model.selectedTimelineMessageGroups
-        XCTAssertEqual(model.timelinePerformanceDiagnostics.visibleRangeUpdateCount, firstCount)
+        await model.prepareSelectedTimelinePresentation()
+        XCTAssertEqual(model.timelinePerformanceDiagnostics.visibleRangeUpdateCount, 1)
         XCTAssertGreaterThanOrEqual(model.timelinePerformanceDiagnostics.loadedMessageCount, 1)
     }
 
@@ -3040,7 +3043,7 @@ final class StoatFeaturesTests: XCTestCase {
         let serverMessage = Message(id: "01J00000000000000000340001", channelID: channelID, authorID: userID, content: "hi")
         let dmID: ChannelID = "phase34-dm"
         snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, active: true, recipients: [userID])
-        model.snapshot = snapshot
+        model.replaceSnapshotForTesting(snapshot)
         let dmMessage = Message(id: "01J00000000000000000340002", channelID: dmID, authorID: userID, content: "hi")
 
         XCTAssertEqual(model.roleColor(for: serverMessage)?.sourceRoleID, highRoleID)
@@ -3104,8 +3107,9 @@ final class StoatFeaturesTests: XCTestCase {
         )
 
         await model.hydrateServerMembers(serverID: serverID, force: true, reason: "test")
+        await model.prepareMemberListGroups(for: serverID)
         let callCount = await api.fetchServerMembersCallCount
-        let groups = model.memberListGroups(for: serverID)
+        let groups = model.cachedMemberListGroups(for: serverID)
         let items = groups.flatMap(\.items)
 
         XCTAssertEqual(callCount, 1)
@@ -3119,6 +3123,39 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.memberHydrationDiagnostics.returnedCount, 3)
         XCTAssertEqual(model.memberHydrationDiagnostics.mergedUserCount, 2)
         XCTAssertEqual(model.memberHydrationDiagnostics.missingUserCount, 1)
+    }
+
+    @MainActor
+    func testPhase52LargeMemberHydrationCommitsSnapshotAndIdentitiesOnce() async {
+        let serverID: ServerID = "phase52-large-server"
+        let channelID: ChannelID = "phase52-large-channel"
+        let ownerID: UserID = "phase52-user-0"
+        let users = (0...2_000).map { index in
+            User(id: UserID(rawValue: "phase52-user-\(index)"), username: "user\(index)", displayName: "User \(index)")
+        }
+        let members = users.map {
+            ServerMember(id: MemberCompositeKey(serverID: serverID, userID: $0.id), joinedAt: Date())
+        }
+        let snapshot = RealtimeSnapshot(
+            usersByID: [ownerID: users[0]],
+            serversByID: [serverID: Server(id: serverID, ownerID: ownerID, name: "Large")],
+            channelsByID: [channelID: Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")]
+        )
+        let api = RecordingAPIClient(membersByServer: [serverID: members], usersByServer: [serverID: users])
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            communityAPIClient: api
+        )
+
+        await model.hydrateServerMembers(serverID: serverID, force: true, reason: "phase52 stress")
+
+        XCTAssertEqual(model.snapshot.membersByServerAndUserID.count, 2_001)
+        XCTAssertEqual(model.snapshot.usersByID.count, 2_001)
+        XCTAssertEqual(model.phase52FreezeDiagnostics.snapshotInstallCount, 1)
+        XCTAssertEqual(model.phase52FreezeDiagnostics.memberHydrationCommitCount, 1)
+        XCTAssertEqual(model.phase52FreezeDiagnostics.identityBatchCommitCount, 1)
     }
 
     @MainActor
@@ -3716,7 +3753,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase40RefreshDMsMergesChannelsWithoutDuplicates() async {
+    func testPhase40RefreshDMsMergesChannelsWithoutDuplicates() async throws {
         var snapshot = RealtimeSnapshot()
         let currentUserID: UserID = "phase40-me"
         let friendID: UserID = "phase40-friend"
@@ -3733,6 +3770,7 @@ final class StoatFeaturesTests: XCTestCase {
         let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: api)
 
         await model.refreshDMs(source: DMRefreshSource.directMessages)
+        try await Task.sleep(for: .milliseconds(30))
 
         let callCount = await api.fetchDirectMessagesCallCount
         XCTAssertEqual(callCount, 1)
@@ -4154,12 +4192,13 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase24ServerOverviewAndPermissionGating() {
+    func testPhase24ServerOverviewAndPermissionGating() async throws {
         let model = MainShellViewModel(snapshot: MockShellData.snapshot)
         let server = model.servers.first { $0.name == "Bagel Lab" }!
 
         model.selectServer(server.id)
         model.openServerOverview()
+        try await Task.sleep(for: .milliseconds(20))
 
         guard case let .loaded(details) = model.serverOverviewState else {
             return XCTFail("Expected server overview details")
@@ -4218,7 +4257,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase25ServerSettingsCategoriesRolesAndCommandsUseMockAPI() async {
+    func testPhase25ServerSettingsCategoriesRolesAndCommandsUseMockAPI() async throws {
         var snapshot = MockShellData.snapshot
         let seedServer = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         snapshot.serversByID[seedServer.id]?.defaultPermissions.insert(.manageRole)
@@ -4227,6 +4266,7 @@ final class StoatFeaturesTests: XCTestCase {
 
         model.selectServer(server.id)
         model.openServerOverview()
+        try await Task.sleep(for: .milliseconds(20))
 
         guard case let .loaded(settings) = model.serverSettingsState else {
             return XCTFail("Expected server settings")
@@ -4250,7 +4290,9 @@ final class StoatFeaturesTests: XCTestCase {
         await model.applyCategoryChanges()
         XCTAssertTrue(model.snapshot.serversByID[server.id]?.categories?.contains { $0.title == "Phase 25" && $0.channels.contains(firstChannelID!) } == true)
 
-        model.snapshot.serversByID[server.id]?.defaultPermissions.insert(.manageRole)
+        model.mutateSnapshotForTesting {
+            $0.serversByID[server.id]?.defaultPermissions.insert(.manageRole)
+        }
         model.openCreateRole()
         model.roleEditorForm?.name = "Phase 25 Role"
         model.roleEditorForm?.colour = "#33AAEE"
@@ -4580,7 +4622,7 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(banned[.ban].disabledReason, .targetAlreadyBanned)
 
         snapshot.membersByServerAndUserID[ServerMemberKey(targetMember.id)] = ServerMember(id: targetMember.id, joinedAt: targetMember.joinedAt, roles: [roleID])
-        model.snapshot = snapshot
+        model.replaceSnapshotForTesting(snapshot)
         let elevatedTarget = model.memberModerationMenuState(targetUserID: target)
         XCTAssertEqual(elevatedTarget[.timeout].disabledReason, .targetRoleEqualOrHigher)
     }
@@ -4851,7 +4893,10 @@ final class StoatFeaturesTests: XCTestCase {
         snapshot.messagesByChannelID[channelID] = [
             Message(id: "phase46-message-1", channelID: channelID, authorID: current, content: "hello")
         ]
-        model.snapshot = snapshot
+        model.replaceSnapshotForTesting(
+            snapshot,
+            changes: RealtimeSnapshotChangeSet(messageChannelIDs: [channelID])
+        )
 
         XCTAssertEqual(model.memberPanelModerationPrewarmToken, token)
         XCTAssertEqual(model.phase46MemberPanelPrewarmState.preparedKey, preparedKey)
@@ -5007,7 +5052,7 @@ final class StoatFeaturesTests: XCTestCase {
 
         let before = model.cachedServerCapabilities
         // Replace the snapshot — cache must update.
-        model.snapshot = RealtimeSnapshot()
+        model.replaceSnapshotForTesting(RealtimeSnapshot())
         let after = model.cachedServerCapabilities
         // After clearing the snapshot the selected server no longer exists; capabilities should differ.
         XCTAssertNotEqual(before, after)
@@ -5097,7 +5142,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase37MemberOrderingHighestRoleColorAndDMIsolation() throws {
+    func testPhase37MemberOrderingHighestRoleColorAndDMIsolation() async throws {
         let serverID: ServerID = "phase37-server"
         let channelID: ChannelID = "phase37-channel"
         let adminID: RoleID = "phase37-admin"
@@ -5128,7 +5173,8 @@ final class StoatFeaturesTests: XCTestCase {
         snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userUnknown)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userUnknown), joinedAt: Date(), roles: ["phase37-missing-role"])
         let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot)
 
-        let groups = model.memberListGroups(for: serverID)
+        await model.prepareMemberListGroups(for: serverID)
+        let groups = model.cachedMemberListGroups(for: serverID)
         XCTAssertEqual(groups.map(\.id).prefix(3), ["role-\(managerID.rawValue)", "role-\(ordinaryID.rawValue)", "bots"])
         XCTAssertEqual(groups.first?.items.map(\.userID), [userManager])
         XCTAssertEqual(groups.flatMap(\.items).filter { $0.userID == userAdmin }.count, 1)
@@ -5186,11 +5232,11 @@ final class StoatFeaturesTests: XCTestCase {
         let loader = SlowImageResourceLoader(delayNanoseconds: 500_000_000)
         let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, imageResourceLoader: loader)
 
-        _ = model.memberListGroups(for: serverID)
-        _ = model.memberListGroups(for: serverID)
+        await model.prepareMemberListGroups(for: serverID)
+        await model.prepareMemberListGroups(for: serverID)
         model.updateTimelineVisibility(messageID: "01J00000000000000000370001", channelID: channelID, isVisible: true)
-        _ = MarkdownMessageContent("hello **markdown**")
-        _ = MarkdownMessageContent("hello **markdown**")
+        _ = MarkdownContentPreparer.prepare("hello **markdown**")
+        _ = MarkdownContentPreparer.prepare("hello **markdown**")
         for index in 0..<24 {
             let file = File(id: FileID(rawValue: "phase37-image-\(index)"), tag: "attachments", filename: "\(index).png", contentType: "image/png", size: 1)
             model.loadImageResource(for: file, kind: .attachmentPreview)
@@ -5483,14 +5529,14 @@ private final class TestStreamHub<Element: Sendable>: @unchecked Sendable {
 
 private final class MutableSnapshotSource: ShellSnapshotSource, @unchecked Sendable {
     private let lock = NSLock()
-    private let hub = TestStreamHub<RealtimeSnapshot>()
+    private let hub = TestStreamHub<RealtimeSnapshotUpdate>()
     private var snapshot: RealtimeSnapshot
 
     init(snapshot: RealtimeSnapshot) {
         self.snapshot = snapshot
     }
 
-    var snapshots: AsyncStream<RealtimeSnapshot> {
+    var updates: AsyncStream<RealtimeSnapshotUpdate> {
         hub.stream()
     }
 
@@ -5502,7 +5548,12 @@ private final class MutableSnapshotSource: ShellSnapshotSource, @unchecked Senda
         lock.withLock {
             self.snapshot = snapshot
         }
-        hub.yield(snapshot)
+        hub.yield(
+            RealtimeSnapshotUpdate(
+                snapshot: snapshot,
+                changes: RealtimeSnapshotChangeSet(isFullReplacement: true)
+            )
+        )
     }
 }
 
@@ -6618,7 +6669,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase51QuickSwitcherCapsFiveThousandIndexedChannels() {
+    func testPhase51QuickSwitcherCapsFiveThousandIndexedChannels() async throws {
         let serverID: ServerID = "phase51-index-server"
         let channels = (0..<5_000).map { index in
             Channel(id: ChannelID(rawValue: "phase51-index-\(index)"), kind: .textChannel, serverID: serverID, name: "indexed channel \(index)")
@@ -6631,6 +6682,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         let switcher = QuickSwitcherViewModel(snapshot: snapshot)
 
         switcher.query = "indexed channel"
+        try await Task.sleep(for: .milliseconds(120))
 
         XCTAssertEqual(switcher.results.count, 50)
         XCTAssertEqual(Set(switcher.results.map(\.id)).count, 50)

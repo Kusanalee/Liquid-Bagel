@@ -287,6 +287,22 @@ final class StoatRealtimeTests: XCTestCase {
         XCTAssertEqual(snapshot.messagesByChannelID["channel1"]?.map(\.id), ["msg2"])
     }
 
+    func testPhase52BulkPublishesOneAtomicUpdateWithUnionedChanges() async {
+        let store = RealtimeStateStore()
+        var iterator = store.updates.makeAsyncIterator()
+        let channelID: ChannelID = "phase52-channel"
+        let first = Message(id: "phase52-message-1", channelID: channelID, authorID: "phase52-user", content: "one")
+        let second = Message(id: "phase52-message-2", channelID: channelID, authorID: "phase52-user", content: "two")
+
+        let returned = await store.apply(.bulk([.message(first), .message(second)]))
+        let published = await iterator.next()
+
+        XCTAssertEqual(returned, published)
+        XCTAssertEqual(published?.changes.messageChannelIDs, [channelID])
+        XCTAssertEqual(published?.changes.insertedMessages.map(\.id), [first.id, second.id])
+        XCTAssertEqual(published?.snapshot.messagesByChannelID[channelID]?.map(\.id), [first.id, second.id])
+    }
+
     private func jsonObject(_ event: ClientGatewayEvent) throws -> [String: Any] {
         let data = try encoder.encode(event)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])

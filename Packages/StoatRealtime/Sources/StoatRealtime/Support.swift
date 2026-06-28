@@ -5,8 +5,10 @@ final class StreamHub<Element: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuations: [UUID: AsyncStream<Element>.Continuation] = [:]
 
-    func stream() -> AsyncStream<Element> {
-        AsyncStream { continuation in
+    func stream(
+        bufferingPolicy: AsyncStream<Element>.Continuation.BufferingPolicy = .unbounded
+    ) -> AsyncStream<Element> {
+        AsyncStream(bufferingPolicy: bufferingPolicy) { continuation in
             let id = UUID()
             lock.lock()
             continuations[id] = continuation

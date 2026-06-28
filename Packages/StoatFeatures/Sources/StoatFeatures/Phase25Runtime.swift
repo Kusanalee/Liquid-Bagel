@@ -105,6 +105,17 @@ public struct CategoryEditorForm: Hashable, Sendable {
         guard let categoryID, let index = categories.firstIndex(where: { $0.id == categoryID }) else { return }
         categories[index].channels.append(channelID)
     }
+
+    /// Reorders the categories themselves (drives drag/up-down reordering in the editor).
+    public mutating func moveCategories(fromOffsets source: IndexSet, toOffset destination: Int) {
+        categories.move(fromOffsets: source, toOffset: destination)
+    }
+
+    /// Reorders the channels within a single category, preserving cross-category membership.
+    public mutating func moveChannels(inCategory categoryID: String?, fromOffsets source: IndexSet, toOffset destination: Int) {
+        guard let categoryID, let index = categories.firstIndex(where: { $0.id == categoryID }) else { return }
+        categories[index].channels.move(fromOffsets: source, toOffset: destination)
+    }
 }
 
 public struct RoleEditorForm: Hashable, Sendable {

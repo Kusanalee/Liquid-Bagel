@@ -673,7 +673,7 @@ public extension TimelineMessageStatus {
 }
 
 public protocol ShellSnapshotSource: Sendable {
-    var snapshots: AsyncStream<RealtimeSnapshot> { get }
+    var updates: AsyncStream<RealtimeSnapshotUpdate> { get }
     func currentSnapshot() async -> RealtimeSnapshot
 }
 
@@ -684,9 +684,14 @@ public struct MockShellSnapshotSource: ShellSnapshotSource {
         self.snapshot = snapshot
     }
 
-    public var snapshots: AsyncStream<RealtimeSnapshot> {
+    public var updates: AsyncStream<RealtimeSnapshotUpdate> {
         AsyncStream { continuation in
-            continuation.yield(snapshot)
+            continuation.yield(
+                RealtimeSnapshotUpdate(
+                    snapshot: snapshot,
+                    changes: RealtimeSnapshotChangeSet(isFullReplacement: true)
+                )
+            )
             continuation.finish()
         }
     }
@@ -703,8 +708,8 @@ public struct RealtimeStoreSnapshotSource: ShellSnapshotSource {
         self.store = store
     }
 
-    public var snapshots: AsyncStream<RealtimeSnapshot> {
-        store.snapshots
+    public var updates: AsyncStream<RealtimeSnapshotUpdate> {
+        store.updates
     }
 
     public func currentSnapshot() async -> RealtimeSnapshot {
@@ -985,6 +990,12 @@ public final class ChannelMessageController {
     public func hydrate(from snapshot: RealtimeSnapshot) {
         for (channelID, messages) in snapshot.messagesByChannelID {
             mergeSnapshotMessages(messages, channelID: channelID)
+        }
+    }
+
+    public func hydrate(channelIDs: Set<ChannelID>, from snapshot: RealtimeSnapshot) {
+        for channelID in channelIDs {
+            mergeSnapshotMessages(snapshot.messagesByChannelID[channelID] ?? [], channelID: channelID)
         }
     }
 
@@ -2112,8 +2123,8 @@ public final class AppSessionCoordinator {
 
         eventTask = Task { [weak self] in
             for await event in realtimeClient.events {
-                await store.apply(event)
-                let snapshot = await store.snapshot()
+                let update = await store.apply(event)
+                let snapshot = update.snapshot
                 await MainActor.run {
                     self?.snapshot = snapshot
                     self?.applyVerificationState(event: event, snapshot: snapshot)

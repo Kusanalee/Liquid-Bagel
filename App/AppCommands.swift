@@ -8,10 +8,10 @@ struct AppCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
             Button("New Direct Message") {
-                commandHandler?.perform(.openQuickSwitcher)
+                commandHandler?.perform(.openNewDirectMessage)
             }
             .keyboardShortcut("n", modifiers: [.command])
-            .disabled(true)
+            .disabled(commandHandler?.canPerform(.openNewDirectMessage) == false)
         }
 
         CommandGroup(after: .sidebar) {
