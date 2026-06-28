@@ -31,19 +31,19 @@
       "size" : "128x128"
     },
     {
-      "filename" : "AppIcon-128@2x.png",
+      "filename" : "ChatGPT Image Jun 7, 2026, 05_19_48 PM.png",
       "idiom" : "mac",
       "scale" : "2x",
       "size" : "128x128"
     },
     {
-      "filename" : "AppIcon-256.png",
+      "filename" : "AppIcon-256 1.png",
       "idiom" : "mac",
       "scale" : "1x",
       "size" : "256x256"
     },
     {
-      "filename" : "AppIcon-256@2x.png",
+      "filename" : "AppIcon-256.png",
       "idiom" : "mac",
       "scale" : "2x",
       "size" : "256x256"
@@ -64,8 +64,5 @@
   "info" : {
     "author" : "xcode",
     "version" : 1
-  },
-  "properties" : {
-    "pre-rendered" : true
   }
 }
