@@ -62,6 +62,9 @@ public protocol StoatAPIClient: Sendable {
     func createChannel(serverID: ServerID, draft: ChannelCreateDraft) async throws -> Channel
     func editChannel(id: ChannelID, draft: ChannelEditDraft) async throws -> Channel
     func deleteChannel(id: ChannelID) async throws
+    func fetchServerEmojis(serverID: ServerID) async throws -> [Emoji]
+    func createEmoji(uploadID: FileID, draft: EmojiCreateDraft) async throws -> Emoji
+    func deleteEmoji(id: EmojiID) async throws
 }
 
 public extension StoatAPIClient {
@@ -79,6 +82,18 @@ public extension StoatAPIClient {
 
     func fetchUserProfile(userID: UserID) async throws -> UserProfile {
         throw StoatAPIError.unimplementedEndpoint("User profile fetch is not implemented by this API client.")
+    }
+
+    func fetchServerEmojis(serverID: ServerID) async throws -> [Emoji] {
+        throw StoatAPIError.unimplementedEndpoint("Server emoji listing is not implemented by this API client.")
+    }
+
+    func createEmoji(uploadID: FileID, draft: EmojiCreateDraft) async throws -> Emoji {
+        throw StoatAPIError.unimplementedEndpoint("Server emoji creation is not implemented by this API client.")
+    }
+
+    func deleteEmoji(id: EmojiID) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Server emoji deletion is not implemented by this API client.")
     }
 
     func fetchUser(userID: UserID) async throws -> User {
@@ -756,6 +771,37 @@ public actor LiveStoatAPIClient: StoatAPIClient {
 
     public func deleteChannel(id: ChannelID) async throws {
         _ = try await perform(StoatRequest<EmptyResponse>(method: .delete, path: "/channels/\(id.rawValue.stoatPathComponentEscaped)"))
+    }
+
+    public func fetchServerEmojis(serverID: ServerID) async throws -> [Emoji] {
+        try await perform(
+            StoatRequest<[Emoji]>(
+                method: .get,
+                path: "/servers/\(serverID.rawValue.stoatPathComponentEscaped)/emojis"
+            )
+        )
+    }
+
+    public func createEmoji(uploadID: FileID, draft: EmojiCreateDraft) async throws -> Emoji {
+        guard let validated = draft.validated else {
+            throw StoatAPIError.invalidEnvironment("Emoji name must be 1 to 32 characters.")
+        }
+        return try await perform(
+            StoatRequest<Emoji>(
+                method: .put,
+                path: "/custom/emoji/\(uploadID.rawValue.stoatPathComponentEscaped)",
+                body: .json(try encoder.encode(validated))
+            )
+        )
+    }
+
+    public func deleteEmoji(id: EmojiID) async throws {
+        _ = try await perform(
+            StoatRequest<EmptyResponse>(
+                method: .delete,
+                path: "/custom/emoji/\(id.rawValue.stoatPathComponentEscaped)"
+            )
+        )
     }
 
     private func perform<Response: Decodable & Sendable>(_ request: StoatRequest<Response>) async throws -> Response {

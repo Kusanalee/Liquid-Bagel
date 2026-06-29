@@ -123,12 +123,20 @@ public struct ChannelEditDraft: Codable, Hashable, Sendable {
     public var name: String?
     public var description: String?
     public var nsfw: Bool?
+    public var slowmode: UInt64?
     public var remove: [ChannelEditRemovedField]
 
-    public init(name: String? = nil, description: String? = nil, nsfw: Bool? = nil, remove: [ChannelEditRemovedField] = []) {
+    public init(
+        name: String? = nil,
+        description: String? = nil,
+        nsfw: Bool? = nil,
+        slowmode: UInt64? = nil,
+        remove: [ChannelEditRemovedField] = []
+    ) {
         self.name = name
         self.description = description
         self.nsfw = nsfw
+        self.slowmode = slowmode
         self.remove = remove
     }
 
@@ -147,13 +155,14 @@ public struct ChannelEditDraft: Codable, Hashable, Sendable {
             name: trimmedName == original.name ? nil : trimmedName,
             description: normalizedDescription == original.description ? nil : normalizedDescription,
             nsfw: nsfw == original.nsfw ? nil : nsfw,
+            slowmode: slowmode == (original.slowmode ?? 0) ? nil : slowmode,
             remove: normalizedRemove
         )
         return draft.hasChanges ? draft : nil
     }
 
     public var hasChanges: Bool {
-        name != nil || description != nil || nsfw != nil || !remove.isEmpty
+        name != nil || description != nil || nsfw != nil || slowmode != nil || !remove.isEmpty
     }
 }
 
@@ -161,6 +170,28 @@ public enum ChannelEditRemovedField: String, Codable, Hashable, Sendable {
     case description = "Description"
     case icon = "Icon"
     case voice = "Voice"
+}
+
+public struct EmojiCreateDraft: Codable, Hashable, Sendable {
+    public var name: String
+    public var parent: EmojiParent
+    public var nsfw: Bool?
+
+    public init(name: String, serverID: ServerID, nsfw: Bool? = nil) {
+        self.name = name
+        self.parent = .server(serverID)
+        self.nsfw = nsfw
+    }
+
+    public var validated: EmojiCreateDraft? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 32,
+              case .server = parent
+        else { return nil }
+        var draft = self
+        draft.name = trimmed
+        return draft
+    }
 }
 
 public struct ServerEditDraft: Codable, Hashable, Sendable {

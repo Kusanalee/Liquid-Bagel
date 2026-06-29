@@ -661,6 +661,10 @@ public final class MainShellViewModel {
     public var serverSettingsSaveState: ManagementActionState<Server> = .idle
     public var serverIconDraft: ServerMediaDraft?
     public var serverBannerDraft: ServerMediaDraft?
+    public var serverEmojiName = ""
+    public var serverEmojiDraft: ServerMediaDraft?
+    public var serverEmojiManagementState: ManagementActionState<[Emoji]> = .idle
+    public var pendingServerEmojiDeletion: Emoji?
     public var categoryEditorForm: CategoryEditorForm?
     public var categoryEditorState: ManagementActionState<Server> = .idle
     public var roleEditorForm: RoleEditorForm?
@@ -1223,7 +1227,7 @@ public final class MainShellViewModel {
     }
 
     public var selectedTimelinePresentationToken: String {
-        "\(selectedConversationChannelID?.rawValue ?? "none")|\(selectedTimelinePresentationRevision)|\(phase51MediaRevision)|\(phase43IdentityGeneration)"
+        "\(selectedConversationChannelID?.rawValue ?? "none")|\(selectedTimelinePresentationRevision)|\(snapshotRevision)|\(phase51MediaRevision)|\(phase43IdentityGeneration)|\(isRuntimeSendCapable)"
     }
 
     public func prepareSelectedTimelinePresentation() async {
@@ -1240,6 +1244,18 @@ public final class MainShellViewModel {
         let attachmentStates = attachmentPreviewStates
         let loadedAttachments = loadedAttachmentData
         let localAttachmentIDs = Set(attachmentLocalFiles.keys)
+        let currentUserID = currentUserID
+        let isRuntimeSendCapable = isRuntimeSendCapable
+        let developerControlsEnabled = isDeveloperControlsEnabled
+        let permissionsByChannelID = Dictionary(
+            uniqueKeysWithValues: Set(messages.map(\.message.channelID)).compactMap { channelID in
+                snapshot.channelsByID[channelID].map { channel in
+                    (channelID, channel.permissions ?? channel.serverID.flatMap {
+                        snapshot.serversByID[$0]?.defaultPermissions
+                    })
+                }
+            }
+        )
         let worker = Task.detached(priority: .userInitiated) {
             let groups = TimelineMessageGrouping.group(messages)
             let assetContext = Phase52TimelineAssetContext(
@@ -1253,6 +1269,7 @@ public final class MainShellViewModel {
                 let message = timelineMessage.message
                 let customEmojiItems = assetContext.inlineCustomEmojiItems(for: message)
                 let server = snapshot.channelsByID[message.channelID]?.serverID.flatMap { snapshot.serversByID[$0] }
+                let channel = snapshot.channelsByID[message.channelID]
                 let display = identitySnapshots.resolvedDisplay(
                     userID: message.authorID,
                     user: message.user ?? snapshot.usersByID[message.authorID],
@@ -1268,7 +1285,24 @@ public final class MainShellViewModel {
                     },
                     attachmentItems: assetContext.attachmentItems(for: message),
                     customEmojiItems: customEmojiItems,
-                    embedItems: assetContext.embedItems(for: message)
+                    embedItems: assetContext.embedItems(for: message),
+                    actionItems: Phase52TimelineInteractionPreparer.actionItems(
+                        for: timelineMessage,
+                        currentUserID: currentUserID,
+                        channel: channel,
+                        permissions: permissionsByChannelID[message.channelID] ?? nil,
+                        isRuntimeSendCapable: isRuntimeSendCapable,
+                        developerControlsEnabled: developerControlsEnabled
+                    ),
+                    reactionItems: assetContext.reactionItems(
+                        for: message,
+                        currentUserID: currentUserID
+                    ),
+                    systemEventPresentation: Phase52TimelineInteractionPreparer.systemEventPresentation(
+                        for: message,
+                        snapshot: snapshot,
+                        identitySnapshots: identitySnapshots
+                    )
                 )
                 return (message.id, row)
             })
@@ -2141,7 +2175,7 @@ public final class MainShellViewModel {
 
     private func timelineGroupCacheKey(messages: [TimelineMessage]) -> String {
         guard let channelID = selectedConversationChannelID else { return "none" }
-        return "\(channelID.rawValue)|\(messageController.presentationRevision(for: channelID))|\(phase51MediaRevision)|\(phase43IdentityGeneration)"
+        return "\(channelID.rawValue)|\(messageController.presentationRevision(for: channelID))|\(snapshotRevision)|\(phase51MediaRevision)|\(phase43IdentityGeneration)|\(isRuntimeSendCapable)"
     }
 
     private func invalidateTimelineMediaPresentation() {
@@ -3893,6 +3927,155 @@ public final class MainShellViewModel {
         chooseServerMediaDraft(tag: .banners)
     }
 
+    public func chooseServerEmojiDraft() {
+        chooseServerMediaDraft(tag: .emojis)
+    }
+
+    public func emojiManagementDisabledReason() -> String? {
+        let capabilities = serverManagementCapabilities()
+        guard capabilities.isConnectedForLiveActions else {
+            return "Reconnect to manage server emoji."
+        }
+        guard let server = selectedServer else {
+            return "Select a server before managing emoji."
+        }
+        if currentUserID == server.ownerID {
+            return nil
+        }
+        let resolution = Phase25PermissionResolver.resolve(
+            server: server,
+            channel: selectedChannel,
+            member: selectedServerMember,
+            currentUserID: currentUserID
+        )
+        guard resolution.effectivePermissions.contains(.manageCustomisation) else {
+            return resolution.warnings.isEmpty
+                ? "You do not have permission to manage server emoji."
+                : "Permission resolution is incomplete for server emoji management."
+        }
+        return nil
+    }
+
+    public func refreshServerEmojis() async {
+        guard let server = selectedServer else {
+            serverEmojiManagementState = .failed("Select a server before refreshing emoji.")
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            serverEmojiManagementState = .failed("Reconnect before refreshing server emoji.")
+            return
+        }
+        serverEmojiManagementState = .loading
+        do {
+            let emojis = try await apiClient.fetchServerEmojis(serverID: server.id)
+            snapshot.emojisByID = snapshot.emojisByID.filter { _, emoji in
+                if case let .server(serverID) = emoji.parent {
+                    return serverID != server.id
+                }
+                return true
+            }
+            for emoji in emojis {
+                snapshot.emojisByID[emoji.id] = emoji
+            }
+            serverEmojiManagementState = .loaded(emojis)
+            invalidateTimelineMediaPresentation()
+        } catch {
+            serverEmojiManagementState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func createServerEmoji() async {
+        guard let server = selectedServer else {
+            serverEmojiManagementState = .failed("Select a server before creating emoji.")
+            return
+        }
+        guard let draft = serverEmojiDraft else {
+            serverEmojiManagementState = .failed("Choose an emoji image before creating it.")
+            return
+        }
+        let createDraft = EmojiCreateDraft(name: serverEmojiName, serverID: server.id)
+        guard let validated = createDraft.validated else {
+            serverEmojiManagementState = .failed("Emoji name must be 1 to 32 characters.")
+            return
+        }
+        if let reason = emojiManagementDisabledReason() {
+            serverEmojiManagementState = .failed(reason)
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            serverEmojiManagementState = .failed("Reconnect before creating server emoji.")
+            return
+        }
+        serverEmojiManagementState = .loading
+        do {
+            let upload = try await apiClient.uploadFile(
+                data: draft.data,
+                filename: draft.filename,
+                mimeType: draft.mimeType,
+                tag: .emojis
+            )
+            let emoji = try await apiClient.createEmoji(uploadID: upload.id, draft: validated)
+            snapshot.emojisByID[emoji.id] = emoji
+            serverEmojiName = ""
+            serverEmojiDraft = nil
+            serverEmojiManagementState = .loaded(
+                snapshot.emojisByID.values.filter {
+                    if case let .server(serverID) = $0.parent {
+                        return serverID == server.id
+                    }
+                    return false
+                }
+            )
+            invalidateTimelineMediaPresentation()
+            loadImageResource(
+                for: CustomEmojiDisplayItem(emoji: emoji).file,
+                kind: .customEmoji
+            )
+        } catch {
+            serverEmojiManagementState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func requestDeleteServerEmoji(_ id: EmojiID) {
+        guard let emoji = snapshot.emojisByID[id] else {
+            serverEmojiManagementState = .failed("That emoji is no longer available.")
+            return
+        }
+        pendingServerEmojiDeletion = emoji
+    }
+
+    public func confirmDeleteServerEmoji() async {
+        guard let emoji = pendingServerEmojiDeletion else { return }
+        if let reason = emojiManagementDisabledReason() {
+            serverEmojiManagementState = .failed(reason)
+            pendingServerEmojiDeletion = nil
+            return
+        }
+        guard let apiClient = apiClientForCommunityAction() else {
+            serverEmojiManagementState = .failed("Reconnect before deleting server emoji.")
+            pendingServerEmojiDeletion = nil
+            return
+        }
+        serverEmojiManagementState = .loading
+        do {
+            try await apiClient.deleteEmoji(id: emoji.id)
+            snapshot.emojisByID.removeValue(forKey: emoji.id)
+            pendingServerEmojiDeletion = nil
+            serverEmojiManagementState = .loaded(
+                snapshot.emojisByID.values.filter {
+                    if case let .server(serverID) = $0.parent {
+                        return serverID == selectedServer?.id
+                    }
+                    return false
+                }
+            )
+            invalidateTimelineMediaPresentation()
+        } catch {
+            pendingServerEmojiDeletion = nil
+            serverEmojiManagementState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
     public func saveServerAppearance() async {
         guard let server = selectedServer else {
             serverSettingsSaveState = .failed("Select a server before saving appearance.")
@@ -5086,10 +5269,21 @@ public final class MainShellViewModel {
                     let draft = ServerMediaDraft(data: data, filename: filename, mimeType: mimeType)
                     if tag == .icons {
                         self.serverIconDraft = draft
-                    } else {
+                    } else if tag == .banners {
                         self.serverBannerDraft = draft
+                    } else if tag == .emojis {
+                        self.serverEmojiDraft = draft
                     }
-                    self.phase25Status = tag == .icons ? "Icon draft selected; save to upload." : "Banner draft selected; save to upload."
+                    switch tag {
+                    case .icons:
+                        self.phase25Status = "Icon draft selected; save to upload."
+                    case .banners:
+                        self.phase25Status = "Banner draft selected; save to upload."
+                    case .emojis:
+                        self.phase25Status = "Emoji draft selected; create to upload."
+                    default:
+                        break
+                    }
                 } catch {
                     self.phase25Status = "Could not read selected image."
                 }
@@ -5179,7 +5373,7 @@ public final class MainShellViewModel {
             return
         }
         guard let draft = form.draft(original: original) else {
-            channelEditState = .failed("Change the channel name or description before saving.")
+            channelEditState = .failed("Change a channel setting before saving.")
             return
         }
         guard let apiClient = apiClientForCommunityAction() else {
@@ -12849,8 +13043,8 @@ public struct TimelineMessageGroupView: View {
                             preparedMarkdownContent: rowPresentation?.preparedMarkdownContent,
                             embedItems: rowPresentation?.embedItems ?? [],
                             authorAvatarData: viewModel.imageData(for: rowPresentation?.authorDisplay.avatarFile ?? viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
-                            actionItems: rowActionItems(for: timelineMessage),
-                            reactionItems: rowReactionItems(for: timelineMessage),
+                            actionItems: rowActionItems(for: timelineMessage, presentation: rowPresentation),
+                            reactionItems: rowReactionItems(for: timelineMessage, presentation: rowPresentation),
                             onMessageAction: { actionID in
                                 select(timelineMessage, source: .contextMenu)
                                 viewModel.performMessageAction(actionID, on: timelineMessage)
@@ -12915,7 +13109,7 @@ public struct TimelineMessageGroupView: View {
                             select(timelineMessage)
                         }
                         .contextMenu {
-                            ForEach(viewModel.messageActionItems(for: timelineMessage)) { item in
+                            ForEach(rowPresentation?.actionItems ?? []) { item in
                                 Button(role: buttonRole(for: item)) {
                                     select(timelineMessage, source: .contextMenu)
                                     viewModel.performMessageAction(item.id, on: timelineMessage)
@@ -12940,7 +13134,8 @@ public struct TimelineMessageGroupView: View {
 
     @ViewBuilder private func systemEventRow(_ timelineMessage: TimelineMessage) -> some View {
         Phase43SystemEventRow(
-            presentation: viewModel.systemEventPresentation(for: timelineMessage.message),
+            presentation: viewModel.timelineRowPresentation(for: timelineMessage.message.id)?.systemEventPresentation
+                ?? SystemEventPresentation.text("System event"),
             onOpenParticipant: { participant in
                 viewModel.showUserProfile(
                     participant.userID,
@@ -12959,8 +13154,11 @@ public struct TimelineMessageGroupView: View {
         }
     }
 
-    private func rowActionItems(for timelineMessage: TimelineMessage) -> [MessageRowActionItem] {
-        viewModel.messageActionItems(for: timelineMessage).map { item in
+    private func rowActionItems(
+        for timelineMessage: TimelineMessage,
+        presentation: TimelineRowPresentation?
+    ) -> [MessageRowActionItem] {
+        (presentation?.actionItems ?? []).map { item in
             MessageRowActionItem(
                 id: item.id,
                 title: item.title,
@@ -12972,19 +13170,11 @@ public struct TimelineMessageGroupView: View {
         }
     }
 
-    private func rowReactionItems(for timelineMessage: TimelineMessage) -> [MessageReactionDisplayItem] {
-        viewModel.reactionSummaries(for: timelineMessage.message).map {
-            if let emoji = viewModel.customEmojiDisplayItem(for: $0.emoji) {
-                return MessageReactionDisplayItem(
-                    emoji: $0.emoji,
-                    count: $0.count,
-                    hasCurrentUserReacted: $0.hasCurrentUserReacted,
-                    customEmojiName: emoji.name,
-                    customEmojiImageData: viewModel.imageData(for: emoji.file, kind: .customEmoji)
-                )
-            }
-            return MessageReactionDisplayItem(emoji: $0.emoji, count: $0.count, hasCurrentUserReacted: $0.hasCurrentUserReacted)
-        }
+    private func rowReactionItems(
+        for timelineMessage: TimelineMessage,
+        presentation: TimelineRowPresentation?
+    ) -> [MessageReactionDisplayItem] {
+        presentation?.reactionItems ?? []
     }
 
     private func buttonRole(for item: MessageActionItem) -> ButtonRole? {
@@ -14747,6 +14937,23 @@ public struct ServerOverviewView: View {
         .frame(width: 680)
         .frame(minHeight: 620)
         .accessibilityLabel("Server settings")
+        .confirmationDialog(
+            "Delete server emoji?",
+            isPresented: Binding(
+                get: { viewModel.pendingServerEmojiDeletion != nil },
+                set: { if !$0 { viewModel.pendingServerEmojiDeletion = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete Emoji", role: .destructive) {
+                Task { await viewModel.confirmDeleteServerEmoji() }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingServerEmojiDeletion = nil
+            }
+        } message: {
+            Text("This removes the emoji from the server and cannot be undone.")
+        }
     }
 
     private func settings(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
@@ -14767,6 +14974,8 @@ public struct ServerOverviewView: View {
                 appearance(details)
             case .categories:
                 categories(details)
+            case .emojis:
+                emojis(presentation)
             case .roles:
                 roles(presentation)
             case .permissions:
@@ -14777,6 +14986,115 @@ public struct ServerOverviewView: View {
                 moderation(presentation)
             case .danger:
                 EmptyStateView(title: "Server deletion deferred", message: "Danger Zone is intentionally disabled in Phase 25.", systemImage: "lock.shield")
+            }
+        }
+    }
+
+    private func emojis(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    Text("Create Server Emoji")
+                        .font(.headline)
+                    TextField("Emoji name", text: $viewModel.serverEmojiName)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityLabel("Emoji name")
+                    HStack {
+                        Button {
+                            viewModel.chooseServerEmojiDraft()
+                        } label: {
+                            Label("Choose Image", systemImage: "face.smiling")
+                        }
+                        Text(viewModel.serverEmojiDraft?.filename ?? "No image selected")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer()
+                        Button {
+                            Task { await viewModel.createServerEmoji() }
+                        } label: {
+                            Label("Create", systemImage: "plus")
+                        }
+                        .buttonStyle(GlassButtonStyle())
+                        .disabled(
+                            viewModel.serverEmojiDraft == nil
+                                || EmojiCreateDraft(
+                                    name: viewModel.serverEmojiName,
+                                    serverID: presentation.details.server.id
+                                ).validated == nil
+                                || presentation.emojiManagementDisabledReason != nil
+                        )
+                    }
+                    stateMessage(
+                        viewModel.serverEmojiManagementState,
+                        loading: "Updating server emoji",
+                        success: "Server emoji updated"
+                    )
+                }
+            }
+
+            GlassPanel {
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    HStack {
+                        Text("Server Emoji")
+                            .font(.headline)
+                        Spacer()
+                        Text("\(presentation.emojiItems.count)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Button {
+                            Task { await viewModel.refreshServerEmojis() }
+                        } label: {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    if presentation.emojiItems.isEmpty {
+                        EmptyStateView(
+                            title: "No server emoji",
+                            message: "Create one above or refresh the verified server emoji route.",
+                            systemImage: "face.smiling"
+                        )
+                    } else {
+                        LazyVStack(alignment: .leading, spacing: StoatSpacing.small) {
+                            ForEach(presentation.emojiItems) { item in
+                                HStack(spacing: StoatSpacing.medium) {
+                                    AvatarView(
+                                        title: item.name,
+                                        size: 32,
+                                        imageData: viewModel.imageData(for: item.file, kind: .customEmoji)
+                                    )
+                                    VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
+                                        Text(":\(item.name):")
+                                            .font(.body.monospaced())
+                                        if item.animated {
+                                            Text("Animated")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        viewModel.requestDeleteServerEmoji(item.id)
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                    .disabled(presentation.emojiManagementDisabledReason != nil)
+                                }
+                                .padding(StoatSpacing.small)
+                                .background(
+                                    Color.primary.opacity(0.04),
+                                    in: RoundedRectangle(
+                                        cornerRadius: StoatRadius.small,
+                                        style: .continuous
+                                    )
+                                )
+                                .onAppear {
+                                    viewModel.loadImageResource(for: item.file, kind: .customEmoji)
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -15826,6 +16144,26 @@ public struct ChannelSettingsView: View {
                     get: { viewModel.channelEditForm?.isNSFW ?? false },
                     set: { viewModel.channelEditForm?.isNSFW = $0 }
                 ))
+                if viewModel.selectedChannel?.kind == .textChannel {
+                    Picker("Slowmode", selection: Binding(
+                        get: { viewModel.channelEditForm?.slowmodeSeconds ?? 0 },
+                        set: { viewModel.channelEditForm?.slowmodeSeconds = $0 }
+                    )) {
+                        Text("Off").tag(UInt64(0))
+                        Text("5 seconds").tag(UInt64(5))
+                        Text("10 seconds").tag(UInt64(10))
+                        Text("30 seconds").tag(UInt64(30))
+                        Text("1 minute").tag(UInt64(60))
+                        Text("5 minutes").tag(UInt64(300))
+                        Text("10 minutes").tag(UInt64(600))
+                        Text("30 minutes").tag(UInt64(1_800))
+                        Text("1 hour").tag(UInt64(3_600))
+                        Text("2 hours").tag(UInt64(7_200))
+                        Text("6 hours").tag(UInt64(21_600))
+                    }
+                    .accessibilityLabel("Channel slowmode")
+                    .accessibilityHint("Limits how often non-exempt members can send messages")
+                }
 
                 stateMessage(viewModel.channelEditState)
 

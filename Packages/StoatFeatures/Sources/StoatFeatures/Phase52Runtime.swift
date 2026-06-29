@@ -253,6 +253,97 @@ public enum Phase52MemberListPreparer {
     }
 }
 
+public enum Phase52TimelineInteractionPreparer {
+    public static func actionItems(
+        for timelineMessage: TimelineMessage,
+        currentUserID: UserID?,
+        channel: Channel?,
+        permissions: Permissions?,
+        isRuntimeSendCapable: Bool,
+        developerControlsEnabled: Bool
+    ) -> [MessageActionItem] {
+        let message = timelineMessage.message
+        let isConfirmed = timelineMessage.status == .confirmed
+        let canReact = message.system == nil
+            && channel != nil
+            && isRuntimeSendCapable
+            && (permissions?.contains(.react) ?? true)
+        let canEdit = isConfirmed
+            && message.system == nil
+            && message.content?.isEmpty == false
+            && currentUserID == message.authorID
+            && isRuntimeSendCapable
+        let canDelete: Bool
+        switch timelineMessage.status {
+        case .failed:
+            canDelete = true
+        case .pending, .retrying, .deleting:
+            canDelete = false
+        case .confirmed:
+            canDelete = message.system == nil
+                && isRuntimeSendCapable
+                && (
+                    currentUserID == message.authorID
+                        || permissions?.contains(.manageMessages) == true
+                )
+        }
+        let canPin = isConfirmed
+            && message.system == nil
+            && channel != nil
+            && isRuntimeSendCapable
+            && (permissions?.contains(.manageMessages) ?? true)
+        let canReply = isConfirmed
+            && message.system == nil
+            && channel != nil
+            && isRuntimeSendCapable
+        let context = MessageActionContext(
+            timelineMessage: timelineMessage,
+            currentUserID: currentUserID,
+            canReply: canReply,
+            canEdit: canEdit,
+            canDelete: canDelete,
+            canReact: canReact,
+            canPin: canPin,
+            developerControlsEnabled: developerControlsEnabled
+        )
+        let items = Phase17MessageActions.actionItems(for: context)
+        guard message.system != nil else { return items }
+        return items.filter { item in
+            item.kind == .copyText || item.kind == .copyMessageID
+        }
+    }
+
+    public static func systemEventPresentation(
+        for message: Message,
+        snapshot: RealtimeSnapshot,
+        identitySnapshots: Phase43IdentitySnapshotStore
+    ) -> SystemEventPresentation? {
+        guard message.system != nil else { return nil }
+        let serverID = snapshot.channelsByID[message.channelID]?.serverID
+        let server = serverID.flatMap { snapshot.serversByID[$0] }
+        return Phase27SystemEventPresenter.presentation(for: message) { userID, role in
+            let member = serverID.flatMap {
+                snapshot.membersByServerAndUserID[ServerMemberKey(serverID: $0, userID: userID)]
+            }
+            let user = snapshot.usersByID[userID]
+            let display = identitySnapshots.resolvedDisplay(
+                userID: userID,
+                user: user,
+                member: member,
+                server: server
+            )
+            guard !display.isFallback else { return nil }
+            let confidence: SystemEventParticipantConfidence = member != nil || user != nil ? .high : .medium
+            return SystemEventParticipant(
+                userID: userID,
+                role: role,
+                display: display,
+                confidence: confidence
+            )
+        }
+    }
+}
+
 public struct Phase52TimelineAssetContext: Sendable {
     private var snapshot: RealtimeSnapshot
     private var customEmojiByShortcode: [String: [CustomEmojiDisplayItem]]
@@ -349,6 +440,30 @@ public struct Phase52TimelineAssetContext: Sendable {
                 embed: embed,
                 mediaItem: mediaItem,
                 mediaPreviewData: mediaItem?.previewData
+            )
+        }
+    }
+
+    public func reactionItems(for message: Message, currentUserID: UserID?) -> [MessageReactionDisplayItem] {
+        Phase17MessageActions.reactionSummaries(for: message, currentUserID: currentUserID).map { summary in
+            if let emoji = snapshot.emojisByID.values.first(where: {
+                $0.id.rawValue == summary.emoji || $0.name == summary.emoji
+            }) {
+                let displayItem = CustomEmojiDisplayItem(emoji: emoji)
+                return MessageReactionDisplayItem(
+                    emoji: summary.emoji,
+                    count: summary.count,
+                    hasCurrentUserReacted: summary.hasCurrentUserReacted,
+                    customEmojiName: emoji.name,
+                    customEmojiImageData: imageDataByKey[
+                        ImageCacheKey(id: displayItem.file.id.rawValue, kind: .customEmoji)
+                    ]
+                )
+            }
+            return MessageReactionDisplayItem(
+                emoji: summary.emoji,
+                count: summary.count,
+                hasCurrentUserReacted: summary.hasCurrentUserReacted
             )
         }
     }

@@ -203,6 +203,35 @@ final class StoatModelsTests: XCTestCase {
         XCTAssertNil(clear["timeout"])
     }
 
+    func testPhase53SlowmodeAndEmojiDraftsEncodeVerifiedFields() throws {
+        let channel = Channel(
+            id: "channel-1",
+            kind: .textChannel,
+            serverID: "server-1",
+            name: "general",
+            slowmode: 5
+        )
+        let slowmode = try XCTUnwrap(
+            ChannelEditDraft(slowmode: 30).validatedForEdit(original: channel)
+        )
+        let slowmodeObject = try encodedJSONObject(slowmode)
+        XCTAssertEqual(slowmodeObject["slowmode"] as? Int, 30)
+
+        let emoji = try XCTUnwrap(
+            EmojiCreateDraft(name: " bagel ", serverID: "server-1").validated
+        )
+        let emojiObject = try encodedJSONObject(emoji)
+        XCTAssertEqual(emojiObject["name"] as? String, "bagel")
+        XCTAssertEqual(
+            (emojiObject["parent"] as? [String: Any])?["type"] as? String,
+            "Server"
+        )
+        XCTAssertEqual(
+            (emojiObject["parent"] as? [String: Any])?["id"] as? String,
+            "server-1"
+        )
+    }
+
     private func decodeFixture<T: Decodable>(_ type: T.Type, named name: String) throws -> T {
         let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json"))
         let data = try Data(contentsOf: url)

@@ -64,16 +64,23 @@ public struct ChannelEditForm: Hashable, Sendable {
     public var name: String
     public var description: String
     public var isNSFW: Bool
+    public var slowmodeSeconds: UInt64
 
     public init(channel: Channel) {
         self.channelID = channel.id
         self.name = channel.name ?? channel.displayName
         self.description = channel.description ?? ""
         self.isNSFW = channel.nsfw
+        self.slowmodeSeconds = channel.slowmode ?? 0
     }
 
     public func draft(original: Channel) -> ChannelEditDraft? {
-        ChannelEditDraft(name: name, description: description, nsfw: isNSFW).validatedForEdit(original: original)
+        ChannelEditDraft(
+            name: name,
+            description: description,
+            nsfw: isNSFW,
+            slowmode: slowmodeSeconds
+        ).validatedForEdit(original: original)
     }
 }
 

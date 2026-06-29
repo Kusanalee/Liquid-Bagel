@@ -244,13 +244,14 @@ final class StoatAPITests: XCTestCase {
             credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
             transport: editTransport
         )
-        _ = try await editClient.editChannel(id: "channel-2", draft: ChannelEditDraft(name: "ops-renamed", description: nil, remove: [.description]))
+        _ = try await editClient.editChannel(id: "channel-2", draft: ChannelEditDraft(name: "ops-renamed", description: nil, slowmode: 30, remove: [.description]))
         let capturedEditRequest = await editTransport.lastRequest()
         let editRequest = try XCTUnwrap(capturedEditRequest)
         let editBody = String(data: try XCTUnwrap(editRequest.httpBody), encoding: .utf8)
         XCTAssertEqual(editRequest.httpMethod, "PATCH")
         XCTAssertEqual(editRequest.url?.path, "/channels/channel-2")
         XCTAssertTrue(editBody?.contains(#""name":"ops-renamed""#) == true)
+        XCTAssertTrue(editBody?.contains(#""slowmode":30"#) == true)
         XCTAssertTrue(editBody?.contains(#""remove":["Description"]"#) == true)
 
         let deleteTransport = RecordingHTTPTransport(statusCode: 204)
@@ -263,6 +264,51 @@ final class StoatAPITests: XCTestCase {
         let deleteRequest = try XCTUnwrap(capturedDeleteRequest)
         XCTAssertEqual(deleteRequest.httpMethod, "DELETE")
         XCTAssertEqual(deleteRequest.url?.path, "/channels/channel-2")
+    }
+
+    func testPhase53ServerEmojiEndpointRequests() async throws {
+        let emojiJSON = Data(#"{"_id":"emoji-1","parent":{"type":"Server","id":"server-1"},"creator_id":"user-1","name":"bagel","animated":false,"nsfw":false}"#.utf8)
+
+        let listTransport = RecordingHTTPTransport(data: Data("[\(String(decoding: emojiJSON, as: UTF8.self))]".utf8))
+        let listClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: listTransport
+        )
+        let listed = try await listClient.fetchServerEmojis(serverID: "server-1")
+        let capturedListRequest = await listTransport.lastRequest()
+        let listRequest = try XCTUnwrap(capturedListRequest)
+        XCTAssertEqual(listed.first?.name, "bagel")
+        XCTAssertEqual(listRequest.httpMethod, "GET")
+        XCTAssertEqual(listRequest.url?.path, "/servers/server-1/emojis")
+
+        let createTransport = RecordingHTTPTransport(data: emojiJSON)
+        let createClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: createTransport
+        )
+        _ = try await createClient.createEmoji(
+            uploadID: "emoji-1",
+            draft: EmojiCreateDraft(name: "bagel", serverID: "server-1")
+        )
+        let capturedCreateRequest = await createTransport.lastRequest()
+        let createRequest = try XCTUnwrap(capturedCreateRequest)
+        let createBody = String(data: try XCTUnwrap(createRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(createRequest.httpMethod, "PUT")
+        XCTAssertEqual(createRequest.url?.path, "/custom/emoji/emoji-1")
+        XCTAssertTrue(createBody?.contains(#""name":"bagel""#) == true)
+        XCTAssertTrue(createBody?.contains(#""type":"Server""#) == true)
+        XCTAssertTrue(createBody?.contains(#""id":"server-1""#) == true)
+
+        let deleteTransport = RecordingHTTPTransport(statusCode: 204)
+        let deleteClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: deleteTransport
+        )
+        try await deleteClient.deleteEmoji(id: "emoji-1")
+        let capturedDeleteRequest = await deleteTransport.lastRequest()
+        let deleteRequest = try XCTUnwrap(capturedDeleteRequest)
+        XCTAssertEqual(deleteRequest.httpMethod, "DELETE")
+        XCTAssertEqual(deleteRequest.url?.path, "/custom/emoji/emoji-1")
     }
 
     func testPhase22DirectMessageAndProfileEndpointRequests() async throws {

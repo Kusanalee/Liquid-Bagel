@@ -11,6 +11,7 @@ public actor MockStoatAPIClient: StoatAPIClient {
     private var members: [MemberCompositeKey: ServerMember]
     private var bans: [MemberCompositeKey: ServerBan]
     private var profiles: [UserID: UserProfile]
+    private var emojis: [EmojiID: Emoji]
 
     public init() {
         let liquid = User(
@@ -109,6 +110,7 @@ public actor MockStoatAPIClient: StoatAPIClient {
             stoat.id: UserProfile(content: "Mock profile for Stoat System."),
             design.id: UserProfile(content: "Mock profile for Design Pilot.")
         ]
+        self.emojis = [:]
         self.messagesByChannel = [
             general: [
                 Message(
@@ -799,6 +801,9 @@ public actor MockStoatAPIClient: StoatAPIClient {
         if let nsfw = draft.nsfw {
             channels[index].nsfw = nsfw
         }
+        if let slowmode = draft.slowmode {
+            channels[index].slowmode = slowmode == 0 ? nil : slowmode
+        }
         return channels[index]
     }
 
@@ -816,6 +821,36 @@ public actor MockStoatAPIClient: StoatAPIClient {
                 category.channels.removeAll { $0 == id }
                 return category
             }
+        }
+    }
+
+    public func fetchServerEmojis(serverID: ServerID) async throws -> [Emoji] {
+        emojis.values.filter {
+            if case let .server(parentServerID) = $0.parent {
+                return parentServerID == serverID
+            }
+            return false
+        }
+    }
+
+    public func createEmoji(uploadID: FileID, draft: EmojiCreateDraft) async throws -> Emoji {
+        guard let validated = draft.validated else {
+            throw StoatAPIError.invalidEnvironment("Emoji name must be 1 to 32 characters.")
+        }
+        let emoji = Emoji(
+            id: EmojiID(rawValue: uploadID.rawValue),
+            parent: validated.parent,
+            creatorID: currentUser.id,
+            name: validated.name,
+            nsfw: validated.nsfw ?? false
+        )
+        emojis[emoji.id] = emoji
+        return emoji
+    }
+
+    public func deleteEmoji(id: EmojiID) async throws {
+        guard emojis.removeValue(forKey: id) != nil else {
+            throw StoatAPIError.notFound
         }
     }
 

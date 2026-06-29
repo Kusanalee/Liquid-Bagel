@@ -4230,10 +4230,12 @@ final class StoatFeaturesTests: XCTestCase {
         model.openChannelSettings()
         model.channelEditForm?.name = "phase-24-renamed"
         model.channelEditForm?.description = ""
+        model.channelEditForm?.slowmodeSeconds = 30
         await model.saveChannelSettings()
 
         XCTAssertEqual(model.snapshot.channelsByID[created!.id]?.displayName, "phase-24-renamed")
         XCTAssertNil(model.snapshot.channelsByID[created!.id]?.description)
+        XCTAssertEqual(model.snapshot.channelsByID[created!.id]?.slowmode, 30)
 
         model.requestDeleteSelectedChannel()
         XCTAssertEqual(model.pendingChannelDeletion?.channel.id, created!.id)
@@ -4242,6 +4244,46 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertNil(model.snapshot.channelsByID[created!.id])
         XCTAssertNotEqual(model.selection.channelID, created!.id)
         XCTAssertEqual(model.phase24Status, "Channel deleted")
+    }
+
+    @MainActor
+    func testPhase53ServerEmojiCreateRefreshDeleteUsesPreparedSettings() async throws {
+        var snapshot = MockShellData.snapshot
+        let server = try XCTUnwrap(snapshot.serversByID.values.first { $0.name == "Bagel Lab" })
+        snapshot.serversByID[server.id]?.defaultPermissions.insert(.manageCustomisation)
+        let model = MainShellViewModel(
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            communityAPIClient: MockStoatAPIClient()
+        )
+        model.selectServer(server.id)
+        model.openServerOverview()
+        try await Task.sleep(for: .milliseconds(20))
+
+        model.serverEmojiName = "phase53"
+        model.serverEmojiDraft = ServerMediaDraft(
+            data: Data([0x89, 0x50, 0x4E, 0x47]),
+            filename: "phase53.png",
+            mimeType: "image/png"
+        )
+        await model.createServerEmoji()
+        let created = try XCTUnwrap(
+            model.snapshot.emojisByID.values.first { $0.name == "phase53" }
+        )
+
+        try await Task.sleep(for: .milliseconds(20))
+        guard case let .loaded(presentation) = model.serverSettingsPresentationState else {
+            return XCTFail("Expected prepared server settings")
+        }
+        XCTAssertTrue(presentation.emojiItems.contains { $0.id == created.id })
+
+        await model.refreshServerEmojis()
+        XCTAssertNotNil(model.snapshot.emojisByID[created.id])
+
+        model.requestDeleteServerEmoji(created.id)
+        XCTAssertEqual(model.pendingServerEmojiDeletion?.id, created.id)
+        await model.confirmDeleteServerEmoji()
+        XCTAssertNil(model.snapshot.emojisByID[created.id])
     }
 
     @MainActor
@@ -6804,6 +6846,9 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         await model.prepareSelectedTimelinePresentation()
 
         XCTAssertFalse(model.selectedTimelineMessageGroups.isEmpty)
+        XCTAssertFalse(
+            model.timelineRowPresentation(for: messages[0].id)?.actionItems.isEmpty ?? true
+        )
         XCTAssertEqual(model.phase51PerformanceDiagnostics.timelineBuildCount, firstBuildCount)
         XCTAssertGreaterThanOrEqual(model.phase51PerformanceDiagnostics.timelineCacheHitCount, 1)
     }

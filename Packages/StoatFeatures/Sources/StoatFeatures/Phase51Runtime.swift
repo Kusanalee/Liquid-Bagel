@@ -71,6 +71,8 @@ public struct ServerSettingsPresentationSnapshot: Hashable, Sendable {
     public var orderedRoles: [Role]
     public var textChannels: [Channel]
     public var permissionGroups: [String]
+    public var emojiItems: [CustomEmojiDisplayItem]
+    public var emojiManagementDisabledReason: String?
     public var memberItems: [MemberManagementItem]
     public var timeoutItems: [MemberManagementItem]
 
@@ -80,6 +82,8 @@ public struct ServerSettingsPresentationSnapshot: Hashable, Sendable {
         orderedRoles: [Role],
         textChannels: [Channel],
         permissionGroups: [String],
+        emojiItems: [CustomEmojiDisplayItem],
+        emojiManagementDisabledReason: String?,
         memberItems: [MemberManagementItem],
         timeoutItems: [MemberManagementItem]
     ) {
@@ -88,6 +92,8 @@ public struct ServerSettingsPresentationSnapshot: Hashable, Sendable {
         self.orderedRoles = orderedRoles
         self.textChannels = textChannels
         self.permissionGroups = permissionGroups
+        self.emojiItems = emojiItems
+        self.emojiManagementDisabledReason = emojiManagementDisabledReason
         self.memberItems = memberItems
         self.timeoutItems = timeoutItems
     }
@@ -102,6 +108,9 @@ public struct TimelineRowPresentation: Hashable, Sendable, Identifiable {
     public var attachmentItems: [AttachmentDisplayItem]
     public var customEmojiItems: [MessageInlineCustomEmojiItem]
     public var embedItems: [MessageEmbedDisplayItem]
+    public var actionItems: [MessageActionItem]
+    public var reactionItems: [MessageReactionDisplayItem]
+    public var systemEventPresentation: SystemEventPresentation?
 
     public init(
         messageID: MessageID,
@@ -110,7 +119,10 @@ public struct TimelineRowPresentation: Hashable, Sendable, Identifiable {
         preparedMarkdownContent: PreparedMarkdownContent? = nil,
         attachmentItems: [AttachmentDisplayItem] = [],
         customEmojiItems: [MessageInlineCustomEmojiItem] = [],
-        embedItems: [MessageEmbedDisplayItem] = []
+        embedItems: [MessageEmbedDisplayItem] = [],
+        actionItems: [MessageActionItem] = [],
+        reactionItems: [MessageReactionDisplayItem] = [],
+        systemEventPresentation: SystemEventPresentation? = nil
     ) {
         self.messageID = messageID
         self.authorDisplay = authorDisplay
@@ -119,6 +131,9 @@ public struct TimelineRowPresentation: Hashable, Sendable, Identifiable {
         self.attachmentItems = attachmentItems
         self.customEmojiItems = customEmojiItems
         self.embedItems = embedItems
+        self.actionItems = actionItems
+        self.reactionItems = reactionItems
+        self.systemEventPresentation = systemEventPresentation
     }
 }
 
@@ -250,6 +265,17 @@ public enum Phase51PresentationBuilder {
             capabilities: capabilities,
             permissionPreview: permissionPreview
         )
+        let emojiManagementDisabledReason: String?
+        if !capabilities.isConnectedForLiveActions {
+            emojiManagementDisabledReason = "Reconnect to manage server emoji."
+        } else if currentUserID == server.ownerID
+            || permissionPreview.effectivePermissions.contains(.manageCustomisation) {
+            emojiManagementDisabledReason = nil
+        } else if permissionPreview.warnings.isEmpty {
+            emojiManagementDisabledReason = "You do not have permission to manage server emoji."
+        } else {
+            emojiManagementDisabledReason = "Permission resolution is incomplete for server emoji management."
+        }
         let memberItems = members.map { member in
             let user = snapshot.usersByID[member.id.userID]
             let display = identitySnapshots.resolvedDisplay(
@@ -276,6 +302,11 @@ public enum Phase51PresentationBuilder {
             orderedRoles: server.roles.values.sorted { $0.rank < $1.rank },
             textChannels: channels.filter { $0.kind == .textChannel },
             permissionGroups: Array(Set(Phase26Permissions.editableKeys.map(\.group))).sorted(),
+            emojiItems: snapshot.emojisByID.values
+                .map(CustomEmojiDisplayItem.init(emoji:))
+                .filter { $0.serverID == serverID }
+                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending },
+            emojiManagementDisabledReason: emojiManagementDisabledReason,
             memberItems: filteredMembers,
             timeoutItems: filteredMembers.filter { $0.timeoutSummary != nil }
         )

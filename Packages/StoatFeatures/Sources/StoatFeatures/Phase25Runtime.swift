@@ -6,6 +6,7 @@ public enum ServerSettingsTab: String, CaseIterable, Hashable, Sendable {
     case overview
     case appearance
     case categories
+    case emojis
     case roles
     case permissions
     case members
@@ -17,6 +18,7 @@ public enum ServerSettingsTab: String, CaseIterable, Hashable, Sendable {
         case .overview: "Overview"
         case .appearance: "Appearance"
         case .categories: "Categories"
+        case .emojis: "Emoji"
         case .roles: "Roles"
         case .permissions: "Permissions"
         case .members: "Members"
