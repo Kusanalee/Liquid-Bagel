@@ -3499,8 +3499,8 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertFalse(text.contains(#"{"raw":"body"}"#))
     }
 
-    func testPhase30ParityMatrixContainsRequiredSectionsAndKeepsDMsPartialUntilLiveQA() {
-        let matrix = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: false)
+    func testPhase54ParityMatrixMatchesDocumentedSectionItemStatuses() throws {
+        let matrix = Phase30ParityMatrixBuilder.build()
         let sections = Set(matrix.sections)
         XCTAssertTrue(sections.isSuperset(of: [
             "Account and session",
@@ -3516,11 +3516,31 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertFalse(matrix.items.contains { item in
             (item.status == .deferred || item.status == .blockedByUnverifiedAPI) && item.recommendedNextAction.isEmpty
         })
+        XCTAssertEqual(
+            matrix.items.first { $0.section == "Server/community" && $0.name == "server emoji management" }?.status,
+            .partial
+        )
 
-        let unrecovered = Phase30ParityMatrixBuilder.build(dmRecoveredByTests: false, dmLiveQAPassed: false)
-        XCTAssertEqual(unrecovered.items.first { $0.section == "Core chat" && $0.name == "DMs" }?.status, .broken)
-        let passed = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: true)
-        XCTAssertEqual(passed.items.first { $0.section == "Core chat" && $0.name == "DMs" }?.status, .done)
+        var repositoryRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        for _ in 0..<4 {
+            repositoryRoot.deleteLastPathComponent()
+        }
+        let matrixDocument = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Docs/ParityMatrix.md"),
+            encoding: .utf8
+        )
+        let allowedStatuses = Set(ParityStatus.allCases.map(\.rawValue))
+        let documentedRows = Set(matrixDocument.split(separator: "\n").compactMap { line -> String? in
+            let columns = line.split(separator: "|", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            guard columns.count >= 11, allowedStatuses.contains(columns[3]) else { return nil }
+            return "\(columns[1])\u{1F}\(columns[2])\u{1F}\(columns[3])"
+        })
+        let runtimeRows = Set(matrix.items.map {
+            "\($0.section)\u{1F}\($0.name)\u{1F}\($0.status.rawValue)"
+        })
+
+        XCTAssertEqual(runtimeRows, documentedRows)
     }
 
     @MainActor
@@ -3692,7 +3712,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     func testPhase41ParityRowsRemainPartialUntilLiveQA() {
-        let matrix = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: true)
+        let matrix = Phase30ParityMatrixBuilder.build()
         let profileEdit = matrix.items.first { $0.section == "Account and session" && $0.name == "account profile edit" }
         let avatarEdit = matrix.items.first { $0.section == "Account and session" && $0.name == "avatar edit" }
         let backgroundEdit = matrix.items.first { $0.section == "Account and session" && $0.name == "profile banner/background edit" }
@@ -5065,7 +5085,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     func testPhase42ParityRowsRemainPartialUntilLiveQA() {
-        let matrix = Phase30ParityMatrixBuilder.build(dmLiveQAPassed: true)
+        let matrix = Phase30ParityMatrixBuilder.build()
         let memberModeration = matrix.items.first { $0.section == "Server/community" && $0.name == "member moderation" }
         let bansTimeouts = matrix.items.first { $0.section == "Server/community" && $0.name == "bans/timeouts" }
 

@@ -1366,7 +1366,7 @@ public final class MainShellViewModel {
     }
 
     public var phase30ParityMatrix: ParityMatrix {
-        Phase30ParityMatrixBuilder.build(dmLiveQAPassed: false)
+        Phase30ParityMatrixBuilder.build()
     }
 
     public var effectiveRuntimeMode: AppRuntimeMode {

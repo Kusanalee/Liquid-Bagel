@@ -274,14 +274,12 @@ public enum ParityMatrixFormatter {
 }
 
 public enum Phase30ParityMatrixBuilder {
-    public static func build(dmRecoveredByTests: Bool = true, dmLiveQAPassed: Bool = false) -> ParityMatrix {
-        let dmStatus: ParityStatus = dmLiveQAPassed ? .done : (dmRecoveredByTests ? .partial : .broken)
-        let dmKnownGaps = dmLiveQAPassed ? "No critical live QA gaps recorded" : "Live QA has not proven list/load/send/attachments/participants"
-        let dmNextAction = dmLiveQAPassed ? "Keep monitoring" : "Run Phase 40 live DM checklist"
+    public static func build() -> ParityMatrix {
         let specs: [(String, String, ParityStatus, String, String, String, String, String, String)] = [
-            ("Account and session", "login", .done, "Verified API/client behavior", "Manual credential/session setup exists", "MFA and full login creation remain limited", "Existing session tests", "Launch and validate manually", "Keep stable"),
+            ("Account and session", "login", .partial, "Verified API/client behavior", "Phase 39 email/password login validates, saves the scoped credential, and starts live connection", "Live production credential QA remains pending", "Phase 38/39 login tests", "Run Phase 49 login checklist", "Phase 49 live audit"),
             ("Account and session", "MFA", .partial, "Official client", "Validation failure states exist", "Full MFA login flow is not implemented", "Session validation tests", "Test with MFA account when available", "Phase 31 research"),
-            ("Account and session", "token/session import", .done, "Existing app behavior", "Manual token import and validation", "No automatic validation on launch by design", "No-auto-validation regression", "Import saved session manually", "Keep explicit"),
+            ("Account and session", "token/session import", .partial, "Existing app behavior", "Token import validates, saves to the selected environment scope, and connects", "Live token-import QA remains pending", "Phase 39 token import tests", "Run Phase 49 token import checklist", "Phase 49 live audit"),
+            ("Account and session", "live-default startup", .partial, "Phase 32/38/39 runtime", "Shared AppSessionCoordinator performs idempotent saved-credential auto-connect", "Live relaunch and recovery dogfood remains pending", "Phase 38/39 startup tests", "Run Phase 49 startup checklist", "Phase 49 live audit"),
             ("Account and session", "session list", .partial, "Verified session routes", "Account settings has session surface", "Full official-client parity needs more QA", "Session endpoint tests", "Open sessions view", "Audit in Phase 31"),
             ("Account and session", "revoke sessions", .partial, "Verified session routes", "Logout/revoke support is present", "Bulk/session-list parity not fully audited", "Auth endpoint tests", "Revoke a test session", "Audit in Phase 31"),
             ("Account and session", "logout", .done, "Verified auth route", "Explicit logout/disconnect behavior", "None critical", "Auth endpoint tests", "Logout manually", "Keep stable"),
@@ -293,24 +291,27 @@ public enum Phase30ParityMatrixBuilder {
             ("Account and session", "user settings sync", .partial, "Ready user_settings", "Preferences are local plus decoded settings", "Full cloud sync parity incomplete", "Persistence tests", "Open settings", "Phase 31"),
 
             ("Core chat", "server text channels", .done, "Ready channels and channel messages", "Server channel selection, load, send", "Critical path covered", "Message load/send tests", "Open server channel", "Keep stable"),
-            ("Core chat", "DMs", dmStatus, "Ready channels, users/dms, users/{target}/dm", "Phase 40 explicit DM refresh/open merge, stable Home rows, shared timeline pipeline, notification routing, and redacted diagnostics", dmKnownGaps, "Phase 31/32/40 DM regression tests", "Run Phase 40 DM checklist", dmNextAction),
+            ("Core chat", "DMs", .partial, "Ready channels, users/dms, users/{target}/dm", "Phase 40 explicit DM refresh/open merge, stable Home rows, shared timeline pipeline, notification routing, and redacted diagnostics", "Live QA has not proven list/load/send/attachments/participants", "Phase 31/32/40 DM regression tests", "Run Phase 40 live DM checklist", "Live QA before done"),
             ("Core chat", "group DMs", .partial, "Ready channel kind Group", "Selection/load/sidebar supported", "Create/open group route not verified", "Group DM tests", "Click group DM", "Verify creation route later"),
             ("Core chat", "saved messages", .partial, "Ready channel kind SavedMessages", "Selection/load supported when modeled", "Live availability needs QA", "Saved selection tests", "Click Saved Messages if present", "Live QA"),
             ("Core chat", "send/edit/delete messages", .done, "Verified channel message routes", "Send/edit/delete wired with confirmations", "No persistent success toast by design", "Message action tests", "Send/edit/delete manually", "Keep stable"),
             ("Core chat", "replies", .partial, "Message schema", "Reply composer context exists", "Deep parity needs more QA", "Reply tests", "Reply to loaded message", "Polish later"),
             ("Core chat", "pins", .partial, "Verified pin routes", "Pin actions/search exist", "Full pinned UX parity incomplete", "Pin route tests", "Open pinned search", "Phase 31 polish"),
             ("Core chat", "reactions", .partial, "Verified reaction routes", "Common reactions supported", "Custom emoji reaction send not fully audited", "Reaction tests", "React manually", "Emoji audit later"),
+            ("Core chat", "emoji picker", .partial, "Native Unicode input, Ready emojis", "Searchable grouped Unicode and custom emoji picker", "Official autocomplete and live custom emoji syntax comparison remain pending", "Phase 32-35 and Phase 47 emoji tests", "Run Phase 48 emoji checklist", "Phase 48 live audit"),
             ("Core chat", "custom emoji", .partial, "Ready emojis", "Models decode emojis", "Picker/rendering parity incomplete", "Model/realtime tests", "Inspect emoji-heavy server", "Low-risk polish after DMs"),
             ("Core chat", "markdown", .partial, "Message content", "Markdown rendering exists", "Full official rendering parity incomplete", "Render tests", "Open markdown messages", "Polish later"),
             ("Core chat", "embeds", .partial, "Message schema", "Embed rendering exists", "All embed variants not audited", "Render tests", "Open embeds", "Audit variants"),
             ("Core chat", "attachments", .done, "Verified upload/send/media routes", "Explicit upload, preview, download, open", "No persistent cache by design", "Attachment tests", "Send file/image", "Keep explicit"),
             ("Core chat", "image preview", .done, "Autumn media routes", "Inline previews and explicit viewer", "Memory-only cache", "Media tests", "Preview image", "Keep bounded"),
             ("Core chat", "drag/drop upload", .done, "Composer attachment flow", "Drop targets active conversation", "No auto-upload until send", "Attachment tests", "Drop file", "Keep stable"),
+            ("Core chat", "clipboard paste upload", .partial, "macOS pasteboard, composer flow", "Image/file paste opens explicit attachment review while text paste stays normal", "Finder and provider edge QA remains pending", "Phase 33 paste tests", "Paste image and file", "Live macOS QA"),
+            ("Core chat", "upload size limit", .done, "Local attachment validation", "Shared 20 MB limit rejects oversized files before upload", "None critical", "Phase 33 boundary tests", "Try a file larger than 20 MB", "Keep stable"),
             ("Core chat", "read ack/unreads", .partial, "Ack route and Ready unreads", "Channel ID ack and local clear", "Live DM ack needs Phase 30 QA", "Ack tests", "Read a DM/server channel", "Monitor diagnostics"),
             ("Core chat", "typing indicators", .partial, "Realtime typing events", "Typing send/end helpers exist", "Full display parity incomplete", "Typing tests", "Type in channel", "Polish later"),
             ("Core chat", "search", .partial, "Verified search routes", "Loaded/live/pinned search exists", "Global search parity incomplete", "Search tests", "Search selected channel", "Phase 31"),
             ("Core chat", "jump to message", .partial, "Message fetch/search routes", "Loaded and around-message behavior exists", "Cross-context route QA needed", "Timeline tests", "Jump from search", "Polish later"),
-            ("Core chat", "system events", .done, "Message system schema", "Safe names and fallbacks", "Unsupported events shown generically", "System event tests", "Open event channel", "Keep stable"),
+            ("Core chat", "system events", .partial, "Message system schema", "Safe names and fallbacks with resolvable clickable actors", "Live event payload variety remains pending", "System and Phase 33/35 tests", "Open an event channel", "Live event QA"),
             ("Core chat", "user/avatar hydration", .partial, "Ready users/members and message/profile data", "Central resolver avoids full raw ID author names", "Live QA must confirm affected chats", "Phase 31 resolver tests", "Inspect real chats", "Keep partial until live QA"),
 
             ("Server/community", "server list", .done, "Ready servers", "Server rail from Ready", "No REST list by design", "Selection tests", "Connect manually", "Keep Ready source"),
@@ -322,11 +323,12 @@ public enum Phase30ParityMatrixBuilder {
             ("Server/community", "invite create/list/revoke", .partial, "Verified invite routes", "Manage invites flow exists", "Full parity QA pending", "Invite tests", "Manage invites", "Audit later"),
             ("Server/community", "channel create/edit/delete", .partial, "Verified channel routes", "Create/edit/delete text channels", "Destructive/permission edge QA pending", "Management tests", "Manage test channel", "Audit later"),
             ("Server/community", "categories", .partial, "Server edit categories", "Category editor exists", "Reorder/move parity not complete", "Category tests", "Edit categories", "Polish later"),
+            ("Server/community", "server emoji management", .partial, "Verified emoji upload/create/list/delete routes", "Phase 53 provides prepared refresh, create, and confirmed delete flows", "Live permission, persistence, and error-path QA remains pending", "Phase 53 model/API/feature tests", "Manage emoji in a safe owned server", "Phase 54 live audit"),
             ("Server/community", "roles", .partial, "Verified role routes", "Role overview/create/edit/delete", "Rank/perms parity incomplete", "Role tests", "Open roles", "Polish later"),
             ("Server/community", "role assignment", .partial, "Verified member edit", "Confirmed role assignment", "Rank edge QA pending", "Member tests", "Assign test role", "Audit later"),
             ("Server/community", "permissions preview", .done, "Backend permission model", "Read-only resolver", "Write parity separate", "Permission resolver tests", "Open preview", "Keep stable"),
             ("Server/community", "permission editing", .partial, "Verified permission routes", "Guarded writes exist", "Full official UX parity incomplete", "Permission tests", "Edit test permission", "Audit later"),
-            ("Server/community", "member list", .done, "Ready members/users", "Missing/offline fallbacks kept", "No hidden member fetch", "Member tests", "Open large server", "Keep stable"),
+            ("Server/community", "member list", .partial, "Ready members/users and verified member refresh", "Selected-server foreground hydration preserves Ready state and batches presentation", "Large-server completeness and realtime reconciliation need live proof", "Member and Phase 35-37 tests", "Open a large role-heavy server", "Keep partial until live QA"),
             ("Server/community", "member moderation", .partial, "Verified moderation routes", "Phase 42 central resolver, cached menu availability, confirmations, member/profile/settings/dashboard entry points", "Live hierarchy and destructive-action QA pending", "Moderation tests, menu cache regression tests", "Use test server only", "Run Phase 42 checklist"),
             ("Server/community", "bans/timeouts", .partial, "Verified moderation routes", "Phase 42 ban management plus member-state active timeout management", "Live QA pending; no separate verified timeout-list route", "Moderation tests", "Use test server only", "Run Phase 42 checklist"),
 
