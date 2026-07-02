@@ -259,7 +259,7 @@ public enum RoleColorResolver {
     }
 
     public static func nativeRolePriority(_ lhs: Role, _ rhs: Role) -> Bool {
-        if lhs.rank != rhs.rank { return lhs.rank > rhs.rank }
+        if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
         let lhsAdmin = isAdministrative(role: lhs)
         let rhsAdmin = isAdministrative(role: rhs)
         if lhsAdmin != rhsAdmin { return lhsAdmin && !rhsAdmin }
@@ -564,13 +564,15 @@ public enum MemberListDeriver {
             return MemberListDerivationResult(groups: groups, diagnostics: diagnostics(for: groups, started: started))
         }
 
-        let orderedRoles = server.roles.values
-            .sorted(by: RoleColorResolver.nativeRolePriority)
+        let online = sorted.filter(\.isOnline)
+        let offline = sorted.filter { !$0.isOnline && $0.user != nil }
+        let unknown = sorted.filter { $0.user == nil }
+
         var used: Set<UserID> = []
         var groups: [MemberListGroup] = []
         var duplicateSuppressionCount = 0
         var unknownRoleIDs = Set<RoleID>()
-        let ownerItems = sorted.filter { item in
+        let ownerItems = online.filter { item in
             item.userID == server.ownerID
         }
         if !ownerItems.isEmpty {
@@ -578,12 +580,15 @@ public enum MemberListDeriver {
             groups.append(MemberListGroup(id: "owner", title: "Owner - \(ownerItems.count)", items: ownerItems))
         }
 
-        for role in orderedRoles {
-            let items = sorted.filter { item in
+        let hoistedRoles = server.roles.values
+            .filter(\.hoist)
+            .sorted(by: RoleColorResolver.nativeRolePriority)
+        for role in hoistedRoles {
+            let items = online.filter { item in
                 guard let member = item.member else { return false }
                 guard !used.contains(item.userID), member.roles.contains(role.id) else { return false }
-                let highestRole = RoleColorResolver.sortedRoles(member: member, server: server).first
-                return highestRole?.id == role.id
+                let highestHoistedRole = RoleColorResolver.sortedRoles(member: member, server: server).first(where: \.hoist)
+                return highestHoistedRole?.id == role.id
             }
             guard !items.isEmpty else { continue }
             duplicateSuppressionCount += items.filter { used.contains($0.userID) }.count
@@ -591,19 +596,21 @@ public enum MemberListDeriver {
             groups.append(MemberListGroup(id: "role-\(role.id.rawValue)", title: "\(role.name) - \(items.count)", items: items))
         }
 
-        let bots = sorted.filter { $0.isBot && !used.contains($0.userID) }
-        if !bots.isEmpty {
-            used.formUnion(bots.map(\.userID))
-            groups.append(MemberListGroup(id: "bots", title: "Bots - \(bots.count)", items: bots))
+        let remainingOnline = online.filter { !used.contains($0.userID) }
+        if !remainingOnline.isEmpty {
+            groups.append(MemberListGroup(id: "online", title: "Online - \(remainingOnline.count)", items: remainingOnline))
         }
-
-        let remaining = sorted.filter { !used.contains($0.userID) }
+        if !offline.isEmpty {
+            groups.append(MemberListGroup(id: "offline", title: "Offline - \(offline.count)", items: offline))
+        }
+        if !unknown.isEmpty {
+            groups.append(MemberListGroup(id: "unknown", title: "Unknown - \(unknown.count)", items: unknown))
+        }
         for item in sorted {
             for roleID in item.roleIDs where server.roles[roleID] == nil {
                 unknownRoleIDs.insert(roleID)
             }
         }
-        groups.append(contentsOf: fallbackGroups(items: remaining))
         return MemberListDerivationResult(groups: groups, diagnostics: diagnostics(for: groups, started: started, duplicateSuppressionCount: duplicateSuppressionCount, unknownRoleCount: unknownRoleIDs.count))
     }
 
@@ -625,7 +632,6 @@ public enum MemberListDeriver {
     }
 
     private static func memberSort(_ lhs: MemberListItem, _ rhs: MemberListItem) -> Bool {
-        if lhs.isOnline != rhs.isOnline { return lhs.isOnline && !rhs.isOnline }
         let compared = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
         if compared != .orderedSame { return compared == .orderedAscending }
         return lhs.userID.rawValue < rhs.userID.rawValue

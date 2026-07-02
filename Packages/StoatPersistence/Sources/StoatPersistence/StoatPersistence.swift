@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import StoatAPI
 import StoatModels
@@ -627,6 +628,106 @@ public struct SyncedClientPreferences: Codable, Hashable, Sendable {
         preferences.liquidGlassTransparency = AppPreferences.clampedLiquidGlassTransparency(liquidGlassTransparency)
         preferences.inlineImagePreviewPolicy = inlineImagePreviewPolicy
         preferences.notificationPreferences = notificationPreferences.validated()
+    }
+}
+
+public protocol ChannelMessageCaching: Sendable {
+    func messages(for channelID: ChannelID) async -> [Message]
+    func store(_ messages: [Message], for channelID: ChannelID) async
+    func removeAll() async
+}
+
+public struct NoopChannelMessageCache: ChannelMessageCaching {
+    public init() {}
+
+    public func messages(for channelID: ChannelID) async -> [Message] { [] }
+    public func store(_ messages: [Message], for channelID: ChannelID) async {}
+    public func removeAll() async {}
+}
+
+public actor FileChannelMessageCache: ChannelMessageCaching {
+    private struct Envelope: Codable {
+        var version: Int
+        var channelID: ChannelID
+        var savedAt: Date
+        var messages: [Message]
+    }
+
+    private static let envelopeVersion = 1
+    private let directory: URL
+    private let maxMessagesPerChannel: Int
+    private let maxChannels: Int
+    private var isPrepared = false
+
+    public init(scopeIdentifier: String, directory: URL? = nil, maxMessagesPerChannel: Int = 50, maxChannels: Int = 200) {
+        let scope = Self.digest(scopeIdentifier)
+        if let directory {
+            self.directory = directory.appendingPathComponent(scope, isDirectory: true)
+        } else {
+            let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+            self.directory = base.appendingPathComponent("LiquidBagel/MessageCache/\(scope)", isDirectory: true)
+        }
+        self.maxMessagesPerChannel = max(1, maxMessagesPerChannel)
+        self.maxChannels = max(1, maxChannels)
+    }
+
+    public func messages(for channelID: ChannelID) async -> [Message] {
+        let url = fileURL(for: channelID)
+        guard let data = try? Data(contentsOf: url),
+              let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
+              envelope.version == Self.envelopeVersion,
+              envelope.channelID == channelID
+        else { return [] }
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        return envelope.messages
+    }
+
+    public func store(_ messages: [Message], for channelID: ChannelID) async {
+        guard !messages.isEmpty else { return }
+        prepareIfNeeded()
+        let envelope = Envelope(
+            version: Self.envelopeVersion,
+            channelID: channelID,
+            savedAt: Date(),
+            messages: Array(messages.suffix(maxMessagesPerChannel))
+        )
+        guard let data = try? JSONEncoder().encode(envelope) else { return }
+        try? data.write(to: fileURL(for: channelID), options: .atomic)
+        evictIfNeeded()
+    }
+
+    public func removeAll() async {
+        try? FileManager.default.removeItem(at: directory)
+        isPrepared = false
+    }
+
+    private func prepareIfNeeded() {
+        guard !isPrepared else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        isPrepared = true
+    }
+
+    private func fileURL(for channelID: ChannelID) -> URL {
+        directory.appendingPathComponent("\(Self.digest(channelID.rawValue)).json", isDirectory: false)
+    }
+
+    private func evictIfNeeded() {
+        let keys: [URLResourceKey] = [.contentModificationDateKey]
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys),
+              urls.count > maxChannels
+        else { return }
+        let dated = urls.map { url -> (url: URL, modified: Date) in
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            return (url, values?.contentModificationDate ?? .distantPast)
+        }
+        for entry in dated.sorted(by: { $0.modified < $1.modified }).prefix(urls.count - maxChannels) {
+            try? FileManager.default.removeItem(at: entry.url)
+        }
+    }
+
+    private static func digest(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
     }
 }
 

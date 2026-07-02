@@ -338,38 +338,40 @@ private struct ProfileEditorSection: View {
         Section("Profile") {
             if let user = viewModel.currentUserForPresentation {
                 VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                    HStack(alignment: .top, spacing: StoatSpacing.large) {
+                    ZStack(alignment: .bottomLeading) {
+                        backgroundPreview(for: user)
                         AvatarView(title: viewModel.profileEditDraft.displayName.isEmpty ? user.username : viewModel.profileEditDraft.displayName, size: 72, isOnline: user.online, presence: user.status?.presence, imageData: avatarPreviewData(for: user))
-                        VStack(alignment: .leading, spacing: StoatSpacing.small) {
-                            backgroundPreview(for: user)
-                                .frame(height: 92)
-                            HStack(spacing: StoatSpacing.small) {
-                                Button {
-                                    viewModel.chooseProfileAvatar()
-                                } label: {
-                                    Label("Choose Avatar", systemImage: "photo")
-                                }
-                                Button(role: .destructive) {
-                                    viewModel.removeProfileAvatar()
-                                } label: {
-                                    Label("Remove Avatar", systemImage: "person.crop.circle.badge.minus")
-                                }
-                                .disabled(!canRemoveAvatar)
-                            }
-                            HStack(spacing: StoatSpacing.small) {
-                                Button {
-                                    viewModel.chooseProfileBackground()
-                                } label: {
-                                    Label("Choose Banner", systemImage: "rectangle.on.rectangle.angled")
-                                }
-                                Button(role: .destructive) {
-                                    viewModel.removeProfileBackground()
-                                } label: {
-                                    Label("Remove Banner", systemImage: "rectangle.badge.minus")
-                                }
-                                .disabled(!canRemoveBackground)
-                            }
+                            .padding(.leading, StoatSpacing.large)
+                            .offset(y: 36)
+                    }
+                    .padding(.bottom, 36)
+
+                    HStack(spacing: StoatSpacing.small) {
+                        Button {
+                            viewModel.chooseProfileAvatar()
+                        } label: {
+                            Label("Choose Avatar", systemImage: "photo")
                         }
+                        Button(role: .destructive) {
+                            viewModel.removeProfileAvatar()
+                        } label: {
+                            Label("Remove Avatar", systemImage: "person.crop.circle.badge.minus")
+                        }
+                        .disabled(!canRemoveAvatar)
+                    }
+
+                    HStack(spacing: StoatSpacing.small) {
+                        Button {
+                            viewModel.chooseProfileBackground()
+                        } label: {
+                            Label("Choose Banner", systemImage: "rectangle.on.rectangle.angled")
+                        }
+                        Button(role: .destructive) {
+                            viewModel.removeProfileBackground()
+                        } label: {
+                            Label("Remove Banner", systemImage: "rectangle.badge.minus")
+                        }
+                        .disabled(!canRemoveBackground)
                     }
 
                     TextField("Display name", text: $viewModel.profileEditDraft.displayName)
@@ -462,14 +464,20 @@ private struct ProfileEditorSection: View {
     }
 
     @ViewBuilder private func backgroundPreview(for user: User) -> some View {
-        let data = backgroundPreviewData(for: user)
+        Color.clear
+            .frame(height: 120)
+            .frame(maxWidth: .infinity)
+            .overlay {
+                bannerOverlayContent(for: user)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
+    }
+
+    @ViewBuilder private func bannerOverlayContent(for user: User) -> some View {
         #if canImport(AppKit)
-        if let data {
+        if let data = backgroundPreviewData(for: user) {
             DecodedDataImage(data: data, pixelSize: 1200)
                 .scaledToFill()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipped()
-                .clipShape(RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
         } else {
             backgroundFallback
         }

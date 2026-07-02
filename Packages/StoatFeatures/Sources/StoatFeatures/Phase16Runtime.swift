@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import StoatAPI
 import StoatModels
@@ -91,7 +92,7 @@ public actor ImageMemoryCache {
     private let maxEntries: Int
     private let maxBytes: Int
 
-    public init(maxEntries: Int = 128, maxBytes: Int = 32 * 1024 * 1024) {
+    public init(maxEntries: Int = 512, maxBytes: Int = 32 * 1024 * 1024) {
         self.maxEntries = max(1, maxEntries)
         self.maxBytes = max(1, maxBytes)
     }
@@ -138,6 +139,85 @@ public actor ImageMemoryCache {
     }
 }
 
+public protocol ImageDiskCaching: Sendable {
+    func data(for key: ImageCacheKey) async -> Data?
+    func store(_ data: Data, for key: ImageCacheKey) async
+    func removeAll() async
+}
+
+public struct NoopImageDiskCache: ImageDiskCaching {
+    public init() {}
+
+    public func data(for key: ImageCacheKey) async -> Data? { nil }
+    public func store(_ data: Data, for key: ImageCacheKey) async {}
+    public func removeAll() async {}
+}
+
+public actor FileImageDiskCache: ImageDiskCaching {
+    private let directory: URL
+    private let maxBytes: Int
+    private var isPrepared = false
+
+    public init(directory: URL? = nil, maxBytes: Int = 256 * 1024 * 1024) {
+        if let directory {
+            self.directory = directory
+        } else {
+            let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+            self.directory = base.appendingPathComponent("LiquidBagel/ImageCache", isDirectory: true)
+        }
+        self.maxBytes = max(1, maxBytes)
+    }
+
+    public func data(for key: ImageCacheKey) async -> Data? {
+        let url = fileURL(for: key)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        return data
+    }
+
+    public func store(_ data: Data, for key: ImageCacheKey) async {
+        guard data.count <= maxBytes else { return }
+        prepareIfNeeded()
+        try? data.write(to: fileURL(for: key), options: .atomic)
+        evictIfNeeded()
+    }
+
+    public func removeAll() async {
+        try? FileManager.default.removeItem(at: directory)
+        isPrepared = false
+    }
+
+    private func prepareIfNeeded() {
+        guard !isPrepared else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        isPrepared = true
+    }
+
+    private func fileURL(for key: ImageCacheKey) -> URL {
+        let digest = SHA256.hash(data: Data("\(key.kind)|\(key.id)".utf8))
+        let name = digest.map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent("\(name).img", isDirectory: false)
+    }
+
+    private func evictIfNeeded() {
+        let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys) else { return }
+        var entries: [(url: URL, size: Int, modified: Date)] = urls.compactMap { url in
+            guard let values = try? url.resourceValues(forKeys: Set(keys)) else { return nil }
+            return (url, values.fileSize ?? 0, values.contentModificationDate ?? .distantPast)
+        }
+        var totalBytes = entries.reduce(0) { $0 + $1.size }
+        guard totalBytes > maxBytes else { return }
+        entries.sort { $0.modified < $1.modified }
+        for entry in entries {
+            guard totalBytes > maxBytes else { break }
+            try? FileManager.default.removeItem(at: entry.url)
+            totalBytes -= entry.size
+        }
+    }
+}
+
 public actor MockImageResourceLoader: ImageResourceLoading {
     public private(set) var calls: [ImageResourceRequest] = []
     private var result: Result<Data, any Error & Sendable>
@@ -167,16 +247,22 @@ public actor MockImageResourceLoader: ImageResourceLoading {
 
 public struct LiveImageResourceLoader: ImageResourceLoading {
     public var cache: ImageMemoryCache
+    public var diskCache: any ImageDiskCaching
     private let session: URLSession
 
-    public init(cache: ImageMemoryCache, session: URLSession = .shared) {
+    public init(cache: ImageMemoryCache, diskCache: any ImageDiskCaching = NoopImageDiskCache(), session: URLSession = .shared) {
         self.cache = cache
+        self.diskCache = diskCache
         self.session = session
     }
 
     public func loadImage(_ request: ImageResourceRequest) async throws -> ImageResourceResult {
         if let cached = await cache.imageData(for: request.cacheKey) {
             return ImageResourceResult(request: request, contentType: nil, data: cached, fromCache: true)
+        }
+        if let persisted = await diskCache.data(for: request.cacheKey), persisted.count <= request.maxBytes {
+            await cache.store(persisted, for: request.cacheKey)
+            return ImageResourceResult(request: request, contentType: nil, data: persisted, fromCache: true)
         }
         var urlRequest = URLRequest(url: request.url)
         urlRequest.httpMethod = "GET"
@@ -196,6 +282,7 @@ public struct LiveImageResourceLoader: ImageResourceLoading {
             let contentType = http.value(forHTTPHeaderField: "Content-Type")
             try Self.validateImageContentType(contentType)
             await cache.store(data, for: request.cacheKey)
+            await diskCache.store(data, for: request.cacheKey)
             return ImageResourceResult(request: request, contentType: contentType, data: data)
         } catch let error as AttachmentActionError {
             throw error
@@ -326,12 +413,14 @@ public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
     public var environment: StoatAPIEnvironment
     public var previewLimitBytes: Int
     public var urlResolver: any AttachmentURLResolving
+    public var diskCache: any ImageDiskCaching
     private let session: URLSession
 
-    public init(environment: StoatAPIEnvironment, previewLimitBytes: Int = 8 * 1024 * 1024, urlResolver: any AttachmentURLResolving = DefaultAttachmentURLResolver(), session: URLSession = .shared) {
+    public init(environment: StoatAPIEnvironment, previewLimitBytes: Int = 8 * 1024 * 1024, urlResolver: any AttachmentURLResolving = DefaultAttachmentURLResolver(), diskCache: any ImageDiskCaching = NoopImageDiskCache(), session: URLSession = .shared) {
         self.environment = environment
         self.previewLimitBytes = previewLimitBytes
         self.urlResolver = urlResolver
+        self.diskCache = diskCache
         self.session = session
     }
 
@@ -341,6 +430,10 @@ public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
         }
         if purpose == .preview, let byteCount = item.byteCount, byteCount > previewLimitBytes {
             throw AttachmentActionError.tooLargeForPreview(maxBytes: previewLimitBytes)
+        }
+        let previewCacheKey = ImageCacheKey(id: item.id, kind: .attachmentPreview)
+        if purpose == .preview, let persisted = await diskCache.data(for: previewCacheKey), persisted.count <= previewLimitBytes {
+            return RemoteAttachmentData(fileID: fileID, filename: item.displayName, contentType: item.contentType, byteCount: persisted.count, data: persisted)
         }
         guard let url = urlResolver.remoteURL(for: item, environment: environment, purpose: purpose) else {
             throw AttachmentActionError.unavailable("Remote media is not configured.")
@@ -364,6 +457,7 @@ public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
             let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? item.contentType
             if purpose == .preview {
                 try Self.validatePreviewContentType(contentType, item: item)
+                await diskCache.store(data, for: previewCacheKey)
             }
             return RemoteAttachmentData(fileID: fileID, filename: item.displayName, contentType: contentType, byteCount: data.count, data: data)
         } catch let error as AttachmentActionError {

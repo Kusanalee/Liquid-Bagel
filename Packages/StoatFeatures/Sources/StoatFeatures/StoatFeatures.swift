@@ -723,6 +723,7 @@ public final class MainShellViewModel {
     @ObservationIgnored public var remoteAttachmentLoader: any RemoteAttachmentLoading
     @ObservationIgnored public var imageResourceLoader: any ImageResourceLoading
     @ObservationIgnored public var imageMemoryCache: ImageMemoryCache
+    @ObservationIgnored public var imageDiskCache: any ImageDiskCaching = NoopImageDiskCache()
     @ObservationIgnored public var attachmentSaver: any AttachmentSaving
     @ObservationIgnored public var attachmentOpener: any AttachmentOpening
     @ObservationIgnored public var channelAckSender: any ChannelAckSending
@@ -760,8 +761,12 @@ public final class MainShellViewModel {
     @ObservationIgnored private var attachmentPreviewOrder: [String] = []
     @ObservationIgnored private var attachmentPreviewByteCount = 0
     @ObservationIgnored private let maxAttachmentPreviewBytes = 64 * 1024 * 1024
-    @ObservationIgnored private let maxConcurrentImageResourceLoads = 6
-    @ObservationIgnored private let maxConcurrentInlinePreviewLoads = 4
+    @ObservationIgnored private let maxConcurrentImageResourceLoads = 8
+    @ObservationIgnored private let maxConcurrentInlinePreviewLoads = 6
+    @ObservationIgnored private var imageResourceFailureCounts: [ImageCacheKey: Int] = [:]
+    @ObservationIgnored private var queuedInlinePreviewItems: [AttachmentDisplayItem] = []
+    @ObservationIgnored private var lastRequestedDockBadgeValue: Int?
+    @ObservationIgnored private var dockBadgeApplyTask: Task<Void, Never>?
     @ObservationIgnored public var phase43HydrationPolicy = Phase43HydrationPolicy()
     @ObservationIgnored private var phase43IdentityHydrationTasks: [UserID: Task<Void, Never>] = [:]
     @ObservationIgnored private var phase43QueuedIdentityHydration: [UserID: Phase43IdentityHydrationSource] = [:]
@@ -6009,8 +6014,11 @@ public final class MainShellViewModel {
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
         attachmentUploadHandler = liveAPIClient.map { LiveAttachmentUploadHandler(apiClient: $0) } ?? MockAttachmentUploadHandler()
         if sessionCoordinator.mode == .liveManual {
-            remoteAttachmentLoader = LiveRemoteAttachmentLoader(environment: sessionCoordinator.environment)
-            imageResourceLoader = LiveImageResourceLoader(cache: imageMemoryCache)
+            if imageDiskCache is NoopImageDiskCache {
+                imageDiskCache = FileImageDiskCache()
+            }
+            remoteAttachmentLoader = LiveRemoteAttachmentLoader(environment: sessionCoordinator.environment, diskCache: imageDiskCache)
+            imageResourceLoader = LiveImageResourceLoader(cache: imageMemoryCache, diskCache: imageDiskCache)
         } else {
             remoteAttachmentLoader = MockRemoteAttachmentLoader()
             imageResourceLoader = MockImageResourceLoader()
@@ -6024,11 +6032,18 @@ public final class MainShellViewModel {
         } else {
             messageReferenceResolver = DisabledMessageReferenceResolver()
         }
+        var channelMessageCache: (any ChannelMessageCaching)?
+        if sessionCoordinator.mode == .liveManual, let currentUserID = sessionCoordinator.currentUser?.id {
+            channelMessageCache = FileChannelMessageCache(
+                scopeIdentifier: "\(sessionCoordinator.environment.stableID)|\(currentUserID.rawValue)"
+            )
+        }
         messageController.configure(
             runtimeMode: sessionCoordinator.mode,
             apiClient: liveAPIClient,
             currentUserID: sessionCoordinator.currentUser?.id ?? (sessionCoordinator.mode == .mock ? MockShellData.currentUserID : nil),
-            loadGeneration: sessionCoordinator.mode == .liveManual ? sessionCoordinator.liveConnectionGeneration : nil
+            loadGeneration: sessionCoordinator.mode == .liveManual ? sessionCoordinator.liveConnectionGeneration : nil,
+            messageCache: channelMessageCache
         )
         observe(snapshotSource: sessionCoordinator.snapshotSource)
         validateSelection()
@@ -6589,6 +6604,12 @@ public final class MainShellViewModel {
     public func attachmentDisplayItems(for message: Message) -> [AttachmentDisplayItem] {
         (message.attachments ?? []).map { file in
             var item = AttachmentDisplayItem(file: file, previewState: attachmentPreviewStates["file-\(file.id.rawValue)"] ?? .notLoaded)
+            if item.kind == .video,
+               case let .remote(fileID, tag, .none) = item.source,
+               let baseURL = sessionCoordinator?.environment.mediaBaseURL ?? StoatAPIEnvironment.production.mediaBaseURL,
+               let url = try? LiveRemoteAttachmentLoader.mediaURL(baseURL: baseURL, tag: tag, fileID: fileID, filename: nil) {
+                item.source = .remote(fileID: fileID, tag: tag, url: url)
+            }
             if let loaded = loadedAttachmentData[item.id] {
                 item.previewState = .readyRemote
                 item.previewData = loaded.data
@@ -6602,7 +6623,7 @@ public final class MainShellViewModel {
 
     public func embedDisplayItems(for message: Message) -> [MessageEmbedDisplayItem] {
         (message.embeds ?? []).enumerated().map { index, embed in
-            let mediaItem = embed.media.map { embedMediaDisplayItem(for: $0) }
+            let mediaItem = embed.media.map { embedMediaDisplayItem(for: $0) } ?? externalEmbedMediaItem(for: embed)
             return MessageEmbedDisplayItem(
                 id: "embed-\(message.id.rawValue)-\(index)",
                 embed: embed,
@@ -6610,6 +6631,18 @@ public final class MainShellViewModel {
                 mediaPreviewData: mediaItem?.previewData
             )
         }
+    }
+
+    private func externalEmbedMediaItem(for embed: Embed) -> AttachmentDisplayItem? {
+        guard var item = ExternalEmbedMediaFactory.mediaItem(for: embed) else { return nil }
+        if let state = attachmentPreviewStates[item.id] {
+            item.previewState = state
+        }
+        if let loaded = loadedAttachmentData[item.id] {
+            item.previewState = .readyRemote
+            item.previewData = loaded.data
+        }
+        return item
     }
 
     private func embedMediaDisplayItem(for file: File) -> AttachmentDisplayItem {
@@ -6636,10 +6669,16 @@ public final class MainShellViewModel {
         guard effectiveRuntimeMode == .liveManual || effectiveRuntimeMode == .mock else { return }
         for item in attachmentDisplayItems(for: message) where shouldAutoLoadInlineImage(item) {
             guard attachmentLoadTasks[item.id] == nil else { continue }
-            guard attachmentLoadTasks.count < maxConcurrentInlinePreviewLoads else {
-                lastAttachmentAction = "Media-heavy safe mode: preview queue saturated"
-                break
-            }
+            guard !queuedInlinePreviewItems.contains(where: { $0.id == item.id }) else { continue }
+            queuedInlinePreviewItems.append(item)
+        }
+        drainInlinePreviewQueue()
+    }
+
+    private func drainInlinePreviewQueue() {
+        while attachmentLoadTasks.count < maxConcurrentInlinePreviewLoads, !queuedInlinePreviewItems.isEmpty {
+            let item = queuedInlinePreviewItems.removeFirst()
+            guard attachmentLoadTasks[item.id] == nil, shouldAutoLoadInlineImage(item) else { continue }
             attachmentLoadTasks[item.id] = Task { [weak self] in
                 await self?.loadInlineImagePreview(item)
             }
@@ -6649,12 +6688,18 @@ public final class MainShellViewModel {
     public func loadModeledEmbedMediaPreviews(for message: Message) {
         guard effectiveRuntimeMode == .liveManual || effectiveRuntimeMode == .mock else { return }
         for embed in message.embeds ?? [] {
-            guard let media = embed.media else { continue }
-            let item = AttachmentDisplayItem(file: media)
-            guard item.kind == .image else { continue }
-            guard item.byteCount.map({ $0 <= 8 * 1024 * 1024 }) ?? true else { continue }
-            loadImageResource(for: media, kind: .attachmentPreview)
+            if let media = embed.media {
+                let item = AttachmentDisplayItem(file: media)
+                guard item.kind == .image else { continue }
+                guard item.byteCount.map({ $0 <= 8 * 1024 * 1024 }) ?? true else { continue }
+                loadImageResource(for: media, kind: .attachmentPreview)
+            } else if let item = externalEmbedMediaItem(for: embed), item.kind == .image, shouldAutoLoadInlineImage(item) {
+                guard attachmentLoadTasks[item.id] == nil else { continue }
+                guard !queuedInlinePreviewItems.contains(where: { $0.id == item.id }) else { continue }
+                queuedInlinePreviewItems.append(item)
+            }
         }
+        drainInlinePreviewQueue()
     }
 
     private func shouldAutoLoadInlineImage(_ item: AttachmentDisplayItem) -> Bool {
@@ -6677,6 +6722,7 @@ public final class MainShellViewModel {
         defer {
             Task { @MainActor [weak self] in
                 self?.attachmentLoadTasks[item.id] = nil
+                self?.drainInlinePreviewQueue()
             }
         }
         do {
@@ -6704,6 +6750,7 @@ public final class MainShellViewModel {
 
     private func cancelInlineImagePreviews(for message: Message) {
         for item in attachmentDisplayItems(for: message) {
+            queuedInlinePreviewItems.removeAll { $0.id == item.id }
             guard let task = attachmentLoadTasks[item.id] else { continue }
             task.cancel()
             attachmentLoadTasks[item.id] = nil
@@ -6711,6 +6758,7 @@ public final class MainShellViewModel {
                 attachmentPreviewStates[item.id] = .notLoaded
             }
         }
+        drainInlinePreviewQueue()
     }
 
     public func imageData(for file: File?, kind: ImageResourceKind) -> Data? {
@@ -6785,9 +6833,10 @@ public final class MainShellViewModel {
               queuedImageResourceRequests[key] == nil
         else { return }
         if case .failed = imageResourceStates[key] {
-            if kind == .userAvatar,
-               let failedAt = imageResourceFailureDates[key],
-               phase43Now().timeIntervalSince(failedAt) >= 60 {
+            let failureCount = max(1, imageResourceFailureCounts[key] ?? 1)
+            let retryDelay = min(60.0, 5.0 * pow(2.0, Double(failureCount - 1)))
+            if let failedAt = imageResourceFailureDates[key],
+               phase43Now().timeIntervalSince(failedAt) >= retryDelay {
                 imageResourceStates.removeValue(forKey: key)
                 imageResourceFailureDates.removeValue(forKey: key)
             } else {
@@ -6801,11 +6850,13 @@ public final class MainShellViewModel {
 
     public func clearImageMemoryCache() async {
         await imageMemoryCache.removeAll()
+        await imageDiskCache.removeAll()
         loadedImageResources.removeAll()
         imagePresentationOrder.removeAll()
         imagePresentationByteCount = 0
         imageResourceStates.removeAll()
         imageResourceFailureDates.removeAll()
+        imageResourceFailureCounts.removeAll()
         queuedImageResourceRequests.removeAll()
         invalidateTimelineMediaPresentation()
         lastImageResourceAction = "Cleared image memory cache"
@@ -6864,6 +6915,7 @@ public final class MainShellViewModel {
                 self.storeImagePresentationData(loaded.data, for: request.cacheKey)
                 self.imageResourceStates[request.cacheKey] = .readyRemote
                 self.imageResourceFailureDates.removeValue(forKey: request.cacheKey)
+                self.imageResourceFailureCounts.removeValue(forKey: request.cacheKey)
                 self.imageCompletedCount += 1
             self.lastImageResourceAction = loaded.fromCache ? "Loaded image from memory cache" : "Loaded image"
                 self.updateFreezePerformanceDiagnostics(marker: self.lastImageResourceAction)
@@ -6880,6 +6932,7 @@ public final class MainShellViewModel {
             await MainActor.run {
                 self.imageResourceStates[request.cacheKey] = .failed(message)
                 self.imageResourceFailureDates[request.cacheKey] = self.phase43Now()
+                self.imageResourceFailureCounts[request.cacheKey, default: 0] += 1
                 self.lastImageResourceAction = "Image load failed"
                 self.updateVisibleIdentityDiagnostics()
                 self.updateFreezePerformanceDiagnostics(marker: self.lastImageResourceAction)
@@ -6889,7 +6942,7 @@ public final class MainShellViewModel {
 
     private func drainImageResourceQueue() {
         while imageResourceLoadTasks.count < maxConcurrentImageResourceLoads,
-              let next = queuedImageResourceRequests.first {
+              let next = nextQueuedImageResourceRequest() {
             queuedImageResourceRequests.removeValue(forKey: next.key)
             imageResourceLoadTasks[next.key] = Task { [weak self] in
                 await self?.loadImageResource(next.value)
@@ -6898,8 +6951,19 @@ public final class MainShellViewModel {
         if queuedImageResourceRequests.count > maxConcurrentImageResourceLoads * 2 {
             lastImageResourceAction = "Media-heavy safe mode: image queue saturated"
             freezePerformanceDiagnostics.mediaSafeModeEnabled = true
+        } else if freezePerformanceDiagnostics.mediaSafeModeEnabled, queuedImageResourceRequests.isEmpty {
+            lastImageResourceAction = "Image queue drained: media safe mode off"
+            freezePerformanceDiagnostics.mediaSafeModeEnabled = false
         }
         updateFreezePerformanceDiagnostics(marker: lastImageResourceAction)
+    }
+
+    private func nextQueuedImageResourceRequest() -> (key: ImageCacheKey, value: ImageResourceRequest)? {
+        let identityKinds: Set<ImageResourceKind> = [.userAvatar, .serverIcon, .customEmoji]
+        if let identity = queuedImageResourceRequests.first(where: { identityKinds.contains($0.key.kind) }) {
+            return identity
+        }
+        return queuedImageResourceRequests.first
     }
 
     private func loadVisibleIdentityImagesForCurrentSelection() {
@@ -9936,7 +10000,17 @@ public final class MainShellViewModel {
     private func updateDockBadge() {
         let counts = NotificationBadgeCalculator.counts(snapshot: snapshot, preferences: notificationPreferences, localReadStates: localReadStates)
         let value = counts.badgeValue(mode: notificationPreferences.dockBadge)
-        Task { [dockBadgeManager] in
+        if value == 0,
+           effectiveRuntimeMode == .liveManual,
+           sessionCoordinator?.hydrationStatus.readyReceived != true,
+           let lastRequested = lastRequestedDockBadgeValue, lastRequested > 0 {
+            // Unread state is transiently empty before hydration completes; keep the current badge instead of flashing it away.
+            return
+        }
+        guard value != lastRequestedDockBadgeValue else { return }
+        lastRequestedDockBadgeValue = value
+        dockBadgeApplyTask = Task { [dockBadgeManager, previousApply = dockBadgeApplyTask] in
+            await previousApply?.value
             await dockBadgeManager.setBadgeCount(value)
         }
     }

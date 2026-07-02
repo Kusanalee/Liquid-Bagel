@@ -16,7 +16,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A50000000000000000000001"
-               BuildableName = "LiquidBagel.app"
+               BuildableName = "Liquid Bagel.app"
                BlueprintName = "LiquidBagel"
                ReferencedContainer = "container:LiquidBagel.xcodeproj">
             </BuildableReference>
@@ -46,7 +46,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A50000000000000000000001"
-            BuildableName = "LiquidBagel.app"
+            BuildableName = "Liquid Bagel.app"
             BlueprintName = "LiquidBagel"
             ReferencedContainer = "container:LiquidBagel.xcodeproj">
          </BuildableReference>
@@ -63,7 +63,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A50000000000000000000001"
-            BuildableName = "LiquidBagel.app"
+            BuildableName = "Liquid Bagel.app"
             BlueprintName = "LiquidBagel"
             ReferencedContainer = "container:LiquidBagel.xcodeproj">
          </BuildableReference>

@@ -959,6 +959,7 @@ public final class ChannelMessageController {
     @ObservationIgnored private var completedInitialLoadChannelIDs: Set<ChannelID> = []
     @ObservationIgnored private var configuredLoadGeneration: Int?
     @ObservationIgnored private var presentationRevisionsByChannelID: [ChannelID: Int] = [:]
+    @ObservationIgnored private var messageCache: any ChannelMessageCaching = NoopChannelMessageCache()
 
     public init(
         runtimeMode: AppRuntimeMode = .mock,
@@ -984,8 +985,10 @@ public final class ChannelMessageController {
         runtimeMode: AppRuntimeMode,
         apiClient: (any StoatAPIClient)?,
         currentUserID: UserID?,
-        loadGeneration: Int? = nil
+        loadGeneration: Int? = nil,
+        messageCache: (any ChannelMessageCaching)? = nil
     ) {
+        self.messageCache = messageCache ?? NoopChannelMessageCache()
         let identityScopeChanged = self.runtimeMode != runtimeMode
             || self.currentUserID != currentUserID
         let loadScopeChanged = identityScopeChanged
@@ -1012,6 +1015,9 @@ public final class ChannelMessageController {
     }
 
     public func reset() {
+        Task { [messageCache] in
+            await messageCache.removeAll()
+        }
         statesByChannelID.removeAll()
         historiesByChannelID.removeAll()
         sendingChannelIDs.removeAll()
@@ -1086,6 +1092,13 @@ public final class ChannelMessageController {
 
         if shouldUseLiveAPI, let apiClient {
             mergeSnapshotMessages(snapshotMessages, channelID: channelID)
+            if state(for: channelID).timelineMessages.isEmpty {
+                let cached = await messageCache.messages(for: channelID)
+                guard initialLoadTokens[channelID] == token else { return .cancelled }
+                if !cached.isEmpty {
+                    mergeSnapshotMessages(cached, channelID: channelID)
+                }
+            }
             apply(.initialLoadStarted, channelID: channelID)
             var cachedHistory = history(for: channelID)
             cachedHistory.hasMoreBefore = true
@@ -1371,7 +1384,56 @@ public final class ChannelMessageController {
     }
 
     private func apply(_ event: ChannelMessageHistoryEvent, channelID: ChannelID) {
+        let persistMode = persistMode(for: event)
+        let confirmedIDsBefore = persistMode == .ifChanged ? confirmedPersistableMessages(for: channelID).map(\.id) : nil
         setHistory(reducer.reduce(history(for: channelID), event: event))
+        switch persistMode {
+        case .never:
+            return
+        case .always:
+            persistHistory(for: channelID)
+        case .ifChanged:
+            if confirmedIDsBefore != confirmedPersistableMessages(for: channelID).map(\.id) {
+                persistHistory(for: channelID)
+            }
+        }
+    }
+
+    private enum HistoryPersistMode {
+        case never
+        case always
+        case ifChanged
+    }
+
+    private func persistMode(for event: ChannelMessageHistoryEvent) -> HistoryPersistMode {
+        switch event {
+        case .initialLoadSucceeded, .realtimeMessageReceived, .sendConfirmed, .messageUpdated, .messageDeleted, .reactionChanged:
+            .always
+        case .snapshotMerged:
+            .ifChanged
+        default:
+            .never
+        }
+    }
+
+    private func confirmedPersistableMessages(for channelID: ChannelID) -> [Message] {
+        history(for: channelID).messages.compactMap { timelineMessage in
+            switch timelineMessage.status {
+            case .confirmed:
+                timelineMessage.message
+            case .deleting, .pending, .failed, .retrying:
+                nil
+            }
+        }
+    }
+
+    private func persistHistory(for channelID: ChannelID) {
+        guard shouldUseLiveAPI else { return }
+        let messages = confirmedPersistableMessages(for: channelID)
+        guard !messages.isEmpty else { return }
+        Task { [messageCache] in
+            await messageCache.store(messages, for: channelID)
+        }
     }
 
     private func setFailedMetadata(_ metadata: FailedMessageRecoveryMetadata, messageID: MessageID, channelID: ChannelID) {

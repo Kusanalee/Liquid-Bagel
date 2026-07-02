@@ -2507,6 +2507,32 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.notificationDiagnostics.dockBadgeValue, expectedBadge)
     }
 
+    @MainActor
+    func testPhase55DockBadgeUpdatesAreDedupedAcrossLifecycleChurn() async throws {
+        let dock = MockDockBadgeManager()
+        let model = MainShellViewModel(
+            snapshot: MockShellData.snapshot,
+            notificationDeliverer: MockNotificationService(),
+            notificationPermissionManager: MockNotificationPermissionManager(),
+            dockBadgeManager: dock,
+            notificationRouteCenter: NotificationRouteCenter()
+        )
+        let channel = model.snapshot.channelsByID.values.first { ($0.serverID != nil) && $0.kind == .textChannel }!
+        model.localReadStates[channel.id] = LocalReadState(channelID: channel.id, unreadCount: 1, mentionCount: 1)
+        let expectedBadge = NotificationBadgeCalculator
+            .counts(snapshot: model.snapshot, preferences: .defaults, localReadStates: model.localReadStates)
+            .badgeValue(mode: .unreadChannelsAndMentions)
+
+        model.updateAppLifecyclePhase(.inactive)
+        model.updateAppLifecyclePhase(.inactive)
+        model.updateAppLifecyclePhase(.background)
+        try await Task.sleep(for: .milliseconds(30))
+
+        let counts = await dock.badgeCounts
+        XCTAssertEqual(counts.last, expectedBadge)
+        XCTAssertEqual(counts.filter { $0 == expectedBadge }.count, 1)
+    }
+
     func testPhase19NotificationDiagnosticsRemainRedacted() {
         let diagnostics = NotificationDiagnostics(
             permissionStatus: .authorized,
@@ -2875,6 +2901,169 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase55MemberListHoistedSectionsRankOrderAndOfflineAtBottom() {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase55-members-server"
+        let hoistedTopID: RoleID = "phase55-hoisted-top"
+        let hoistedLowID: RoleID = "phase55-hoisted-low"
+        let plainRoleID: RoleID = "phase55-plain-role"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "phase55-owner", name: "Phase 55", roles: [
+            hoistedTopID: Role(id: hoistedTopID, name: "Admins", permissions: PermissionOverride(), hoist: true, rank: 1),
+            hoistedLowID: Role(id: hoistedLowID, name: "Regulars", permissions: PermissionOverride(), hoist: true, rank: 20),
+            plainRoleID: Role(id: plainRoleID, name: "Cosmetic", permissions: PermissionOverride(), hoist: false, rank: 0)
+        ])
+
+        func addMember(_ id: String, roles memberRoles: [RoleID] = [], online: Bool) {
+            let userID = UserID(rawValue: id)
+            snapshot.usersByID[userID] = User(id: userID, username: id, online: online)
+            snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(
+                id: MemberCompositeKey(serverID: serverID, userID: userID),
+                joinedAt: Date(),
+                roles: memberRoles
+            )
+        }
+
+        addMember("phase55-owner", online: true)
+        addMember("phase55-admin", roles: [hoistedLowID, hoistedTopID], online: true)
+        addMember("phase55-regular", roles: [hoistedLowID, plainRoleID], online: true)
+        addMember("phase55-cosmetic-only", roles: [plainRoleID], online: true)
+        addMember("phase55-nobody", online: true)
+        addMember("phase55-sleepy-admin", roles: [hoistedTopID], online: false)
+        addMember("phase55-sleepy", online: false)
+
+        let result = MemberListDeriver.result(server: snapshot.serversByID[serverID], snapshot: snapshot)
+
+        XCTAssertEqual(result.groups.map(\.id), [
+            "owner",
+            "role-\(hoistedTopID.rawValue)",
+            "role-\(hoistedLowID.rawValue)",
+            "online",
+            "offline"
+        ])
+        XCTAssertEqual(result.groups.first { $0.id == "role-\(hoistedTopID.rawValue)" }?.items.map(\.userID), ["phase55-admin"])
+        XCTAssertEqual(result.groups.first { $0.id == "role-\(hoistedLowID.rawValue)" }?.items.map(\.userID), ["phase55-regular"])
+        XCTAssertEqual(result.groups.first { $0.id == "online" }?.items.map(\.userID), ["phase55-cosmetic-only", "phase55-nobody"])
+        XCTAssertEqual(result.groups.first { $0.id == "offline" }?.items.map(\.userID), ["phase55-sleepy", "phase55-sleepy-admin"])
+    }
+
+    @MainActor
+    func testPhase55MediaSafeModeResetsAfterImageQueueDrains() async throws {
+        let loader = SlowImageResourceLoader(delayNanoseconds: 10_000_000)
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        for index in 0..<32 {
+            let file = File(id: FileID(rawValue: "phase55-safemode-\(index)"), tag: "attachments", filename: "\(index).png", contentType: "image/png", size: 1)
+            model.loadImageResource(for: file, kind: .attachmentPreview)
+        }
+        XCTAssertTrue(model.freezePerformanceDiagnostics.mediaSafeModeEnabled)
+
+        for _ in 0..<200 {
+            let diagnostics = await model.imageResourceDiagnostics()
+            if diagnostics.queuedTaskCount == 0, diagnostics.activeTaskCount == 0 { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertFalse(model.freezePerformanceDiagnostics.mediaSafeModeEnabled)
+    }
+
+    @MainActor
+    func testPhase55InlinePreviewQueueDrainsBeyondConcurrencyLimit() async throws {
+        let data = Data("png".utf8)
+        let loader = MockRemoteAttachmentLoader(result: .success(RemoteAttachmentData(filename: "photo.png", contentType: "image/png", byteCount: data.count, data: data)))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, remoteAttachmentLoader: loader)
+        let files = (0..<10).map { index in
+            File(id: FileID(rawValue: "phase55-inline-\(index)"), tag: "attachments", filename: "photo\(index).png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
+        }
+        let message = Message(id: "01J00000000000000000550001", channelID: "01HX0000000000000000000101", authorID: MockShellData.currentUserID, attachments: files)
+
+        model.loadInlineImagePreviews(for: message)
+        for _ in 0..<100 {
+            let states = model.attachmentDisplayItems(for: message).map(\.previewState)
+            if states.allSatisfy({ $0 == .readyRemote }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let callCount = await loader.callCount()
+        XCTAssertEqual(callCount, 10)
+        XCTAssertTrue(model.attachmentDisplayItems(for: message).allSatisfy { $0.previewState == .readyRemote })
+    }
+
+    @MainActor
+    func testPhase55FailedImageResourceRetriesWithBackoffForAllKinds() async throws {
+        let loader = MockImageResourceLoader(result: .failure(AttachmentActionError.unavailable("nope")))
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let clock = Phase55TestClock(now: Date())
+        model.setPhase43NowProvider { clock.now }
+        let file = File(id: "phase55-banner", tag: "banners", filename: "banner.png", contentType: "image/png", size: 10)
+
+        model.loadImageResource(for: file, kind: .serverBanner)
+        try await Task.sleep(for: .milliseconds(30))
+        let afterFirst = await loader.callCount()
+        XCTAssertEqual(afterFirst, 1)
+
+        model.loadImageResource(for: file, kind: .serverBanner)
+        try await Task.sleep(for: .milliseconds(30))
+        let withinBackoff = await loader.callCount()
+        XCTAssertEqual(withinBackoff, 1)
+
+        clock.now = clock.now.addingTimeInterval(6)
+        model.loadImageResource(for: file, kind: .serverBanner)
+        try await Task.sleep(for: .milliseconds(30))
+        let afterBackoff = await loader.callCount()
+        XCTAssertEqual(afterBackoff, 2)
+    }
+
+    @MainActor
+    func testPhase55ChannelMessageControllerPaintsDiskCacheBeforeNetworkFetch() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("phase55-msgcache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = FileChannelMessageCache(scopeIdentifier: "phase55-msg-scope", directory: directory)
+        let channelID: ChannelID = "phase55-cache-channel"
+        let cachedMessage = Message(id: "01J00000000000000000550101", channelID: channelID, authorID: "phase55-author", content: "from disk")
+        await cache.store([cachedMessage], for: channelID)
+
+        let networkMessage = Message(id: "01J00000000000000000550102", channelID: channelID, authorID: "phase55-author", content: "from network")
+        let api = RecordingAPIClient(messagesByChannel: [channelID: [networkMessage]], fetchMessagesDelayNanoseconds: 300_000_000)
+        let controller = ChannelMessageController(runtimeMode: .liveManual, apiClient: api, currentUserID: "phase55-me")
+        controller.configure(runtimeMode: .liveManual, apiClient: api, currentUserID: "phase55-me", messageCache: cache)
+
+        let loadTask = Task { await controller.loadInitialIfNeeded(channelID: channelID, snapshotMessages: []) }
+        var paintedFromDiskBeforeFetch = false
+        for _ in 0..<40 {
+            if controller.state(for: channelID).timelineMessages.contains(where: { $0.message.id == cachedMessage.id }) {
+                paintedFromDiskBeforeFetch = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(paintedFromDiskBeforeFetch)
+        XCTAssertFalse(controller.state(for: channelID).timelineMessages.contains { $0.message.id == networkMessage.id })
+
+        _ = await loadTask.value
+        XCTAssertTrue(controller.state(for: channelID).timelineMessages.contains { $0.message.id == networkMessage.id })
+    }
+
+    func testPhase55FileImageDiskCacheRoundTripAndLoaderHit() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("phase55-disk-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let disk = FileImageDiskCache(directory: directory, maxBytes: 1024 * 1024)
+        let key = ImageCacheKey(id: "phase55-file", kind: .userAvatar)
+        let stored = Data("avatar-bytes".utf8)
+
+        await disk.store(stored, for: key)
+        let roundTrip = await disk.data(for: key)
+        XCTAssertEqual(roundTrip, stored)
+
+        let loader = LiveImageResourceLoader(cache: ImageMemoryCache(), diskCache: disk)
+        let request = ImageResourceRequest(id: "phase55-file", url: URL(string: "https://invalid.example/never")!, kind: .userAvatar, maxBytes: 1024)
+        let result = try await loader.loadImage(request)
+        XCTAssertTrue(result.fromCache)
+        XCTAssertEqual(result.data, stored)
+
+        await disk.removeAll()
+        let cleared = await disk.data(for: key)
+        XCTAssertNil(cleared)
+    }
+
+    @MainActor
     func testPhase28NotificationPermissionRequestUpdatesDiagnostics() async throws {
         let manager = MockNotificationPermissionManager(status: .notDetermined)
         let model = MainShellViewModel(
@@ -3083,8 +3272,8 @@ final class StoatFeaturesTests: XCTestCase {
         let userID: UserID = "phase34-color-user"
         let lowRoleID: RoleID = "phase34-low"
         let highRoleID: RoleID = "phase34-high"
-        let low = Role(id: lowRoleID, name: "Low", permissions: PermissionOverride(), colour: "#111111", rank: 1)
-        let high = Role(id: highRoleID, name: "High", permissions: PermissionOverride(), colour: "#33AAEE", rank: 50)
+        let low = Role(id: lowRoleID, name: "Low", permissions: PermissionOverride(), colour: "#111111", rank: 50)
+        let high = Role(id: highRoleID, name: "High", permissions: PermissionOverride(), colour: "#33AAEE", rank: 1)
         snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Phase 34", roles: [lowRoleID: low, highRoleID: high])
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
         snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(
@@ -3299,8 +3488,8 @@ final class StoatFeaturesTests: XCTestCase {
         try await Task.sleep(nanoseconds: 20_000_000)
         let diagnostics = await model.imageResourceDiagnostics()
 
-        XCTAssertLessThanOrEqual(diagnostics.activeTaskCount, 6)
-        XCTAssertGreaterThanOrEqual(diagnostics.queuedTaskCount, 4)
+        XCTAssertLessThanOrEqual(diagnostics.activeTaskCount, 8)
+        XCTAssertGreaterThanOrEqual(diagnostics.queuedTaskCount, 2)
     }
 
     @MainActor
@@ -5526,9 +5715,9 @@ final class StoatFeaturesTests: XCTestCase {
         let userUnknown: UserID = "phase37-user-unknown"
         var server = Server(id: serverID, ownerID: "phase37-owner", name: "Phase 37")
         server.roles = [
-            adminID: Role(id: adminID, name: "Admins", permissions: PermissionOverride(allow: [.manageServer]), colour: "#FF3366", rank: 0),
-            managerID: Role(id: managerID, name: "Managers", permissions: PermissionOverride(allow: [.manageRole]), colour: "#3366FF", rank: 20),
-            ordinaryID: Role(id: ordinaryID, name: "Members", permissions: PermissionOverride(), colour: "#00AA44", rank: 1)
+            adminID: Role(id: adminID, name: "Admins", permissions: PermissionOverride(allow: [.manageServer]), colour: "#FF3366", hoist: true, rank: 0),
+            managerID: Role(id: managerID, name: "Managers", permissions: PermissionOverride(allow: [.manageRole]), colour: "#3366FF", hoist: true, rank: 5),
+            ordinaryID: Role(id: ordinaryID, name: "Members", permissions: PermissionOverride(), colour: "#00AA44", rank: 50)
         ]
         var snapshot = RealtimeSnapshot()
         snapshot.serversByID[serverID] = server
@@ -5546,8 +5735,8 @@ final class StoatFeaturesTests: XCTestCase {
 
         await model.prepareMemberListGroups(for: serverID)
         let groups = model.cachedMemberListGroups(for: serverID)
-        XCTAssertEqual(groups.map(\.id).prefix(3), ["role-\(managerID.rawValue)", "role-\(ordinaryID.rawValue)", "bots"])
-        XCTAssertEqual(groups.first?.items.map(\.userID), [userManager])
+        XCTAssertEqual(groups.map(\.id), ["role-\(adminID.rawValue)", "role-\(managerID.rawValue)", "online", "unknown"])
+        XCTAssertEqual(groups.first?.items.map(\.userID), [userAdmin])
         XCTAssertEqual(groups.flatMap(\.items).filter { $0.userID == userAdmin }.count, 1)
         XCTAssertEqual(model.memberRoleSortDiagnostics.unknownRoleCount, 1)
 
@@ -5608,7 +5797,7 @@ final class StoatFeaturesTests: XCTestCase {
         model.updateTimelineVisibility(messageID: "01J00000000000000000370001", channelID: channelID, isVisible: true)
         _ = MarkdownContentPreparer.prepare("hello **markdown**")
         _ = MarkdownContentPreparer.prepare("hello **markdown**")
-        for index in 0..<24 {
+        for index in 0..<32 {
             let file = File(id: FileID(rawValue: "phase37-image-\(index)"), tag: "attachments", filename: "\(index).png", contentType: "image/png", size: 1)
             model.loadImageResource(for: file, kind: .attachmentPreview)
         }
@@ -6013,6 +6202,14 @@ private final class MutableSnapshotSource: ShellSnapshotSource, @unchecked Senda
                 changes: RealtimeSnapshotChangeSet(isFullReplacement: true)
             )
         )
+    }
+}
+
+private final class Phase55TestClock: @unchecked Sendable {
+    var now: Date
+
+    init(now: Date) {
+        self.now = now
     }
 }
 

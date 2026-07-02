@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import OSLog
 import StoatDesignSystem
@@ -8,6 +9,10 @@ import UniformTypeIdentifiers
 #if canImport(AppKit)
 import AppKit
 import ImageIO
+#endif
+
+#if canImport(AVKit)
+import AVKit
 #endif
 
 private enum StoatUILayoutDiagnostics {
@@ -387,6 +392,7 @@ public struct ComposerAttachmentChip: Identifiable, Hashable, Sendable {
 
 public enum AttachmentDisplayKind: Hashable, Sendable {
     case image
+    case video
     case pdf
     case text
     case archive
@@ -396,6 +402,7 @@ public enum AttachmentDisplayKind: Hashable, Sendable {
     public var label: String {
         switch self {
         case .image: "Image"
+        case .video: "Video"
         case .pdf: "PDF"
         case .text: "Text"
         case .archive: "Archive"
@@ -407,6 +414,7 @@ public enum AttachmentDisplayKind: Hashable, Sendable {
     public var systemImage: String {
         switch self {
         case .image: "photo"
+        case .video: "play.rectangle"
         case .pdf: "doc.richtext"
         case .text: "doc.text"
         case .archive: "archivebox"
@@ -419,7 +427,7 @@ public enum AttachmentDisplayKind: Hashable, Sendable {
         switch self {
         case .image, .pdf, .text:
             true
-        case .archive, .generic, .unsupported:
+        case .video, .archive, .generic, .unsupported:
             false
         }
     }
@@ -522,6 +530,16 @@ public struct AttachmentDisplayItem: Identifiable, Hashable, Sendable, CustomStr
 
     public var debugDescription: String {
         "AttachmentDisplayItem(id: \(id), fileID: \(AttachmentDisplayFormatting.shortID(fileID?.rawValue)), name: \(displayName), kind: \(kind.label), state: \(previewState.safeLabel))"
+    }
+
+    public var playbackURL: URL? {
+        if case let .remote(_, _, url) = source { return url }
+        return nil
+    }
+
+    public var isExternalEmbedMedia: Bool {
+        if case let .remote(_, tag, _) = source { return tag == "external" }
+        return false
     }
 }
 
@@ -739,6 +757,79 @@ public struct MessageEmbedDisplayItem: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum ExternalEmbedMediaFactory {
+    public static func mediaItem(for embed: Embed) -> AttachmentDisplayItem? {
+        if let thumbnail = youtubeThumbnailItem(special: embed.special) {
+            return thumbnail
+        }
+        if let image = embed.image {
+            return imageItem(urlString: image.url)
+        }
+        if embed.kind == .image, let url = embed.url ?? embed.originalURL {
+            return imageItem(urlString: url)
+        }
+        if let video = embed.video {
+            return videoItem(urlString: video.url)
+        }
+        if embed.kind == .video, let url = embed.url ?? embed.originalURL {
+            return videoItem(urlString: url)
+        }
+        return nil
+    }
+
+    public static func imageItem(urlString: String) -> AttachmentDisplayItem? {
+        guard let url = safeHTTPSURL(urlString) else { return nil }
+        let id = "embed-ext-\(digest(url.absoluteString))"
+        return AttachmentDisplayItem(
+            id: id,
+            displayName: displayName(for: url, fallback: "embed-image"),
+            kind: .image,
+            source: .remote(fileID: FileID(rawValue: id), tag: "external", url: url)
+        )
+    }
+
+    public static func videoItem(urlString: String) -> AttachmentDisplayItem? {
+        guard let url = safeHTTPSURL(urlString) else { return nil }
+        guard ["mp4", "mov", "m4v"].contains(url.pathExtension.lowercased()) else { return nil }
+        let id = "embed-ext-\(digest(url.absoluteString))"
+        return AttachmentDisplayItem(
+            id: id,
+            displayName: displayName(for: url, fallback: "embed-video"),
+            kind: .video,
+            source: .remote(fileID: FileID(rawValue: id), tag: "external", url: url)
+        )
+    }
+
+    public static func youtubeThumbnailItem(special: JSONValue?) -> AttachmentDisplayItem? {
+        guard case let .object(fields) = special,
+              case .string("YouTube") = fields["type"] ?? .null,
+              case let .string(videoID) = fields["id"] ?? .null
+        else { return nil }
+        let allowed = videoID.unicodeScalars.allSatisfy {
+            CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_"
+        }
+        guard allowed, !videoID.isEmpty else { return nil }
+        return imageItem(urlString: "https://i.ytimg.com/vi/\(videoID)/hqdefault.jpg")
+    }
+
+    private static func safeHTTPSURL(_ raw: String) -> URL? {
+        guard let components = URLComponents(string: raw),
+              components.scheme?.lowercased() == "https",
+              components.host?.isEmpty == false
+        else { return nil }
+        return components.url
+    }
+
+    private static func digest(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func displayName(for url: URL, fallback: String) -> String {
+        let last = url.lastPathComponent
+        return last.isEmpty || last == "/" ? fallback : last
+    }
+}
+
 public struct EmojiPickerSection: Identifiable, Hashable, Sendable {
     public var id: String
     public var title: String
@@ -784,7 +875,9 @@ public enum AttachmentDisplayFormatting {
                 return .image
             case .text:
                 return .text
-            case .video, .audio:
+            case .video:
+                return playableVideoKind(contentType: contentType, filename: filename)
+            case .audio:
                 return .unsupported
             case .file, .unknown:
                 break
@@ -793,10 +886,22 @@ public enum AttachmentDisplayFormatting {
         let loweredType = (contentType ?? "").lowercased()
         let ext = URL(fileURLWithPath: filename).pathExtension.lowercased()
         if loweredType.hasPrefix("image/") || ["png", "jpg", "jpeg", "gif", "heic", "webp"].contains(ext) { return .image }
+        if loweredType.hasPrefix("video/") || ["mp4", "mov", "m4v", "webm"].contains(ext) {
+            return playableVideoKind(contentType: contentType, filename: filename)
+        }
         if loweredType == "application/pdf" || ext == "pdf" { return .pdf }
         if loweredType.hasPrefix("text/") || ["md", "markdown", "json", "csv", "rtf", "txt"].contains(ext) { return .text }
         if ["zip", "gz", "tgz", "tar", "7z", "rar"].contains(ext) { return .archive }
         return .generic
+    }
+
+    private static func playableVideoKind(contentType: String?, filename: String) -> AttachmentDisplayKind {
+        let loweredType = (contentType ?? "").lowercased()
+        let ext = URL(fileURLWithPath: filename).pathExtension.lowercased()
+        if ["video/mp4", "video/quicktime", "video/x-m4v"].contains(loweredType) || ["mp4", "mov", "m4v"].contains(ext) {
+            return .video
+        }
+        return .unsupported
     }
 
     public static func shortID(_ value: String?) -> String {
@@ -2119,6 +2224,59 @@ public struct AttachmentPreviewPlaceholder: View {
     }
 }
 
+#if canImport(AVKit)
+public struct VideoAttachmentPlayer: View {
+    private let url: URL
+    private let isCompact: Bool
+    private let maxWidth: CGFloat
+    private let height: CGFloat
+    @State private var player: AVPlayer?
+
+    public init(url: URL, isCompact: Bool = false, maxWidth: CGFloat? = nil, height: CGFloat? = nil) {
+        self.url = url
+        self.isCompact = isCompact
+        self.maxWidth = maxWidth ?? (isCompact ? 430 : 580)
+        self.height = height ?? (isCompact ? 260 : 380)
+    }
+
+    public var body: some View {
+        Group {
+            if let player {
+                VideoPlayer(player: player)
+            } else {
+                Button {
+                    let player = AVPlayer(url: url)
+                    self.player = player
+                    player.play()
+                } label: {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                            .fill(Color.black.opacity(0.85))
+                        VStack(spacing: StoatSpacing.small) {
+                            Image(systemName: "play.circle.fill")
+                                .font(.system(size: 44))
+                            Text("Play video")
+                                .font(.caption.weight(.medium))
+                        }
+                        .foregroundStyle(.white)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .frame(maxWidth: maxWidth)
+        .frame(height: height)
+        .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        .onDisappear {
+            player?.pause()
+            player?.replaceCurrentItem(with: nil)
+            player = nil
+        }
+        .accessibilityLabel(player == nil ? "Play video" : "Video player")
+    }
+}
+#endif
+
 public struct AttachmentTimelineCard: View {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -2148,6 +2306,7 @@ public struct AttachmentTimelineCard: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.small) {
             inlineImagePreview
+            inlineVideoPlayer
             HStack(spacing: StoatSpacing.small) {
                 thumbnail
                 VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
@@ -2192,6 +2351,14 @@ public struct AttachmentTimelineCard: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Open image \(item.displayName)")
+        }
+        #endif
+    }
+
+    @ViewBuilder private var inlineVideoPlayer: some View {
+        #if canImport(AVKit)
+        if item.kind == .video, let url = item.playbackURL {
+            VideoAttachmentPlayer(url: url, isCompact: isCompact)
         }
         #endif
     }
@@ -2336,6 +2503,8 @@ public struct AttachmentTimelineCard: View {
             .secondary
         case .image:
             .accentColor
+        case .video:
+            .purple
         case .pdf:
             .red
         case .text:
@@ -2849,7 +3018,7 @@ public struct EmbedTimelineCard: View {
         self.init(
             item: MessageEmbedDisplayItem(
                 embed: embed,
-                mediaItem: embed.media.map { AttachmentDisplayItem(file: $0) }
+                mediaItem: embed.media.map { AttachmentDisplayItem(file: $0) } ?? ExternalEmbedMediaFactory.mediaItem(for: embed)
             ),
             isCompact: isCompact
         )
@@ -2928,18 +3097,20 @@ public struct EmbedTimelineCard: View {
     @ViewBuilder private func embedMedia(_ mediaItem: AttachmentDisplayItem) -> some View {
         VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
             mediaPreview(mediaItem)
-            HStack(spacing: StoatSpacing.xSmall) {
-                Image(systemName: mediaItem.kind.systemImage)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(mediaItem.displayName)
-                        .font(.caption.weight(.medium))
-                        .lineLimit(1)
-                    Text("\(mediaItem.kind.label) · \(AttachmentDisplayFormatting.formattedSize(mediaItem.byteCount))")
-                        .font(.caption2)
+            if !mediaItem.isExternalEmbedMedia {
+                HStack(spacing: StoatSpacing.xSmall) {
+                    Image(systemName: mediaItem.kind.systemImage)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .frame(width: 16)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(mediaItem.displayName)
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                        Text("\(mediaItem.kind.label) · \(AttachmentDisplayFormatting.formattedSize(mediaItem.byteCount))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
             }
             mediaControls(mediaItem)
@@ -2947,6 +3118,18 @@ public struct EmbedTimelineCard: View {
     }
 
     @ViewBuilder private func mediaPreview(_ mediaItem: AttachmentDisplayItem) -> some View {
+        #if canImport(AVKit)
+        if mediaItem.kind == .video, let url = mediaItem.playbackURL {
+            VideoAttachmentPlayer(url: url, isCompact: isCompact, maxWidth: isCompact ? 280 : 360, height: isCompact ? 180 : 240)
+        } else {
+            imageMediaPreview(mediaItem)
+        }
+        #else
+        imageMediaPreview(mediaItem)
+        #endif
+    }
+
+    @ViewBuilder private func imageMediaPreview(_ mediaItem: AttachmentDisplayItem) -> some View {
         #if canImport(AppKit)
         if mediaItem.kind == .image,
            mediaItem.previewState.isReady,
@@ -2980,7 +3163,7 @@ public struct EmbedTimelineCard: View {
 
     @ViewBuilder private func mediaControls(_ mediaItem: AttachmentDisplayItem) -> some View {
         HStack(spacing: StoatSpacing.xSmall) {
-            if mediaItem.kind.isPreviewable {
+            if mediaItem.kind.isPreviewable, !(mediaItem.isExternalEmbedMedia && mediaItem.previewState.isReady) {
                 Button {
                     onPreviewMedia(mediaItem)
                 } label: {
@@ -2988,7 +3171,7 @@ public struct EmbedTimelineCard: View {
                 }
                 .buttonStyle(.borderless)
             }
-            if mediaItem.source.isRemoteLoadable {
+            if mediaItem.source.isRemoteLoadable, !mediaItem.isExternalEmbedMedia {
                 Button {
                     onDownloadMedia(mediaItem)
                 } label: {
@@ -2996,7 +3179,7 @@ public struct EmbedTimelineCard: View {
                 }
                 .buttonStyle(.borderless)
             }
-            if mediaItem.previewState.isReady {
+            if mediaItem.previewState.isReady, !mediaItem.isExternalEmbedMedia {
                 Button {
                     onOpenMedia(mediaItem)
                 } label: {

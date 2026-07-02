@@ -63,6 +63,50 @@ final class StoatUITests: XCTestCase {
         XCTAssertTrue(StoatAccessibility.attachmentActionLabel(action: "Save As", filename: "brief.pdf").contains("brief.pdf"))
     }
 
+    func testPhase55VideoAttachmentKindMapping() {
+        XCTAssertEqual(AttachmentDisplayFormatting.kind(contentType: "video/mp4", filename: "clip.mp4"), .video)
+        XCTAssertEqual(AttachmentDisplayFormatting.kind(contentType: "video/quicktime", filename: "clip.mov"), .video)
+        XCTAssertEqual(AttachmentDisplayFormatting.kind(contentType: nil, filename: "clip.m4v"), .video)
+        XCTAssertEqual(AttachmentDisplayFormatting.kind(contentType: "video/webm", filename: "clip.webm"), .unsupported)
+        XCTAssertEqual(AttachmentDisplayFormatting.kind(contentType: "video/mp4", filename: "clip.mp4", metadata: .video(width: 10, height: 10)), .video)
+        XCTAssertEqual(AttachmentDisplayFormatting.kind(contentType: "video/webm", filename: "clip.webm", metadata: .video(width: 10, height: 10)), .unsupported)
+        XCTAssertEqual(AttachmentDisplayFormatting.kind(contentType: "audio/mpeg", filename: "song.mp3", metadata: .audio), .unsupported)
+
+        let video = File(id: "file-video", tag: "attachments", filename: "clip.mp4", metadata: .video(width: 640, height: 480), contentType: "video/mp4", size: 1_000)
+        let item = AttachmentDisplayItem(file: video)
+        XCTAssertEqual(item.kind, .video)
+        XCTAssertFalse(item.kind.isPreviewable)
+        XCTAssertNil(item.playbackURL)
+    }
+
+    func testPhase55ExternalEmbedMediaFactorySynthesizesSafeItems() {
+        let imageEmbed = Embed(kind: .website, url: "https://tenor.com/view", image: EmbedImage(url: "https://media1.tenor.com/m/abc/dance.gif", width: 200, height: 200))
+        let imageItem = ExternalEmbedMediaFactory.mediaItem(for: imageEmbed)
+        XCTAssertEqual(imageItem?.kind, .image)
+        XCTAssertTrue(imageItem?.isExternalEmbedMedia == true)
+        XCTAssertEqual(imageItem?.playbackURL?.absoluteString, "https://media1.tenor.com/m/abc/dance.gif")
+        XCTAssertTrue(imageItem?.id.hasPrefix("embed-ext-") == true)
+
+        let insecureEmbed = Embed(kind: .website, image: EmbedImage(url: "http://insecure.example/x.png", width: 10, height: 10))
+        XCTAssertNil(ExternalEmbedMediaFactory.mediaItem(for: insecureEmbed))
+
+        let topLevelImage = Embed(kind: .image, url: "https://images.example/direct.png")
+        XCTAssertEqual(ExternalEmbedMediaFactory.mediaItem(for: topLevelImage)?.kind, .image)
+
+        let videoEmbed = Embed(kind: .website, video: EmbedVideo(url: "https://cdn.example/clip.mp4", width: 640, height: 480))
+        XCTAssertEqual(ExternalEmbedMediaFactory.mediaItem(for: videoEmbed)?.kind, .video)
+
+        let embedPlayerVideo = Embed(kind: .website, video: EmbedVideo(url: "https://www.youtube.com/embed/xyz", width: 640, height: 480))
+        XCTAssertNil(ExternalEmbedMediaFactory.mediaItem(for: embedPlayerVideo))
+
+        let youtube = Embed(kind: .website, special: .object(["type": .string("YouTube"), "id": .string("dQw4w9WgXcQ")]))
+        let thumbnail = ExternalEmbedMediaFactory.mediaItem(for: youtube)
+        XCTAssertEqual(thumbnail?.playbackURL?.absoluteString, "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg")
+
+        let evilYoutube = Embed(kind: .website, special: .object(["type": .string("YouTube"), "id": .string("../evil?x=1")]))
+        XCTAssertNil(ExternalEmbedMediaFactory.mediaItem(for: evilYoutube))
+    }
+
     func testPhase17MessageActionAndReactionDisplayHelpers() {
         let action = MessageRowActionItem(id: "delete", title: "Delete Message", systemImage: "trash", role: .destructive, isEnabled: false)
         XCTAssertEqual(action.id, "delete")
