@@ -598,6 +598,8 @@ public final class MainShellViewModel {
     public var freezePerformanceDiagnostics = FreezePerformanceDiagnostics()
     public private(set) var phase51PerformanceDiagnostics = Phase51PerformanceDiagnostics()
     public private(set) var phase52FreezeDiagnostics = Phase52FreezeDiagnostics()
+    public private(set) var timelinePresentationState: TimelinePresentationState = .idle
+    public private(set) var timelinePresentationDiagnostics = TimelinePresentationDiagnostics()
     public private(set) var shellPresentationSnapshot = ShellPresentationSnapshot()
     public private(set) var serverSettingsPresentationState: ManagementActionState<ServerSettingsPresentationSnapshot> = .idle
     public var memberHydrationDiagnostics = MemberHydrationDiagnostics()
@@ -737,6 +739,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var phase51TimelinePresentationTask: Task<Void, Never>?
     @ObservationIgnored private var phase51DiagnosticsPublishTask: Task<Void, Never>?
     @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
+    @ObservationIgnored private var selectedChannelLoadTaskChannelID: ChannelID?
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
     @ObservationIgnored private var typingCleanupTask: Task<Void, Never>?
     @ObservationIgnored private var ackTasksByChannelID: [ChannelID: Task<Void, Never>] = [:]
@@ -791,7 +794,10 @@ public final class MainShellViewModel {
     @ObservationIgnored private var visibleRangeUpdateTasks: [ChannelID: Task<Void, Never>] = [:]
     @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
     @ObservationIgnored private var selectedTimelineGroupCacheKey: String?
+    @ObservationIgnored private var selectedTimelineGroupCacheChannelID: ChannelID?
     @ObservationIgnored private var selectedTimelineGroupCache: [TimelineMessageGroup] = []
+    @ObservationIgnored private var timelineRowPresentationCacheKey: String?
+    @ObservationIgnored private var timelineRowPresentationCacheChannelID: ChannelID?
     @ObservationIgnored private var timelineRowPresentationCache: [MessageID: TimelineRowPresentation] = [:]
     @ObservationIgnored private var memberListGroupCacheKey: MemberListCacheKey?
     @ObservationIgnored private var memberListGroupCache: [MemberListGroup] = []
@@ -1235,18 +1241,78 @@ public final class MainShellViewModel {
         messageController.presentationRevision(for: selectedConversationChannelID)
     }
 
+    public var selectedTimelineGroupingToken: String {
+        timelineGroupingCacheKey()
+    }
+
     public var selectedTimelinePresentationToken: String {
-        "\(selectedConversationChannelID?.rawValue ?? "none")|\(selectedTimelinePresentationRevision)|\(snapshotRevision)|\(phase51MediaRevision)|\(phase43IdentityGeneration)|\(isRuntimeSendCapable)"
+        timelineRowPresentationCacheKeyValue()
     }
 
     public func prepareSelectedTimelinePresentation() async {
+        await prepareSelectedTimelineGrouping()
+        if selectedTimelineMessageGroups.isEmpty, !selectedTimelineMessages.isEmpty {
+            await Task.yield()
+            await prepareSelectedTimelineGrouping()
+        }
+        await prepareSelectedTimelineRows()
+    }
+
+    public func prepareSelectedTimelineGrouping() async {
         let messages = selectedTimelineMessages
-        let key = timelineGroupCacheKey(messages: messages)
+        let key = timelineGroupingCacheKey()
         if key == selectedTimelineGroupCacheKey {
             phase51PerformanceDiagnostics.timelineCacheHitCount += 1
             updateTimelinePerformanceDiagnostics(messages: messages, groups: selectedTimelineGroupCache)
             return
         }
+        guard let channelID = selectedConversationChannelID else {
+            timelinePresentationState = .idle
+            return
+        }
+        let previousGroups = cachedSelectedTimelineMessageGroups()
+        timelinePresentationState = .preparing(
+            channelID: channelID,
+            loadedMessageCount: messages.count,
+            visibleGroupCount: previousGroups.count
+        )
+        let worker = Task.detached(priority: .userInitiated) {
+            TimelineMessageGrouping.group(messages)
+        }
+        let groups = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+        guard !Task.isCancelled else {
+            timelinePresentationDiagnostics.cancellationCount += 1
+            return
+        }
+        guard key == timelineGroupingCacheKey(), selectedConversationChannelID == channelID else {
+            timelinePresentationDiagnostics.staleResultDiscardCount += 1
+            return
+        }
+        selectedTimelineGroupCacheKey = key
+        selectedTimelineGroupCacheChannelID = channelID
+        selectedTimelineGroupCache = groups
+        timelinePresentationState = .ready(
+            channelID: channelID,
+            messageCount: messages.count,
+            groupCount: groups.count
+        )
+        timelinePresentationDiagnostics.groupingBuildCount += 1
+        timelinePresentationDiagnostics.visibleMessageCount = messages.count
+        timelinePresentationDiagnostics.visibleGroupCount = groups.count
+        updateTimelinePerformanceDiagnostics(messages: messages, groups: groups)
+        phase51PerformanceDiagnostics.timelineBuildCount += 1
+        schedulePhase51DiagnosticsPublish()
+    }
+
+    public func prepareSelectedTimelineRows() async {
+        let messages = selectedTimelineMessages
+        let key = timelineRowPresentationCacheKeyValue()
+        guard key != timelineRowPresentationCacheKey else { return }
+        guard let channelID = selectedConversationChannelID else { return }
         let snapshot = snapshot
         let identitySnapshots = phase43IdentitySnapshots
         let imageDataByKey = loadedImageResources
@@ -1266,7 +1332,6 @@ public final class MainShellViewModel {
             }
         )
         let worker = Task.detached(priority: .userInitiated) {
-            let groups = TimelineMessageGrouping.group(messages)
             let assetContext = Phase52TimelineAssetContext(
                 snapshot: snapshot,
                 imageDataByKey: imageDataByKey,
@@ -1274,7 +1339,7 @@ public final class MainShellViewModel {
                 loadedAttachments: loadedAttachments,
                 localAttachmentIDs: localAttachmentIDs
             )
-            let rows = Dictionary(uniqueKeysWithValues: messages.map { timelineMessage in
+            return Dictionary(uniqueKeysWithValues: messages.map { timelineMessage in
                 let message = timelineMessage.message
                 let customEmojiItems = assetContext.inlineCustomEmojiItems(for: message)
                 let server = snapshot.channelsByID[message.channelID]?.serverID.flatMap { snapshot.serversByID[$0] }
@@ -1315,24 +1380,29 @@ public final class MainShellViewModel {
                 )
                 return (message.id, row)
             })
-            return (groups, rows)
         }
-        let result = await withTaskCancellationHandler {
+        let rows = await withTaskCancellationHandler {
             await worker.value
         } onCancel: {
             worker.cancel()
         }
-        guard !Task.isCancelled, key == timelineGroupCacheKey(messages: selectedTimelineMessages) else { return }
-        selectedTimelineGroupCacheKey = key
-        selectedTimelineGroupCache = result.0
-        timelineRowPresentationCache = result.1
-        updateTimelinePerformanceDiagnostics(messages: messages, groups: result.0)
-        phase51PerformanceDiagnostics.timelineBuildCount += 1
-        schedulePhase51DiagnosticsPublish()
+        guard !Task.isCancelled else {
+            timelinePresentationDiagnostics.cancellationCount += 1
+            return
+        }
+        guard key == timelineRowPresentationCacheKeyValue(), selectedConversationChannelID == channelID else {
+            timelinePresentationDiagnostics.staleResultDiscardCount += 1
+            return
+        }
+        timelineRowPresentationCacheKey = key
+        timelineRowPresentationCacheChannelID = channelID
+        timelineRowPresentationCache = rows
+        timelinePresentationDiagnostics.rowBuildCount += 1
     }
 
     public func timelineRowPresentation(for messageID: MessageID) -> TimelineRowPresentation? {
-        timelineRowPresentationCache[messageID]
+        guard timelineRowPresentationCacheChannelID == selectedConversationChannelID else { return nil }
+        return timelineRowPresentationCache[messageID]
     }
 
     public var selectedChannelMessageState: ChannelMessageState {
@@ -2175,21 +2245,36 @@ public final class MainShellViewModel {
 
     private func cachedSelectedTimelineMessageGroups() -> [TimelineMessageGroup] {
         let messages = selectedTimelineMessages
-        let key = timelineGroupCacheKey(messages: messages)
-        if key == selectedTimelineGroupCacheKey {
+        guard selectedTimelineGroupCacheChannelID == selectedConversationChannelID else { return [] }
+        if timelineGroupingCacheKey() == selectedTimelineGroupCacheKey {
             return selectedTimelineGroupCache
         }
-        return []
+        let currentMessageIDs = Set(messages.map(\.message.id))
+        return selectedTimelineGroupCache.compactMap { group in
+            let retained = group.messages.filter { currentMessageIDs.contains($0.message.id) }
+            guard !retained.isEmpty else { return nil }
+            return TimelineMessageGroup(
+                id: group.id,
+                authorID: group.authorID,
+                channelID: group.channelID,
+                messages: retained,
+                startsAt: group.startsAt
+            )
+        }
     }
 
-    private func timelineGroupCacheKey(messages: [TimelineMessage]) -> String {
+    private func timelineGroupingCacheKey() -> String {
         guard let channelID = selectedConversationChannelID else { return "none" }
-        return "\(channelID.rawValue)|\(messageController.presentationRevision(for: channelID))|\(snapshotRevision)|\(phase51MediaRevision)|\(phase43IdentityGeneration)|\(isRuntimeSendCapable)"
+        return "\(channelID.rawValue)|\(messageController.presentationRevision(for: channelID))"
+    }
+
+    private func timelineRowPresentationCacheKeyValue() -> String {
+        "\(timelineGroupingCacheKey())|\(snapshotRevision)|\(phase51MediaRevision)|\(phase43IdentityGeneration)|\(isRuntimeSendCapable)"
     }
 
     private func invalidateTimelineMediaPresentation() {
         phase51MediaRevision &+= 1
-        selectedTimelineGroupCacheKey = nil
+        timelineRowPresentationCacheKey = nil
     }
 
     private struct MemberListCacheKey: Hashable {
@@ -3452,7 +3537,7 @@ public final class MainShellViewModel {
 
     private func invalidateIdentityPresentationCaches() {
         memberListGroupCacheKey = nil
-        selectedTimelineGroupCacheKey = nil
+        timelineRowPresentationCacheKey = nil
         if let context = profilePresentationContext {
             profilePresentationContext = profileContext(userID: context.userID, serverID: context.serverID, source: context.openSource)
         }
@@ -5942,7 +6027,8 @@ public final class MainShellViewModel {
         messageController.configure(
             runtimeMode: sessionCoordinator.mode,
             apiClient: liveAPIClient,
-            currentUserID: sessionCoordinator.currentUser?.id ?? (sessionCoordinator.mode == .mock ? MockShellData.currentUserID : nil)
+            currentUserID: sessionCoordinator.currentUser?.id ?? (sessionCoordinator.mode == .mock ? MockShellData.currentUserID : nil),
+            loadGeneration: sessionCoordinator.mode == .liveManual ? sessionCoordinator.liveConnectionGeneration : nil
         )
         observe(snapshotSource: sessionCoordinator.snapshotSource)
         validateSelection()
@@ -5964,6 +6050,7 @@ public final class MainShellViewModel {
     public func observe(snapshotSource: any ShellSnapshotSource) {
         snapshotObservationTask?.cancel()
         snapshotObservationTask = Task { [weak self] in
+            let updates = snapshotSource.updates
             let current = await snapshotSource.currentSnapshot()
             await MainActor.run {
                 self?.applySnapshotUpdate(
@@ -5973,7 +6060,7 @@ public final class MainShellViewModel {
                     )
                 )
             }
-            for await update in snapshotSource.updates {
+            for await update in updates {
                 await MainActor.run {
                     self?.applySnapshotUpdate(update)
                 }
@@ -9502,6 +9589,7 @@ public final class MainShellViewModel {
     }
 
     private func applySnapshotUpdate(_ update: RealtimeSnapshotUpdate) {
+        guard !update.changes.isEmpty else { return }
         let oldSnapshot = self.snapshot
         reconcileHydratedMemberOverlay(with: update)
         let mergedSnapshot = snapshotWithHydratedMemberOverlay(update.snapshot)
@@ -9515,14 +9603,22 @@ public final class MainShellViewModel {
         } else if !update.changes.messageChannelIDs.isEmpty {
             messageController.hydrate(channelIDs: update.changes.messageChannelIDs, from: mergedSnapshot)
         }
+        for (channelID, deletedMessageIDs) in update.changes.deletedMessageIDsByChannelID {
+            for messageID in deletedMessageIDs {
+                messageController.removeMessage(channelID: channelID, messageID: messageID)
+            }
+        }
         processNotificationChanges(update.changes, snapshot: mergedSnapshot)
         previousSnapshot = mergedSnapshot
         restoreOrValidateSelection()
+        let selectedChannelID = selectedConversationChannelID
         if update.changes.isFullReplacement
-            || update.changes.messageChannelIDs.contains(selectedConversationChannelID ?? "")
-            || update.changes.channelIDs.contains(selectedConversationChannelID ?? "") {
+            || update.changes.channelIDs.contains(selectedChannelID ?? "") {
             acknowledgeSelectedChannel()
             scheduleSelectedChannelLoad()
+            reconcileTimelineSelection()
+        } else if update.changes.messageChannelIDs.contains(selectedChannelID ?? "") {
+            acknowledgeSelectedChannel()
             reconcileTimelineSelection()
         }
         if update.changes.isFullReplacement
@@ -9914,8 +10010,15 @@ public final class MainShellViewModel {
     }
 
     private func scheduleSelectedChannelLoad() {
+        guard let channelID = selectedConversationChannelID else {
+            selectedChannelLoadTask?.cancel()
+            selectedChannelLoadTask = nil
+            selectedChannelLoadTaskChannelID = nil
+            return
+        }
+        guard selectedChannelLoadTaskChannelID != channelID else { return }
         selectedChannelLoadTask?.cancel()
-        guard let channelID = selectedConversationChannelID else { return }
+        selectedChannelLoadTaskChannelID = channelID
         let snapshotMessages = snapshot.messagesByChannelID[channelID] ?? []
         let isDMRoute = snapshot.channelsByID[channelID].map(DMChannelClassifier.isDirectMessageLike) == true
         if isDMRoute {
@@ -9935,9 +10038,13 @@ public final class MainShellViewModel {
         }
         selectedChannelLoadTask = Task { [weak self] in
             guard let self else { return }
-            await self.messageController.loadInitialIfNeeded(channelID: channelID, snapshotMessages: snapshotMessages)
+            let outcome = await self.messageController.loadInitialIfNeeded(channelID: channelID, snapshotMessages: snapshotMessages)
+            if self.selectedChannelLoadTaskChannelID == channelID {
+                self.selectedChannelLoadTask = nil
+                self.selectedChannelLoadTaskChannelID = nil
+            }
             if isDMRoute {
-                let result = self.safeLoadResultDescription(for: channelID)
+                let result = self.safeLoadResultDescription(for: channelID, outcome: outcome)
                 self.dmRouteDiagnostics.lastLoadResult = result
                 self.dmLiveTrace.messageLoadResult = result
                 self.dmLiveTrace.timelineChannelID = self.selectedConversationChannelID
@@ -9948,13 +10055,31 @@ public final class MainShellViewModel {
                 }
                 self.dmLiveTrace.lastError = result.hasPrefix("failed") ? result : nil
             }
-            if self.timelineViewport.channelID != channelID || self.timelineViewport.pendingScrollIntent == nil {
+            if self.selectedConversationChannelID == channelID,
+               (self.timelineViewport.channelID != channelID || self.timelineViewport.pendingScrollIntent == nil) {
                 self.updateViewportForSelectedChannel()
             }
         }
     }
 
-    private func safeLoadResultDescription(for channelID: ChannelID) -> String {
+    private func safeLoadResultDescription(
+        for channelID: ChannelID,
+        outcome: ChannelMessageLoadOutcome? = nil
+    ) -> String {
+        if let outcome {
+            switch outcome {
+            case let .loaded(messageCount):
+                return "loaded \(messageCount)"
+            case let .alreadyLoaded(messageCount):
+                return "cached \(messageCount)"
+            case .deduplicated:
+                return "load already in progress"
+            case .cancelled:
+                return "load cancelled"
+            case let .failed(_, cachedMessageCount):
+                return "failed, cached \(cachedMessageCount)"
+            }
+        }
         switch messageController.state(for: channelID) {
         case .idle:
             return "idle"
@@ -12084,6 +12209,7 @@ public struct CredentialSetupView: View {
         let identity = viewModel.visibleIdentityDiagnostics
         let freeze = viewModel.freezePerformanceDiagnostics
         let phase51 = viewModel.phase51PerformanceDiagnostics
+        let presentation = viewModel.timelinePresentationDiagnostics
         let roleSort = viewModel.memberRoleSortDiagnostics
         let dmConversation = viewModel.dmDiagnostics
         let moderation = viewModel.moderationDiagnostics
@@ -12112,6 +12238,8 @@ public struct CredentialSetupView: View {
             LabeledContent("Freeze markers", value: freeze.lastMainThreadMarker ?? "-")
             LabeledContent("Freeze counts", value: "timeline \(freeze.timelineRenderPassCount), grouping \(freeze.memberGroupingCount), grouping cache \(freeze.memberGroupingCacheHitCount), visible \(freeze.visibleRangeUpdateCount), capability cache \(freeze.capabilityCacheUpdateCount)")
             LabeledContent("Phase 51 presentations", value: "shell \(phase51.shellBuildCount), timeline \(phase51.timelineBuildCount), cache \(phase51.timelineCacheHitCount), settings \(phase51.serverSettingsBuildCount), cancelled \(phase51.serverSettingsCancellationCount)")
+            LabeledContent("Timeline presentation", value: "groups \(presentation.groupingBuildCount), rows \(presentation.rowBuildCount), visible \(presentation.visibleMessageCount)/\(presentation.visibleGroupCount), cancelled \(presentation.cancellationCount), stale \(presentation.staleResultDiscardCount)")
+            LabeledContent("Realtime coalescing", value: "\(viewModel.sessionCoordinator?.coalescedRealtimeUpdateCount ?? 0) pending updates merged")
             LabeledContent("Phase 51 diagnostics", value: "published \(phase51.diagnosticsPublishCount), throttled \(phase51.diagnosticsThrottleCount), budget violations \(phase51.mainThreadBudgetViolationCount)")
             LabeledContent("Markdown cache", value: "parsed \(freeze.markdownParseCount), hits \(freeze.markdownCacheHitCount)")
             LabeledContent("Image queue", value: "active \(freeze.imageActiveCount), queued \(freeze.imageQueuedCount), completed \(freeze.imageCompletedCount), failed \(freeze.imageFailedCount), safe \(freeze.mediaSafeModeEnabled ? "yes" : "no")")
@@ -12894,7 +13022,10 @@ public struct MessageTimelineView: View {
             }
         }
         .task(id: viewModel.selectedTimelinePresentationToken) {
-            await viewModel.prepareSelectedTimelinePresentation()
+            await viewModel.prepareSelectedTimelineRows()
+        }
+        .task(id: viewModel.selectedTimelineGroupingToken) {
+            await viewModel.prepareSelectedTimelineGrouping()
         }
     }
 
@@ -13017,8 +13148,21 @@ public struct MessageTimelineView: View {
                 .frame(maxWidth: .infinity)
         }
         unreadSeparator
-        ForEach(viewModel.selectedTimelineMessageGroups) { group in
-            TimelineMessageGroupView(group: group, author: viewModel.snapshot.usersByID[group.authorID], viewModel: viewModel)
+        let groups = viewModel.selectedTimelineMessageGroups
+        if groups.isEmpty, !viewModel.selectedTimelineMessages.isEmpty {
+            HStack(spacing: StoatSpacing.small) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Preparing messages…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .accessibilityLabel("Preparing loaded messages")
+        } else {
+            ForEach(groups) { group in
+                TimelineMessageGroupView(group: group, author: viewModel.snapshot.usersByID[group.authorID], viewModel: viewModel)
+            }
         }
         newestIndicator
         typingIndicator

@@ -41,6 +41,139 @@ final class StreamHub<Element: Sendable>: @unchecked Sendable {
     }
 }
 
+final class CoalescingStreamHub<Element: Sendable>: @unchecked Sendable {
+    private final class Mailbox: @unchecked Sendable {
+        private let lock = NSLock()
+        private let merge: @Sendable (Element, Element) -> Element
+        private var pending: Element?
+        private var waiter: CheckedContinuation<Element?, Never>?
+        private var isFinished = false
+        private var coalescedCount = 0
+
+        init(merge: @escaping @Sendable (Element, Element) -> Element) {
+            self.merge = merge
+        }
+
+        func push(_ value: Element) {
+            lock.lock()
+            guard !isFinished else {
+                lock.unlock()
+                return
+            }
+            if let waiter {
+                self.waiter = nil
+                lock.unlock()
+                waiter.resume(returning: value)
+                return
+            }
+            if let pending {
+                self.pending = merge(pending, value)
+                coalescedCount += 1
+            } else {
+                pending = value
+            }
+            lock.unlock()
+        }
+
+        func next() async -> Element? {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let pending {
+                    self.pending = nil
+                    lock.unlock()
+                    continuation.resume(returning: pending)
+                    return
+                }
+                if isFinished {
+                    lock.unlock()
+                    continuation.resume(returning: nil)
+                    return
+                }
+                waiter = continuation
+                lock.unlock()
+            }
+        }
+
+        func finish() {
+            lock.lock()
+            guard !isFinished else {
+                lock.unlock()
+                return
+            }
+            isFinished = true
+            pending = nil
+            let waiter = self.waiter
+            self.waiter = nil
+            lock.unlock()
+            waiter?.resume(returning: nil)
+        }
+
+        var coalescedCountSnapshot: Int {
+            lock.lock()
+            let count = coalescedCount
+            lock.unlock()
+            return count
+        }
+    }
+
+    private let lock = NSLock()
+    private let merge: @Sendable (Element, Element) -> Element
+    private var mailboxes: [UUID: Mailbox] = [:]
+
+    init(merge: @escaping @Sendable (Element, Element) -> Element) {
+        self.merge = merge
+    }
+
+    func stream() -> AsyncStream<Element> {
+        let id = UUID()
+        let mailbox = Mailbox(merge: merge)
+        lock.lock()
+        mailboxes[id] = mailbox
+        lock.unlock()
+        return AsyncStream(
+            unfolding: {
+                await mailbox.next()
+            },
+            onCancel: { [weak self] in
+                self?.removeMailbox(id)
+            }
+        )
+    }
+
+    func yield(_ value: Element) {
+        lock.lock()
+        let mailboxes = Array(mailboxes.values)
+        lock.unlock()
+        for mailbox in mailboxes {
+            mailbox.push(value)
+        }
+    }
+
+    func finish() {
+        lock.lock()
+        let mailboxes = Array(mailboxes.values)
+        self.mailboxes.removeAll()
+        lock.unlock()
+        for mailbox in mailboxes {
+            mailbox.finish()
+        }
+    }
+
+    var coalescedCount: Int {
+        lock.lock()
+        let count = mailboxes.values.reduce(0) { $0 + $1.coalescedCountSnapshot }
+        lock.unlock()
+        return count
+    }
+
+    private func removeMailbox(_ id: UUID) {
+        lock.lock()
+        let mailbox = mailboxes.removeValue(forKey: id)
+        lock.unlock()
+        mailbox?.finish()
+    }
+}
+
 struct AnyCodingKey: CodingKey {
     var stringValue: String
     var intValue: Int?

@@ -303,6 +303,52 @@ final class StoatRealtimeTests: XCTestCase {
         XCTAssertEqual(published?.snapshot.messagesByChannelID[channelID]?.map(\.id), [first.id, second.id])
     }
 
+    func testPendingRealtimeUpdatesCoalesceLatestSnapshotAndAllChanges() async {
+        let store = RealtimeStateStore()
+        var iterator = store.updates.makeAsyncIterator()
+        let firstChannelID: ChannelID = "coalesce-first"
+        let secondChannelID: ChannelID = "coalesce-second"
+        let first = Message(id: "coalesce-message-1", channelID: firstChannelID, authorID: "coalesce-user", content: "one")
+        let second = Message(id: "coalesce-message-2", channelID: secondChannelID, authorID: "coalesce-user", content: "two")
+
+        await store.apply(.message(first))
+        await store.apply(.message(second))
+        let published = await iterator.next()
+
+        XCTAssertEqual(published?.changes.messageChannelIDs, [firstChannelID, secondChannelID])
+        XCTAssertEqual(published?.changes.insertedMessages.map(\.id), [first.id, second.id])
+        XCTAssertEqual(published?.snapshot.messagesByChannelID[firstChannelID]?.map(\.id), [first.id])
+        XCTAssertEqual(published?.snapshot.messagesByChannelID[secondChannelID]?.map(\.id), [second.id])
+        XCTAssertEqual(store.coalescedUpdateCount, 1)
+    }
+
+    func testEmptyControlUpdateIsReturnedButNotPublished() async {
+        let store = RealtimeStateStore()
+        var iterator = store.updates.makeAsyncIterator()
+        let empty = await store.apply(.pong(data: 42))
+        let message = Message(id: "after-pong", channelID: "pong-channel", authorID: "pong-user", content: "visible")
+        await store.apply(.message(message))
+        let published = await iterator.next()
+
+        XCTAssertTrue(empty.changes.isEmpty)
+        XCTAssertEqual(published?.changes.insertedMessages.map(\.id), [message.id])
+    }
+
+    func testCoalescingInsertThenDeletePublishesNetDeletionWithoutStaleInsert() async {
+        let store = RealtimeStateStore()
+        var iterator = store.updates.makeAsyncIterator()
+        let channelID: ChannelID = "coalesce-delete-channel"
+        let message = Message(id: "coalesce-delete-message", channelID: channelID, authorID: "coalesce-user", content: "temporary")
+
+        await store.apply(.message(message))
+        await store.apply(.messageDelete(MessageDeleteEvent(id: message.id, channelID: channelID)))
+        let published = await iterator.next()
+
+        XCTAssertTrue(published?.changes.insertedMessages.isEmpty == true)
+        XCTAssertEqual(published?.changes.deletedMessageIDsByChannelID[channelID], [message.id])
+        XCTAssertTrue(published?.snapshot.messagesByChannelID[channelID]?.isEmpty != false)
+    }
+
     private func jsonObject(_ event: ClientGatewayEvent) throws -> [String: Any] {
         let data = try encoder.encode(event)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])

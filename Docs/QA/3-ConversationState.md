@@ -24,7 +24,8 @@ Categorical outcomes only. DM diagnostics stay redacted; no participant IDs or m
 | 7 | Receive unread server and DM messages; open the channels | Unread/mention badges clear only after successful ack; official client agrees | | |
 | 8 | Search loaded messages locally, then run selected-channel remote search for an unloaded message; open a result | Result opens via unified jump with highlight; remote authors resolve | | |
 | 9 | Jump from reply, pin, search, and unread entry points in one session | All routes go through the unified coordinator; unloaded targets fetch around-message; failures degrade to channel | | |
-| 10 | Copy Developer Verification diagnostics after this lane | DM trace and identity diagnostics stay redacted | | |
+| 10 | With history loaded, rapidly switch server channel → DM → group DM → Saved Notes while reactions and avatar/media loads arrive | Each route retains or prepares only its own groups, never shows the previous conversation, and does not restart completed history fetches for message mutations | | |
+| 11 | Copy Developer Verification diagnostics after this lane | DM trace, timeline presentation, realtime coalescing, and identity diagnostics stay redacted | | |
 
 ## Matrix Rows Unlocked
 

@@ -271,6 +271,14 @@ public enum ChannelMessageState: Equatable, Sendable {
     }
 }
 
+public enum ChannelMessageLoadOutcome: Equatable, Sendable {
+    case loaded(messageCount: Int)
+    case alreadyLoaded(messageCount: Int)
+    case deduplicated
+    case cancelled
+    case failed(message: String, cachedMessageCount: Int)
+}
+
 public struct ChannelMessageHistory: Hashable, Sendable {
     public var channelID: ChannelID
     public var messages: [TimelineMessage]
@@ -389,9 +397,11 @@ public enum ChannelMessageHistoryEvent: Hashable, Sendable {
     case initialLoadStarted
     case initialLoadSucceeded(messages: [Message], hasMoreBefore: Bool, loadedAt: Date)
     case initialLoadFailed(String)
+    case initialLoadCancelled
     case olderLoadStarted
     case olderLoadSucceeded(messages: [Message], hasMoreBefore: Bool, loadedAt: Date)
     case olderLoadFailed(String)
+    case olderLoadCancelled
     case snapshotMerged([Message])
     case optimisticSendCreated(TimelineMessage)
     case sendConfirmed(message: Message, nonce: String?)
@@ -426,6 +436,7 @@ public struct ChannelMessageHistoryReducer: Sendable {
         case .initialLoadStarted:
             history.isLoadingInitial = true
             history.errorMessage = nil
+            history.loadedRange.lastPaginationError = nil
         case let .initialLoadSucceeded(messages, hasMoreBefore, loadedAt):
             history.messages = merge(current: history.messages, incoming: messages)
             history.hasMoreBefore = hasMoreBefore
@@ -437,6 +448,8 @@ public struct ChannelMessageHistoryReducer: Sendable {
             history.isLoadingInitial = false
             history.errorMessage = message
             history.loadedRange.lastPaginationError = message
+        case .initialLoadCancelled:
+            history.isLoadingInitial = false
         case .olderLoadStarted:
             history.isLoadingOlder = true
             history.errorMessage = nil
@@ -452,6 +465,8 @@ public struct ChannelMessageHistoryReducer: Sendable {
             history.isLoadingOlder = false
             history.errorMessage = message
             history.loadedRange.lastPaginationError = message
+        case .olderLoadCancelled:
+            history.isLoadingOlder = false
         case let .snapshotMerged(messages):
             history.messages = merge(current: history.messages, incoming: messages)
             history.loadedRange = Self.loadedRange(for: history.messages, hasMoreBefore: history.hasMoreBefore, hasMoreAfter: history.loadedRange.hasMoreAfter, error: history.loadedRange.lastPaginationError)
@@ -938,7 +953,11 @@ public final class ChannelMessageController {
     @ObservationIgnored private let pageSize: Int
     @ObservationIgnored private let messageCapPerChannel: Int
     @ObservationIgnored private var reducer: ChannelMessageHistoryReducer
-    @ObservationIgnored private var loadTokens: [ChannelID: UUID] = [:]
+    @ObservationIgnored private var initialLoadTokens: [ChannelID: UUID] = [:]
+    @ObservationIgnored private var paginationLoadTokens: [ChannelID: UUID] = [:]
+    @ObservationIgnored private var initialLoadInFlightChannelIDs: Set<ChannelID> = []
+    @ObservationIgnored private var completedInitialLoadChannelIDs: Set<ChannelID> = []
+    @ObservationIgnored private var configuredLoadGeneration: Int?
     @ObservationIgnored private var presentationRevisionsByChannelID: [ChannelID: Int] = [:]
 
     public init(
@@ -961,10 +980,35 @@ public final class ChannelMessageController {
         self.lastErrorByChannelID = [:]
     }
 
-    public func configure(runtimeMode: AppRuntimeMode, apiClient: (any StoatAPIClient)?, currentUserID: UserID?) {
+    public func configure(
+        runtimeMode: AppRuntimeMode,
+        apiClient: (any StoatAPIClient)?,
+        currentUserID: UserID?,
+        loadGeneration: Int? = nil
+    ) {
+        let identityScopeChanged = self.runtimeMode != runtimeMode
+            || self.currentUserID != currentUserID
+        let loadScopeChanged = identityScopeChanged
+            || (self.apiClient == nil) != (apiClient == nil)
+            || configuredLoadGeneration != loadGeneration
+        if identityScopeChanged {
+            statesByChannelID.removeAll()
+            historiesByChannelID.removeAll()
+            sendingChannelIDs.removeAll()
+            retryingMessageIDs.removeAll()
+            lastErrorByChannelID.removeAll()
+            presentationRevisionsByChannelID.removeAll()
+        }
+        if loadScopeChanged {
+            initialLoadTokens.removeAll()
+            paginationLoadTokens.removeAll()
+            initialLoadInFlightChannelIDs.removeAll()
+            completedInitialLoadChannelIDs.removeAll()
+        }
         self.runtimeMode = runtimeMode
         self.apiClient = apiClient
         self.currentUserID = currentUserID
+        configuredLoadGeneration = loadGeneration
     }
 
     public func reset() {
@@ -973,7 +1017,11 @@ public final class ChannelMessageController {
         sendingChannelIDs.removeAll()
         retryingMessageIDs.removeAll()
         lastErrorByChannelID.removeAll()
-        loadTokens.removeAll()
+        initialLoadTokens.removeAll()
+        paginationLoadTokens.removeAll()
+        initialLoadInFlightChannelIDs.removeAll()
+        completedInitialLoadChannelIDs.removeAll()
+        configuredLoadGeneration = nil
         presentationRevisionsByChannelID.removeAll()
     }
 
@@ -999,17 +1047,42 @@ public final class ChannelMessageController {
         }
     }
 
-    public func loadInitialIfNeeded(channelID: ChannelID, snapshotMessages: [Message]) async {
-        if case .loaded = state(for: channelID), !snapshotMessages.isEmpty {
+    @discardableResult
+    public func loadInitialIfNeeded(channelID: ChannelID, snapshotMessages: [Message]) async -> ChannelMessageLoadOutcome {
+        if !snapshotMessages.isEmpty {
             mergeSnapshotMessages(snapshotMessages, channelID: channelID)
-            return
         }
-        await loadInitialMessages(channelID: channelID, snapshotMessages: snapshotMessages)
+        if completedInitialLoadChannelIDs.contains(channelID) {
+            return .alreadyLoaded(messageCount: state(for: channelID).timelineMessages.count)
+        }
+        if initialLoadInFlightChannelIDs.contains(channelID) {
+            return .deduplicated
+        }
+        return await performInitialLoad(channelID: channelID, snapshotMessages: snapshotMessages, force: false)
     }
 
-    public func loadInitialMessages(channelID: ChannelID, snapshotMessages: [Message]) async {
+    @discardableResult
+    public func loadInitialMessages(channelID: ChannelID, snapshotMessages: [Message]) async -> ChannelMessageLoadOutcome {
+        await performInitialLoad(channelID: channelID, snapshotMessages: snapshotMessages, force: true)
+    }
+
+    private func performInitialLoad(
+        channelID: ChannelID,
+        snapshotMessages: [Message],
+        force: Bool
+    ) async -> ChannelMessageLoadOutcome {
+        if !force, initialLoadInFlightChannelIDs.contains(channelID) {
+            return .deduplicated
+        }
         let token = UUID()
-        loadTokens[channelID] = token
+        initialLoadTokens[channelID] = token
+        initialLoadInFlightChannelIDs.insert(channelID)
+        lastErrorByChannelID[channelID] = nil
+        defer {
+            if initialLoadTokens[channelID] == token {
+                initialLoadInFlightChannelIDs.remove(channelID)
+            }
+        }
 
         if shouldUseLiveAPI, let apiClient {
             mergeSnapshotMessages(snapshotMessages, channelID: channelID)
@@ -1019,18 +1092,28 @@ public final class ChannelMessageController {
             setHistory(cachedHistory)
             do {
                 let fetched = try await apiClient.fetchMessages(channelID: channelID, before: nil, after: nil, limit: pageSize)
-                guard loadTokens[channelID] == token else { return }
+                guard initialLoadTokens[channelID] == token else { return .cancelled }
                 apply(.initialLoadSucceeded(messages: fetched, hasMoreBefore: fetched.count >= pageSize, loadedAt: Date()), channelID: channelID)
+                completedInitialLoadChannelIDs.insert(channelID)
                 lastErrorByChannelID[channelID] = nil
+                return .loaded(messageCount: state(for: channelID).timelineMessages.count)
             } catch {
-                guard loadTokens[channelID] == token else { return }
-                apply(.initialLoadFailed(error.userFacingMessage), channelID: channelID)
-                lastErrorByChannelID[channelID] = error.userFacingMessage
+                guard initialLoadTokens[channelID] == token else { return .cancelled }
+                if error is CancellationError || Task.isCancelled {
+                    apply(.initialLoadCancelled, channelID: channelID)
+                    return .cancelled
+                }
+                let message = error.userFacingMessage
+                apply(.initialLoadFailed(message), channelID: channelID)
+                lastErrorByChannelID[channelID] = message
+                return .failed(message: message, cachedMessageCount: state(for: channelID).timelineMessages.count)
             }
-            return
         }
 
         apply(.initialLoadSucceeded(messages: snapshotMessages, hasMoreBefore: false, loadedAt: Date()), channelID: channelID)
+        completedInitialLoadChannelIDs.insert(channelID)
+        lastErrorByChannelID[channelID] = nil
+        return .loaded(messageCount: state(for: channelID).timelineMessages.count)
     }
 
     @discardableResult
@@ -1040,17 +1123,21 @@ public final class ChannelMessageController {
         guard let before = current.map(\.message.id).sorted(by: messageIDChronologicalSort).first else { return false }
 
         let token = UUID()
-        loadTokens[channelID] = token
+        paginationLoadTokens[channelID] = token
         apply(.olderLoadStarted, channelID: channelID)
 
         do {
             let fetched = try await apiClient.fetchMessages(channelID: channelID, before: before, after: nil, limit: pageSize)
-            guard loadTokens[channelID] == token else { return false }
+            guard paginationLoadTokens[channelID] == token else { return false }
             apply(.olderLoadSucceeded(messages: fetched, hasMoreBefore: fetched.count >= pageSize, loadedAt: Date()), channelID: channelID)
             lastErrorByChannelID[channelID] = nil
             return true
         } catch {
-            guard loadTokens[channelID] == token else { return false }
+            guard paginationLoadTokens[channelID] == token else { return false }
+            if error is CancellationError || Task.isCancelled {
+                apply(.olderLoadCancelled, channelID: channelID)
+                return false
+            }
             apply(.olderLoadFailed(error.userFacingMessage), channelID: channelID)
             lastErrorByChannelID[channelID] = error.userFacingMessage
             return false
@@ -1061,7 +1148,7 @@ public final class ChannelMessageController {
     public func loadMessagesAround(channelID: ChannelID, targetMessageID: MessageID, limit: Int? = nil) async -> Bool {
         guard shouldUseLiveAPI, let apiClient else { return false }
         let token = UUID()
-        loadTokens[channelID] = token
+        paginationLoadTokens[channelID] = token
         apply(.olderLoadStarted, channelID: channelID)
 
         do {
@@ -1069,7 +1156,7 @@ public final class ChannelMessageController {
                 channelID: channelID,
                 options: MessageFetchOptions(nearby: targetMessageID, limit: limit ?? pageSize)
             )
-            guard loadTokens[channelID] == token else { return false }
+            guard paginationLoadTokens[channelID] == token else { return false }
             let hasMoreBefore = history(for: channelID).hasMoreBefore
             apply(.olderLoadSucceeded(messages: fetched, hasMoreBefore: hasMoreBefore, loadedAt: Date()), channelID: channelID)
             var updated = history(for: channelID)
@@ -1078,7 +1165,11 @@ public final class ChannelMessageController {
             lastErrorByChannelID[channelID] = nil
             return true
         } catch {
-            guard loadTokens[channelID] == token else { return false }
+            guard paginationLoadTokens[channelID] == token else { return false }
+            if error is CancellationError || Task.isCancelled {
+                apply(.olderLoadCancelled, channelID: channelID)
+                return false
+            }
             apply(.olderLoadFailed(error.userFacingMessage), channelID: channelID)
             lastErrorByChannelID[channelID] = error.userFacingMessage
             return false
@@ -1122,9 +1213,9 @@ public final class ChannelMessageController {
         return state
     }
 
-    public func refreshMessages(channelID: ChannelID, snapshotMessages: [Message]) async {
-        apply(.initialLoadStarted, channelID: channelID)
-        await loadInitialMessages(channelID: channelID, snapshotMessages: snapshotMessages)
+    @discardableResult
+    public func refreshMessages(channelID: ChannelID, snapshotMessages: [Message]) async -> ChannelMessageLoadOutcome {
+        await performInitialLoad(channelID: channelID, snapshotMessages: snapshotMessages, force: true)
     }
 
     public func sendMessage(
@@ -1418,6 +1509,10 @@ public final class AppSessionCoordinator {
     @ObservationIgnored private var connectionTask: Task<Void, Never>?
     @ObservationIgnored private var diagnosticsTask: Task<Void, Never>?
     @ObservationIgnored private var liveFirstStartupAttemptedEnvironmentIDs: Set<String>
+
+    public var coalescedRealtimeUpdateCount: Int {
+        realtimeStore?.coalescedUpdateCount ?? 0
+    }
 
     public init(
         tokenStore: any TokenStore = KeychainTokenStore(),

@@ -137,6 +137,37 @@ public struct TimelineRowPresentation: Hashable, Sendable, Identifiable {
     }
 }
 
+public enum TimelinePresentationState: Hashable, Sendable {
+    case idle
+    case preparing(channelID: ChannelID, loadedMessageCount: Int, visibleGroupCount: Int)
+    case ready(channelID: ChannelID, messageCount: Int, groupCount: Int)
+}
+
+public struct TimelinePresentationDiagnostics: Hashable, Sendable {
+    public var groupingBuildCount: Int
+    public var rowBuildCount: Int
+    public var cancellationCount: Int
+    public var staleResultDiscardCount: Int
+    public var visibleMessageCount: Int
+    public var visibleGroupCount: Int
+
+    public init(
+        groupingBuildCount: Int = 0,
+        rowBuildCount: Int = 0,
+        cancellationCount: Int = 0,
+        staleResultDiscardCount: Int = 0,
+        visibleMessageCount: Int = 0,
+        visibleGroupCount: Int = 0
+    ) {
+        self.groupingBuildCount = groupingBuildCount
+        self.rowBuildCount = rowBuildCount
+        self.cancellationCount = cancellationCount
+        self.staleResultDiscardCount = staleResultDiscardCount
+        self.visibleMessageCount = visibleMessageCount
+        self.visibleGroupCount = visibleGroupCount
+    }
+}
+
 public struct Phase51PerformanceDiagnostics: Hashable, Sendable {
     public var shellBuildCount: Int
     public var shellCacheHitCount: Int

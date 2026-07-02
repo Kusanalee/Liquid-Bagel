@@ -647,6 +647,59 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testInitialHistoryLoadSurvivesRealtimeMessageAndDeduplicatesConcurrentRequest() async {
+        let channelID: ChannelID = "history-interleave-channel"
+        let historical = message(id: ulid(milliseconds: 1_000), author: "a", channel: channelID)
+        let realtime = message(id: ulid(milliseconds: 2_000), author: "b", channel: channelID)
+        let api = RecordingAPIClient(
+            messagesByChannel: [channelID: [historical]],
+            fetchMessagesDelayNanoseconds: 40_000_000
+        )
+        let controller = ChannelMessageController(
+            runtimeMode: .liveManual,
+            apiClient: api,
+            currentUserID: "a"
+        )
+
+        async let initial = controller.loadInitialIfNeeded(channelID: channelID, snapshotMessages: [])
+        try? await Task.sleep(for: .milliseconds(10))
+        controller.hydrate(from: RealtimeSnapshot(messagesByChannelID: [channelID: [realtime]]))
+        let duplicate = await controller.loadInitialIfNeeded(channelID: channelID, snapshotMessages: [realtime])
+        let outcome = await initial
+
+        XCTAssertEqual(outcome, .loaded(messageCount: 2))
+        XCTAssertEqual(duplicate, .deduplicated)
+        XCTAssertEqual(
+            controller.state(for: channelID).timelineMessages.map(\.message.id),
+            [historical.id, realtime.id]
+        )
+        let fetchCount = await api.fetchMessagesCallCount
+        XCTAssertEqual(fetchCount, 1)
+    }
+
+    @MainActor
+    func testCancelledInitialHistoryLoadLeavesRecoverableNonErrorState() async {
+        let channelID: ChannelID = "history-cancel-channel"
+        let api = RecordingAPIClient(fetchMessagesDelayNanoseconds: 100_000_000)
+        let controller = ChannelMessageController(
+            runtimeMode: .liveManual,
+            apiClient: api,
+            currentUserID: "history-cancel-user"
+        )
+
+        let task = Task {
+            await controller.loadInitialIfNeeded(channelID: channelID, snapshotMessages: [])
+        }
+        try? await Task.sleep(for: .milliseconds(10))
+        task.cancel()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(controller.state(for: channelID), .empty)
+        XCTAssertNil(controller.lastErrorByChannelID[channelID])
+    }
+
+    @MainActor
     func testComposerDraftsSendSuccessAndEchoDedupe() async {
         let model = MainShellViewModel(snapshot: MockShellData.snapshot)
         let server = model.servers.first { $0.name == "Bagel Lab" }!
@@ -6056,6 +6109,7 @@ private actor RecordingAPIClient: StoatAPIClient {
     private var editedUsersByID: [UserID: User] = [:]
     private var profilesByUserID: [UserID: UserProfile]
     private let fetchError: (any Error & Sendable)?
+    private let fetchMessagesDelayNanoseconds: UInt64
     private let directMessagesFetchError: (any Error & Sendable)?
     private let openDirectMessageError: (any Error & Sendable)?
     private let openDirectMessageDelayNanoseconds: UInt64
@@ -6077,6 +6131,7 @@ private actor RecordingAPIClient: StoatAPIClient {
         openDirectMessagesByUserID: [UserID: Channel] = [:],
         profilesByUserID: [UserID: UserProfile] = [:],
         fetchError: (any Error & Sendable)? = nil,
+        fetchMessagesDelayNanoseconds: UInt64 = 0,
         directMessagesFetchError: (any Error & Sendable)? = nil,
         openDirectMessageError: (any Error & Sendable)? = nil,
         openDirectMessageDelayNanoseconds: UInt64 = 0,
@@ -6097,6 +6152,7 @@ private actor RecordingAPIClient: StoatAPIClient {
         self.openDirectMessagesByUserID = openDirectMessagesByUserID
         self.profilesByUserID = profilesByUserID
         self.fetchError = fetchError
+        self.fetchMessagesDelayNanoseconds = fetchMessagesDelayNanoseconds
         self.directMessagesFetchError = directMessagesFetchError
         self.openDirectMessageError = openDirectMessageError
         self.openDirectMessageDelayNanoseconds = openDirectMessageDelayNanoseconds
@@ -6275,6 +6331,9 @@ private actor RecordingAPIClient: StoatAPIClient {
 
     func fetchMessages(channelID: ChannelID, options: MessageFetchOptions) async throws -> [Message] {
         fetchMessagesCallCount += 1
+        if fetchMessagesDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: fetchMessagesDelayNanoseconds)
+        }
         if let fetchError {
             throw fetchError
         }
@@ -6303,6 +6362,9 @@ private actor RecordingAPIClient: StoatAPIClient {
 
     func fetchMessages(channelID: ChannelID, before: MessageID?, after: MessageID?, limit: Int?) async throws -> [Message] {
         fetchMessagesCallCount += 1
+        if fetchMessagesDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: fetchMessagesDelayNanoseconds)
+        }
         if let fetchError {
             throw fetchError
         }
@@ -7178,6 +7240,220 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         )
         XCTAssertEqual(model.phase51PerformanceDiagnostics.timelineBuildCount, firstBuildCount)
         XCTAssertGreaterThanOrEqual(model.phase51PerformanceDiagnostics.timelineCacheHitCount, 1)
+    }
+
+    @MainActor
+    func testTimelineGroupsStayVisibleAcrossMediaIdentityAndSnapshotInvalidation() async {
+        let currentUserID: UserID = "timeline-current"
+        let authorID: UserID = "timeline-author"
+        let channelID: ChannelID = "timeline-channel"
+        let message = Message(
+            id: "01J00000000000000000000991",
+            channelID: channelID,
+            authorID: authorID,
+            content: "still visible"
+        )
+        let channel = Channel(id: channelID, kind: .directMessage, recipients: [currentUserID, authorID])
+        var snapshot = RealtimeSnapshot(
+            usersByID: [
+                currentUserID: User(id: currentUserID, username: "current"),
+                authorID: User(id: authorID, username: "author")
+            ],
+            channelsByID: [channelID: channel],
+            messagesByChannelID: [channelID: [message]]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
+            snapshot: snapshot,
+            currentUser: snapshot.usersByID[currentUserID]
+        )
+        await model.prepareSelectedTimelinePresentation()
+        XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [message.id])
+
+        await model.clearImageMemoryCache()
+        XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [message.id])
+
+        snapshot.usersByID[authorID]?.displayName = "Updated Author"
+        model.replaceSnapshotForTesting(
+            snapshot,
+            changes: RealtimeSnapshotChangeSet(userIDs: [authorID])
+        )
+        XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [message.id])
+    }
+
+    @MainActor
+    func testSharedTimelineGroupingWorksForEveryConversationKind() async {
+        let currentUserID: UserID = "timeline-route-current"
+        let otherUserID: UserID = "timeline-route-other"
+        let serverID: ServerID = "timeline-route-server"
+        let routes: [(Channel, ShellSelection)] = [
+            (
+                Channel(id: "timeline-route-text", kind: .textChannel, serverID: serverID, name: "general"),
+                ShellSelection(space: .server(serverID), serverID: serverID, channelID: "timeline-route-text")
+            ),
+            (
+                Channel(id: "timeline-route-dm", kind: .directMessage, recipients: [currentUserID, otherUserID]),
+                ShellSelection(space: .directMessages, dmChannelID: "timeline-route-dm")
+            ),
+            (
+                Channel(id: "timeline-route-group", kind: .group, name: "Group", recipients: [currentUserID, otherUserID]),
+                ShellSelection(space: .directMessages, dmChannelID: "timeline-route-group")
+            ),
+            (
+                Channel(id: "timeline-route-saved", kind: .savedMessages, userID: currentUserID, recipients: [currentUserID]),
+                ShellSelection(space: .directMessages, dmChannelID: "timeline-route-saved")
+            )
+        ]
+
+        for (index, route) in routes.enumerated() {
+            let channel = route.0
+            let message = Message(
+                id: MessageID(rawValue: String(format: "01J%023d", 900 + index)),
+                channelID: channel.id,
+                authorID: otherUserID,
+                content: channel.kind.rawAPIValue
+            )
+            let server = Server(
+                id: serverID,
+                ownerID: currentUserID,
+                name: "Timeline",
+                channelIDs: channel.serverID == nil ? [] : [channel.id]
+            )
+            let snapshot = RealtimeSnapshot(
+                usersByID: [
+                    currentUserID: User(id: currentUserID, username: "current"),
+                    otherUserID: User(id: otherUserID, username: "other")
+                ],
+                serversByID: channel.serverID == nil ? [:] : [serverID: server],
+                channelsByID: [channel.id: channel],
+                messagesByChannelID: [channel.id: [message]]
+            )
+            let model = MainShellViewModel(
+                selection: route.1,
+                snapshot: snapshot,
+                currentUser: snapshot.usersByID[currentUserID]
+            )
+
+            await model.prepareSelectedTimelinePresentation()
+            XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [message.id])
+            await model.clearImageMemoryCache()
+            XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [message.id])
+        }
+    }
+
+    @MainActor
+    func testTimelineChannelSwitchNeverShowsPreviousConversationGroups() async {
+        let currentUserID: UserID = "timeline-switch-current"
+        let firstID: ChannelID = "timeline-switch-first"
+        let secondID: ChannelID = "timeline-switch-second"
+        let firstMessage = Message(id: "01J00000000000000000000981", channelID: firstID, authorID: currentUserID, content: "first")
+        let secondMessage = Message(id: "01J00000000000000000000982", channelID: secondID, authorID: currentUserID, content: "second")
+        let snapshot = RealtimeSnapshot(
+            usersByID: [currentUserID: User(id: currentUserID, username: "current")],
+            channelsByID: [
+                firstID: Channel(id: firstID, kind: .directMessage, recipients: [currentUserID]),
+                secondID: Channel(id: secondID, kind: .directMessage, recipients: [currentUserID])
+            ],
+            messagesByChannelID: [firstID: [firstMessage], secondID: [secondMessage]]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .directMessages, dmChannelID: firstID),
+            snapshot: snapshot,
+            currentUser: snapshot.usersByID[currentUserID]
+        )
+        await model.prepareSelectedTimelinePresentation()
+
+        model.selectChannel(secondID)
+        XCTAssertTrue(model.selectedTimelineMessageGroups.isEmpty)
+        await model.prepareSelectedTimelinePresentation()
+        XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [secondMessage.id])
+    }
+
+    @MainActor
+    func testRealtimeMessageMutationDoesNotRestartCompletedHistoryFetch() async {
+        let currentUserID: UserID = "timeline-fetch-current"
+        let channelID: ChannelID = "timeline-fetch-channel"
+        let message = Message(id: "01J00000000000000000000971", channelID: channelID, authorID: currentUserID, content: "hello")
+        let channel = Channel(id: channelID, kind: .directMessage, recipients: [currentUserID])
+        let snapshot = RealtimeSnapshot(
+            usersByID: [currentUserID: User(id: currentUserID, username: "current")],
+            channelsByID: [channelID: channel]
+        )
+        let api = RecordingAPIClient(messagesByChannel: [channelID: [message]])
+        let controller = ChannelMessageController(
+            runtimeMode: .liveManual,
+            apiClient: api,
+            currentUserID: currentUserID
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
+            snapshot: snapshot,
+            runtimeMode: .liveManual,
+            sessionState: .connected,
+            currentUser: snapshot.usersByID[currentUserID],
+            messageController: controller
+        )
+        model.selectChannel(channelID)
+        try? await Task.sleep(for: .milliseconds(30))
+
+        var updatedSnapshot = snapshot
+        var reacted = message
+        reacted.reactions["bagel"] = [currentUserID]
+        updatedSnapshot.messagesByChannelID[channelID] = [reacted]
+        model.replaceSnapshotForTesting(
+            updatedSnapshot,
+            changes: RealtimeSnapshotChangeSet(messageChannelIDs: [channelID])
+        )
+        try? await Task.sleep(for: .milliseconds(20))
+
+        let fetchCount = await api.fetchMessagesCallCount
+        XCTAssertEqual(fetchCount, 1)
+        XCTAssertEqual(model.selectedTimelineMessages.first?.message.reactions["bagel"], [currentUserID])
+    }
+
+    @MainActor
+    func testRealtimeDeleteRemovesMessageFromControllerAndVisibleGroups() async {
+        let currentUserID: UserID = "timeline-delete-current"
+        let channelID: ChannelID = "timeline-delete-channel"
+        let message = Message(id: "01J00000000000000000000961", channelID: channelID, authorID: currentUserID, content: "delete me")
+        let channel = Channel(id: channelID, kind: .directMessage, recipients: [currentUserID])
+        let snapshot = RealtimeSnapshot(
+            usersByID: [currentUserID: User(id: currentUserID, username: "current")],
+            channelsByID: [channelID: channel],
+            messagesByChannelID: [channelID: [message]]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
+            snapshot: snapshot,
+            currentUser: snapshot.usersByID[currentUserID]
+        )
+        await model.prepareSelectedTimelinePresentation()
+
+        var deletedSnapshot = snapshot
+        deletedSnapshot.messagesByChannelID[channelID] = []
+        model.replaceSnapshotForTesting(
+            deletedSnapshot,
+            changes: RealtimeSnapshotChangeSet(
+                messageChannelIDs: [channelID],
+                deletedMessageIDsByChannelID: [channelID: [message.id]]
+            )
+        )
+
+        XCTAssertTrue(model.selectedTimelineMessages.isEmpty)
+        XCTAssertTrue(model.selectedTimelineMessageGroups.isEmpty)
+    }
+
+    @MainActor
+    func testMessageControllerClearsCachedHistoryWhenUserScopeChanges() async {
+        let channelID: ChannelID = "timeline-scope-channel"
+        let message = Message(id: "01J00000000000000000000951", channelID: channelID, authorID: "first-user", content: "private")
+        let controller = ChannelMessageController(runtimeMode: .mock, currentUserID: "first-user")
+        _ = await controller.loadInitialMessages(channelID: channelID, snapshotMessages: [message])
+        XCTAssertTrue(controller.state(for: channelID).hasMessages)
+
+        controller.configure(runtimeMode: .liveManual, apiClient: nil, currentUserID: "second-user", loadGeneration: 1)
+
+        XCTAssertEqual(controller.state(for: channelID), .idle)
     }
 }
 

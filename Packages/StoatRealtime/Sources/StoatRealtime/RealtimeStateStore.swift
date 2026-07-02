@@ -119,6 +119,23 @@ public struct RealtimeSnapshotChangeSet: Hashable, Sendable {
             || !removedMemberKeys.isEmpty
     }
 
+    public var isEmpty: Bool {
+        !isFullReplacement
+            && userIDs.isEmpty
+            && serverIDs.isEmpty
+            && channelIDs.isEmpty
+            && messageChannelIDs.isEmpty
+            && insertedMessages.isEmpty
+            && deletedMessageIDsByChannelID.isEmpty
+            && memberKeys.isEmpty
+            && removedMemberKeys.isEmpty
+            && emojiIDs.isEmpty
+            && unreadChannelIDs.isEmpty
+            && typingChannelIDs.isEmpty
+            && !userSettingsChanged
+            && !policyChangesChanged
+    }
+
     public mutating func formUnion(_ other: RealtimeSnapshotChangeSet) {
         isFullReplacement = isFullReplacement || other.isFullReplacement
         userIDs.formUnion(other.userIDs)
@@ -147,15 +164,39 @@ public struct RealtimeSnapshotUpdate: Hashable, Sendable {
         self.snapshot = snapshot
         self.changes = changes
     }
+
+    public func coalescing(previous: RealtimeSnapshotUpdate) -> RealtimeSnapshotUpdate {
+        var changes = previous.changes
+        changes.formUnion(self.changes)
+        var seenInsertedMessageIDs: Set<MessageID> = []
+        changes.insertedMessages = changes.insertedMessages.filter { message in
+            guard snapshot.messagesByChannelID[message.channelID]?.contains(where: { $0.id == message.id }) == true else {
+                return false
+            }
+            return seenInsertedMessageIDs.insert(message.id).inserted
+        }
+        for (channelID, deletedMessageIDs) in changes.deletedMessageIDsByChannelID {
+            let liveMessageIDs = Set((snapshot.messagesByChannelID[channelID] ?? []).map(\.id))
+            changes.deletedMessageIDsByChannelID[channelID] = deletedMessageIDs.subtracting(liveMessageIDs)
+        }
+        changes.deletedMessageIDsByChannelID = changes.deletedMessageIDsByChannelID.filter { !$0.value.isEmpty }
+        return RealtimeSnapshotUpdate(snapshot: snapshot, changes: changes)
+    }
 }
 
 public actor RealtimeStateStore {
     public private(set) var currentSnapshot: RealtimeSnapshot
     public let messageCapPerChannel: Int
-    private let snapshotHub = StreamHub<RealtimeSnapshotUpdate>()
+    private let snapshotHub = CoalescingStreamHub<RealtimeSnapshotUpdate> { previous, latest in
+        latest.coalescing(previous: previous)
+    }
 
     public nonisolated var updates: AsyncStream<RealtimeSnapshotUpdate> {
-        snapshotHub.stream(bufferingPolicy: .bufferingNewest(1))
+        snapshotHub.stream()
+    }
+
+    public nonisolated var coalescedUpdateCount: Int {
+        snapshotHub.coalescedCount
     }
 
     public init(initialSnapshot: RealtimeSnapshot = RealtimeSnapshot(), messageCapPerChannel: Int = 200) {
@@ -172,7 +213,9 @@ public actor RealtimeStateStore {
         var changes = RealtimeSnapshotChangeSet()
         apply(event, changes: &changes)
         let update = RealtimeSnapshotUpdate(snapshot: currentSnapshot, changes: changes)
-        snapshotHub.yield(update)
+        if !changes.isEmpty {
+            snapshotHub.yield(update)
+        }
         return update
     }
 
