@@ -232,6 +232,38 @@ final class StoatModelsTests: XCTestCase {
         )
     }
 
+    func testPhase55GroupCreateDraftValidatesAndEncodesVerifiedFields() throws {
+        XCTAssertNil(GroupChannelCreateDraft(name: "   ").validatedForCreate)
+        XCTAssertNil(GroupChannelCreateDraft(name: String(repeating: "x", count: 33)).validatedForCreate)
+
+        let validated = try XCTUnwrap(
+            GroupChannelCreateDraft(
+                name: " Bagel Crew ",
+                description: "  ",
+                users: ["user-2", "user-3"]
+            ).validatedForCreate
+        )
+        XCTAssertEqual(validated.name, "Bagel Crew")
+        XCTAssertNil(validated.description)
+
+        let object = try encodedJSONObject(validated)
+        XCTAssertEqual(object["name"] as? String, "Bagel Crew")
+        XCTAssertEqual(object["users"] as? [String], ["user-2", "user-3"])
+        XCTAssertNil(object["description"])
+        XCTAssertNil(object["nsfw"])
+    }
+
+    func testPhase55SyncedSettingValueUsesTupleWireFormat() throws {
+        let json = Data(#"{"liquidbagel:preferences":[1700000000000,"{\"messageDensity\":\"compact\"}"]}"#.utf8)
+        let decoded = try JSONDecoder.stoat.decode([String: SyncedSettingValue].self, from: json)
+        XCTAssertEqual(decoded["liquidbagel:preferences"]?.timestamp, 1_700_000_000_000)
+        XCTAssertEqual(decoded["liquidbagel:preferences"]?.rawValue, #"{"messageDensity":"compact"}"#)
+
+        let encoded = try JSONEncoder.stoat.encode(decoded)
+        let redecoded = try JSONDecoder.stoat.decode([String: SyncedSettingValue].self, from: encoded)
+        XCTAssertEqual(redecoded, decoded)
+    }
+
     private func decodeFixture<T: Decodable>(_ type: T.Type, named name: String) throws -> T {
         let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json"))
         let data = try Data(contentsOf: url)

@@ -447,3 +447,31 @@ Phase 0 captures enough current API and client research to keep the native macOS
 - Notification self-test is an explicit settings action. It can request authorization, records before/after state, and schedules a local test only when the resulting status allows delivery.
 - Diagnostics include named `UNError.Code` values when UserNotifications reports them, plus sanitized bundle/signing/sandbox/app-path checklist data.
 - Current project inspection found no app-owned App Intents or Shortcuts implementation. `com.apple.linkd.autoShortcut` should be treated as system/Xcode noise unless future source inspection finds app-owned intent code.
+
+## Phase 55 Notes
+
+### Sources inspected
+
+- Generated API schema: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/schema.ts
+- Generated API routes: https://raw.githubusercontent.com/stoatchat/javascript-client-api/main/src/routes.ts
+
+### Verified group channel creation
+
+- `POST /channels/create` accepts `DataCreateGroup` and returns a `Channel` (Group variant).
+- `DataCreateGroup` fields: required `name` string, optional `description` string, optional `icon` attachment ID, optional `users` string array (defaults to empty; the schema notes the current user must be friends with these users), optional `nsfw` boolean.
+- The generated schema documents no explicit name-length bound; Liquid Bagel applies the conservative 1-32 character bound already used for server names.
+- `PUT /channels/{target}/recipients/{member}` and `DELETE /channels/{target}/recipients/{member}` exist for group member add/remove; both take no body and return no body. Group member management remains deferred beyond creation.
+
+### Custom status text finding
+
+- Custom status text uses the same verified `PATCH /users/{currentUserID}` route as presence, either with `status: { text, presence }` to set or `remove: ["StatusText"]` to clear.
+- Phase 55 wires the previously deferred text editing through this route with a conservative 128-character client bound.
+
+### Verified settings sync routes
+
+- Sources: generated routes/schema above, backend `crates/delta/src/routes/sync/set_settings.rs`, and official web client `packages/client/components/state/stores/Sync.ts`.
+- `POST /sync/settings/fetch` accepts `OptionsFetchSettings` (`{ "keys": [String] }`) and returns an object mapping each requested key to a `[timestamp, value]` tuple, where `timestamp` is epoch milliseconds and `value` is the previously uploaded string.
+- `POST /sync/settings/set?timestamp=<ms>` accepts a `HashMap<String, String>` body. The backend stores each key as `(timestamp, value)`, capping timestamps newer than the current server time and accepting older ones.
+- The official web client syncs the `ordering`, `notifications`, and `release-notes` keys with JSON-stringified values.
+- Liquid Bagel stores its allowlisted preference subset (message density, Liquid Glass transparency, inline image policy, notification preferences) under the namespaced `liquidbagel:preferences` key with explicit fetch/push only. Interpreting official-client keys remains deferred until their payload schemas are verified.
+- `GET /sync/unreads` also exists in the generated routes and remains unused because Ready unreads already cover it.

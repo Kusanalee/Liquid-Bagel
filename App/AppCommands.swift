@@ -12,6 +12,12 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("n", modifiers: [.command])
             .disabled(commandHandler?.canPerform(.openNewDirectMessage) == false)
+
+            Button("New Group") {
+                commandHandler?.perform(.openNewGroup)
+            }
+            .keyboardShortcut("n", modifiers: [.command, .shift])
+            .disabled(commandHandler?.canPerform(.openNewGroup) == false)
         }
 
         CommandGroup(after: .sidebar) {

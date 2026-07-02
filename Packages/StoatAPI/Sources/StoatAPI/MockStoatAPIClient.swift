@@ -6,6 +6,7 @@ public actor MockStoatAPIClient: StoatAPIClient {
     private var users: [UserID: User]
     private var servers: [Server]
     private var channels: [Channel]
+    private var syncedSettings: [String: SyncedSettingValue] = [:]
     private var messagesByChannel: [ChannelID: [Message]]
     private var invites: [InviteID: Invite]
     private var members: [MemberCompositeKey: ServerMember]
@@ -565,6 +566,39 @@ public actor MockStoatAPIClient: StoatAPIClient {
         servers.append(server)
         channels.append(channel)
         return ServerCreateResponse(server: server, channels: [channel])
+    }
+
+    public func fetchSyncedSettings(keys: [String]) async throws -> [String: SyncedSettingValue] {
+        syncedSettings.filter { keys.contains($0.key) }
+    }
+
+    public func setSyncedSettings(_ values: [String: String], timestamp: Int64) async throws {
+        // The verified backend caps future timestamps at the current server time.
+        let capped = min(timestamp, Int64(Date().timeIntervalSince1970 * 1000))
+        for (key, value) in values {
+            syncedSettings[key] = SyncedSettingValue(timestamp: capped, rawValue: value)
+        }
+    }
+
+    public func createGroupChannel(draft: GroupChannelCreateDraft) async throws -> Channel {
+        guard let validated = draft.validatedForCreate else {
+            throw StoatAPIError.invalidEnvironment("Group name must be 1 to 32 characters.")
+        }
+        let channelID = ChannelID(rawValue: "mock-group-\(channels.count + 1)")
+        var recipients = [currentUser.id]
+        recipients.append(contentsOf: validated.users.filter { $0 != currentUser.id })
+        let channel = Channel(
+            id: channelID,
+            kind: .group,
+            name: validated.name,
+            ownerID: currentUser.id,
+            description: validated.description,
+            active: true,
+            recipients: recipients,
+            nsfw: validated.nsfw ?? false
+        )
+        channels.append(channel)
+        return channel
     }
 
     public func fetchServer(id: ServerID, includeChannels: Bool = false) async throws -> ServerFetchResponse {

@@ -812,6 +812,33 @@ private struct AppearanceSettingsTab: View {
                 }
             }
 
+            Section("Cloud Sync") {
+                Text("Sync appearance and notification preferences across devices through your account. Fetch and push are explicit; nothing syncs automatically.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Fetch From Cloud") {
+                        Task { await viewModel.fetchCloudPreferences() }
+                    }
+                    .disabled(settingsSyncWorking)
+                    Button("Push To Cloud") {
+                        Task { await viewModel.pushCloudPreferences() }
+                    }
+                    .disabled(settingsSyncWorking)
+                    if case .staleRemote = viewModel.settingsSyncState {
+                        Button("Apply Older Cloud Copy") {
+                            Task { await viewModel.fetchCloudPreferences(applyOlder: true) }
+                        }
+                        .disabled(settingsSyncWorking)
+                    }
+                }
+                if let status = settingsSyncStatusText {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(settingsSyncStatusIsError ? .red : .secondary)
+                }
+            }
+
             if let error = connectionViewModel.errorMessage ?? viewModel.sessionCoordinator?.preferenceErrorMessage {
                 Section("Status") {
                     Text(error).foregroundStyle(.red)
@@ -823,6 +850,39 @@ private struct AppearanceSettingsTab: View {
 
     private var transparencyPercent: String {
         "\(Int((connectionViewModel.preferences.liquidGlassTransparency * 100).rounded()))%"
+    }
+
+    private var settingsSyncWorking: Bool {
+        viewModel.settingsSyncState == .working
+    }
+
+    private var settingsSyncStatusIsError: Bool {
+        if case .failed = viewModel.settingsSyncState { return true }
+        return false
+    }
+
+    private var settingsSyncStatusText: String? {
+        switch viewModel.settingsSyncState {
+        case .idle:
+            return nil
+        case .working:
+            return "Syncing..."
+        case let .applied(timestamp):
+            return "Applied cloud preferences from \(Self.syncTimestampText(timestamp))."
+        case let .pushed(timestamp):
+            return "Pushed preferences to the cloud at \(Self.syncTimestampText(timestamp))."
+        case let .staleRemote(timestamp):
+            return "The cloud copy from \(Self.syncTimestampText(timestamp)) is not newer than this device."
+        case .empty:
+            return "No cloud preferences are saved yet. Use Push To Cloud to create them."
+        case let .failed(message):
+            return message
+        }
+    }
+
+    private static func syncTimestampText(_ timestamp: Int64) -> String {
+        Date(timeIntervalSince1970: TimeInterval(timestamp) / 1000)
+            .formatted(date: .abbreviated, time: .shortened)
     }
 }
 

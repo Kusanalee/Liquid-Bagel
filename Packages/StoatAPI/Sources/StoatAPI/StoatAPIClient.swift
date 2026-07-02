@@ -44,6 +44,9 @@ public protocol StoatAPIClient: Sendable {
     func fetchServerInvites(serverID: ServerID) async throws -> [Invite]
     func deleteInvite(code: InviteCode) async throws
     func createServer(draft: ServerCreateDraft) async throws -> ServerCreateResponse
+    func createGroupChannel(draft: GroupChannelCreateDraft) async throws -> Channel
+    func fetchSyncedSettings(keys: [String]) async throws -> [String: SyncedSettingValue]
+    func setSyncedSettings(_ values: [String: String], timestamp: Int64) async throws
     func fetchServer(id: ServerID, includeChannels: Bool) async throws -> ServerFetchResponse
     func editServer(id: ServerID, draft: ServerEditDraft) async throws -> Server
     func createRole(serverID: ServerID, draft: RoleCreateDraft) async throws -> RoleCreateResponse
@@ -106,6 +109,18 @@ public extension StoatAPIClient {
 
     func fetchDirectMessages() async throws -> [Channel] {
         throw StoatAPIError.unimplementedEndpoint("Direct message listing is not implemented by this API client.")
+    }
+
+    func createGroupChannel(draft: GroupChannelCreateDraft) async throws -> Channel {
+        throw StoatAPIError.unimplementedEndpoint("Group channel creation is not implemented by this API client.")
+    }
+
+    func fetchSyncedSettings(keys: [String]) async throws -> [String: SyncedSettingValue] {
+        throw StoatAPIError.unimplementedEndpoint("Settings sync fetch is not implemented by this API client.")
+    }
+
+    func setSyncedSettings(_ values: [String: String], timestamp: Int64) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Settings sync set is not implemented by this API client.")
     }
 
     func openDirectMessage(userID: UserID) async throws -> Channel {
@@ -591,6 +606,40 @@ public actor LiveStoatAPIClient: StoatAPIClient {
                 method: .post,
                 path: "/servers/create",
                 body: .json(try encoder.encode(validated))
+            )
+        )
+    }
+
+    public func createGroupChannel(draft: GroupChannelCreateDraft) async throws -> Channel {
+        guard let validated = draft.validatedForCreate else {
+            throw StoatAPIError.invalidEnvironment("Group name must be 1 to 32 characters.")
+        }
+        return try await perform(
+            StoatRequest<Channel>(
+                method: .post,
+                path: "/channels/create",
+                body: .json(try encoder.encode(validated))
+            )
+        )
+    }
+
+    public func fetchSyncedSettings(keys: [String]) async throws -> [String: SyncedSettingValue] {
+        try await perform(
+            StoatRequest<[String: SyncedSettingValue]>(
+                method: .post,
+                path: "/sync/settings/fetch",
+                body: .json(try encoder.encode(SyncedSettingsFetchRequest(keys: keys)))
+            )
+        )
+    }
+
+    public func setSyncedSettings(_ values: [String: String], timestamp: Int64) async throws {
+        _ = try await perform(
+            StoatRequest<EmptyResponse>(
+                method: .post,
+                path: "/sync/settings/set",
+                queryItems: [URLQueryItem(name: "timestamp", value: String(timestamp))],
+                body: .json(try encoder.encode(values))
             )
         )
     }

@@ -3724,6 +3724,262 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase55CustomStatusTextSetPatchesStatusAndPreservesPresence() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", status: UserStatus(text: nil, presence: .idle), relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(currentUser: currentUser)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        model.customStatusDraft = "  Reviewing bagels  "
+        await model.submitCustomStatusDraft()
+
+        let drafts = await api.editedUserDrafts
+        XCTAssertEqual(drafts.count, 1)
+        XCTAssertEqual(drafts.first?.1.status?.text, "Reviewing bagels")
+        XCTAssertEqual(drafts.first?.1.status?.presence, .idle)
+        XCTAssertTrue(drafts.first?.1.remove.isEmpty ?? false)
+        XCTAssertEqual(model.currentUserForPresentation?.status?.text, "Reviewing bagels")
+        XCTAssertEqual(model.currentUserForPresentation?.status?.presence, .idle)
+        XCTAssertFalse(model.isPresentingCustomStatusEditor)
+    }
+
+    @MainActor
+    func testPhase55CustomStatusClearUsesRemoveStatusTextField() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", status: UserStatus(text: "old status", presence: .online), relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(currentUser: currentUser)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        await model.clearCustomStatus()
+
+        let drafts = await api.editedUserDrafts
+        XCTAssertEqual(drafts.count, 1)
+        XCTAssertNil(drafts.first?.1.status)
+        XCTAssertEqual(drafts.first?.1.remove, [.statusText])
+        XCTAssertNil(model.currentUserForPresentation?.status?.text)
+        XCTAssertEqual(model.currentUserForPresentation?.status?.presence, .online)
+    }
+
+    @MainActor
+    func testPhase55CustomStatusFailureRollsBackOptimisticText() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", status: UserStatus(text: "keep me", presence: .online), relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(currentUser: currentUser, editUserError: StoatAPIError.serverError(statusCode: 500, message: "nope"))
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        await model.setCurrentUserStatusText("new text")
+
+        let editCount = await api.editUserCallCount
+        XCTAssertEqual(editCount, 1)
+        XCTAssertEqual(model.currentUserForPresentation?.status?.text, "keep me")
+        XCTAssertNotNil(model.statusUpdateStatus)
+        XCTAssertTrue(model.statusUpdateStatus?.contains("failed") ?? false)
+    }
+
+    @MainActor
+    func testPhase55CustomStatusOverLimitAndUnchangedDraftsDoNotMutate() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", status: UserStatus(text: "same", presence: .online), relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(currentUser: currentUser)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        model.openCustomStatusEditor()
+        XCTAssertEqual(model.customStatusDraft, "same")
+        XCTAssertTrue(model.isPresentingCustomStatusEditor)
+
+        model.customStatusDraft = String(repeating: "x", count: MainShellViewModel.customStatusTextLimit + 1)
+        await model.submitCustomStatusDraft()
+        XCTAssertTrue(model.isPresentingCustomStatusEditor)
+
+        model.customStatusDraft = "same"
+        await model.submitCustomStatusDraft()
+
+        let editCount = await api.editUserCallCount
+        XCTAssertEqual(editCount, 0)
+        XCTAssertFalse(model.isPresentingCustomStatusEditor)
+    }
+
+    @MainActor
+    func testPhase55CreateGroupMergesChannelAndSelectsConversation() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(currentUser: currentUser)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        model.openNewGroup()
+        XCTAssertTrue(model.isPresentingNewGroup)
+        model.groupCreateName = " Bagel Crew "
+        model.toggleNewGroupCandidate("phase55-friend-b")
+        model.toggleNewGroupCandidate("phase55-friend-a")
+        await model.createGroupFromDraft()
+
+        let drafts = await api.createdGroupDrafts
+        XCTAssertEqual(drafts.count, 1)
+        XCTAssertEqual(drafts.first?.name, "Bagel Crew")
+        XCTAssertEqual(drafts.first?.users, ["phase55-friend-a", "phase55-friend-b"])
+        guard case let .created(channelID) = model.groupCreateState else {
+            XCTFail("Expected created state, got \(model.groupCreateState)")
+            return
+        }
+        XCTAssertFalse(model.isPresentingNewGroup)
+        XCTAssertEqual(model.selectedConversationChannelID, channelID)
+        XCTAssertEqual(model.snapshot.channelsByID[channelID]?.kind, .group)
+        XCTAssertEqual(model.snapshot.channelsByID[channelID]?.name, "Bagel Crew")
+        XCTAssertTrue(model.groupCreateName.isEmpty)
+        XCTAssertTrue(model.groupCreateSelectedUserIDs.isEmpty)
+    }
+
+    @MainActor
+    func testPhase55CreateGroupFailureKeepsDraftAndReportsSafeError() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(
+            currentUser: currentUser,
+            createGroupError: StoatAPIError.serverError(statusCode: 500, message: "nope")
+        )
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        model.openNewGroup()
+        model.groupCreateName = "Bagel Crew"
+        model.toggleNewGroupCandidate("phase55-friend-a")
+        await model.createGroupFromDraft()
+
+        guard case let .failed(message) = model.groupCreateState else {
+            XCTFail("Expected failed state, got \(model.groupCreateState)")
+            return
+        }
+        XCTAssertFalse(message.contains("500"))
+        XCTAssertTrue(model.isPresentingNewGroup)
+        XCTAssertEqual(model.groupCreateName, "Bagel Crew")
+        XCTAssertEqual(model.groupCreateSelectedUserIDs, ["phase55-friend-a"])
+
+        model.groupCreateName = "   "
+        await model.createGroupFromDraft()
+        let draftCount = await api.createdGroupDrafts.count
+        XCTAssertEqual(draftCount, 1)
+        if case .failed = model.groupCreateState {} else {
+            XCTFail("Empty group name should fail validation")
+        }
+    }
+
+    @MainActor
+    func testPhase55CloudPreferencesFetchAppliesNewerRemote() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let remote = SyncedClientPreferences(
+            messageDensity: .compact,
+            liquidGlassTransparency: 0.4,
+            inlineImagePreviewPolicy: .explicitClickOnly
+        )
+        let payload = String(decoding: try JSONEncoder().encode(remote), as: UTF8.self)
+        let api = RecordingAPIClient(
+            currentUser: currentUser,
+            syncedSettings: [MainShellViewModel.cloudPreferencesKey: SyncedSettingValue(timestamp: 200, rawValue: payload)]
+        )
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        await model.fetchCloudPreferences()
+
+        let fetchedKeys = await api.fetchedSettingsKeys
+        XCTAssertEqual(fetchedKeys, [[MainShellViewModel.cloudPreferencesKey]])
+        XCTAssertEqual(model.settingsSyncState, .applied(200))
+        XCTAssertEqual(model.messageDensity, .compact)
+        XCTAssertEqual(model.liquidGlassTransparency, 0.4, accuracy: 0.001)
+        XCTAssertEqual(model.inlineImagePreviewPolicy, .explicitClickOnly)
+    }
+
+    @MainActor
+    func testPhase55CloudPreferencesStaleRemoteRequiresExplicitApply() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let newer = SyncedClientPreferences(messageDensity: .compact)
+        let older = SyncedClientPreferences(messageDensity: .comfortable, liquidGlassTransparency: 0.3)
+        let api = RecordingAPIClient(
+            currentUser: currentUser,
+            syncedSettings: [
+                MainShellViewModel.cloudPreferencesKey: SyncedSettingValue(
+                    timestamp: 200,
+                    rawValue: String(decoding: try JSONEncoder().encode(newer), as: UTF8.self)
+                )
+            ]
+        )
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        await model.fetchCloudPreferences()
+        XCTAssertEqual(model.settingsSyncState, .applied(200))
+        XCTAssertEqual(model.messageDensity, .compact)
+
+        await api.overrideSyncedSetting(
+            key: MainShellViewModel.cloudPreferencesKey,
+            value: SyncedSettingValue(timestamp: 100, rawValue: String(decoding: try JSONEncoder().encode(older), as: UTF8.self))
+        )
+        await model.fetchCloudPreferences()
+        XCTAssertEqual(model.settingsSyncState, .staleRemote(100))
+        XCTAssertEqual(model.messageDensity, .compact)
+
+        await model.fetchCloudPreferences(applyOlder: true)
+        XCTAssertEqual(model.settingsSyncState, .applied(100))
+        XCTAssertEqual(model.messageDensity, .comfortable)
+        XCTAssertEqual(model.liquidGlassTransparency, 0.3, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testPhase55CloudPreferencesPushSendsAllowlistedPayloadAndEmptyStateReports() async throws {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(currentUser: currentUser)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        await model.fetchCloudPreferences()
+        XCTAssertEqual(model.settingsSyncState, .empty)
+
+        model.messageDensity = .compact
+        model.liquidGlassTransparency = 0.5
+        await model.pushCloudPreferences()
+
+        let payloads = await api.setSettingsPayloads
+        XCTAssertEqual(payloads.count, 1)
+        let payload = try XCTUnwrap(payloads.first)
+        XCTAssertGreaterThan(payload.timestamp, 0)
+        XCTAssertEqual(model.settingsSyncState, .pushed(payload.timestamp))
+        let raw = try XCTUnwrap(payload.values[MainShellViewModel.cloudPreferencesKey])
+        let decoded = try JSONDecoder().decode(SyncedClientPreferences.self, from: Data(raw.utf8))
+        XCTAssertEqual(decoded.messageDensity, .compact)
+        XCTAssertEqual(decoded.liquidGlassTransparency, 0.5, accuracy: 0.001)
+        XCTAssertNil(raw.range(of: "environmentProfiles"))
+        XCTAssertNil(raw.range(of: "lastSelected"))
+    }
+
+    @MainActor
+    func testPhase55CloudPreferencesFailureReportsSafeError() async {
+        var snapshot = RealtimeSnapshot()
+        let currentUser = User(id: "phase55-me", username: "me", relationship: .user)
+        snapshot.usersByID[currentUser.id] = currentUser
+        let api = RecordingAPIClient(
+            currentUser: currentUser,
+            settingsSyncError: StoatAPIError.serverError(statusCode: 500, message: "secret detail")
+        )
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        await model.fetchCloudPreferences()
+        guard case let .failed(message) = model.settingsSyncState else {
+            XCTFail("Expected failed state, got \(model.settingsSyncState)")
+            return
+        }
+        XCTAssertFalse(message.contains("500"))
+        XCTAssertFalse(message.contains("secret detail"))
+    }
+
+    @MainActor
     private func phase40LiveModel(snapshot: RealtimeSnapshot, currentUser: User, api: RecordingAPIClient) async -> MainShellViewModel {
         let coordinator = AppSessionCoordinator(
             tokenStore: InMemoryTokenStore(credential: .sessionToken("phase40-token")),
@@ -5787,6 +6043,9 @@ private actor RecordingAPIClient: StoatAPIClient {
     private(set) var removedReactions: [(ChannelID, MessageID, String)] = []
     private(set) var editedUserDrafts: [(UserID, UserEditDraft)] = []
     private(set) var uploadedFiles: [RecordedUpload] = []
+    private(set) var createdGroupDrafts: [GroupChannelCreateDraft] = []
+    private(set) var fetchedSettingsKeys: [[String]] = []
+    private(set) var setSettingsPayloads: [(values: [String: String], timestamp: Int64)] = []
 
     private let currentUser: User
     private var messagesByChannel: [ChannelID: [Message]]
@@ -5805,6 +6064,9 @@ private actor RecordingAPIClient: StoatAPIClient {
     private let editUserError: (any Error & Sendable)?
     private let uploadError: (any Error & Sendable)?
     private let uploadedFileIDsByTag: [UploadTag: FileID]
+    private let createGroupError: (any Error & Sendable)?
+    private var syncedSettings: [String: SyncedSettingValue]
+    private let settingsSyncError: (any Error & Sendable)?
 
     init(
         currentUser: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
@@ -5822,7 +6084,10 @@ private actor RecordingAPIClient: StoatAPIClient {
         memberFetchDelayNanoseconds: UInt64 = 0,
         editUserError: (any Error & Sendable)? = nil,
         uploadError: (any Error & Sendable)? = nil,
-        uploadedFileIDsByTag: [UploadTag: FileID] = [:]
+        uploadedFileIDsByTag: [UploadTag: FileID] = [:],
+        createGroupError: (any Error & Sendable)? = nil,
+        syncedSettings: [String: SyncedSettingValue] = [:],
+        settingsSyncError: (any Error & Sendable)? = nil
     ) {
         self.currentUser = currentUser
         self.messagesByChannel = messagesByChannel
@@ -5840,6 +6105,31 @@ private actor RecordingAPIClient: StoatAPIClient {
         self.editUserError = editUserError
         self.uploadError = uploadError
         self.uploadedFileIDsByTag = uploadedFileIDsByTag
+        self.createGroupError = createGroupError
+        self.syncedSettings = syncedSettings
+        self.settingsSyncError = settingsSyncError
+    }
+
+    func overrideSyncedSetting(key: String, value: SyncedSettingValue) {
+        syncedSettings[key] = value
+    }
+
+    func fetchSyncedSettings(keys: [String]) async throws -> [String: SyncedSettingValue] {
+        fetchedSettingsKeys.append(keys)
+        if let settingsSyncError {
+            throw settingsSyncError
+        }
+        return syncedSettings.filter { keys.contains($0.key) }
+    }
+
+    func setSyncedSettings(_ values: [String: String], timestamp: Int64) async throws {
+        setSettingsPayloads.append((values: values, timestamp: timestamp))
+        if let settingsSyncError {
+            throw settingsSyncError
+        }
+        for (key, value) in values {
+            syncedSettings[key] = SyncedSettingValue(timestamp: timestamp, rawValue: value)
+        }
     }
 
     func fetchRootConfiguration() async throws -> StoatConfig {
@@ -5849,6 +6139,23 @@ private actor RecordingAPIClient: StoatAPIClient {
     func fetchCurrentUser() async throws -> User {
         fetchCurrentUserCallCount += 1
         return currentUser
+    }
+
+    func createGroupChannel(draft: GroupChannelCreateDraft) async throws -> Channel {
+        createdGroupDrafts.append(draft)
+        if let createGroupError {
+            throw createGroupError
+        }
+        var recipients = [currentUser.id]
+        recipients.append(contentsOf: draft.users.filter { $0 != currentUser.id })
+        return Channel(
+            id: ChannelID(rawValue: "recorded-group-\(createdGroupDrafts.count)"),
+            kind: .group,
+            name: draft.trimmedName,
+            ownerID: currentUser.id,
+            active: true,
+            recipients: recipients
+        )
     }
 
     func editUser(userID: UserID, draft: UserEditDraft) async throws -> User {

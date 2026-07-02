@@ -311,6 +311,65 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(deleteRequest.url?.path, "/custom/emoji/emoji-1")
     }
 
+    func testPhase55GroupChannelCreateEndpointRequest() async throws {
+        let groupJSON = Data(#"{"_id":"group-1","channel_type":"Group","name":"Bagel Crew","owner":"me","recipients":["me","user-2"]}"#.utf8)
+        let transport = RecordingHTTPTransport(data: groupJSON)
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        let channel = try await client.createGroupChannel(
+            draft: GroupChannelCreateDraft(name: " Bagel Crew ", users: ["user-2"])
+        )
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let body = String(data: try XCTUnwrap(request.httpBody), encoding: .utf8)
+        XCTAssertEqual(channel.id, "group-1")
+        XCTAssertEqual(channel.kind, .group)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/channels/create")
+        XCTAssertTrue(body?.contains(#""name":"Bagel Crew""#) == true)
+        XCTAssertTrue(body?.contains(#""users":["user-2"]"#) == true)
+
+        do {
+            _ = try await client.createGroupChannel(draft: GroupChannelCreateDraft(name: "   "))
+            XCTFail("Invalid group name should throw before any request")
+        } catch {
+            // expected: validation failure without a network request
+        }
+    }
+
+    func testPhase55SettingsSyncEndpointRequests() async throws {
+        let fetchTransport = RecordingHTTPTransport(data: Data(#"{"liquidbagel:preferences":[1700000000000,"{}"]}"#.utf8))
+        let fetchClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: fetchTransport
+        )
+        let settings = try await fetchClient.fetchSyncedSettings(keys: ["liquidbagel:preferences"])
+        let capturedFetchRequest = await fetchTransport.lastRequest()
+        let fetchRequest = try XCTUnwrap(capturedFetchRequest)
+        let fetchBody = String(data: try XCTUnwrap(fetchRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(settings["liquidbagel:preferences"]?.timestamp, 1_700_000_000_000)
+        XCTAssertEqual(fetchRequest.httpMethod, "POST")
+        XCTAssertEqual(fetchRequest.url?.path, "/sync/settings/fetch")
+        XCTAssertTrue(fetchBody?.contains(#""keys":["liquidbagel:preferences"]"#) == true)
+
+        let setTransport = RecordingHTTPTransport(statusCode: 204)
+        let setClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: setTransport
+        )
+        try await setClient.setSyncedSettings(["liquidbagel:preferences": "{}"], timestamp: 1_700_000_000_123)
+        let capturedSetRequest = await setTransport.lastRequest()
+        let setRequest = try XCTUnwrap(capturedSetRequest)
+        let setBody = String(data: try XCTUnwrap(setRequest.httpBody), encoding: .utf8)
+        XCTAssertEqual(setRequest.httpMethod, "POST")
+        XCTAssertEqual(setRequest.url?.path, "/sync/settings/set")
+        XCTAssertEqual(setRequest.url?.query, "timestamp=1700000000123")
+        XCTAssertEqual(setBody, #"{"liquidbagel:preferences":"{}"}"#)
+    }
+
     func testPhase22DirectMessageAndProfileEndpointRequests() async throws {
         let profileTransport = RecordingHTTPTransport(data: Data(#"{"content":"hello"}"#.utf8))
         let profileClient = LiveStoatAPIClient(

@@ -317,6 +317,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public var inlineImagePreviewPolicy: InlineImagePreviewPolicy
     public var timelineTuning: TimelineTuningConfiguration
     public var notificationPreferences: NotificationPreferences
+    public var lastSettingsSyncTimestamp: Int64?
 
     private enum CodingKeys: String, CodingKey {
         case lastSelectedEnvironmentID
@@ -332,6 +333,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         case inlineImagePreviewPolicy
         case timelineTuning
         case notificationPreferences
+        case lastSettingsSyncTimestamp
     }
 
     public init(
@@ -347,7 +349,8 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         liquidGlassTransparency: Double = 1.0,
         inlineImagePreviewPolicy: InlineImagePreviewPolicy = .automaticSmallImages,
         timelineTuning: TimelineTuningConfiguration = .defaults,
-        notificationPreferences: NotificationPreferences = .defaults
+        notificationPreferences: NotificationPreferences = .defaults,
+        lastSettingsSyncTimestamp: Int64? = nil
     ) {
         self.lastSelectedEnvironmentID = lastSelectedEnvironmentID
         self.environmentProfiles = Self.normalizedProfiles(environmentProfiles)
@@ -362,6 +365,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.inlineImagePreviewPolicy = inlineImagePreviewPolicy
         self.timelineTuning = timelineTuning.validated()
         self.notificationPreferences = notificationPreferences.validated()
+        self.lastSettingsSyncTimestamp = lastSettingsSyncTimestamp
     }
 
     public init(from decoder: Decoder) throws {
@@ -380,7 +384,8 @@ public struct AppPreferences: Codable, Hashable, Sendable {
             liquidGlassTransparency: try container.decodeIfPresent(Double.self, forKey: .liquidGlassTransparency) ?? (legacyReduceGlassIntensity ? 0.35 : 1.0),
             inlineImagePreviewPolicy: try container.decodeIfPresent(InlineImagePreviewPolicy.self, forKey: .inlineImagePreviewPolicy) ?? .automaticSmallImages,
             timelineTuning: try container.decodeIfPresent(TimelineTuningConfiguration.self, forKey: .timelineTuning) ?? .defaults,
-            notificationPreferences: try container.decodeIfPresent(NotificationPreferences.self, forKey: .notificationPreferences) ?? .defaults
+            notificationPreferences: try container.decodeIfPresent(NotificationPreferences.self, forKey: .notificationPreferences) ?? .defaults,
+            lastSettingsSyncTimestamp: try container.decodeIfPresent(Int64.self, forKey: .lastSettingsSyncTimestamp)
         )
     }
 
@@ -399,6 +404,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         try container.encode(inlineImagePreviewPolicy, forKey: .inlineImagePreviewPolicy)
         try container.encode(timelineTuning.validated(), forKey: .timelineTuning)
         try container.encode(notificationPreferences.validated(), forKey: .notificationPreferences)
+        try container.encodeIfPresent(lastSettingsSyncTimestamp, forKey: .lastSettingsSyncTimestamp)
     }
 
     public static var defaults: AppPreferences {
@@ -574,6 +580,53 @@ public actor InMemoryAppPreferencesStore: AppPreferencesStore {
 
     public func resetPreferences() async throws {
         preferences = .defaults
+    }
+}
+
+/// The allowlisted preference subset synced through the verified `/sync/settings` routes.
+/// Environment profiles, launch mode, developer flags, and last-selected IDs intentionally never sync.
+public struct SyncedClientPreferences: Codable, Hashable, Sendable {
+    public var messageDensity: MessageDensityPreference
+    public var liquidGlassTransparency: Double
+    public var inlineImagePreviewPolicy: InlineImagePreviewPolicy
+    public var notificationPreferences: NotificationPreferences
+
+    public init(
+        messageDensity: MessageDensityPreference = .comfortable,
+        liquidGlassTransparency: Double = 1.0,
+        inlineImagePreviewPolicy: InlineImagePreviewPolicy = .automaticSmallImages,
+        notificationPreferences: NotificationPreferences = .defaults
+    ) {
+        self.messageDensity = messageDensity
+        self.liquidGlassTransparency = AppPreferences.clampedLiquidGlassTransparency(liquidGlassTransparency)
+        self.inlineImagePreviewPolicy = inlineImagePreviewPolicy
+        self.notificationPreferences = notificationPreferences.validated()
+    }
+
+    public init(preferences: AppPreferences) {
+        self.init(
+            messageDensity: preferences.messageDensity,
+            liquidGlassTransparency: preferences.liquidGlassTransparency,
+            inlineImagePreviewPolicy: preferences.inlineImagePreviewPolicy,
+            notificationPreferences: preferences.notificationPreferences
+        )
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            messageDensity: try container.decodeIfPresent(MessageDensityPreference.self, forKey: .messageDensity) ?? .comfortable,
+            liquidGlassTransparency: try container.decodeIfPresent(Double.self, forKey: .liquidGlassTransparency) ?? 1.0,
+            inlineImagePreviewPolicy: try container.decodeIfPresent(InlineImagePreviewPolicy.self, forKey: .inlineImagePreviewPolicy) ?? .automaticSmallImages,
+            notificationPreferences: try container.decodeIfPresent(NotificationPreferences.self, forKey: .notificationPreferences) ?? .defaults
+        )
+    }
+
+    public func apply(to preferences: inout AppPreferences) {
+        preferences.messageDensity = messageDensity
+        preferences.liquidGlassTransparency = AppPreferences.clampedLiquidGlassTransparency(liquidGlassTransparency)
+        preferences.inlineImagePreviewPolicy = inlineImagePreviewPolicy
+        preferences.notificationPreferences = notificationPreferences.validated()
     }
 }
 

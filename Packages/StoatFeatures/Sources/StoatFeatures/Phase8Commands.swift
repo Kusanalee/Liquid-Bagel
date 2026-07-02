@@ -30,6 +30,7 @@ public enum AppCommand: Hashable, Sendable {
     case jumpToFriends
     case jumpToAddFriend
     case openNewDirectMessage
+    case openNewGroup
     case jumpToDiscover
     case openJoinInvite
     case openCreateServer

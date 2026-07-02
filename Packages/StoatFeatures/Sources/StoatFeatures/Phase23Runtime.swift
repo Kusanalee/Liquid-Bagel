@@ -44,6 +44,23 @@ public enum ServerCreateState: Hashable, Sendable {
     case failed(String)
 }
 
+public enum GroupCreateState: Hashable, Sendable {
+    case idle
+    case creating
+    case created(ChannelID)
+    case failed(String)
+}
+
+public enum SettingsSyncState: Hashable, Sendable {
+    case idle
+    case working
+    case applied(Int64)
+    case pushed(Int64)
+    case staleRemote(Int64)
+    case empty
+    case failed(String)
+}
+
 public enum InviteManagementState: Hashable, Sendable {
     case idle
     case loading

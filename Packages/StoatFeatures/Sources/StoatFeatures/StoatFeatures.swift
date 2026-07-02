@@ -621,6 +621,15 @@ public final class MainShellViewModel {
     public var statusUpdateStatus: String?
     public var pendingRelationshipAction: PendingRelationshipAction?
     public var isPresentingNewDirectMessage = false
+    public var isPresentingCustomStatusEditor = false
+    public var customStatusDraft = ""
+    public var isPresentingNewGroup = false
+    public var groupCreateName = ""
+    public var groupCreateSearch = ""
+    public var groupCreateSelectedUserIDs: Set<UserID> = []
+    public var groupCreateState: GroupCreateState = .idle
+    public var settingsSyncState: SettingsSyncState = .idle
+    private var localSettingsSyncTimestamp: Int64?
     public var newDirectMessageSearch = ""
     public var isJoinInvitePresented = false
     public var inviteInput = ""
@@ -2326,6 +2335,62 @@ public final class MainShellViewModel {
         await openDirectMessage(with: userID, source: .newMessagePicker)
     }
 
+    /// Friends available to add to a new group, filtered by the group picker search text.
+    public var newGroupCandidates: [FriendListItem] {
+        let friends = shellPresentationSnapshot.allFriendItems.filter { $0.relationshipStatus == .friend }
+        let query = groupCreateSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return friends }
+        return friends.filter { item in
+            item.user.username.lowercased().contains(query) ||
+                (item.user.displayName?.lowercased().contains(query) ?? false)
+        }
+    }
+
+    public func openNewGroup() {
+        groupCreateName = ""
+        groupCreateSearch = ""
+        groupCreateSelectedUserIDs = []
+        groupCreateState = .idle
+        isPresentingNewDirectMessage = false
+        isPresentingNewGroup = true
+    }
+
+    public func toggleNewGroupCandidate(_ userID: UserID) {
+        if groupCreateSelectedUserIDs.contains(userID) {
+            groupCreateSelectedUserIDs.remove(userID)
+        } else {
+            groupCreateSelectedUserIDs.insert(userID)
+        }
+    }
+
+    public func createGroupFromDraft() async {
+        guard let apiClient = apiClientForCommunityAction() else {
+            groupCreateState = .failed("Reconnect before creating a group.")
+            return
+        }
+        let draft = GroupChannelCreateDraft(
+            name: groupCreateName,
+            users: groupCreateSelectedUserIDs.sorted { $0.rawValue < $1.rawValue }
+        )
+        guard let validated = draft.validatedForCreate else {
+            groupCreateState = .failed("Group name must be 1 to 32 characters.")
+            return
+        }
+        groupCreateState = .creating
+        do {
+            let channel = try await apiClient.createGroupChannel(draft: validated)
+            _ = mergeDMChannels([channel], source: effectiveRuntimeMode == .mock ? .mock : .explicit)
+            selectChannel(channel.id)
+            groupCreateState = .created(channel.id)
+            isPresentingNewGroup = false
+            groupCreateName = ""
+            groupCreateSearch = ""
+            groupCreateSelectedUserIDs = []
+        } catch {
+            groupCreateState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
     public func openSavedNotes(source: DMOpenSource = .savedNotes) async {
         guard let currentUserID else {
             relationshipActionStatus = "Sign in before opening Saved Notes."
@@ -2375,6 +2440,69 @@ public final class MainShellViewModel {
             let updated = try await apiClient.editUser(userID: userID, draft: UserEditDraft(status: UserStatus(text: existingStatus.text, presence: presence)))
             upsertUser(updated)
             statusUpdateStatus = "Status changed to \(presence.displayName)."
+            placeholderStatus = statusUpdateStatus
+        } catch {
+            if let originalUser {
+                upsertUser(originalUser)
+            }
+            statusUpdateStatus = "Status change failed: \(error.userFacingMessage)"
+            placeholderStatus = statusUpdateStatus
+        }
+    }
+
+    /// Maximum accepted custom status text length, matching the verified user edit schema bound.
+    public static let customStatusTextLimit = 128
+
+    public func openCustomStatusEditor() {
+        customStatusDraft = currentUserForPresentation?.status?.text ?? ""
+        isPresentingCustomStatusEditor = true
+    }
+
+    public func submitCustomStatusDraft() async {
+        let trimmed = customStatusDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count <= Self.customStatusTextLimit else {
+            statusUpdateStatus = "Custom status must be \(Self.customStatusTextLimit) characters or fewer."
+            placeholderStatus = statusUpdateStatus
+            return
+        }
+        isPresentingCustomStatusEditor = false
+        await setCurrentUserStatusText(trimmed.isEmpty ? nil : trimmed)
+    }
+
+    public func clearCustomStatus() async {
+        isPresentingCustomStatusEditor = false
+        await setCurrentUserStatusText(nil)
+    }
+
+    public func setCurrentUserStatusText(_ text: String?) async {
+        guard let userID = currentUserID,
+              let apiClient = apiClientForCommunityAction()
+        else {
+            statusUpdateStatus = "Reconnect before changing status."
+            placeholderStatus = statusUpdateStatus
+            return
+        }
+
+        let originalUser = currentUserForPresentation
+        let existingStatus = originalUser?.status ?? UserStatus()
+        guard text != existingStatus.text else { return }
+
+        var optimistic = originalUser ?? User(id: userID, username: UserDisplayResolver.shortenedID(userID))
+        optimistic.status = UserStatus(text: text, presence: existingStatus.presence)
+        upsertUser(optimistic)
+        statusUpdateStatus = text == nil ? "Clearing custom status..." : "Setting custom status..."
+        placeholderStatus = statusUpdateStatus
+
+        do {
+            let draft: UserEditDraft
+            if let text {
+                draft = UserEditDraft(status: UserStatus(text: text, presence: existingStatus.presence))
+            } else {
+                draft = UserEditDraft(remove: [.statusText])
+            }
+            let updated = try await apiClient.editUser(userID: userID, draft: draft)
+            upsertUser(updated)
+            statusUpdateStatus = text == nil ? "Custom status cleared." : "Custom status set."
             placeholderStatus = statusUpdateStatus
         } catch {
             if let originalUser {
@@ -8419,6 +8547,80 @@ public final class MainShellViewModel {
         saveNotificationPreferences(preferences)
     }
 
+    /// The namespaced `/sync/settings` key holding Liquid Bagel's allowlisted preferences.
+    public static let cloudPreferencesKey = "liquidbagel:preferences"
+
+    private var lastSettingsSyncTimestamp: Int64? {
+        sessionCoordinator?.preferences.lastSettingsSyncTimestamp ?? localSettingsSyncTimestamp
+    }
+
+    public func fetchCloudPreferences(applyOlder: Bool = false) async {
+        guard let apiClient = apiClientForCommunityAction() else {
+            settingsSyncState = .failed("Reconnect before syncing preferences.")
+            return
+        }
+        settingsSyncState = .working
+        do {
+            let response = try await apiClient.fetchSyncedSettings(keys: [Self.cloudPreferencesKey])
+            guard let value = response[Self.cloudPreferencesKey] else {
+                settingsSyncState = .empty
+                return
+            }
+            if let last = lastSettingsSyncTimestamp, value.timestamp <= last, !applyOlder {
+                settingsSyncState = .staleRemote(value.timestamp)
+                return
+            }
+            let synced = try JSONDecoder().decode(SyncedClientPreferences.self, from: Data(value.rawValue.utf8))
+            await applyCloudPreferences(synced, timestamp: value.timestamp)
+            settingsSyncState = .applied(value.timestamp)
+        } catch is DecodingError {
+            settingsSyncState = .failed("Cloud preferences are in an unrecognized format.")
+        } catch {
+            settingsSyncState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    public func pushCloudPreferences() async {
+        guard let apiClient = apiClientForCommunityAction() else {
+            settingsSyncState = .failed("Reconnect before syncing preferences.")
+            return
+        }
+        settingsSyncState = .working
+        let synced = SyncedClientPreferences(
+            messageDensity: messageDensity,
+            liquidGlassTransparency: liquidGlassTransparency,
+            inlineImagePreviewPolicy: inlineImagePreviewPolicy,
+            notificationPreferences: notificationPreferences
+        )
+        do {
+            let payload = String(decoding: try JSONEncoder().encode(synced), as: UTF8.self)
+            let timestamp = max(Int64(Date().timeIntervalSince1970 * 1000), (lastSettingsSyncTimestamp ?? 0) + 1)
+            try await apiClient.setSyncedSettings([Self.cloudPreferencesKey: payload], timestamp: timestamp)
+            localSettingsSyncTimestamp = timestamp
+            await sessionCoordinator?.updatePreferences { preferences in
+                preferences.lastSettingsSyncTimestamp = timestamp
+            }
+            settingsSyncState = .pushed(timestamp)
+        } catch {
+            settingsSyncState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    private func applyCloudPreferences(_ synced: SyncedClientPreferences, timestamp: Int64) async {
+        localSettingsSyncTimestamp = timestamp
+        if let sessionCoordinator {
+            await sessionCoordinator.updatePreferences { preferences in
+                synced.apply(to: &preferences)
+                preferences.lastSettingsSyncTimestamp = timestamp
+            }
+            syncFromSessionCoordinator()
+        } else {
+            messageDensity = synced.messageDensity
+            liquidGlassTransparency = AppPreferences.clampedLiquidGlassTransparency(synced.liquidGlassTransparency)
+            inlineImagePreviewPolicy = synced.inlineImagePreviewPolicy
+        }
+    }
+
     public func setSelectedChannelMuted(_ isMuted: Bool) {
         guard let channelID = selectedConversationChannelID else { return }
         phase44Diagnostics.muteSuppressionDecisionCounts[isMuted ? "localChannelMuteEnabled" : "localChannelMuteDisabled", default: 0] += 1
@@ -9983,7 +10185,7 @@ extension MainShellViewModel: AppCommandHandling {
             return true
         case .pasteAttachment:
             return selectedConversationChannelID != nil
-        case .openNewDirectMessage:
+        case .openNewDirectMessage, .openNewGroup:
             return canRefreshDMs
         case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions, .openMembers:
             return selection.serverID != nil
@@ -10098,6 +10300,8 @@ extension MainShellViewModel: AppCommandHandling {
             return "Select a channel before pasting an attachment."
         case .openNewDirectMessage:
             return "Connect before starting a direct message."
+        case .openNewGroup:
+            return "Connect before creating a group."
         case .openServerOverview, .openServerAppearance, .openCategoryEditor, .openRoles, .openPermissions, .openMembers:
             return "Select a server before opening server settings."
         case .openPermissionEditor:
@@ -10216,6 +10420,8 @@ extension MainShellViewModel: AppCommandHandling {
             openFriends(tab: .addFriend)
         case .openNewDirectMessage:
             openNewDirectMessage()
+        case .openNewGroup:
+            openNewGroup()
         case .jumpToDiscover:
             selectDiscover()
         case .openJoinInvite:
@@ -10931,6 +11137,12 @@ public struct MainShellView: View {
         }
         .sheet(isPresented: $viewModel.isPresentingNewDirectMessage) {
             NewDirectMessagePicker(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.isPresentingCustomStatusEditor) {
+            CustomStatusEditorView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.isPresentingNewGroup) {
+            CreateGroupChannelView(viewModel: viewModel)
         }
         .sheet(isPresented: $viewModel.isJoinInvitePresented) {
             JoinInviteView(viewModel: viewModel)
@@ -12160,6 +12372,19 @@ public struct ServerRailView: View {
             statusMenuButton(.focus)
             statusMenuButton(.busy)
             statusMenuButton(.invisible)
+            Divider()
+            Button {
+                viewModel.openCustomStatusEditor()
+            } label: {
+                Label(user.status?.text == nil ? "Set Custom Status..." : "Edit Custom Status...", systemImage: "text.bubble")
+            }
+            if user.status?.text != nil {
+                Button {
+                    Task { await viewModel.clearCustomStatus() }
+                } label: {
+                    Label("Clear Custom Status", systemImage: "xmark.circle")
+                }
+            }
         }
         .accessibilityLabel("Profile and status, \(user.status?.presence?.displayName ?? (user.online ? "Online" : "Offline"))")
         .accessibilityHint("Open your profile, or right click to change status")
@@ -14780,6 +15005,12 @@ public struct NewDirectMessagePicker: View {
                 Text("New Direct Message")
                     .font(.title2.weight(.semibold))
                 Spacer()
+                Button {
+                    viewModel.openNewGroup()
+                } label: {
+                    Label("New Group", systemImage: "person.3")
+                }
+                .accessibilityLabel("Create a new group")
                 Button("Close") { viewModel.isPresentingNewDirectMessage = false }
                     .keyboardShortcut(.cancelAction)
             }
@@ -14816,6 +15047,144 @@ public struct NewDirectMessagePicker: View {
         }
         .padding(StoatSpacing.large)
         .frame(width: 460, height: 420, alignment: .topLeading)
+    }
+}
+
+public struct CreateGroupChannelView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            HStack {
+                Text("New Group")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button("Close") { viewModel.isPresentingNewGroup = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            TextField("Group name", text: $viewModel.groupCreateName)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Group name")
+            TextField("Search friends to add", text: $viewModel.groupCreateSearch)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Search friends to add to the group")
+            let candidates = viewModel.newGroupCandidates
+            if candidates.isEmpty {
+                Text(viewModel.groupCreateSearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "Add friends to include them in a group."
+                    : "No friends match that search.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, StoatSpacing.medium)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: StoatSpacing.xSmall) {
+                        ForEach(candidates) { item in
+                            Button {
+                                viewModel.toggleNewGroupCandidate(item.user.id)
+                            } label: {
+                                HStack {
+                                    Image(systemName: viewModel.groupCreateSelectedUserIDs.contains(item.user.id) ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(viewModel.groupCreateSelectedUserIDs.contains(item.user.id) ? Color.accentColor : Color.secondary)
+                                    MemberRow(
+                                        user: item.user,
+                                        imageData: viewModel.imageData(for: item.user.avatar, kind: .userAvatar)
+                                    )
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("\(item.user.displayName ?? item.user.username), \(viewModel.groupCreateSelectedUserIDs.contains(item.user.id) ? "selected" : "not selected")")
+                            .onAppear { viewModel.loadImageResource(for: item.user.avatar, kind: .userAvatar) }
+                        }
+                    }
+                }
+            }
+            if case let .failed(message) = viewModel.groupCreateState {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Text("\(viewModel.groupCreateSelectedUserIDs.count) selected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    Task { await viewModel.createGroupFromDraft() }
+                } label: {
+                    Label("Create Group", systemImage: "person.3")
+                }
+                .buttonStyle(GlassButtonStyle())
+                .disabled(isCreating)
+            }
+        }
+        .padding(StoatSpacing.large)
+        .frame(width: 460, height: 480, alignment: .topLeading)
+    }
+
+    private var isCreating: Bool {
+        if case .creating = viewModel.groupCreateState { return true }
+        return false
+    }
+}
+
+public struct CustomStatusEditorView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            HStack {
+                Text("Custom Status")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button("Close") { viewModel.isPresentingCustomStatusEditor = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            TextField("What's happening?", text: $viewModel.customStatusDraft)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Custom status text")
+                .onSubmit {
+                    Task { await viewModel.submitCustomStatusDraft() }
+                }
+            HStack {
+                Text("\(viewModel.customStatusDraft.trimmingCharacters(in: .whitespacesAndNewlines).count)/\(MainShellViewModel.customStatusTextLimit)")
+                    .font(.caption)
+                    .foregroundStyle(isOverLimit ? .red : .secondary)
+                    .accessibilityLabel("Status length \(viewModel.customStatusDraft.count) of \(MainShellViewModel.customStatusTextLimit)")
+                Spacer()
+                Button("Clear") {
+                    Task { await viewModel.clearCustomStatus() }
+                }
+                .disabled(currentStatusText == nil && viewModel.customStatusDraft.isEmpty)
+                Button {
+                    Task { await viewModel.submitCustomStatusDraft() }
+                } label: {
+                    Label("Save", systemImage: "checkmark.circle")
+                }
+                .buttonStyle(GlassButtonStyle())
+                .keyboardShortcut(.defaultAction)
+                .disabled(isOverLimit)
+            }
+        }
+        .padding(StoatSpacing.large)
+        .frame(width: 420, alignment: .topLeading)
+    }
+
+    private var isOverLimit: Bool {
+        viewModel.customStatusDraft.trimmingCharacters(in: .whitespacesAndNewlines).count > MainShellViewModel.customStatusTextLimit
+    }
+
+    private var currentStatusText: String? {
+        viewModel.currentUserForPresentation?.status?.text
     }
 }
 
