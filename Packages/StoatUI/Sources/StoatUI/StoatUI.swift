@@ -12,6 +12,7 @@ import ImageIO
 #endif
 
 #if canImport(AVKit)
+import AVFoundation
 import AVKit
 #endif
 
@@ -2226,12 +2227,96 @@ public struct AttachmentPreviewPlaceholder: View {
 }
 
 #if canImport(AVKit)
+struct VideoPosterDiagnostics: Hashable, Sendable {
+    var cacheCount: Int
+    var byteCount: Int
+    var inFlightCount: Int
+}
+
+actor VideoPosterStore {
+    static let shared = VideoPosterStore()
+
+    private var posters: [URL: Data] = [:]
+    private var order: [URL] = []
+    private var inFlight: [URL: Task<Data?, Never>] = [:]
+    private var byteCount = 0
+    private let maxEntries: Int
+    private let maxBytes: Int
+
+    init(maxEntries: Int = 40, maxBytes: Int = 16 * 1024 * 1024) {
+        self.maxEntries = max(1, maxEntries)
+        self.maxBytes = max(1, maxBytes)
+    }
+
+    func poster(for url: URL) async -> Data? {
+        if let data = posters[url] {
+            order.removeAll { $0 == url }
+            order.append(url)
+            return data
+        }
+        if let task = inFlight[url] {
+            return await task.value
+        }
+        let task = Task.detached(priority: .utility) {
+            await Self.generatePoster(for: url)
+        }
+        inFlight[url] = task
+        let data = await task.value
+        inFlight[url] = nil
+        if let data {
+            insert(data, for: url)
+        }
+        return data
+    }
+
+    func insert(_ data: Data, for url: URL) {
+        if let previous = posters[url] {
+            byteCount -= previous.count
+        }
+        posters[url] = data
+        byteCount += data.count
+        order.removeAll { $0 == url }
+        order.append(url)
+        while (order.count > maxEntries || byteCount > maxBytes), let oldest = order.first {
+            order.removeFirst()
+            if let removed = posters.removeValue(forKey: oldest) {
+                byteCount -= removed.count
+            }
+        }
+    }
+
+    func cachedPoster(for url: URL) -> Data? {
+        posters[url]
+    }
+
+    func diagnostics() -> VideoPosterDiagnostics {
+        VideoPosterDiagnostics(cacheCount: posters.count, byteCount: byteCount, inFlightCount: inFlight.count)
+    }
+
+    private nonisolated static func generatePoster(for url: URL) async -> Data? {
+        let asset = AVURLAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 1_160, height: 760)
+        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceAfter = .positiveInfinity
+        do {
+            let result = try await generator.image(at: CMTime(seconds: 1, preferredTimescale: 600))
+            let representation = NSBitmapImageRep(cgImage: result.image)
+            return representation.representation(using: .jpeg, properties: [.compressionFactor: 0.72])
+        } catch {
+            return nil
+        }
+    }
+}
+
 public struct VideoAttachmentPlayer: View {
     private let url: URL
     private let isCompact: Bool
     private let maxWidth: CGFloat
     private let height: CGFloat
     @State private var player: AVPlayer?
+    @State private var posterData: Data?
 
     public init(url: URL, isCompact: Bool = false, maxWidth: CGFloat? = nil, height: CGFloat? = nil) {
         self.url = url
@@ -2253,6 +2338,11 @@ public struct VideoAttachmentPlayer: View {
                     ZStack {
                         RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
                             .fill(Color.black.opacity(0.85))
+                        if let posterData {
+                            DecodedDataImage(data: posterData, pixelSize: 1_160)
+                                .scaledToFill()
+                                .overlay(Color.black.opacity(0.28))
+                        }
                         VStack(spacing: StoatSpacing.small) {
                             Image(systemName: "play.circle.fill")
                                 .font(.system(size: 44))
@@ -2268,6 +2358,11 @@ public struct VideoAttachmentPlayer: View {
         .frame(maxWidth: maxWidth)
         .frame(height: height)
         .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        .task(id: url) {
+            guard player == nil else { return }
+            posterData = nil
+            posterData = await VideoPosterStore.shared.poster(for: url)
+        }
         .onDisappear {
             player?.pause()
             player?.replaceCurrentItem(with: nil)

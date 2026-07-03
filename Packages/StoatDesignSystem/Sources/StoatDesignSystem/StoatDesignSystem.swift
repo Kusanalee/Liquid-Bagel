@@ -348,6 +348,65 @@ public extension View {
     }
 }
 
+public struct StoatToolbarTitle: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private let title: String
+
+    public init(_ title: String) {
+        self.title = title
+    }
+
+    public var body: some View {
+        Text(title)
+            .font(.headline)
+            .lineLimit(1)
+            .padding(.horizontal, StoatSpacing.medium)
+            .padding(.vertical, StoatSpacing.small)
+            .modifier(AdaptiveToolbarTitleGlass())
+            .contentTransition(.interpolate)
+            .animation(StoatAnimation.allowed(reduceMotion, .snappy(duration: 0.22)), value: title)
+    }
+}
+
+private struct AdaptiveToolbarTitleGlass: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.stoatLiquidGlassTransparency) private var liquidGlassTransparency
+
+    func body(content: Content) -> some View {
+        let style = StoatMaterialStyle.resolved(
+            reduceTransparency: reduceTransparency,
+            increaseContrast: colorSchemeContrast == .increased,
+            liquidGlassTransparency: liquidGlassTransparency
+        )
+        if reduceTransparency || !style.usesMaterial {
+            content
+                .background(
+                    reduceTransparency
+                        ? Color(nsColor: .controlBackgroundColor)
+                        : Color.primary.opacity(style.backgroundOpacity),
+                    in: Capsule()
+                )
+                .overlay {
+                    Capsule()
+                        .strokeBorder(Color.primary.opacity(style.strokeOpacity), lineWidth: colorSchemeContrast == .increased ? 1.5 : 1)
+                }
+        } else if #available(macOS 26.0, *) {
+            content
+                .background(Color.primary.opacity(style.backgroundOpacity), in: Capsule())
+                .glassEffect(.regular, in: Capsule())
+        } else {
+            content
+                .background(.regularMaterial, in: Capsule())
+                .overlay {
+                    Capsule()
+                        .strokeBorder(Color.primary.opacity(style.strokeOpacity), lineWidth: colorSchemeContrast == .increased ? 1.5 : 1)
+                }
+        }
+    }
+}
+
 public struct GlassButtonStyle: ButtonStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 

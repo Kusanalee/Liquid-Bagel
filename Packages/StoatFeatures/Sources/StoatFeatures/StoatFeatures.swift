@@ -763,7 +763,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var imageResourceFailureDates: [ImageCacheKey: Date] = [:]
     @ObservationIgnored private var imagePresentationOrder: [ImageCacheKey] = []
     @ObservationIgnored private var imagePresentationByteCount = 0
-    @ObservationIgnored private let maxImagePresentationBytes = 32 * 1024 * 1024
+    @ObservationIgnored private let maxImagePresentationBytes = 64 * 1024 * 1024
     @ObservationIgnored private var attachmentPreviewOrder: [String] = []
     @ObservationIgnored private var attachmentPreviewByteCount = 0
     @ObservationIgnored private let maxAttachmentPreviewBytes = 64 * 1024 * 1024
@@ -771,6 +771,8 @@ public final class MainShellViewModel {
     @ObservationIgnored private let maxConcurrentInlinePreviewLoads = 6
     @ObservationIgnored private var imageResourceFailureCounts: [ImageCacheKey: Int] = [:]
     @ObservationIgnored private var queuedInlinePreviewItems: [AttachmentDisplayItem] = []
+    @ObservationIgnored private var deferredImageResourceRequests: [ImageCacheKey: ImageResourceRequest] = [:]
+    @ObservationIgnored private var deferredImageResourceDrainScheduled = false
     @ObservationIgnored private var lastRequestedDockBadgeValue: Int?
     @ObservationIgnored private var dockBadgeApplyTask: Task<Void, Never>?
     @ObservationIgnored private var pendingTimelineMediaInvalidation = false
@@ -783,6 +785,8 @@ public final class MainShellViewModel {
     @ObservationIgnored private var memberHydrationGenerations: [ServerID: Int] = [:]
     @ObservationIgnored private var hydratedMemberServerIDs: Set<ServerID> = []
     @ObservationIgnored private var restHydratedMembersByServerID: [ServerID: [ServerMemberKey: ServerMember]] = [:]
+    @ObservationIgnored private var restHydratedUsersByServerID: [ServerID: [UserID: User]] = [:]
+    @ObservationIgnored private var memberHydrationScope: String?
     @ObservationIgnored private var lastMemberHydrationRequestedAt: [ServerID: Date] = [:]
     @ObservationIgnored private var activeTypingChannelID: ChannelID?
     @ObservationIgnored private var lastTypingBeginAt: [ChannelID: Date] = [:]
@@ -2152,6 +2156,7 @@ public final class MainShellViewModel {
         phase52FreezeDiagnostics.memberHydrationCommitCount += 1
         phase52FreezeDiagnostics.identityBatchCommitCount += 1
         restHydratedMembersByServerID[serverID] = preparation.returnedMembersByKey
+        restHydratedUsersByServerID[serverID] = preparation.returnedUsersByID
         hydratedMemberServerIDs.insert(serverID)
         memberHydrationTasks[serverID] = nil
         memberHydrationLoadingServerIDs.remove(serverID)
@@ -2263,22 +2268,15 @@ public final class MainShellViewModel {
 
     private func cachedSelectedTimelineMessageGroups() -> [TimelineMessageGroup] {
         let messages = selectedTimelineMessages
-        guard selectedTimelineGroupCacheChannelID == selectedConversationChannelID else { return [] }
+        guard !messages.isEmpty else { return [] }
         if timelineGroupingCacheKey() == selectedTimelineGroupCacheKey {
             return selectedTimelineGroupCache
         }
-        let currentMessageIDs = Set(messages.map(\.message.id))
-        return selectedTimelineGroupCache.compactMap { group in
-            let retained = group.messages.filter { currentMessageIDs.contains($0.message.id) }
-            guard !retained.isEmpty else { return nil }
-            return TimelineMessageGroup(
-                id: group.id,
-                authorID: group.authorID,
-                channelID: group.channelID,
-                messages: retained,
-                startsAt: group.startsAt
-            )
-        }
+        // First paint must not wait for the detached presentation pass. Histories are capped
+        // at 250 messages, so this small pure grouping pass is cheap enough to render a newly
+        // selected channel or optimistic send immediately. The asynchronous preparer still
+        // owns the persistent cache and all heavier row presentation work.
+        return TimelineMessageGrouping.group(messages)
     }
 
     private func timelineGroupingCacheKey() -> String {
@@ -6036,6 +6034,16 @@ public final class MainShellViewModel {
 
     public func syncFromSessionCoordinator() {
         guard let sessionCoordinator else { return }
+        let nextMemberHydrationScope = [
+            String(describing: sessionCoordinator.mode),
+            sessionCoordinator.environment.stableID,
+            sessionCoordinator.currentUser?.id.rawValue ?? "no-user",
+            String(sessionCoordinator.liveConnectionGeneration)
+        ].joined(separator: "|")
+        if memberHydrationScope != nextMemberHydrationScope {
+            clearMemberHydrationOverlay()
+            memberHydrationScope = nextMemberHydrationScope
+        }
         let previousNotificationGeneration = notificationLiveConnectionGeneration
         runtimeMode = sessionCoordinator.mode
         sessionState = sessionCoordinator.sessionState
@@ -6827,7 +6835,30 @@ public final class MainShellViewModel {
 
     public func imageData(for file: File?, kind: ImageResourceKind) -> Data? {
         guard let file else { return nil }
-        return loadedImageResources[ImageCacheKey(id: file.id.rawValue, kind: kind)]
+        let key = ImageCacheKey(id: file.id.rawValue, kind: kind)
+        if let data = loadedImageResources[key] {
+            return data
+        }
+        if let request = imageResourceRequest(for: file, kind: kind) {
+            scheduleDeferredImageResourceRequest(request)
+        }
+        return nil
+    }
+
+    private func scheduleDeferredImageResourceRequest(_ request: ImageResourceRequest) {
+        deferredImageResourceRequests[request.cacheKey] = request
+        guard !deferredImageResourceDrainScheduled else { return }
+        deferredImageResourceDrainScheduled = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            let requests = Array(self.deferredImageResourceRequests.values)
+            self.deferredImageResourceRequests.removeAll()
+            self.deferredImageResourceDrainScheduled = false
+            for request in requests {
+                self.enqueueImageResourceRequest(request)
+            }
+        }
     }
 
     private func storeImagePresentationData(_ data: Data, for key: ImageCacheKey) {
@@ -6885,9 +6916,13 @@ public final class MainShellViewModel {
 
     public func loadImageResource(for file: File?, kind: ImageResourceKind) {
         guard let request = imageResourceRequest(for: file, kind: kind) else { return }
+        enqueueImageResourceRequest(request)
+    }
+
+    private func enqueueImageResourceRequest(_ request: ImageResourceRequest) {
         let key = request.cacheKey
         if freezePerformanceDiagnostics.mediaSafeModeEnabled,
-           kind == .attachmentPreview || kind == .customEmoji || kind == .profileBackground,
+           request.kind == .attachmentPreview || request.kind == .customEmoji || request.kind == .profileBackground,
            queuedImageResourceRequests.count > maxConcurrentImageResourceLoads * 2 {
             lastImageResourceAction = "Media-heavy safe mode: tap-to-load placeholder"
             return
@@ -6922,6 +6957,7 @@ public final class MainShellViewModel {
         imageResourceFailureDates.removeAll()
         imageResourceFailureCounts.removeAll()
         queuedImageResourceRequests.removeAll()
+        deferredImageResourceRequests.removeAll()
         invalidateTimelineMediaPresentation()
         lastImageResourceAction = "Cleared image memory cache"
     }
@@ -9786,15 +9822,50 @@ public final class MainShellViewModel {
     }
 
     private func reconcileHydratedMemberOverlay(with update: RealtimeSnapshotUpdate) {
-        guard !restHydratedMembersByServerID.isEmpty else { return }
+        guard !restHydratedMembersByServerID.isEmpty || !restHydratedUsersByServerID.isEmpty else { return }
+        let incomingUsers: [UserID: User]
+        if update.changes.isFullReplacement {
+            incomingUsers = update.snapshot.usersByID
+        } else {
+            incomingUsers = update.changes.userIDs.reduce(into: [:]) { result, userID in
+                result[userID] = update.snapshot.usersByID[userID]
+            }
+        }
+        for (userID, user) in incomingUsers {
+            for serverID in Array(restHydratedUsersByServerID.keys) where restHydratedUsersByServerID[serverID]?[userID] != nil {
+                // Gateway updates are authoritative for live presence/status and replace the
+                // stored REST copy so a later sparse gateway snapshot cannot regress them.
+                restHydratedUsersByServerID[serverID]?[userID] = user
+            }
+        }
         for key in update.changes.memberKeys where restHydratedMembersByServerID[key.serverID] != nil {
             if let member = update.snapshot.membersByServerAndUserID[key] {
                 restHydratedMembersByServerID[key.serverID]?[key] = member
             }
+            if let user = update.snapshot.usersByID[key.userID] {
+                restHydratedUsersByServerID[key.serverID, default: [:]][key.userID] = user
+            }
         }
         for key in update.changes.removedMemberKeys where restHydratedMembersByServerID[key.serverID] != nil {
             restHydratedMembersByServerID[key.serverID]?[key] = nil
+            restHydratedUsersByServerID[key.serverID]?[key.userID] = nil
         }
+    }
+
+    private func clearMemberHydrationOverlay() {
+        memberHydrationTasks.values.forEach { $0.cancel() }
+        memberHydrationTasks.removeAll()
+        memberHydrationGenerations.removeAll()
+        hydratedMemberServerIDs.removeAll()
+        restHydratedMembersByServerID.removeAll()
+        restHydratedUsersByServerID.removeAll()
+        lastMemberHydrationRequestedAt.removeAll()
+        memberHydrationLoadingServerIDs.removeAll()
+        memberHydrationErrorsByServerID.removeAll()
+        memberListGroupCacheKey = nil
+        memberListGroupCache.removeAll()
+        memberListLastGroupingServerID = nil
+        memberListGroupsRevision &+= 1
     }
 
     private func mergePhase43IdentityChanges(
@@ -9850,12 +9921,19 @@ public final class MainShellViewModel {
     }
 
     private func snapshotWithHydratedMemberOverlay(_ incoming: RealtimeSnapshot) -> RealtimeSnapshot {
-        guard !restHydratedMembersByServerID.isEmpty else { return incoming }
+        guard !restHydratedMembersByServerID.isEmpty || !restHydratedUsersByServerID.isEmpty else { return incoming }
         var copy = incoming
         for (serverID, hydratedMembers) in restHydratedMembersByServerID {
             copy.membersByServerAndUserID = copy.membersByServerAndUserID.filter { $0.key.serverID != serverID }
             for (key, member) in hydratedMembers {
                 copy.membersByServerAndUserID[key] = member
+            }
+        }
+        for hydratedUsers in restHydratedUsersByServerID.values {
+            for (userID, user) in hydratedUsers where copy.usersByID[userID] == nil {
+                // A user present in the incoming gateway snapshot is always fresher. REST
+                // copies only fill the sparse identities Ready/realtime did not include.
+                copy.usersByID[userID] = user
             }
         }
         return copy
@@ -11615,8 +11693,7 @@ public struct MainShellView: View {
         .onAppear { viewModel.validateSelection() }
         .toolbar {
             ToolbarItem(placement: .principal) {
-                Text(viewModel.title)
-                    .font(.headline)
+                StoatToolbarTitle(viewModel.title)
             }
             ToolbarItemGroup {
                 Button { viewModel.perform(.openQuickSwitcher) } label: { Label("Quick Switcher", systemImage: "magnifyingglass") }

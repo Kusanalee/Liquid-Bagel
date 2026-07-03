@@ -720,6 +720,32 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase56OptimisticAndConfirmedSendGroupsPaintWithoutPreparationPass() async throws {
+        let handler = DelayedMessageActionHandler(delay: .milliseconds(80))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let server = try XCTUnwrap(model.servers.first { $0.name == "Bagel Lab" })
+        model.selectServer(server.id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        model.updateDraft("paint immediately", for: channelID)
+        let tokenBeforeSend = model.selectedTimelineGroupingToken
+
+        let sendTask = Task { await model.sendDraft(for: channelID) }
+        try await Task.sleep(for: .milliseconds(10))
+
+        let optimistic = model.selectedTimelineMessageGroups
+            .flatMap(\.messages)
+            .first { $0.message.content == "paint immediately" }
+        XCTAssertEqual(optimistic?.status, .pending)
+        XCTAssertNotEqual(model.selectedTimelineGroupingToken, tokenBeforeSend)
+
+        await sendTask.value
+        let confirmed = model.selectedTimelineMessageGroups
+            .flatMap(\.messages)
+            .first { $0.message.content == "paint immediately" }
+        XCTAssertEqual(confirmed?.status, .confirmed)
+    }
+
+    @MainActor
     func testFailedSendMarksTimelineMessageFailed() async {
         let handler = MockMessageActionHandler(sendError: MessageActionError.unavailable("send failed"))
         let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
@@ -3184,6 +3210,26 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase56ImageDataMissDefersAndDeduplicatesResourceReload() async throws {
+        let data = Data("avatar".utf8)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let file = File(id: "phase56-avatar-reload", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: data.count)
+
+        XCTAssertNil(model.imageData(for: file, kind: .userAvatar))
+        XCTAssertNil(model.imageData(for: file, kind: .userAvatar))
+
+        for _ in 0..<50 {
+            if model.imageData(for: file, kind: .userAvatar) == data { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertEqual(model.imageData(for: file, kind: .userAvatar), data)
+        let callCount = await loader.callCount()
+        XCTAssertEqual(callCount, 1)
+    }
+
+    @MainActor
     func testPhase55ChannelMessageControllerPaintsDiskCacheBeforeNetworkFetch() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("phase55-msgcache-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -3233,6 +3279,56 @@ final class StoatFeaturesTests: XCTestCase {
         await disk.removeAll()
         let cleared = await disk.data(for: key)
         XCTAssertNil(cleared)
+    }
+
+    func testPhase56MediaRetryPolicyRecoversTransientFailuresAndSkipsPermanentOnes() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SequencedMediaURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let request = ImageResourceRequest(
+            id: "phase56-retry-image",
+            url: URL(string: "https://media.example/image")!,
+            kind: .userAvatar,
+            maxBytes: 1024
+        )
+
+        SequencedMediaURLProtocol.configure([
+            .response(status: 429, headers: ["Retry-After": "0"], data: Data()),
+            .response(status: 200, headers: ["Content-Type": "image/png"], data: Data("png".utf8))
+        ])
+        let imageLoader = LiveImageResourceLoader(cache: ImageMemoryCache(), session: session)
+        let image = try await imageLoader.loadImage(request)
+        XCTAssertEqual(image.data, Data("png".utf8))
+        XCTAssertEqual(SequencedMediaURLProtocol.requestCount, 2)
+
+        SequencedMediaURLProtocol.configure([
+            .failure(URLError(.timedOut)),
+            .response(status: 200, headers: ["Content-Type": "image/png"], data: Data("attachment".utf8))
+        ])
+        let attachment = AttachmentDisplayItem(file: File(
+            id: "phase56-retry-attachment",
+            tag: "attachments",
+            filename: "photo.png",
+            metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false),
+            contentType: "image/png",
+            size: 10
+        ))
+        let attachmentLoader = LiveRemoteAttachmentLoader(environment: .production, session: session)
+        let loadedAttachment = try await attachmentLoader.load(attachment, purpose: .preview)
+        XCTAssertEqual(loadedAttachment.data, Data("attachment".utf8))
+        XCTAssertEqual(SequencedMediaURLProtocol.requestCount, 2)
+
+        SequencedMediaURLProtocol.configure([
+            .response(status: 404, headers: [:], data: Data())
+        ])
+        do {
+            _ = try await LiveImageResourceLoader(cache: ImageMemoryCache(), session: session).loadImage(request)
+            XCTFail("A permanent 404 must fail.")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("not found"))
+        }
+        XCTAssertEqual(SequencedMediaURLProtocol.requestCount, 1)
+        XCTAssertFalse(MediaRequestRetryPolicy.isTransient(URLError(.cancelled)))
     }
 
     func testPhase56FileImageDiskCacheTracksByteCountAndEvictsOldestWhenOverCap() async throws {
@@ -3603,6 +3699,64 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.snapshot.usersByID[onlineUserID]?.online, true, "REST hydration must not clobber gateway-fresh online status")
         XCTAssertEqual(model.snapshot.usersByID[onlineUserID]?.status?.presence, .idle, "REST hydration must not clobber gateway-fresh presence")
         XCTAssertEqual(model.snapshot.usersByID[onlineUserID]?.displayName, "Updated Name", "other REST-sourced fields should still update normally")
+    }
+
+    @MainActor
+    func testPhase56HydratedUsersSurviveSparseGatewaySnapshotsAndRespectRemoval() async {
+        let serverID: ServerID = "phase56-overlay-server"
+        let channelID: ChannelID = "phase56-overlay-channel"
+        let ownerID: UserID = "phase56-overlay-owner"
+        let offlineID: UserID = "phase56-overlay-offline"
+        let server = Server(id: serverID, ownerID: ownerID, name: "Overlay")
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        let members = [ownerID, offlineID].map {
+            ServerMember(id: MemberCompositeKey(serverID: serverID, userID: $0), joinedAt: Date())
+        }
+        let users = [
+            User(id: ownerID, username: "owner", online: false),
+            User(id: offlineID, username: "offline", displayName: "Offline Member", online: false)
+        ]
+        let api = RecordingAPIClient(membersByServer: [serverID: members], usersByServer: [serverID: users])
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: RealtimeSnapshot(
+                usersByID: [ownerID: users[0]],
+                serversByID: [serverID: server],
+                channelsByID: [channelID: channel]
+            ),
+            runtimeMode: .mock,
+            communityAPIClient: api
+        )
+
+        await model.hydrateServerMembers(serverID: serverID, force: true, reason: "overlay test")
+
+        let gatewayOwner = User(id: ownerID, username: "owner", status: UserStatus(presence: .busy), online: true)
+        model.replaceSnapshotForTesting(
+            RealtimeSnapshot(
+                usersByID: [ownerID: gatewayOwner],
+                serversByID: [serverID: server],
+                channelsByID: [channelID: channel],
+                membersByServerAndUserID: [ServerMemberKey(members[0].id): members[0]]
+            ),
+            changes: RealtimeSnapshotChangeSet(isFullReplacement: true)
+        )
+
+        XCTAssertEqual(model.snapshot.usersByID.count, 2)
+        XCTAssertEqual(model.snapshot.usersByID[offlineID]?.displayName, "Offline Member")
+        XCTAssertEqual(model.snapshot.usersByID[ownerID]?.online, true)
+        XCTAssertEqual(model.snapshot.usersByID[ownerID]?.status?.presence, .busy)
+
+        let removedKey = ServerMemberKey(serverID: serverID, userID: offlineID)
+        var afterRemoval = model.snapshot
+        afterRemoval.membersByServerAndUserID[removedKey] = nil
+        afterRemoval.usersByID[offlineID] = nil
+        model.replaceSnapshotForTesting(
+            afterRemoval,
+            changes: RealtimeSnapshotChangeSet(removedMemberKeys: [removedKey])
+        )
+
+        XCTAssertNil(model.snapshot.membersByServerAndUserID[removedKey])
+        XCTAssertNil(model.snapshot.usersByID[offlineID])
     }
 
     @MainActor
@@ -6938,6 +7092,98 @@ private actor RecordingAttachmentMessageActionHandler: MessageActionHandling {
     func endTyping(channelID: ChannelID) async throws {}
 }
 
+private actor DelayedMessageActionHandler: MessageActionHandling {
+    let delay: Duration
+
+    init(delay: Duration) {
+        self.delay = delay
+    }
+
+    func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?, attachments: [FileID]?) async throws -> Message {
+        try await Task.sleep(for: delay)
+        return Message(
+            id: "01J00000100000000000030000",
+            channelID: channelID,
+            authorID: MockShellData.currentUserID,
+            content: content,
+            nonce: nonce,
+            replies: replies?.map(\.id)
+        )
+    }
+
+    func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
+        Message(id: messageID, channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+    }
+
+    func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {}
+    func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {}
+    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func beginTyping(channelID: ChannelID) async throws {}
+    func endTyping(channelID: ChannelID) async throws {}
+}
+
+private final class SequencedMediaURLProtocol: URLProtocol, @unchecked Sendable {
+    enum Stub {
+        case response(status: Int, headers: [String: String], data: Data)
+        case failure(URLError)
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var stubs: [Stub] = []
+    nonisolated(unsafe) private static var recordedRequestCount = 0
+
+    static var requestCount: Int {
+        lock.withLock { recordedRequestCount }
+    }
+
+    static func configure(_ stubs: [Stub]) {
+        lock.withLock {
+            self.stubs = stubs
+            recordedRequestCount = 0
+        }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        let stub: Stub? = Self.lock.withLock {
+            Self.recordedRequestCount += 1
+            return Self.stubs.isEmpty ? nil : Self.stubs.removeFirst()
+        }
+        guard let stub else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        switch stub {
+        case let .failure(error):
+            client?.urlProtocol(self, didFailWithError: error)
+        case let .response(status, headers, data):
+            guard let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers
+            ) else {
+                client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+                return
+            }
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
 private actor ImageAttachmentMessageActionHandler: MessageActionHandling {
     func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?, attachments: [FileID]?) async throws -> Message {
         let files = attachments?.map {
@@ -7799,7 +8045,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         await model.prepareSelectedTimelinePresentation()
 
         model.selectChannel(secondID)
-        XCTAssertTrue(model.selectedTimelineMessageGroups.isEmpty)
+        XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [secondMessage.id])
         await model.prepareSelectedTimelinePresentation()
         XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [secondMessage.id])
     }

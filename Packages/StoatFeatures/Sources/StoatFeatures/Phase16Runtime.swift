@@ -13,6 +13,110 @@ public enum RemoteAttachmentLoadPurpose: Hashable, Sendable {
     case original
 }
 
+enum MediaHTTPFailure: Error {
+    case invalidResponse
+    case status(Int)
+    case network(URLError)
+}
+
+enum MediaRequestRetryPolicy {
+    static let maxAttempts = 3
+    static let maxRetryAfter: TimeInterval = 5
+
+    static func isTransient(statusCode: Int) -> Bool {
+        statusCode == 408 || statusCode == 429 || (500..<600).contains(statusCode)
+    }
+
+    static func isTransient(_ error: URLError) -> Bool {
+        switch error.code {
+        case .timedOut,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .networkConnectionLost,
+             .dnsLookupFailed,
+             .notConnectedToInternet,
+             .resourceUnavailable:
+            true
+        default:
+            false
+        }
+    }
+
+    static func retryDelay(afterAttempt attempt: Int, response: HTTPURLResponse?) -> TimeInterval {
+        if let value = response?.value(forHTTPHeaderField: "Retry-After"),
+           let serverDelay = retryAfterDelay(value) {
+            return min(max(0, serverDelay), maxRetryAfter)
+        }
+        return attempt <= 1 ? 0.25 : 0.75
+    }
+
+    static func safeNetworkMessage(_ error: URLError, resource: String) -> String {
+        switch error.code {
+        case .timedOut:
+            "\(resource) request timed out. Retry."
+        case .notConnectedToInternet:
+            "You appear to be offline. Retry when connected."
+        case .cancelled:
+            "Cancelled"
+        default:
+            "\(resource) connection was interrupted. Retry."
+        }
+    }
+
+    private static func retryAfterDelay(_ value: String) -> TimeInterval? {
+        if let seconds = TimeInterval(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return seconds
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss z"
+        guard let date = formatter.date(from: value) else { return nil }
+        return date.timeIntervalSinceNow
+    }
+}
+
+enum MediaHTTPExecutor {
+    static func data(for request: URLRequest, session: URLSession) async throws -> (Data, HTTPURLResponse) {
+        var attempt = 1
+        while true {
+            do {
+                let (data, response) = try await session.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw MediaHTTPFailure.invalidResponse
+                }
+                guard (200..<300).contains(http.statusCode) else {
+                    if attempt < MediaRequestRetryPolicy.maxAttempts,
+                       MediaRequestRetryPolicy.isTransient(statusCode: http.statusCode) {
+                        try await Task.sleep(for: .seconds(MediaRequestRetryPolicy.retryDelay(afterAttempt: attempt, response: http)))
+                        attempt += 1
+                        continue
+                    }
+                    throw MediaHTTPFailure.status(http.statusCode)
+                }
+                return (data, http)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let failure as MediaHTTPFailure {
+                throw failure
+            } catch let error as URLError {
+                if error.code == .cancelled || Task.isCancelled {
+                    throw CancellationError()
+                }
+                if attempt < MediaRequestRetryPolicy.maxAttempts,
+                   MediaRequestRetryPolicy.isTransient(error) {
+                    try await Task.sleep(for: .seconds(MediaRequestRetryPolicy.retryDelay(afterAttempt: attempt, response: nil)))
+                    attempt += 1
+                    continue
+                }
+                throw MediaHTTPFailure.network(error)
+            } catch {
+                throw MediaHTTPFailure.invalidResponse
+            }
+        }
+    }
+}
+
 public enum ImageResourceKind: Hashable, Sendable {
     case attachmentPreview
     case attachmentOriginal
@@ -306,13 +410,7 @@ public struct LiveImageResourceLoader: ImageResourceLoading {
         urlRequest.cachePolicy = .reloadIgnoringLocalCacheData
         urlRequest.setValue("LiquidBagel/0.1 macOS", forHTTPHeaderField: "User-Agent")
         do {
-            let (data, response) = try await session.data(for: urlRequest)
-            guard let http = response as? HTTPURLResponse else {
-                throw AttachmentActionError.unavailable("Image could not be loaded.")
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                throw AttachmentActionError.unavailable(Self.safeStatusMessage(http.statusCode))
-            }
+            let (data, http) = try await MediaHTTPExecutor.data(for: urlRequest, session: session)
             guard data.count <= request.maxBytes else {
                 throw AttachmentActionError.tooLargeForPreview(maxBytes: request.maxBytes)
             }
@@ -323,6 +421,17 @@ public struct LiveImageResourceLoader: ImageResourceLoading {
             return ImageResourceResult(request: request, contentType: contentType, data: data)
         } catch let error as AttachmentActionError {
             throw error
+        } catch let failure as MediaHTTPFailure {
+            switch failure {
+            case .invalidResponse:
+                throw AttachmentActionError.unavailable("Image could not be loaded.")
+            case let .status(code):
+                throw AttachmentActionError.unavailable(Self.safeStatusMessage(code))
+            case let .network(error):
+                throw AttachmentActionError.unavailable(MediaRequestRetryPolicy.safeNetworkMessage(error, resource: "Image"))
+            }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw AttachmentActionError.unavailable("Image could not be loaded.")
         }
@@ -337,6 +446,8 @@ public struct LiveImageResourceLoader: ImageResourceLoading {
 
     private static func safeStatusMessage(_ code: Int) -> String {
         switch code {
+        case 408:
+            "Image request timed out. Retry."
         case 403:
             "Image is not available."
         case 404:
@@ -344,7 +455,7 @@ public struct LiveImageResourceLoader: ImageResourceLoading {
         case 413:
             "Image is too large."
         case 429:
-            "Image service is rate limited."
+            "Image service is rate limited. Retry shortly."
         case 500..<600:
             "Image service is unavailable."
         default:
@@ -481,13 +592,7 @@ public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
         request.setValue("LiquidBagel/0.1 macOS", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (data, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                throw AttachmentActionError.unavailable("Attachment could not be loaded.")
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                throw AttachmentActionError.unavailable(Self.safeStatusMessage(http.statusCode))
-            }
+            let (data, http) = try await MediaHTTPExecutor.data(for: request, session: session)
             if purpose == .preview, data.count > previewLimitBytes {
                 throw AttachmentActionError.tooLargeForPreview(maxBytes: previewLimitBytes)
             }
@@ -499,6 +604,17 @@ public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
             return RemoteAttachmentData(fileID: fileID, filename: item.displayName, contentType: contentType, byteCount: data.count, data: data)
         } catch let error as AttachmentActionError {
             throw error
+        } catch let failure as MediaHTTPFailure {
+            switch failure {
+            case .invalidResponse:
+                throw AttachmentActionError.unavailable("Attachment could not be loaded.")
+            case let .status(code):
+                throw AttachmentActionError.unavailable(Self.safeStatusMessage(code))
+            case let .network(error):
+                throw AttachmentActionError.unavailable(MediaRequestRetryPolicy.safeNetworkMessage(error, resource: "Attachment"))
+            }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw AttachmentActionError.unavailable("Attachment could not be loaded.")
         }
@@ -528,6 +644,8 @@ public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
 
     private static func safeStatusMessage(_ code: Int) -> String {
         switch code {
+        case 408:
+            "Attachment request timed out. Retry."
         case 403:
             "Attachment is not available."
         case 404:
@@ -535,7 +653,7 @@ public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
         case 413:
             "Attachment is too large."
         case 429:
-            "Attachment service is rate limited."
+            "Attachment service is rate limited. Retry shortly."
         case 500..<600:
             "Attachment service is unavailable."
         default:

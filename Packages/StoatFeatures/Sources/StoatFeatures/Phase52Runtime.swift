@@ -55,6 +55,7 @@ public struct Phase52MemberHydrationPreparation: Sendable {
     public var snapshot: RealtimeSnapshot
     public var identitySnapshots: Phase43IdentitySnapshotStore
     public var returnedMembersByKey: [ServerMemberKey: ServerMember]
+    public var returnedUsersByID: [UserID: User]
     public var previousMemberCount: Int
     public var missingUserCount: Int
     public var invalidatedAvatarKeys: Set<ImageCacheKey>
@@ -63,6 +64,7 @@ public struct Phase52MemberHydrationPreparation: Sendable {
         snapshot: RealtimeSnapshot,
         identitySnapshots: Phase43IdentitySnapshotStore,
         returnedMembersByKey: [ServerMemberKey: ServerMember],
+        returnedUsersByID: [UserID: User],
         previousMemberCount: Int,
         missingUserCount: Int,
         invalidatedAvatarKeys: Set<ImageCacheKey>
@@ -70,6 +72,7 @@ public struct Phase52MemberHydrationPreparation: Sendable {
         self.snapshot = snapshot
         self.identitySnapshots = identitySnapshots
         self.returnedMembersByKey = returnedMembersByKey
+        self.returnedUsersByID = returnedUsersByID
         self.previousMemberCount = previousMemberCount
         self.missingUserCount = missingUserCount
         self.invalidatedAvatarKeys = invalidatedAvatarKeys
@@ -107,6 +110,8 @@ public enum Phase52MemberHydrationPreparer {
         nextSnapshot.membersByServerAndUserID = mergedMembers
 
         var invalidatedAvatarKeys: Set<ImageCacheKey> = []
+        var returnedUsersByID: [UserID: User] = [:]
+        returnedUsersByID.reserveCapacity(response.users.count)
         for (index, user) in response.users.enumerated() {
             let previousAvatar = identitySnapshots.snapshot(for: user.id)?.avatarFile
             if previousAvatar?.id != user.avatar?.id {
@@ -127,6 +132,7 @@ public enum Phase52MemberHydrationPreparer {
                 mergedUser.status = existingUser.status
             }
             nextSnapshot.usersByID[user.id] = mergedUser
+            returnedUsersByID[user.id] = mergedUser
             if index.isMultiple(of: 128) {
                 try Task.checkCancellation()
             }
@@ -134,7 +140,7 @@ public enum Phase52MemberHydrationPreparer {
 
         var nextIdentities = identitySnapshots
         for (index, user) in response.users.enumerated() {
-            _ = nextIdentities.merge(user: user, source: .memberRESTUser, now: now)
+            _ = nextIdentities.merge(user: returnedUsersByID[user.id] ?? user, source: .memberRESTUser, now: now)
             if index.isMultiple(of: 128) {
                 try Task.checkCancellation()
             }
@@ -163,6 +169,7 @@ public enum Phase52MemberHydrationPreparer {
             snapshot: nextSnapshot,
             identitySnapshots: nextIdentities,
             returnedMembersByKey: returnedByKey,
+            returnedUsersByID: returnedUsersByID,
             previousMemberCount: previousMembers.count,
             missingUserCount: missingUsers,
             invalidatedAvatarKeys: invalidatedAvatarKeys

@@ -958,7 +958,7 @@ public final class ChannelMessageController {
     @ObservationIgnored private var initialLoadInFlightChannelIDs: Set<ChannelID> = []
     @ObservationIgnored private var completedInitialLoadChannelIDs: Set<ChannelID> = []
     @ObservationIgnored private var configuredLoadGeneration: Int?
-    @ObservationIgnored private var presentationRevisionsByChannelID: [ChannelID: Int] = [:]
+    private var presentationRevisionsByChannelID: [ChannelID: Int] = [:]
     @ObservationIgnored private var messageCache: any ChannelMessageCaching = NoopChannelMessageCache()
 
     public init(

@@ -79,6 +79,7 @@ final class StoatUITests: XCTestCase {
         XCTAssertNil(item.playbackURL)
     }
 
+    @MainActor
     func testPhase56PresenceDotGatesOnOfflineRegardlessOfStoredPresence() {
         // An offline member whose stored (configured) presence is still "Online" must show
         // as offline — `status.presence` persists after disconnect and must not override a
@@ -111,6 +112,27 @@ final class StoatUITests: XCTestCase {
         let invisibleButOnline = PresenceDot.resolve(presence: .invisible, isOnline: true)
         XCTAssertEqual(invisibleButOnline.color, .secondary)
         XCTAssertEqual(invisibleButOnline.label, "Invisible")
+    }
+
+    func testPhase56VideoPosterStoreBoundsEntriesAndBytes() async {
+        let store = VideoPosterStore(maxEntries: 2, maxBytes: 7)
+        let first = URL(fileURLWithPath: "/tmp/phase56-first.mov")
+        let second = URL(fileURLWithPath: "/tmp/phase56-second.mov")
+        let third = URL(fileURLWithPath: "/tmp/phase56-third.mov")
+
+        await store.insert(Data(repeating: 1, count: 3), for: first)
+        await store.insert(Data(repeating: 2, count: 3), for: second)
+        await store.insert(Data(repeating: 3, count: 3), for: third)
+
+        let diagnostics = await store.diagnostics()
+        let firstPoster = await store.cachedPoster(for: first)
+        let secondPoster = await store.cachedPoster(for: second)
+        let thirdPoster = await store.cachedPoster(for: third)
+        XCTAssertEqual(diagnostics.cacheCount, 2)
+        XCTAssertEqual(diagnostics.byteCount, 6)
+        XCTAssertNil(firstPoster)
+        XCTAssertNotNil(secondPoster)
+        XCTAssertNotNil(thirdPoster)
     }
 
     func testPhase55ExternalEmbedMediaFactorySynthesizesSafeItems() {
