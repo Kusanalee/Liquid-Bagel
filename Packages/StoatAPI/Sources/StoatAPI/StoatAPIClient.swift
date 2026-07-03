@@ -45,6 +45,8 @@ public protocol StoatAPIClient: Sendable {
     func deleteInvite(code: InviteCode) async throws
     func createServer(draft: ServerCreateDraft) async throws -> ServerCreateResponse
     func createGroupChannel(draft: GroupChannelCreateDraft) async throws -> Channel
+    func addGroupRecipient(channelID: ChannelID, userID: UserID) async throws
+    func removeGroupRecipient(channelID: ChannelID, userID: UserID) async throws
     func fetchSyncedSettings(keys: [String]) async throws -> [String: SyncedSettingValue]
     func setSyncedSettings(_ values: [String: String], timestamp: Int64) async throws
     func fetchServer(id: ServerID, includeChannels: Bool) async throws -> ServerFetchResponse
@@ -113,6 +115,14 @@ public extension StoatAPIClient {
 
     func createGroupChannel(draft: GroupChannelCreateDraft) async throws -> Channel {
         throw StoatAPIError.unimplementedEndpoint("Group channel creation is not implemented by this API client.")
+    }
+
+    func addGroupRecipient(channelID: ChannelID, userID: UserID) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Group member add is not implemented by this API client.")
+    }
+
+    func removeGroupRecipient(channelID: ChannelID, userID: UserID) async throws {
+        throw StoatAPIError.unimplementedEndpoint("Group member removal is not implemented by this API client.")
     }
 
     func fetchSyncedSettings(keys: [String]) async throws -> [String: SyncedSettingValue] {
@@ -619,6 +629,24 @@ public actor LiveStoatAPIClient: StoatAPIClient {
                 method: .post,
                 path: "/channels/create",
                 body: .json(try encoder.encode(validated))
+            )
+        )
+    }
+
+    public func addGroupRecipient(channelID: ChannelID, userID: UserID) async throws {
+        _ = try await perform(
+            StoatRequest<EmptyResponse>(
+                method: .put,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/recipients/\(userID.rawValue.stoatPathComponentEscaped)"
+            )
+        )
+    }
+
+    public func removeGroupRecipient(channelID: ChannelID, userID: UserID) async throws {
+        _ = try await perform(
+            StoatRequest<EmptyResponse>(
+                method: .delete,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/recipients/\(userID.rawValue.stoatPathComponentEscaped)"
             )
         )
     }

@@ -20,11 +20,11 @@ Categorical outcomes only.
 | 3 | Adjust the Liquid Glass transparency slider | Panels, sidebars, and toolbars update together; value persists across relaunch | | |
 | 4 | Enable macOS Reduce Transparency | Solid surfaces override the slider | | |
 | 5 | Enable Increase Contrast | Strokes/readability stay strong across shell, timeline, member panel, settings | | |
-| 6 | Run a VoiceOver pass: settings tabs, quick switcher, server rail, channel sidebar, timeline rows, composer, member panel, badges | Elements have sensible labels; unread/mention badges announce counts; no unlabeled controls | | |
-| 7 | Full Keyboard Access: tab through the main shell and settings; use Cmd-K quick switcher, Cmd-N New DM picker, and other wired shortcuts | Focus order sane; shortcuts fire; no keyboard traps | | |
+| 6 | Run a VoiceOver pass: settings tabs, quick switcher, server rail, channel sidebar, timeline rows (including mention pills), composer (including the `@` autocomplete popover), member panel, badges | Elements have sensible labels; unread/mention badges announce counts; mention pills announce "mention, `<name>`" or "mentions you"; the autocomplete popover announces "mention suggestions, N results" with the highlighted candidate marked selected; no unlabeled controls | | |
+| 7 | Full Keyboard Access: tab through the main shell and settings; use Cmd-K quick switcher, Cmd-N New DM picker, Escape (mark channel read), Shift-Escape (mark server read), and other wired shortcuts | Focus order sane; shortcuts fire; no keyboard traps | | |
 | 8 | Audit the menu bar (App, File, Edit, View, Window, Help) against native conventions | Commands route correctly; no dead items; Window management behaves natively | | |
 | 9 | Exercise multiple windows/spaces if supported, full screen, and window restoration | Native behavior without layout breakage | | |
-| 10 | Check role-color readability in both light/dark and Increase Contrast modes | Sanitized colors keep contrast; fallbacks diagnosed, not broken | | |
+| 10 | Check role-color readability in both light/dark and Increase Contrast modes, including mention pills | Sanitized colors keep contrast; Increase Contrast falls back to the system accent for mention pills same as author names; fallbacks diagnosed, not broken | | |
 
 ## Matrix Rows Unlocked
 
@@ -37,3 +37,4 @@ Categorical outcomes only.
 | UI/platform / native macOS window/menu behavior | Steps 8-9 pass |
 | UI/platform / settings organization | Steps 1-2 pass |
 | Server/community / roles (readability portion) | Step 10 passes |
+| Core chat / mentions (accessibility/contrast portion) | Steps 6, 10 pass |

@@ -4,7 +4,7 @@ Covers signed authorization and delivery, click routing, mutes, and active-chann
 
 ## Prerequisites
 
-- A signed build: the checked Xcode settings have `CODE_SIGNING_ALLOWED = NO`, so produce a locally signed archive/build first — the permission prompt will not appear otherwise (Phase 31/36 finding).
+- A signed build: Phase 58 flips `CODE_SIGNING_ALLOWED`/`CODE_SIGNING_REQUIRED` to `YES` in project.pbxproj, so a normal Xcode build now produces an ad-hoc signed app using the existing `DEVELOPMENT_TEAM`/entitlements already configured — no extra archive step should be required. Confirm via Developer Verification diagnostics that "Signature" reads `signed and valid` before running this lane.
 - Second account able to send server messages, mentions, and DMs.
 
 ## Evidence Rules
@@ -18,6 +18,7 @@ Categorical outcomes only. Notification diagnostics record status transitions, n
 | 1 | In the signed build, request notification permission from Settings → Notifications | System prompt appears; before/after diagnostics show `notDetermined` → granted/denied; app appears in System Settings → Notifications | | |
 | 2 | Run the authorized self-test notification | Banner delivers | | |
 | 3 | Receive a server message, a mention, and a DM while the app is backgrounded/in another channel | Notifications deliver; privacy mode redacts content when enabled | | |
+| 3a | From a second account, send a message containing a composer-inserted `<@ULID>` mention of this account | The mention is classified and delivered as a mention notification (not a plain message notification) | | |
 | 4 | Click a server-message notification | Routes to channel and jumps to the target message when its ID is present | | |
 | 5 | Click a DM notification | Routes to the DM conversation | | |
 | 6 | Click a notification whose target message is unavailable/deleted (if testable) | Degrades to channel-level route without error | | |

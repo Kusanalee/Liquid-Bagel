@@ -703,6 +703,115 @@ public struct MessageInlineCustomEmojiItem: Identifiable, Hashable, Sendable {
     }
 }
 
+/// Sanitized role-color components (Phase 58), mirroring `ResolvedRoleColor.red/green/blue`
+/// without depending on StoatFeatures, which StoatUI sits below in the package graph.
+public struct MessageInlineMentionColorComponents: Hashable, Sendable {
+    public var red: Double
+    public var green: Double
+    public var blue: Double
+
+    public init(red: Double, green: Double, blue: Double) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+    }
+}
+
+/// Phase 58: covers the three content-token mention kinds the backend parser recognizes
+/// (`<@ULID>`, `<#ULID>`, `<%ULID>`; Docs/Research.md Phase 58 Notes).
+public enum MessageInlineReferenceKind: Hashable, Sendable {
+    case user
+    case channel
+    case role
+}
+
+public struct MessageInlineReferenceItem: Identifiable, Hashable, Sendable {
+    public var id: String { "\(kind)-\(rawID)" }
+    public var kind: MessageInlineReferenceKind
+    public var rawID: String
+    public var displayName: String
+    public var roleColor: MessageInlineMentionColorComponents?
+    public var isCurrentUser: Bool
+    public var isFallback: Bool
+
+    public init(
+        kind: MessageInlineReferenceKind,
+        rawID: String,
+        displayName: String,
+        roleColor: MessageInlineMentionColorComponents? = nil,
+        isCurrentUser: Bool = false,
+        isFallback: Bool = false
+    ) {
+        self.kind = kind
+        self.rawID = rawID
+        self.displayName = displayName
+        self.roleColor = roleColor
+        self.isCurrentUser = isCurrentUser
+        self.isFallback = isFallback
+    }
+
+    public static func fallbackDisplayName(for kind: MessageInlineReferenceKind) -> String {
+        switch kind {
+        case .user: return "Unknown User"
+        case .channel: return "unknown-channel"
+        case .role: return "unknown-role"
+        }
+    }
+}
+
+/// Extraction-only counterpart to the private inline tokenizer, used by StoatFeatures to find
+/// which users/channels/roles a message content string references before identity resolution
+/// (which needs snapshot/server data StoatUI does not have access to).
+public enum MarkdownReferenceScanner {
+    public struct Match: Hashable, Sendable {
+        public var token: String
+        public var kind: MessageInlineReferenceKind
+        public var rawID: String
+
+        public init(token: String, kind: MessageInlineReferenceKind, rawID: String) {
+            self.token = token
+            self.kind = kind
+            self.rawID = rawID
+        }
+    }
+
+    private static let mentionIDAlphabet = Set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    private static let mentionIDLength = 26
+
+    public static func scan(_ source: String) -> [Match] {
+        var result: [Match] = []
+        var cursor = source.startIndex
+        let end = source.endIndex
+        while cursor < end {
+            if source[cursor] == "<" {
+                let sigilIndex = source.index(after: cursor)
+                if sigilIndex < end, "@#%".contains(source[sigilIndex]) {
+                    let idStart = source.index(after: sigilIndex)
+                    var idEnd = idStart
+                    while idEnd < end, mentionIDAlphabet.contains(source[idEnd]) {
+                        idEnd = source.index(after: idEnd)
+                    }
+                    let idLength = source.distance(from: idStart, to: idEnd)
+                    if idLength == mentionIDLength, idEnd < end, source[idEnd] == ">" {
+                        let tokenEnd = source.index(after: idEnd)
+                        let sigil = source[sigilIndex]
+                        let kind: MessageInlineReferenceKind = sigil == "@" ? .user : (sigil == "#" ? .channel : .role)
+                        result.append(Match(
+                            token: String(source[cursor..<tokenEnd]),
+                            kind: kind,
+                            rawID: String(source[idStart..<idEnd])
+                        ))
+                        cursor = tokenEnd
+                        continue
+                    }
+                }
+            }
+            cursor = source.index(after: cursor)
+        }
+        return result
+    }
+}
+
 public struct MessageEmbedDisplayItem: Identifiable, Hashable, Sendable {
     public var id: String
     public var embed: Embed
@@ -1020,6 +1129,54 @@ public struct GlassSearchField: View {
     }
 }
 
+/// Phase 58: the `@token` immediately before the composer caret, with no intervening whitespace.
+/// Offsets are UTF-16 (matching `NSString`/`NSTextView` indexing) so the caller can splice the
+/// verified mention token into the same `text` binding without needing AppKit types.
+public struct InlineComposerTrigger: Hashable, Sendable {
+    public var utf16Location: Int
+    public var utf16Length: Int
+    public var query: String
+
+    public init(utf16Location: Int, utf16Length: Int, query: String) {
+        self.utf16Location = utf16Location
+        self.utf16Length = utf16Length
+        self.query = query
+    }
+}
+
+/// One-shot cursor-placement command (mirrors the `focusRequestID` bump-to-trigger pattern):
+/// bump `id` whenever `utf16Offset` should be (re-)applied, e.g. right after splicing a completed
+/// mention token into the composer text.
+public struct ComposerCursorRequest: Hashable, Sendable {
+    public var id: Int
+    public var utf16Offset: Int
+
+    public init(id: Int, utf16Offset: Int) {
+        self.id = id
+        self.utf16Offset = utf16Offset
+    }
+}
+
+public enum MentionAutocompleteNavigation: Hashable, Sendable {
+    case up
+    case down
+}
+
+public struct ComposerMentionCandidate: Identifiable, Hashable, Sendable {
+    public var id: UserID { userID }
+    public var userID: UserID
+    public var name: String
+    public var subtitle: String?
+    public var avatarData: Data?
+
+    public init(userID: UserID, name: String, subtitle: String? = nil, avatarData: Data? = nil) {
+        self.userID = userID
+        self.name = name
+        self.subtitle = subtitle
+        self.avatarData = avatarData
+    }
+}
+
 public struct GlassComposer: View {
     @State private var isEmojiPopoverPresented = false
     @Binding private var text: String
@@ -1048,6 +1205,14 @@ public struct GlassComposer: View {
     private let onPasteFileURLs: ([URL]) -> Void
     private let onSend: () -> Void
     private let onFocus: () -> Void
+    private let mentionAutocompleteCandidates: [ComposerMentionCandidate]
+    private let highlightedMentionCandidateID: UserID?
+    private let cursorRequest: ComposerCursorRequest?
+    private let onInlineTriggerChange: (InlineComposerTrigger?) -> Void
+    private let onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void
+    private let onSelectHighlightedMentionCandidate: () -> Void
+    private let onCancelMentionAutocomplete: () -> Void
+    private let onSelectMentionCandidate: (ComposerMentionCandidate) -> Void
 
     public init(
         text: Binding<String>,
@@ -1075,7 +1240,15 @@ public struct GlassComposer: View {
         onPasteImageData: @escaping (Data) -> Void = { _ in },
         onPasteFileURLs: @escaping ([URL]) -> Void = { _ in },
         onSend: @escaping () -> Void = {},
-        onFocus: @escaping () -> Void = {}
+        onFocus: @escaping () -> Void = {},
+        mentionAutocompleteCandidates: [ComposerMentionCandidate] = [],
+        highlightedMentionCandidateID: UserID? = nil,
+        cursorRequest: ComposerCursorRequest? = nil,
+        onInlineTriggerChange: @escaping (InlineComposerTrigger?) -> Void = { _ in },
+        onNavigateMentionAutocomplete: @escaping (MentionAutocompleteNavigation) -> Void = { _ in },
+        onSelectHighlightedMentionCandidate: @escaping () -> Void = {},
+        onCancelMentionAutocomplete: @escaping () -> Void = {},
+        onSelectMentionCandidate: @escaping (ComposerMentionCandidate) -> Void = { _ in }
     ) {
         self._text = text
         self._shouldMentionReplyAuthor = shouldMentionReplyAuthor
@@ -1103,6 +1276,14 @@ public struct GlassComposer: View {
         self.onPasteFileURLs = onPasteFileURLs
         self.onSend = onSend
         self.onFocus = onFocus
+        self.mentionAutocompleteCandidates = mentionAutocompleteCandidates
+        self.highlightedMentionCandidateID = highlightedMentionCandidateID
+        self.cursorRequest = cursorRequest
+        self.onInlineTriggerChange = onInlineTriggerChange
+        self.onNavigateMentionAutocomplete = onNavigateMentionAutocomplete
+        self.onSelectHighlightedMentionCandidate = onSelectHighlightedMentionCandidate
+        self.onCancelMentionAutocomplete = onCancelMentionAutocomplete
+        self.onSelectMentionCandidate = onSelectMentionCandidate
     }
 
     public var body: some View {
@@ -1160,8 +1341,32 @@ public struct GlassComposer: View {
                         onAttach()
                     }
                     ZStack(alignment: .topLeading) {
-                        ComposerTextInput(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSend, onFocus: onFocus, onPasteImageData: onPasteImageData, onPasteFileURLs: onPasteFileURLs)
+                        ComposerTextInput(
+                            text: $text,
+                            isEnabled: isEnabled,
+                            focusRequestID: focusRequestID,
+                            onSubmit: onSend,
+                            onFocus: onFocus,
+                            onPasteImageData: onPasteImageData,
+                            onPasteFileURLs: onPasteFileURLs,
+                            hasMentionCandidates: !mentionAutocompleteCandidates.isEmpty,
+                            cursorRequest: cursorRequest,
+                            onInlineTriggerChange: onInlineTriggerChange,
+                            onNavigateMentionAutocomplete: onNavigateMentionAutocomplete,
+                            onSelectHighlightedMentionCandidate: onSelectHighlightedMentionCandidate,
+                            onCancelMentionAutocomplete: onCancelMentionAutocomplete
+                        )
                             .frame(height: ComposerTextSizing.height(for: text))
+                            .overlay(alignment: .topLeading) {
+                                if !mentionAutocompleteCandidates.isEmpty {
+                                    InlineAutocompletePopover(
+                                        candidates: mentionAutocompleteCandidates,
+                                        highlightedID: highlightedMentionCandidateID,
+                                        onSelect: onSelectMentionCandidate
+                                    )
+                                    .alignmentGuide(.top) { dimensions in dimensions.height + 4 }
+                                }
+                            }
                         if text.isEmpty {
                             Text(placeholder)
                                 .foregroundStyle(.secondary)
@@ -1226,6 +1431,67 @@ public struct GlassComposer: View {
                 }
             }
         }
+    }
+}
+
+#if canImport(AppKit)
+extension GlassComposer {
+    @MainActor
+    static func _testDetectInlineTrigger(text: String, caretUTF16Offset: Int) -> InlineComposerTrigger? {
+        let textView = NSTextView()
+        textView.string = text
+        textView.setSelectedRange(NSRange(location: caretUTF16Offset, length: 0))
+        return ComposerTextView.Coordinator.detectInlineTrigger(in: textView)
+    }
+}
+#endif
+
+private struct InlineAutocompletePopover: View {
+    let candidates: [ComposerMentionCandidate]
+    let highlightedID: UserID?
+    let onSelect: (ComposerMentionCandidate) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(candidates) { candidate in
+                Button {
+                    onSelect(candidate)
+                } label: {
+                    HStack(spacing: StoatSpacing.small) {
+                        AvatarView(title: candidate.name, size: 22, imageData: candidate.avatarData)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(candidate.name)
+                                .font(.callout.weight(.medium))
+                                .lineLimit(1)
+                            if let subtitle = candidate.subtitle {
+                                Text(subtitle)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, StoatSpacing.small)
+                    .padding(.vertical, StoatSpacing.xSmall)
+                    .background(
+                        candidate.userID == highlightedID ? Color.accentColor.opacity(0.18) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(candidate.subtitle.map { "\(candidate.name), \($0)" } ?? candidate.name)
+                .accessibilityAddTraits(candidate.userID == highlightedID ? [.isSelected] : [])
+            }
+        }
+        .padding(StoatSpacing.xxSmall)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        .frame(width: 260)
+        .shadow(radius: 8)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("mention suggestions, \(candidates.count) results")
     }
 }
 
@@ -1453,10 +1719,30 @@ private struct ComposerTextInput: View {
     let onFocus: () -> Void
     let onPasteImageData: (Data) -> Void
     let onPasteFileURLs: ([URL]) -> Void
+    var hasMentionCandidates: Bool = false
+    var cursorRequest: ComposerCursorRequest? = nil
+    var onInlineTriggerChange: (InlineComposerTrigger?) -> Void = { _ in }
+    var onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void = { _ in }
+    var onSelectHighlightedMentionCandidate: () -> Void = {}
+    var onCancelMentionAutocomplete: () -> Void = {}
 
     var body: some View {
         #if canImport(AppKit)
-        ComposerTextView(text: $text, isEnabled: isEnabled, focusRequestID: focusRequestID, onSubmit: onSubmit, onFocus: onFocus, onPasteImageData: onPasteImageData, onPasteFileURLs: onPasteFileURLs)
+        ComposerTextView(
+            text: $text,
+            isEnabled: isEnabled,
+            focusRequestID: focusRequestID,
+            onSubmit: onSubmit,
+            onFocus: onFocus,
+            onPasteImageData: onPasteImageData,
+            onPasteFileURLs: onPasteFileURLs,
+            hasMentionCandidates: hasMentionCandidates,
+            cursorRequest: cursorRequest,
+            onInlineTriggerChange: onInlineTriggerChange,
+            onNavigateMentionAutocomplete: onNavigateMentionAutocomplete,
+            onSelectHighlightedMentionCandidate: onSelectHighlightedMentionCandidate,
+            onCancelMentionAutocomplete: onCancelMentionAutocomplete
+        )
             .font(.body)
         #else
         TextEditor(text: $text)
@@ -1476,6 +1762,12 @@ private struct ComposerTextView: NSViewRepresentable {
     let onFocus: () -> Void
     let onPasteImageData: (Data) -> Void
     let onPasteFileURLs: ([URL]) -> Void
+    var hasMentionCandidates: Bool = false
+    var cursorRequest: ComposerCursorRequest? = nil
+    var onInlineTriggerChange: (InlineComposerTrigger?) -> Void = { _ in }
+    var onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void = { _ in }
+    var onSelectHighlightedMentionCandidate: () -> Void = {}
+    var onCancelMentionAutocomplete: () -> Void = {}
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text, onSubmit: onSubmit, onFocus: onFocus, onPasteImageData: onPasteImageData, onPasteFileURLs: onPasteFileURLs)
@@ -1529,11 +1821,22 @@ private struct ComposerTextView: NSViewRepresentable {
                 nsView.window?.makeFirstResponder(textView)
             }
         }
+        if let cursorRequest, context.coordinator.lastAppliedCursorRequestID != cursorRequest.id {
+            context.coordinator.lastAppliedCursorRequestID = cursorRequest.id
+            let clampedOffset = max(0, min(cursorRequest.utf16Offset, (textView.string as NSString).length))
+            textView.setSelectedRange(NSRange(location: clampedOffset, length: 0))
+            textView.scrollRangeToVisible(NSRange(location: clampedOffset, length: 0))
+        }
         context.coordinator.text = $text
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onFocus = onFocus
         context.coordinator.onPasteImageData = onPasteImageData
         context.coordinator.onPasteFileURLs = onPasteFileURLs
+        context.coordinator.hasMentionCandidates = hasMentionCandidates
+        context.coordinator.onInlineTriggerChange = onInlineTriggerChange
+        context.coordinator.onNavigateMentionAutocomplete = onNavigateMentionAutocomplete
+        context.coordinator.onSelectHighlightedMentionCandidate = onSelectHighlightedMentionCandidate
+        context.coordinator.onCancelMentionAutocomplete = onCancelMentionAutocomplete
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -1543,6 +1846,12 @@ private struct ComposerTextView: NSViewRepresentable {
         var onPasteImageData: (Data) -> Void
         var onPasteFileURLs: ([URL]) -> Void
         var lastFocusRequestID = 0
+        var lastAppliedCursorRequestID = 0
+        var hasMentionCandidates = false
+        var onInlineTriggerChange: (InlineComposerTrigger?) -> Void = { _ in }
+        var onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void = { _ in }
+        var onSelectHighlightedMentionCandidate: () -> Void = {}
+        var onCancelMentionAutocomplete: () -> Void = {}
 
         init(
             text: Binding<String>,
@@ -1565,9 +1874,33 @@ private struct ComposerTextView: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             text.wrappedValue = textView.string
+            onInlineTriggerChange(Self.detectInlineTrigger(in: textView))
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            onInlineTriggerChange(Self.detectInlineTrigger(in: textView))
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if hasMentionCandidates {
+                switch commandSelector {
+                case #selector(NSResponder.moveUp(_:)):
+                    onNavigateMentionAutocomplete(.up)
+                    return true
+                case #selector(NSResponder.moveDown(_:)):
+                    onNavigateMentionAutocomplete(.down)
+                    return true
+                case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertTab(_:)):
+                    onSelectHighlightedMentionCandidate()
+                    return true
+                case #selector(NSResponder.cancelOperation(_:)):
+                    onCancelMentionAutocomplete()
+                    return true
+                default:
+                    break
+                }
+            }
             if commandSelector == #selector(NSText.paste(_:)) {
                 return handlePaste()
             }
@@ -1598,6 +1931,42 @@ private struct ComposerTextView: NSViewRepresentable {
                 return true
             }
             return false
+        }
+
+        /// Phase 58: the `@token` immediately before the caret, scanning backward until
+        /// whitespace (cancels) or `@` (found). Bounded to avoid pathological scans on long lines.
+        @MainActor
+        static func detectInlineTrigger(in textView: NSTextView) -> InlineComposerTrigger? {
+            let selectedRange = textView.selectedRange()
+            guard selectedRange.length == 0 else { return nil }
+            let nsString = textView.string as NSString
+            let caret = selectedRange.location
+            guard caret > 0, caret <= nsString.length else { return nil }
+            let scanLimit = 64
+            var start = caret
+            var scanned = 0
+            while start > 0, scanned < scanLimit {
+                let previousChar = nsString.substring(with: NSRange(location: start - 1, length: 1))
+                if previousChar == "@" {
+                    let atIndex = start - 1
+                    if atIndex > 0 {
+                        let charBeforeAt = nsString.substring(with: NSRange(location: atIndex - 1, length: 1))
+                        // A word character immediately before "@" (e.g. "a@b.com") is not a mention
+                        // trigger -- only fire at the start of the message or after whitespace/punctuation.
+                        if charBeforeAt.rangeOfCharacter(from: .alphanumerics) != nil {
+                            return nil
+                        }
+                    }
+                    let query = nsString.substring(with: NSRange(location: start, length: caret - start))
+                    return InlineComposerTrigger(utf16Location: atIndex, utf16Length: caret - atIndex, query: query)
+                }
+                if previousChar.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
+                    return nil
+                }
+                start -= 1
+                scanned += 1
+            }
+            return nil
         }
     }
 }
@@ -1854,11 +2223,13 @@ public struct MessageRow: View {
     private let replyPreviewItem: MessageRowReplyPreviewItem?
     private let attachmentItems: [AttachmentDisplayItem]?
     private let customEmojiItems: [MessageInlineCustomEmojiItem]
+    private let referenceItems: [String: MessageInlineReferenceItem]
     private let preparedMarkdownContent: PreparedMarkdownContent?
     private let embedItems: [MessageEmbedDisplayItem]?
     private let authorAvatarData: Data?
     private let actionItems: [MessageRowActionItem]
     private let reactionItems: [MessageReactionDisplayItem]
+    private let mentionsCurrentUser: Bool
     private let onMessageAction: (String) -> Void
     private let onToggleReaction: (String) -> Void
     private let onPreviewAttachment: (AttachmentDisplayItem) -> Void
@@ -1871,6 +2242,7 @@ public struct MessageRow: View {
     private let onRetryEmbedMedia: (AttachmentDisplayItem) -> Void
     private let onOpenAuthorProfile: () -> Void
     private let onOpenReplyPreview: () -> Void
+    private let onOpenMention: (UserID) -> Void
 
     public init(
         message: Message,
@@ -1890,11 +2262,13 @@ public struct MessageRow: View {
         replyPreviewItem: MessageRowReplyPreviewItem? = nil,
         attachmentItems: [AttachmentDisplayItem]? = nil,
         customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        referenceItems: [String: MessageInlineReferenceItem] = [:],
         preparedMarkdownContent: PreparedMarkdownContent? = nil,
         embedItems: [MessageEmbedDisplayItem]? = nil,
         authorAvatarData: Data? = nil,
         actionItems: [MessageRowActionItem] = [],
         reactionItems: [MessageReactionDisplayItem] = [],
+        mentionsCurrentUser: Bool = false,
         onMessageAction: @escaping (String) -> Void = { _ in },
         onToggleReaction: @escaping (String) -> Void = { _ in },
         onPreviewAttachment: @escaping (AttachmentDisplayItem) -> Void = { _ in },
@@ -1906,7 +2280,8 @@ public struct MessageRow: View {
         onOpenEmbedMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onRetryEmbedMedia: @escaping (AttachmentDisplayItem) -> Void = { _ in },
         onOpenAuthorProfile: @escaping () -> Void = {},
-        onOpenReplyPreview: @escaping () -> Void = {}
+        onOpenReplyPreview: @escaping () -> Void = {},
+        onOpenMention: @escaping (UserID) -> Void = { _ in }
     ) {
         self.message = message
         self.author = author
@@ -1925,11 +2300,13 @@ public struct MessageRow: View {
         self.replyPreviewItem = replyPreviewItem
         self.attachmentItems = attachmentItems
         self.customEmojiItems = customEmojiItems
+        self.referenceItems = referenceItems
         self.preparedMarkdownContent = preparedMarkdownContent
         self.embedItems = embedItems
         self.authorAvatarData = authorAvatarData
         self.actionItems = actionItems
         self.reactionItems = reactionItems
+        self.mentionsCurrentUser = mentionsCurrentUser
         self.onMessageAction = onMessageAction
         self.onToggleReaction = onToggleReaction
         self.onPreviewAttachment = onPreviewAttachment
@@ -1942,6 +2319,7 @@ public struct MessageRow: View {
         self.onRetryEmbedMedia = onRetryEmbedMedia
         self.onOpenAuthorProfile = onOpenAuthorProfile
         self.onOpenReplyPreview = onOpenReplyPreview
+        self.onOpenMention = onOpenMention
     }
 
     public var body: some View {
@@ -2003,10 +2381,12 @@ public struct MessageRow: View {
                     if let preparedMarkdownContent {
                         MarkdownMessageContent(
                             prepared: preparedMarkdownContent,
-                            customEmojiItems: customEmojiItems
+                            customEmojiItems: customEmojiItems,
+                            referenceItems: referenceItems,
+                            onOpenMention: onOpenMention
                         )
                     } else {
-                        MarkdownMessageContent(content, customEmojiItems: customEmojiItems)
+                        MarkdownMessageContent(content, customEmojiItems: customEmojiItems, referenceItems: referenceItems, onOpenMention: onOpenMention)
                     }
                 }
                 let renderedAttachments = attachmentItems ?? message.attachments?.map { AttachmentDisplayItem(file: $0) } ?? []
@@ -2082,8 +2462,16 @@ public struct MessageRow: View {
                     .strokeBorder(Color.accentColor.opacity(0.72), lineWidth: 2)
             }
         }
+        .overlay(alignment: .leading) {
+            if mentionsCurrentUser && !searchStyle.isHighlighted {
+                RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous)
+                    .fill(Color.yellow.opacity(0.65))
+                    .frame(width: 3)
+                    .padding(.vertical, 2)
+            }
+        }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: reactionCount, status: statusText, isSelected: isSelected, isFocused: isFocused || isTargetHighlighted, searchResultStatus: searchAccessibilityStatus, replyPreview: effectiveReplyPreviewItem?.plainText))
+        .accessibilityLabel(StoatAccessibility.messageLabel(author: authorName, timestamp: timestampText, content: message.content ?? message.system?.content ?? "", isEdited: message.isEdited, isPinned: message.isPinned, reactionCount: reactionCount, status: statusText, isSelected: isSelected, isFocused: isFocused || isTargetHighlighted, searchResultStatus: searchAccessibilityStatus, replyPreview: effectiveReplyPreviewItem?.plainText, mentionsCurrentUser: mentionsCurrentUser))
     }
 
     private var effectiveReplyPreviewItem: MessageRowReplyPreviewItem? {
@@ -2215,6 +2603,9 @@ public struct MessageRow: View {
         }
         if isSelected || isFocused {
             return Color.accentColor.opacity(isFocused ? 0.16 : 0.10)
+        }
+        if mentionsCurrentUser {
+            return Color.yellow.opacity(0.08)
         }
         return Color.clear
     }
@@ -2725,7 +3116,8 @@ public struct PreparedMarkdownContent: Hashable, Sendable {
 public enum MarkdownContentPreparer {
     nonisolated public static func prepare(
         _ source: String,
-        customEmojiItems: [MessageInlineCustomEmojiItem] = []
+        customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        referenceItems: [String: MessageInlineReferenceItem] = [:]
     ) -> PreparedMarkdownContent {
         let blocks = MarkdownBlockCache.shared.blocks(for: source)
         for block in blocks {
@@ -2737,7 +3129,7 @@ public enum MarkdownContentPreparer {
                 inlineSource = nil
             }
             guard let inlineSource else { continue }
-            let tokens = MarkdownInlineCache.shared.tokens(source: inlineSource, items: customEmojiItems)
+            let tokens = MarkdownInlineCache.shared.tokens(source: inlineSource, emojiItems: customEmojiItems, referenceItems: referenceItems)
             for token in tokens {
                 if case let .text(value) = token {
                     _ = MarkdownInlineCache.shared.attributed(value)
@@ -2752,22 +3144,35 @@ public struct MarkdownMessageContent: View {
     private let source: String
     private let preparedContent: PreparedMarkdownContent?
     private let customEmojiItems: [MessageInlineCustomEmojiItem]
+    private let referenceItems: [String: MessageInlineReferenceItem]
+    private let onOpenMention: (UserID) -> Void
     @State private var asynchronouslyPreparedContent: PreparedMarkdownContent?
 
-    public init(_ source: String, customEmojiItems: [MessageInlineCustomEmojiItem] = []) {
+    public init(
+        _ source: String,
+        customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        referenceItems: [String: MessageInlineReferenceItem] = [:],
+        onOpenMention: @escaping (UserID) -> Void = { _ in }
+    ) {
         self.source = source
         self.preparedContent = nil
         self.customEmojiItems = customEmojiItems
+        self.referenceItems = referenceItems
+        self.onOpenMention = onOpenMention
         _asynchronouslyPreparedContent = State(initialValue: nil)
     }
 
     public init(
         prepared: PreparedMarkdownContent,
-        customEmojiItems: [MessageInlineCustomEmojiItem] = []
+        customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        referenceItems: [String: MessageInlineReferenceItem] = [:],
+        onOpenMention: @escaping (UserID) -> Void = { _ in }
     ) {
         self.source = prepared.source
         self.preparedContent = prepared
         self.customEmojiItems = customEmojiItems
+        self.referenceItems = referenceItems
+        self.onOpenMention = onOpenMention
         _asynchronouslyPreparedContent = State(initialValue: nil)
     }
 
@@ -2786,8 +3191,9 @@ public struct MarkdownMessageContent: View {
             guard preparedContent == nil else { return }
             let source = source
             let customEmojiItems = customEmojiItems
+            let referenceItems = referenceItems
             asynchronouslyPreparedContent = await Task.detached(priority: .userInitiated) {
-                MarkdownContentPreparer.prepare(source, customEmojiItems: customEmojiItems)
+                MarkdownContentPreparer.prepare(source, customEmojiItems: customEmojiItems, referenceItems: referenceItems)
             }.value
         }
     }
@@ -2804,7 +3210,7 @@ public struct MarkdownMessageContent: View {
                         .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: StoatRadius.small, style: .continuous))
                         .textSelection(.enabled)
                 case let .quote(quote):
-                    MarkdownInlineContent(source: quote, customEmojiItems: customEmojiItems, font: StoatTypography.messageBody)
+                    MarkdownInlineContent(source: quote, customEmojiItems: customEmojiItems, referenceItems: referenceItems, font: StoatTypography.messageBody, onOpenMention: onOpenMention)
                         .padding(.leading, StoatSpacing.small)
                         .overlay(alignment: .leading) {
                             Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 2)
@@ -2812,7 +3218,7 @@ public struct MarkdownMessageContent: View {
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 case let .heading(level, text):
-                    MarkdownInlineContent(source: text, customEmojiItems: customEmojiItems, font: level <= 1 ? .title3.weight(.semibold) : .headline)
+                    MarkdownInlineContent(source: text, customEmojiItems: customEmojiItems, referenceItems: referenceItems, font: level <= 1 ? .title3.weight(.semibold) : .headline, onOpenMention: onOpenMention)
                         .textSelection(.enabled)
                 case let .listItem(marker, text):
                     HStack(alignment: .firstTextBaseline, spacing: StoatSpacing.small) {
@@ -2820,11 +3226,11 @@ public struct MarkdownMessageContent: View {
                             .font(StoatTypography.messageBody)
                             .foregroundStyle(.secondary)
                             .frame(minWidth: 18, alignment: .trailing)
-                        MarkdownInlineContent(source: text, customEmojiItems: customEmojiItems, font: StoatTypography.messageBody)
+                        MarkdownInlineContent(source: text, customEmojiItems: customEmojiItems, referenceItems: referenceItems, font: StoatTypography.messageBody, onOpenMention: onOpenMention)
                             .textSelection(.enabled)
                     }
                 case let .text(text):
-                    MarkdownInlineContent(source: text, customEmojiItems: customEmojiItems, font: StoatTypography.messageBody)
+                    MarkdownInlineContent(source: text, customEmojiItems: customEmojiItems, referenceItems: referenceItems, font: StoatTypography.messageBody, onOpenMention: onOpenMention)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -2891,8 +3297,12 @@ extension MarkdownMessageContent {
         MarkdownBlock.parse(source).map(\.testDescription)
     }
 
-    nonisolated static func _testInlineTokenDescriptions(for source: String, customEmojiItems: [MessageInlineCustomEmojiItem]) -> [String] {
-        InlineCustomEmojiToken.tokenize(source: source, items: customEmojiItems).map(\.testDescription)
+    nonisolated static func _testInlineTokenDescriptions(
+        for source: String,
+        customEmojiItems: [MessageInlineCustomEmojiItem],
+        referenceItems: [String: MessageInlineReferenceItem] = [:]
+    ) -> [String] {
+        MarkdownInlineToken.tokenize(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems).map(\.testDescription)
     }
 }
 
@@ -2906,16 +3316,27 @@ private struct InlineCustomEmojiMessageContent: View {
 }
 
 private struct MarkdownInlineContent: View {
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     let source: String
     let customEmojiItems: [MessageInlineCustomEmojiItem]
+    let referenceItems: [String: MessageInlineReferenceItem]
     let font: Font
-    private let tokens: [InlineCustomEmojiToken]
+    let onOpenMention: (UserID) -> Void
+    private let tokens: [MarkdownInlineToken]
 
-    init(source: String, customEmojiItems: [MessageInlineCustomEmojiItem], font: Font) {
+    init(
+        source: String,
+        customEmojiItems: [MessageInlineCustomEmojiItem],
+        referenceItems: [String: MessageInlineReferenceItem] = [:],
+        font: Font,
+        onOpenMention: @escaping (UserID) -> Void = { _ in }
+    ) {
         self.source = source
         self.customEmojiItems = customEmojiItems
+        self.referenceItems = referenceItems
         self.font = font
-        self.tokens = MarkdownInlineCache.shared.tokens(source: source, items: customEmojiItems)
+        self.onOpenMention = onOpenMention
+        self.tokens = MarkdownInlineCache.shared.tokens(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems)
     }
 
     var body: some View {
@@ -2928,11 +3349,13 @@ private struct MarkdownInlineContent: View {
                         .textSelection(.enabled)
                 case let .emoji(item):
                     inlineEmoji(item)
+                case let .reference(item):
+                    inlineReference(item)
                 }
             }
         }
         .fixedSize(horizontal: false, vertical: true)
-        .accessibilityLabel(source)
+        .accessibilityLabel(accessibleDescription)
     }
 
     @ViewBuilder private func inlineEmoji(_ item: MessageInlineCustomEmojiItem) -> some View {
@@ -2952,34 +3375,149 @@ private struct MarkdownInlineContent: View {
         #endif
     }
 
+    @ViewBuilder private func inlineReference(_ item: MessageInlineReferenceItem) -> some View {
+        switch item.kind {
+        case .user:
+            Button {
+                onOpenMention(UserID(rawValue: item.rawID))
+            } label: {
+                referencePillLabel(item)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(item.isCurrentUser ? "mentions you" : "mention, \(item.displayName)")
+        case .channel:
+            referencePillLabel(item)
+                .accessibilityLabel("channel mention, \(item.displayName)")
+        case .role:
+            referencePillLabel(item)
+                .accessibilityLabel("role mention, \(item.displayName)")
+        }
+    }
+
+    private func referencePillLabel(_ item: MessageInlineReferenceItem) -> some View {
+        HStack(spacing: 2) {
+            Text(sigil(for: item.kind))
+            Text(item.displayName)
+        }
+        .font(font.weight(.medium))
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
+        .background(referenceBackground(item), in: Capsule())
+        .foregroundStyle(referenceForeground(item))
+    }
+
+    private func sigil(for kind: MessageInlineReferenceKind) -> String {
+        kind == .channel ? "#" : "@"
+    }
+
+    private func referenceForeground(_ item: MessageInlineReferenceItem) -> Color {
+        // Matches the MessageRow author-name convention: Increase Contrast overrides sanitized
+        // role colors with the system accent rather than risking a low-contrast custom hue.
+        if colorSchemeContrast != .increased, let roleColor = item.roleColor {
+            return Color(red: roleColor.red, green: roleColor.green, blue: roleColor.blue)
+        }
+        return .accentColor
+    }
+
+    private func referenceBackground(_ item: MessageInlineReferenceItem) -> Color {
+        item.isCurrentUser ? Color.accentColor.opacity(0.28) : Color.accentColor.opacity(0.14)
+    }
+
+    private var accessibleDescription: String {
+        tokens.map { token -> String in
+            switch token {
+            case let .text(value):
+                return value
+            case let .emoji(item):
+                return item.name
+            case let .reference(item):
+                return "\(sigil(for: item.kind))\(item.displayName)"
+            }
+        }.joined()
+    }
+
     private static func attributed(_ value: String) -> AttributedString {
         MarkdownInlineCache.shared.attributed(value)
     }
 }
 
-private enum InlineCustomEmojiToken: Hashable {
+private enum MarkdownInlineToken: Hashable {
     case text(String)
     case emoji(MessageInlineCustomEmojiItem)
+    case reference(MessageInlineReferenceItem)
 
-    static func tokenize(source: String, items: [MessageInlineCustomEmojiItem]) -> [InlineCustomEmojiToken] {
-        var remaining = source[...]
-        var result: [InlineCustomEmojiToken] = []
-        let byShortcode = Dictionary(uniqueKeysWithValues: items.map { ($0.shortcode, $0) })
+    private static let mentionIDAlphabet = Set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    private static let mentionIDLength = 26
 
-        while let start = remaining.firstIndex(of: ":"),
-              let end = remaining[remaining.index(after: start)...].firstIndex(of: ":") {
-            let before = String(remaining[..<start])
-            if !before.isEmpty { result.append(.text(before)) }
-            let shortcode = String(remaining[start...end])
-            if let item = byShortcode[shortcode] {
-                result.append(.emoji(item))
-            } else {
-                result.append(.text(shortcode))
+    static func tokenize(
+        source: String,
+        emojiItems: [MessageInlineCustomEmojiItem],
+        referenceItems: [String: MessageInlineReferenceItem]
+    ) -> [MarkdownInlineToken] {
+        let byShortcode = Dictionary(uniqueKeysWithValues: emojiItems.map { ($0.shortcode, $0) })
+        var result: [MarkdownInlineToken] = []
+        var textStart = source.startIndex
+        var cursor = source.startIndex
+        let end = source.endIndex
+
+        func flushText(upTo index: String.Index) {
+            if textStart < index {
+                result.append(.text(String(source[textStart..<index])))
             }
-            remaining = remaining[remaining.index(after: end)...]
         }
-        let tail = String(remaining)
-        if !tail.isEmpty { result.append(.text(tail)) }
+
+        while cursor < end {
+            let character = source[cursor]
+            if character == ":" {
+                let afterColon = source.index(after: cursor)
+                if afterColon < end, let closeIndex = source[afterColon...].firstIndex(of: ":") {
+                    let tokenEnd = source.index(after: closeIndex)
+                    let shortcode = String(source[cursor..<tokenEnd])
+                    flushText(upTo: cursor)
+                    if let item = byShortcode[shortcode] {
+                        result.append(.emoji(item))
+                    } else {
+                        result.append(.text(shortcode))
+                    }
+                    cursor = tokenEnd
+                    textStart = cursor
+                    continue
+                }
+            } else if character == "<" {
+                let sigilIndex = source.index(after: cursor)
+                if sigilIndex < end, "@#%".contains(source[sigilIndex]) {
+                    let idStart = source.index(after: sigilIndex)
+                    var idEnd = idStart
+                    while idEnd < end, mentionIDAlphabet.contains(source[idEnd]) {
+                        idEnd = source.index(after: idEnd)
+                    }
+                    let idLength = source.distance(from: idStart, to: idEnd)
+                    if idLength == mentionIDLength, idEnd < end, source[idEnd] == ">" {
+                        let tokenEnd = source.index(after: idEnd)
+                        let tokenText = String(source[cursor..<tokenEnd])
+                        flushText(upTo: cursor)
+                        if let item = referenceItems[tokenText] {
+                            result.append(.reference(item))
+                        } else {
+                            let sigil = source[sigilIndex]
+                            let kind: MessageInlineReferenceKind = sigil == "@" ? .user : (sigil == "#" ? .channel : .role)
+                            let rawID = String(source[idStart..<idEnd])
+                            result.append(.reference(MessageInlineReferenceItem(
+                                kind: kind,
+                                rawID: rawID,
+                                displayName: MessageInlineReferenceItem.fallbackDisplayName(for: kind),
+                                isFallback: true
+                            )))
+                        }
+                        cursor = tokenEnd
+                        textStart = cursor
+                        continue
+                    }
+                }
+            }
+            cursor = source.index(after: cursor)
+        }
+        flushText(upTo: end)
         return result.isEmpty ? [.text(source)] : result
     }
 
@@ -2989,6 +3527,8 @@ private enum InlineCustomEmojiToken: Hashable {
             return "text::\(value)"
         case let .emoji(item):
             return "emoji::\(item.shortcode)"
+        case let .reference(item):
+            return "reference:\(item.kind)::\(item.rawID)"
         }
     }
 }
@@ -2998,11 +3538,12 @@ private final class MarkdownInlineCache: @unchecked Sendable {
 
     private struct TokenKey: Hashable {
         var source: String
-        var items: [MessageInlineCustomEmojiItem]
+        var emojiItems: [MessageInlineCustomEmojiItem]
+        var referenceItems: [String: MessageInlineReferenceItem]
     }
 
     private let lock = NSLock()
-    private var tokensByKey: [TokenKey: [InlineCustomEmojiToken]] = [:]
+    private var tokensByKey: [TokenKey: [MarkdownInlineToken]] = [:]
     private var attributedBySource: [String: AttributedString] = [:]
     private var tokenOrder: [TokenKey] = []
     private var attributedOrder: [String] = []
@@ -3011,18 +3552,18 @@ private final class MarkdownInlineCache: @unchecked Sendable {
     private let maxEntries = 800
     private let maxBytes = 4 * 1024 * 1024
 
-    func tokens(source: String, items: [MessageInlineCustomEmojiItem]) -> [InlineCustomEmojiToken] {
-        let key = TokenKey(source: source, items: items)
+    func tokens(source: String, emojiItems: [MessageInlineCustomEmojiItem], referenceItems: [String: MessageInlineReferenceItem]) -> [MarkdownInlineToken] {
+        let key = TokenKey(source: source, emojiItems: emojiItems, referenceItems: referenceItems)
         lock.lock()
         if let cached = tokensByKey[key] {
             lock.unlock()
             return cached
         }
         lock.unlock()
-        let parsed = InlineCustomEmojiToken.tokenize(source: source, items: items)
+        let parsed = MarkdownInlineToken.tokenize(source: source, emojiItems: emojiItems, referenceItems: referenceItems)
         lock.lock()
         tokensByKey[key] = parsed
-        tokenByteCount += source.utf8.count + items.reduce(0) { $0 + $1.shortcode.utf8.count }
+        tokenByteCount += Self.byteCount(for: key)
         tokenOrder.append(key)
         trimTokens()
         lock.unlock()
@@ -3054,12 +3595,17 @@ private final class MarkdownInlineCache: @unchecked Sendable {
         return parsed
     }
 
+    private static func byteCount(for key: TokenKey) -> Int {
+        key.source.utf8.count
+            + key.emojiItems.reduce(0) { $0 + $1.shortcode.utf8.count }
+            + key.referenceItems.reduce(0) { $0 + $1.key.utf8.count + $1.value.displayName.utf8.count }
+    }
+
     private func trimTokens() {
         while (tokenOrder.count > maxEntries || tokenByteCount > maxBytes), let oldest = tokenOrder.first {
             tokenOrder.removeFirst()
             tokensByKey.removeValue(forKey: oldest)
-            tokenByteCount -= oldest.source.utf8.count
-                + oldest.items.reduce(0) { $0 + $1.shortcode.utf8.count }
+            tokenByteCount -= Self.byteCount(for: oldest)
         }
     }
 }

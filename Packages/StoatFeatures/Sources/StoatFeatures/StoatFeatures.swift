@@ -639,6 +639,18 @@ public final class MainShellViewModel {
     public var groupCreateSearch = ""
     public var groupCreateSelectedUserIDs: Set<UserID> = []
     public var groupCreateState: GroupCreateState = .idle
+    public var isPresentingAddGroupMembers = false
+    public var addGroupMembersChannelID: ChannelID?
+    public var addGroupMembersSearch = ""
+    public var addGroupMembersSelectedUserIDs: Set<UserID> = []
+    public var groupMembershipActionState: GroupMembershipActionState = .idle
+    public var pendingGroupMemberRemoval: PendingGroupMemberRemoval?
+    public var composerMentionTrigger: InlineComposerTrigger?
+    public var composerMentionCandidates: [ComposerMentionCandidate] = []
+    public var composerMentionHighlightedID: UserID?
+    public var composerCursorRequest: ComposerCursorRequest?
+    private var composerCursorRequestCounter = 0
+    private var mentionCandidateIndexCache: (channelID: ChannelID, revision: Int, index: Phase58MentionCandidateIndex)?
     public var settingsSyncState: SettingsSyncState = .idle
     private var localSettingsSyncTimestamp: Int64?
     public var newDirectMessageSearch = ""
@@ -1362,6 +1374,11 @@ public final class MainShellViewModel {
             return Dictionary(uniqueKeysWithValues: messages.map { timelineMessage in
                 let message = timelineMessage.message
                 let customEmojiItems = assetContext.inlineCustomEmojiItems(for: message)
+                let referenceItems = assetContext.inlineReferenceItems(
+                    for: message,
+                    identitySnapshots: identitySnapshots,
+                    currentUserID: currentUserID
+                )
                 let server = snapshot.channelsByID[message.channelID]?.serverID.flatMap { snapshot.serversByID[$0] }
                 let channel = snapshot.channelsByID[message.channelID]
                 let display = identitySnapshots.resolvedDisplay(
@@ -1375,10 +1392,11 @@ public final class MainShellViewModel {
                     authorDisplay: display,
                     isSystemEvent: message.system != nil,
                     preparedMarkdownContent: message.content.map {
-                        MarkdownContentPreparer.prepare($0, customEmojiItems: customEmojiItems)
+                        MarkdownContentPreparer.prepare($0, customEmojiItems: customEmojiItems, referenceItems: referenceItems)
                     },
                     attachmentItems: assetContext.attachmentItems(for: message),
                     customEmojiItems: customEmojiItems,
+                    referenceItems: referenceItems,
                     embedItems: assetContext.embedItems(for: message),
                     actionItems: Phase52TimelineInteractionPreparer.actionItems(
                         for: timelineMessage,
@@ -1396,7 +1414,8 @@ public final class MainShellViewModel {
                         for: message,
                         snapshot: snapshot,
                         identitySnapshots: identitySnapshots
-                    )
+                    ),
+                    mentionsCurrentUser: Phase52TimelineInteractionPreparer.mentionsCurrentUser(message, currentUserID: currentUserID)
                 )
                 return (message.id, row)
             })
@@ -2551,6 +2570,103 @@ public final class MainShellViewModel {
             groupCreateSelectedUserIDs = []
         } catch {
             groupCreateState = .failed(Phase23Safety.safeError(error))
+        }
+    }
+
+    /// Friends available to add to an existing group, excluding current recipients.
+    /// Backend gating (Docs/Research.md Phase 58 Notes): any current group member may add a
+    /// recipient, subject to the adder being friends with the target -- this is not owner-gated.
+    public func addGroupMemberCandidates(for channelID: ChannelID) -> [FriendListItem] {
+        let existingRecipients = Set(snapshot.channelsByID[channelID]?.recipients ?? [])
+        let friends = shellPresentationSnapshot.allFriendItems.filter {
+            $0.relationshipStatus == .friend && !existingRecipients.contains($0.user.id)
+        }
+        let query = addGroupMembersSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return friends }
+        return friends.filter { item in
+            item.user.username.lowercased().contains(query) ||
+                (item.user.displayName?.lowercased().contains(query) ?? false)
+        }
+    }
+
+    public func openAddGroupMembers(for channelID: ChannelID) {
+        addGroupMembersChannelID = channelID
+        addGroupMembersSearch = ""
+        addGroupMembersSelectedUserIDs = []
+        groupMembershipActionState = .idle
+        isPresentingAddGroupMembers = true
+    }
+
+    public func toggleAddGroupMemberCandidate(_ userID: UserID) {
+        if addGroupMembersSelectedUserIDs.contains(userID) {
+            addGroupMembersSelectedUserIDs.remove(userID)
+        } else {
+            addGroupMembersSelectedUserIDs.insert(userID)
+        }
+    }
+
+    public func addSelectedGroupMembers() async {
+        guard let channelID = addGroupMembersChannelID else { return }
+        guard let apiClient = apiClientForCommunityAction() else {
+            groupMembershipActionState = .failed("Reconnect before adding group members.")
+            return
+        }
+        let userIDs = addGroupMembersSelectedUserIDs.sorted { $0.rawValue < $1.rawValue }
+        guard !userIDs.isEmpty else { return }
+        groupMembershipActionState = .working
+        var failureMessage: String?
+        for userID in userIDs {
+            do {
+                try await apiClient.addGroupRecipient(channelID: channelID, userID: userID)
+                if var channel = snapshot.channelsByID[channelID], !channel.recipients.contains(userID) {
+                    channel.recipients.append(userID)
+                    snapshot.channelsByID[channelID] = channel
+                }
+            } catch {
+                failureMessage = Phase23Safety.safeError(error)
+            }
+        }
+        if let failureMessage {
+            groupMembershipActionState = .failed(failureMessage)
+        } else {
+            groupMembershipActionState = .idle
+            isPresentingAddGroupMembers = false
+            addGroupMembersSearch = ""
+            addGroupMembersSelectedUserIDs = []
+        }
+    }
+
+    /// Only ever offered to the group owner, targeting another member. Self-removal must
+    /// continue to route through the existing leave/close-group flow, not this recipients API
+    /// (the backend rejects self-removal here with `CannotRemoveYourself`).
+    public func requestRemoveGroupMember(_ userID: UserID, from channelID: ChannelID, displayName: String) {
+        guard userID != currentUserID else { return }
+        guard snapshot.channelsByID[channelID]?.ownerID == currentUserID else { return }
+        pendingGroupMemberRemoval = PendingGroupMemberRemoval(channelID: channelID, userID: userID, displayName: displayName)
+    }
+
+    public func cancelRemoveGroupMember() {
+        pendingGroupMemberRemoval = nil
+    }
+
+    public func confirmRemoveGroupMember() async {
+        guard let pending = pendingGroupMemberRemoval else { return }
+        guard let apiClient = apiClientForCommunityAction() else {
+            groupMembershipActionState = .failed("Reconnect before removing group members.")
+            return
+        }
+        groupMembershipActionState = .working
+        do {
+            try await apiClient.removeGroupRecipient(channelID: pending.channelID, userID: pending.userID)
+            if var channel = snapshot.channelsByID[pending.channelID] {
+                channel.recipients.removeAll { $0 == pending.userID }
+                snapshot.channelsByID[pending.channelID] = channel
+            }
+            groupMembershipActionState = .idle
+            pendingGroupMemberRemoval = nil
+        } catch {
+            groupMembershipActionState = .failed(Phase23Safety.safeError(error))
+            pendingGroupMemberRemoval = nil
         }
     }
 
@@ -6260,6 +6376,100 @@ public final class MainShellViewModel {
         requestFocus(.composer)
     }
 
+    /// Server members for a server channel, or DM/group/Saved Notes participants otherwise --
+    /// the raw candidate pool a `Phase58MentionCandidateIndex` sorts and searches.
+    private func mentionCandidateSource(for channelID: ChannelID) -> [ComposerMentionCandidate] {
+        guard let channel = snapshot.channelsByID[channelID] else { return [] }
+        let items: [MemberListItem]
+        if let serverID = channel.serverID {
+            items = cachedMemberListGroups(for: serverID).flatMap(\.items)
+        } else {
+            items = directMessageParticipantItems(for: channel)
+        }
+        return items
+            .filter { $0.userID != currentUserID }
+            .map { item in
+                ComposerMentionCandidate(
+                    userID: item.userID,
+                    name: item.displayName,
+                    subtitle: item.subtitle,
+                    avatarData: imageData(for: item.avatar, kind: .userAvatar)
+                )
+            }
+    }
+
+    /// Phase 58: rebuilds the candidate index only when the channel or snapshot revision changes,
+    /// so a run of keystrokes within the same `@query` never re-derives it from scratch.
+    private func mentionCandidateIndex(for channelID: ChannelID) -> Phase58MentionCandidateIndex {
+        if let cached = mentionCandidateIndexCache, cached.channelID == channelID, cached.revision == snapshotRevision {
+            return cached.index
+        }
+        let index = Phase58MentionCandidateIndex(candidates: mentionCandidateSource(for: channelID))
+        mentionCandidateIndexCache = (channelID: channelID, revision: snapshotRevision, index: index)
+        return index
+    }
+
+    public func composerInlineTriggerChanged(_ trigger: InlineComposerTrigger?, for channelID: ChannelID?) {
+        guard let channelID, let trigger else {
+            clearComposerMentionAutocomplete()
+            return
+        }
+        composerMentionTrigger = trigger
+        let matches = mentionCandidateIndex(for: channelID).matches(prefix: trigger.query, limit: 10)
+        composerMentionCandidates = matches
+        if let highlighted = composerMentionHighlightedID, matches.contains(where: { $0.userID == highlighted }) {
+            return
+        }
+        composerMentionHighlightedID = matches.first?.userID
+    }
+
+    public func navigateComposerMentionAutocomplete(_ direction: MentionAutocompleteNavigation) {
+        guard !composerMentionCandidates.isEmpty else { return }
+        let ids = composerMentionCandidates.map(\.userID)
+        guard let highlighted = composerMentionHighlightedID, let currentIndex = ids.firstIndex(of: highlighted) else {
+            composerMentionHighlightedID = ids.first
+            return
+        }
+        switch direction {
+        case .up:
+            composerMentionHighlightedID = ids[max(0, currentIndex - 1)]
+        case .down:
+            composerMentionHighlightedID = ids[min(ids.count - 1, currentIndex + 1)]
+        }
+    }
+
+    public func selectHighlightedComposerMentionCandidate(for channelID: ChannelID?) {
+        guard let candidate = composerMentionCandidates.first(where: { $0.userID == composerMentionHighlightedID }) else {
+            clearComposerMentionAutocomplete()
+            return
+        }
+        selectComposerMentionCandidate(candidate, for: channelID)
+    }
+
+    /// Splices the verified `<@ULID>` token (Docs/Research.md Phase 58 Notes) into the composer
+    /// draft at the trigger's exact range, then requests the caret land right after it.
+    public func selectComposerMentionCandidate(_ candidate: ComposerMentionCandidate, for channelID: ChannelID?) {
+        defer { clearComposerMentionAutocomplete() }
+        guard let channelID, let trigger = composerMentionTrigger else { return }
+        let currentText = draft(for: channelID)
+        let nsText = currentText as NSString
+        guard trigger.utf16Location >= 0, trigger.utf16Location + trigger.utf16Length <= nsText.length else { return }
+        let token = "<@\(candidate.userID.rawValue)> "
+        let updated = nsText.replacingCharacters(in: NSRange(location: trigger.utf16Location, length: trigger.utf16Length), with: token)
+        updateDraft(updated, for: channelID)
+        composerCursorRequestCounter += 1
+        composerCursorRequest = ComposerCursorRequest(
+            id: composerCursorRequestCounter,
+            utf16Offset: trigger.utf16Location + (token as NSString).length
+        )
+    }
+
+    public func clearComposerMentionAutocomplete() {
+        composerMentionTrigger = nil
+        composerMentionCandidates = []
+        composerMentionHighlightedID = nil
+    }
+
     public func customEmojiDisplayItemsForCurrentContext() -> [CustomEmojiDisplayItem] {
         customEmojiDisplayItemsForContext(channelID: selectedConversationChannelID)
     }
@@ -8849,8 +9059,11 @@ public final class MainShellViewModel {
             bundleIdentifier: bundleID,
             bundleDisplayName: displayName,
             appPath: appPath,
-            codeSigningAllowed: "NO in checked Xcode build settings",
-            detectedSignatureStatus: testingSignedNotificationBuild ? "user marked signed build" : "unsigned/debug likely",
+            codeSigningAllowed: "YES (ad-hoc) in checked Xcode build settings",
+            detectedSignatureStatus: NotificationSignatureChecker.detectedSignatureStatus(
+                bundleURL: Bundle.main.bundleURL,
+                overrideAsSigned: testingSignedNotificationBuild
+            ),
             sandboxStatus: sandbox,
             delegateConfigured: delegateConfigured,
             lastUNErrorName: request?.errorCodeName,
@@ -10397,6 +10610,12 @@ public final class MainShellViewModel {
 
     private func acknowledgeSelectedChannel() {
         guard let channelID = selectedConversationChannelID else { return }
+        acknowledgeChannel(channelID)
+    }
+
+    /// Phase 58: shared by `acknowledgeSelectedChannel()` and `markSelectedServerRead()`, which
+    /// acks every selectable channel in the server rather than just the selected one.
+    private func acknowledgeChannel(_ channelID: ChannelID) {
         guard snapshot.channelsByID[channelID] != nil else {
             lastAckResult = "Skipped: selected channel missing"
             return
@@ -10407,6 +10626,27 @@ public final class MainShellViewModel {
             return
         }
         clearLocalUnreadState(channelID: channelID, source: "mock")
+    }
+
+    /// Phase 58: verified `CHAT_JUMP_END` (Escape) behavior -- mark the channel read, jump to the
+    /// newest loaded message, and focus the composer (Docs/Research.md Phase 58 Notes).
+    public func markSelectedChannelReadAndFocusComposer() {
+        guard selectedConversationChannelID != nil else { return }
+        if let newest = selectedTimelineMessages.last {
+            timelineSelection = TimelineSelection(channelID: newest.message.channelID, messageID: newest.message.id, source: .scrollJump)
+            timelineViewport = viewportReducer.jumpNewest(timelineViewport, newestMessageID: newest.message.id)
+        }
+        acknowledgeSelectedChannel()
+        focusComposer()
+    }
+
+    /// Phase 58: verified `CHAT_MARK_SERVER_AS_READ` (Shift-Escape) -- acks every selectable
+    /// channel in the selected server.
+    public func markSelectedServerRead() {
+        guard let serverID = selection.serverID else { return }
+        for channel in navigationHelper.visibleSelectableChannels(in: serverID, snapshot: snapshot) {
+            acknowledgeChannel(channel.id)
+        }
     }
 
     private func clearLocalUnreadState(channelID: ChannelID, source: String) {
@@ -10710,6 +10950,10 @@ extension MainShellViewModel: AppCommandHandling {
             return false
         case .pinOrUnpinSelectedMessage:
             return !isTextEntryFocused && selectedTimelineMessage.map { canPin($0) } == true
+        case .markSelectedChannelRead:
+            return selectedConversationChannelID != nil
+        case .markSelectedServerRead:
+            return selection.serverID != nil
         }
     }
 
@@ -10771,6 +11015,10 @@ extension MainShellViewModel: AppCommandHandling {
             return "No compatible message is selected."
         case .cancelReply:
             return "No reply is active."
+        case .markSelectedChannelRead:
+            return "Select a channel before marking it read."
+        case .markSelectedServerRead:
+            return "Select a server before marking it read."
         default:
             return "Unavailable."
         }
@@ -10969,6 +11217,10 @@ extension MainShellViewModel: AppCommandHandling {
             } else {
                 requestFocus(nil)
             }
+        case .markSelectedChannelRead:
+            markSelectedChannelReadAndFocusComposer()
+        case .markSelectedServerRead:
+            markSelectedServerRead()
         }
     }
 
@@ -11562,6 +11814,26 @@ public struct MainShellView: View {
         }
         .sheet(isPresented: $viewModel.isPresentingNewGroup) {
             CreateGroupChannelView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.isPresentingAddGroupMembers) {
+            AddGroupMembersView(viewModel: viewModel)
+        }
+        .confirmationDialog(
+            "Remove from Group",
+            isPresented: Binding(
+                get: { viewModel.pendingGroupMemberRemoval != nil },
+                set: { if !$0 { viewModel.cancelRemoveGroupMember() } }
+            ),
+            presenting: viewModel.pendingGroupMemberRemoval
+        ) { pending in
+            Button("Remove \(pending.displayName)", role: .destructive) {
+                Task { await viewModel.confirmRemoveGroupMember() }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.cancelRemoveGroupMember()
+            }
+        } message: { pending in
+            Text("\(pending.displayName) will no longer see this group or its messages.")
         }
         .sheet(isPresented: $viewModel.isJoinInvitePresented) {
             JoinInviteView(viewModel: viewModel)
@@ -13282,10 +13554,29 @@ public struct ChatPlaceholderView: View {
                     },
                     onSend: {
                         Task { await viewModel.sendDraft(for: channel.id) }
+                    },
+                    onFocus: {
+                        viewModel.focusComposer()
+                    },
+                    mentionAutocompleteCandidates: viewModel.composerMentionCandidates,
+                    highlightedMentionCandidateID: viewModel.composerMentionHighlightedID,
+                    cursorRequest: viewModel.composerCursorRequest,
+                    onInlineTriggerChange: { trigger in
+                        viewModel.composerInlineTriggerChanged(trigger, for: channel.id)
+                    },
+                    onNavigateMentionAutocomplete: { direction in
+                        viewModel.navigateComposerMentionAutocomplete(direction)
+                    },
+                    onSelectHighlightedMentionCandidate: {
+                        viewModel.selectHighlightedComposerMentionCandidate(for: channel.id)
+                    },
+                    onCancelMentionAutocomplete: {
+                        viewModel.clearComposerMentionAutocomplete()
+                    },
+                    onSelectMentionCandidate: { candidate in
+                        viewModel.selectComposerMentionCandidate(candidate, for: channel.id)
                     }
-                ) {
-                    viewModel.focusComposer()
-                }
+                )
                 .padding([.horizontal, .bottom], StoatSpacing.large)
             }
         }
@@ -13730,11 +14021,13 @@ public struct TimelineMessageGroupView: View {
                             replyPreviewItem: viewModel.replyPreviewItem(for: timelineMessage.message),
                             attachmentItems: viewModel.hydratedAttachmentItems(rowPresentation?.attachmentItems ?? []),
                             customEmojiItems: rowPresentation?.customEmojiItems ?? [],
+                            referenceItems: rowPresentation?.referenceItems ?? [:],
                             preparedMarkdownContent: rowPresentation?.preparedMarkdownContent,
                             embedItems: viewModel.hydratedEmbedItems(rowPresentation?.embedItems ?? []),
                             authorAvatarData: viewModel.imageData(for: rowPresentation?.authorDisplay.avatarFile ?? viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
                             actionItems: rowActionItems(for: timelineMessage, presentation: rowPresentation),
                             reactionItems: rowReactionItems(for: timelineMessage, presentation: rowPresentation),
+                            mentionsCurrentUser: rowPresentation?.mentionsCurrentUser ?? false,
                             onMessageAction: { actionID in
                                 select(timelineMessage, source: .contextMenu)
                                 viewModel.performMessageAction(actionID, on: timelineMessage)
@@ -13773,6 +14066,10 @@ public struct TimelineMessageGroupView: View {
                             },
                             onOpenReplyPreview: {
                                 Task { await viewModel.openReplyPreview(for: timelineMessage.message) }
+                            },
+                            onOpenMention: { mentionedUserID in
+                                let serverID = rowPresentation?.authorDisplay.serverContextID
+                                viewModel.showUserProfile(mentionedUserID, source: .mention, serverID: serverID)
                             }
                         )
                         .id(timelineMessage.message.id)
@@ -14082,6 +14379,16 @@ public struct MemberPanelView: View {
                     .help(String("Refresh Members"))
                     .accessibilityLabel("Refresh members")
                 }
+                if case let .groupDMParticipants(channelID) = context {
+                    Button {
+                        viewModel.openAddGroupMembers(for: channelID)
+                    } label: {
+                        Image(systemName: "person.badge.plus")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(String("Add Members"))
+                    .accessibilityLabel("Add members to this group")
+                }
                 Text("\(panelCount(groups: resolvedGroups))")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -14231,6 +14538,7 @@ public struct MemberPanelView: View {
 
     @ViewBuilder private func dmParticipants(_ channel: Channel) -> some View {
         let items = viewModel.directMessageParticipantItems(for: channel)
+        let isRemovableGroup = channel.kind == .group && channel.ownerID == viewModel.currentUserID
         if items.isEmpty {
             EmptyStateView(title: "No participants", message: "Participant data is not present in the current snapshot.", systemImage: "person")
                 .frame(maxWidth: .infinity)
@@ -14238,7 +14546,7 @@ public struct MemberPanelView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
                     ForEach(items) { item in
-                        memberListRow(item)
+                        memberListRow(item, groupRemoval: isRemovableGroup && item.userID != viewModel.currentUserID ? (channelID: channel.id, displayName: item.displayName) : nil)
                             .onAppear {
                                 viewModel.noteVisibleIdentity(userID: item.userID, user: item.user, member: item.member, serverID: item.member?.id.serverID, source: .visibleMember)
                                 viewModel.imageResourceBecameVisible(
@@ -14257,7 +14565,7 @@ public struct MemberPanelView: View {
         }
     }
 
-    private func memberListRow(_ item: MemberListItem) -> some View {
+    private func memberListRow(_ item: MemberListItem, groupRemoval: (channelID: ChannelID, displayName: String)? = nil) -> some View {
         // SwiftUI can build context menus while flushing the view graph; moderation
         // disabled states must come from cached row state, not permission/channel scans.
         let moderationState = item.member == nil ? nil : viewModel.cachedMemberModerationMenuState(for: item)
@@ -14295,6 +14603,14 @@ public struct MemberPanelView: View {
                 Task { await viewModel.openDirectMessage(with: item.userID, source: .memberRow) }
             } label: {
                 Label("Message", systemImage: "bubble.left.and.bubble.right")
+            }
+            if let groupRemoval {
+                Divider()
+                Button(role: .destructive) {
+                    viewModel.requestRemoveGroupMember(item.userID, from: groupRemoval.channelID, displayName: groupRemoval.displayName)
+                } label: {
+                    Label("Remove from Group", systemImage: "person.badge.minus")
+                }
             }
             if let member = item.member, let moderationState {
                 Divider()
@@ -15644,6 +15960,86 @@ public struct CreateGroupChannelView: View {
 
     private var isCreating: Bool {
         if case .creating = viewModel.groupCreateState { return true }
+        return false
+    }
+}
+
+public struct AddGroupMembersView: View {
+    @Bindable private var viewModel: MainShellViewModel
+
+    public init(viewModel: MainShellViewModel) {
+        self.viewModel = viewModel
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+            HStack {
+                Text("Add Members")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button("Close") { viewModel.isPresentingAddGroupMembers = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            TextField("Search friends to add", text: $viewModel.addGroupMembersSearch)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Search friends to add to the group")
+            let candidates = viewModel.addGroupMembersChannelID.map { viewModel.addGroupMemberCandidates(for: $0) } ?? []
+            if candidates.isEmpty {
+                Text(viewModel.addGroupMembersSearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "All your friends are already in this group, or you have no friends to add yet."
+                    : "No friends match that search.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, StoatSpacing.medium)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: StoatSpacing.xSmall) {
+                        ForEach(candidates) { item in
+                            Button {
+                                viewModel.toggleAddGroupMemberCandidate(item.user.id)
+                            } label: {
+                                HStack {
+                                    Image(systemName: viewModel.addGroupMembersSelectedUserIDs.contains(item.user.id) ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(viewModel.addGroupMembersSelectedUserIDs.contains(item.user.id) ? Color.accentColor : Color.secondary)
+                                    MemberRow(
+                                        user: item.user,
+                                        imageData: viewModel.imageData(for: item.user.avatar, kind: .userAvatar)
+                                    )
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("\(item.user.displayName ?? item.user.username), \(viewModel.addGroupMembersSelectedUserIDs.contains(item.user.id) ? "selected" : "not selected")")
+                            .onAppear { viewModel.loadImageResource(for: item.user.avatar, kind: .userAvatar) }
+                        }
+                    }
+                }
+            }
+            if case let .failed(message) = viewModel.groupMembershipActionState {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            HStack {
+                Text("\(viewModel.addGroupMembersSelectedUserIDs.count) selected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    Task { await viewModel.addSelectedGroupMembers() }
+                } label: {
+                    Label("Add to Group", systemImage: "person.badge.plus")
+                }
+                .buttonStyle(GlassButtonStyle())
+                .disabled(isWorking || viewModel.addGroupMembersSelectedUserIDs.isEmpty)
+            }
+        }
+        .padding(StoatSpacing.large)
+        .frame(width: 460, height: 480, alignment: .topLeading)
+    }
+
+    private var isWorking: Bool {
+        if case .working = viewModel.groupMembershipActionState { return true }
         return false
     }
 }

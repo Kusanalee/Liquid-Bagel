@@ -270,6 +270,13 @@ public enum Phase52MemberListPreparer {
 }
 
 public enum Phase52TimelineInteractionPreparer {
+    /// Phase 58: whether a message's server-parsed `mentions` includes the current user, used to
+    /// accent the timeline row. Reads only the already-decoded message field -- no per-render scan.
+    public static func mentionsCurrentUser(_ message: Message, currentUserID: UserID?) -> Bool {
+        guard let currentUserID else { return false }
+        return message.mentions?.contains(currentUserID) ?? false
+    }
+
     public static func actionItems(
         for timelineMessage: TimelineMessage,
         currentUserID: UserID?,
@@ -399,6 +406,75 @@ public struct Phase52TimelineAssetContext: Sendable {
                 )
             }
             remaining = remaining[remaining.index(after: end)...]
+        }
+        return result
+    }
+
+    /// Phase 58: resolves `<@ULID>`/`<#ULID>`/`<%ULID>` content tokens (Docs/Research.md Phase 58
+    /// Notes) into display-ready items, keyed by the exact matched token text so the StoatUI
+    /// tokenizer can look them up directly. User resolution reuses the Phase 43 identity store
+    /// (cache-only, same snapshot generation the author display already resolves against);
+    /// channel/role resolution reads directly from the already-available snapshot.
+    public func inlineReferenceItems(
+        for message: Message,
+        identitySnapshots: Phase43IdentitySnapshotStore,
+        currentUserID: UserID?
+    ) -> [String: MessageInlineReferenceItem] {
+        guard let content = message.content, content.contains("<") else { return [:] }
+        let matches = MarkdownReferenceScanner.scan(content)
+        guard !matches.isEmpty else { return [:] }
+        let serverID = snapshot.channelsByID[message.channelID]?.serverID
+        let server = serverID.flatMap { snapshot.serversByID[$0] }
+        var result: [String: MessageInlineReferenceItem] = [:]
+        for match in matches {
+            guard result[match.token] == nil else { continue }
+            switch match.kind {
+            case .user:
+                let userID = UserID(rawValue: match.rawID)
+                let user = snapshot.usersByID[userID]
+                let member = serverID.flatMap { snapshot.membersByServerAndUserID[ServerMemberKey(serverID: $0, userID: userID)] }
+                let display = identitySnapshots.resolvedDisplay(userID: userID, user: user, member: member, server: server)
+                result[match.token] = MessageInlineReferenceItem(
+                    kind: .user,
+                    rawID: match.rawID,
+                    displayName: display.displayName,
+                    roleColor: display.roleColor.map {
+                        MessageInlineMentionColorComponents(red: $0.red, green: $0.green, blue: $0.blue)
+                    },
+                    isCurrentUser: currentUserID != nil && currentUserID == userID,
+                    isFallback: display.isFallback
+                )
+            case .channel:
+                let channelID = ChannelID(rawValue: match.rawID)
+                if let channelName = snapshot.channelsByID[channelID]?.name {
+                    result[match.token] = MessageInlineReferenceItem(kind: .channel, rawID: match.rawID, displayName: channelName)
+                } else {
+                    result[match.token] = MessageInlineReferenceItem(
+                        kind: .channel,
+                        rawID: match.rawID,
+                        displayName: MessageInlineReferenceItem.fallbackDisplayName(for: .channel),
+                        isFallback: true
+                    )
+                }
+            case .role:
+                let roleID = RoleID(rawValue: match.rawID)
+                if let role = server?.roles[roleID] {
+                    let color = ResolvedRoleColor(rawValue: role.colour, sourceRoleID: roleID)
+                    result[match.token] = MessageInlineReferenceItem(
+                        kind: .role,
+                        rawID: match.rawID,
+                        displayName: role.name,
+                        roleColor: color.map { MessageInlineMentionColorComponents(red: $0.red, green: $0.green, blue: $0.blue) }
+                    )
+                } else {
+                    result[match.token] = MessageInlineReferenceItem(
+                        kind: .role,
+                        rawID: match.rawID,
+                        displayName: MessageInlineReferenceItem.fallbackDisplayName(for: .role),
+                        isFallback: true
+                    )
+                }
+            }
         }
         return result
     }

@@ -1092,7 +1092,7 @@ private struct NotificationSettingsTab: View {
                 LabeledContent("Delegate", value: readiness.delegateConfigured ? "Configured" : "Missing")
                 LabeledContent("Last UNError", value: readiness.lastUNErrorName ?? "-")
                 LabeledContent("Before/after", value: "\(readiness.lastBeforeStatus ?? "-") -> \(readiness.lastAfterStatus ?? "-")")
-                Toggle("I am testing a signed build", isOn: $viewModel.testingSignedNotificationBuild)
+                Toggle("Override: treat this build as signed", isOn: $viewModel.testingSignedNotificationBuild)
                 Text(readiness.systemSettingsCheck)
                     .font(.caption)
                     .foregroundStyle(.secondary)

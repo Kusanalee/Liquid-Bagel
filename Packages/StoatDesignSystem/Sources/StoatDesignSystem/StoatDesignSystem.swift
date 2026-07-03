@@ -163,7 +163,7 @@ public enum StoatAccessibility {
         return parts.joined(separator: ", ")
     }
 
-    public static func messageLabel(author: String, timestamp: String, content: String, isEdited: Bool = false, isPinned: Bool = false, reactionCount: Int = 0, status: String? = nil, isSelected: Bool = false, isFocused: Bool = false, searchResultStatus: String? = nil, replyPreview: String? = nil) -> String {
+    public static func messageLabel(author: String, timestamp: String, content: String, isEdited: Bool = false, isPinned: Bool = false, reactionCount: Int = 0, status: String? = nil, isSelected: Bool = false, isFocused: Bool = false, searchResultStatus: String? = nil, replyPreview: String? = nil, mentionsCurrentUser: Bool = false) -> String {
         var parts = [author, timestamp, content.isEmpty ? "message" : content]
         if let replyPreview, !replyPreview.isEmpty { parts.append("reply to \(replyPreview)") }
         if isEdited { parts.append("edited") }
@@ -173,6 +173,7 @@ public enum StoatAccessibility {
         if isSelected { parts.append("selected") }
         if isFocused { parts.append("focused") }
         if let searchResultStatus, !searchResultStatus.isEmpty { parts.append(searchResultStatus) }
+        if mentionsCurrentUser { parts.append("mentions you") }
         return parts.joined(separator: ", ")
     }
 

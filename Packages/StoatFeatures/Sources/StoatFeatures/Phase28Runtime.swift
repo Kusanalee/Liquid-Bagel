@@ -3,6 +3,10 @@ import StoatAPI
 import StoatModels
 import StoatRealtime
 
+#if canImport(Security)
+import Security
+#endif
+
 public enum DMChannelClassifier {
     public static func isDirectMessageLike(_ channel: Channel) -> Bool {
         switch channel.kind {
@@ -793,6 +797,34 @@ public struct FreezePerformanceDiagnostics: Hashable, Sendable {
         self.imageReloadAfterEvictionCount = imageReloadAfterEvictionCount
         self.imageQueueEnqueueCount = imageQueueEnqueueCount
         self.timelineMediaInvalidationCount = timelineMediaInvalidationCount
+    }
+}
+
+/// Phase 58: real code-signature detection, replacing the manual-toggle-only heuristic
+/// now that `CODE_SIGNING_ALLOWED`/`CODE_SIGNING_REQUIRED` are enabled (ad-hoc) in project.pbxproj.
+public enum NotificationSignatureChecker {
+    public static func detectedSignatureStatus(bundleURL: URL, overrideAsSigned: Bool) -> String {
+        if overrideAsSigned {
+            return "user marked signed build"
+        }
+        #if canImport(Security)
+        var staticCode: SecStaticCode?
+        let createStatus = SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &staticCode)
+        guard createStatus == errSecSuccess, let staticCode else {
+            return "unsigned or invalid (create status \(createStatus))"
+        }
+        let validityStatus = SecStaticCodeCheckValidity(staticCode, [], nil)
+        switch validityStatus {
+        case errSecSuccess:
+            return "signed and valid"
+        case errSecCSUnsigned:
+            return "unsigned"
+        default:
+            return "signed but invalid (validity status \(validityStatus))"
+        }
+        #else
+        return "unknown (Security unavailable on this platform)"
+        #endif
     }
 }
 

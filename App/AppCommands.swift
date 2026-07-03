@@ -112,6 +112,22 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("f", modifiers: [.command, .shift])
             .disabled(commandHandler?.canPerform(.openLiveChannelSearch) == false)
+
+            Divider()
+
+            // Verified against the official macOS keybind table (Docs/Research.md Phase 58 Notes):
+            // CHAT_JUMP_END = Escape, CHAT_MARK_SERVER_AS_READ = Shift-Escape.
+            Button("Mark Channel Read") {
+                commandHandler?.perform(.markSelectedChannelRead)
+            }
+            .keyboardShortcut(.escape, modifiers: [])
+            .disabled(commandHandler?.canPerform(.markSelectedChannelRead) == false)
+
+            Button("Mark Server Read") {
+                commandHandler?.perform(.markSelectedServerRead)
+            }
+            .keyboardShortcut(.escape, modifiers: [.shift])
+            .disabled(commandHandler?.canPerform(.markSelectedServerRead) == false)
         }
 
         CommandMenu("Search") {

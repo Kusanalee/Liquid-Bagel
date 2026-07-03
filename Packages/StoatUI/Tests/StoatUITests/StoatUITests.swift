@@ -202,6 +202,98 @@ final class StoatUITests: XCTestCase {
         XCTAssertEqual(codeBlocks, ["code::let value = \":bagel:\""])
     }
 
+    func testPhase58MentionTokenizerExtractsUserMentionsOutsideCode() {
+        let userID = "01FD58YK5W7QRV5H3D64KTQYX3"
+        let mention = MessageInlineReferenceItem(kind: .user, rawID: userID, displayName: "Enka")
+
+        let tokens = MarkdownMessageContent._testInlineTokenDescriptions(
+            for: "hello <@\(userID)> how are you",
+            customEmojiItems: [],
+            referenceItems: ["<@\(userID)>": mention]
+        )
+        XCTAssertEqual(tokens, ["text::hello ", "reference:user::\(userID)", "text:: how are you"])
+    }
+
+    func testPhase58MentionTokenizerLeavesFencedCodeLiteral() {
+        let userID = "01FD58YK5W7QRV5H3D64KTQYX3"
+        let mention = MessageInlineReferenceItem(kind: .user, rawID: userID, displayName: "Enka")
+
+        let codeBlocks = MarkdownMessageContent._testBlockDescriptions(for: "```\n<@\(userID)>\n```")
+        XCTAssertEqual(codeBlocks, ["code::<@\(userID)>"])
+
+        // The inline tokenizer itself (given only the fenced content, as the block parser would
+        // hand it) still recognizes the shape -- literalness comes from the block parser routing
+        // code blocks away from inline tokenization entirely (MarkdownContentPreparer.prepare).
+        let tokens = MarkdownMessageContent._testInlineTokenDescriptions(
+            for: "<@\(userID)>",
+            customEmojiItems: [],
+            referenceItems: ["<@\(userID)>": mention]
+        )
+        XCTAssertEqual(tokens, ["reference:user::\(userID)"])
+    }
+
+    func testPhase58UnresolvedMentionRendersUnknownUserFallback() {
+        let userID = "01FD58YK5W7QRV5H3D64KTQYX3"
+
+        let tokens = MarkdownMessageContent._testInlineTokenDescriptions(
+            for: "hey <@\(userID)>",
+            customEmojiItems: [],
+            referenceItems: [:]
+        )
+        XCTAssertEqual(tokens, ["text::hey ", "reference:user::\(userID)"])
+    }
+
+    func testPhase58MentionTokensDoNotHitAngleBracketSanitizer() {
+        // Malformed/short bracket content (not a real 26-char ULID) should NOT be treated as a
+        // mention -- it stays literal text and is still subject to the existing sanitizer.
+        let tokens = MarkdownMessageContent._testInlineTokenDescriptions(
+            for: "a <div> tag and <@short>",
+            customEmojiItems: [],
+            referenceItems: [:]
+        )
+        XCTAssertEqual(tokens, ["text::a <div> tag and <@short>"])
+    }
+
+    func testPhase58ChannelAndRoleMentionsAreRecognized() {
+        let channelID = "01FD58YK5W7QRV5H3D64KTQYX3"
+        let roleID = "01FD58YK5W7QRV5H3D64KTQYX4"
+        let tokens = MarkdownMessageContent._testInlineTokenDescriptions(
+            for: "<#\(channelID)> and <%\(roleID)>",
+            customEmojiItems: [],
+            referenceItems: [:]
+        )
+        XCTAssertEqual(tokens, ["reference:channel::\(channelID)", "text:: and ", "reference:role::\(roleID)"])
+    }
+
+    #if canImport(AppKit)
+    @MainActor
+    func testPhase58InlineTriggerDetectionAtCaretAndCancellation() {
+        let atEnd = GlassComposer._testDetectInlineTrigger(text: "hello @enk", caretUTF16Offset: 10)
+        XCTAssertEqual(atEnd?.query, "enk")
+        XCTAssertEqual(atEnd?.utf16Location, 6)
+        XCTAssertEqual(atEnd?.utf16Length, 4)
+
+        let bareAt = GlassComposer._testDetectInlineTrigger(text: "hello @", caretUTF16Offset: 7)
+        XCTAssertEqual(bareAt?.query, "")
+
+        // Caret sits right after "@enk", mid-word (before the trailing "a") -- query is only
+        // what's been typed so far, not the whole word.
+        let midWord = GlassComposer._testDetectInlineTrigger(text: "@enka is here", caretUTF16Offset: 4)
+        XCTAssertEqual(midWord?.query, "enk")
+        XCTAssertEqual(midWord?.utf16Location, 0)
+
+        let noTrigger = GlassComposer._testDetectInlineTrigger(text: "hello world", caretUTF16Offset: 11)
+        XCTAssertNil(noTrigger)
+
+        let cancelledByWhitespace = GlassComposer._testDetectInlineTrigger(text: "hey @enk done", caretUTF16Offset: 13)
+        XCTAssertNil(cancelledByWhitespace)
+
+        // A word character immediately before "@" (e.g. an email address) must not trigger.
+        let emailLikeNoTrigger = GlassComposer._testDetectInlineTrigger(text: "a@b.com", caretUTF16Offset: 7)
+        XCTAssertNil(emailLikeNoTrigger)
+    }
+    #endif
+
     func testPhase47EmbedDisplayItemSanitizesURLsAndLabelsVariants() {
         let website = Embed(
             kind: .website,

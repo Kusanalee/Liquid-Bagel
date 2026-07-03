@@ -1653,6 +1653,53 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.timelineSelection.messageID, model.firstUnreadMessageID(for: channel.id))
     }
 
+    @MainActor
+    func testPhase58MarkChannelReadCommandRoutes() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channel = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "macos-native" })
+        model.selectChannel(channel.id)
+        let mentionCountBefore = model.localReadStates[channel.id]?.mentionCount ?? 0
+        XCTAssertGreaterThan(mentionCountBefore, 0)
+
+        XCTAssertTrue(model.canPerform(.markSelectedChannelRead))
+        model.perform(.markSelectedChannelRead)
+
+        // Mock-source acks clear unreadCount but intentionally preserve mentionCount (matching
+        // Phase 9's testPhase9LocalUnreadStatePreservesMentionAndJumpsFirstUnread convention) --
+        // only a real live ack round-trip clears mentions.
+        XCTAssertEqual(model.localReadStates[channel.id]?.unreadCount, 0)
+        XCTAssertEqual(model.localReadStates[channel.id]?.mentionCount, mentionCountBefore)
+        XCTAssertEqual(model.focusTarget, .composer)
+        if let newest = model.selectedTimelineMessages.last {
+            XCTAssertEqual(model.timelineSelection.messageID, newest.message.id)
+        }
+    }
+
+    @MainActor
+    func testPhase58MarkServerReadCommandActsOnEveryChannel() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channel = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "macos-native" })
+        guard let serverID = channel.serverID else {
+            XCTFail("Expected a server channel")
+            return
+        }
+        model.selectChannel(channel.id)
+        XCTAssertGreaterThan(model.localReadStates[channel.id]?.mentionCount ?? 0, 0)
+        model.selection = ShellSelection(space: .server(serverID), serverID: serverID)
+
+        XCTAssertTrue(model.canPerform(.markSelectedServerRead))
+        model.perform(.markSelectedServerRead)
+
+        XCTAssertEqual(model.localReadStates[channel.id]?.unreadCount, 0)
+    }
+
+    @MainActor
+    func testPhase58MarkChannelAndServerReadDisabledWithoutSelection() {
+        let model = MainShellViewModel(snapshot: RealtimeSnapshot())
+        XCTAssertFalse(model.canPerform(.markSelectedChannelRead))
+        XCTAssertFalse(model.canPerform(.markSelectedServerRead))
+    }
+
     func testPhase10ViewportReducerCreatesDeterministicScrollIntents() {
         let channelID: ChannelID = "channel"
         let first = TimelineMessage(message: message(id: ulid(milliseconds: 1_000), author: "user", channel: channelID))
@@ -4603,6 +4650,277 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase58AddGroupMemberOptimisticAppendAndGatewayEchoDeduplicates() async {
+        let currentUser = User(id: "phase58-me", username: "me", relationship: .user)
+        let groupID = ChannelID(rawValue: "phase58-group")
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[currentUser.id] = currentUser
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id])
+        let api = RecordingAPIClient(currentUser: currentUser)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        model.openAddGroupMembers(for: groupID)
+        XCTAssertTrue(model.isPresentingAddGroupMembers)
+        model.toggleAddGroupMemberCandidate("phase58-friend-a")
+        await model.addSelectedGroupMembers()
+
+        let added = await api.addedGroupRecipients
+        XCTAssertEqual(added.count, 1)
+        XCTAssertEqual(added.first?.0, groupID)
+        XCTAssertEqual(added.first?.1, "phase58-friend-a")
+        XCTAssertEqual(model.snapshot.channelsByID[groupID]?.recipients, [currentUser.id, "phase58-friend-a"])
+        XCTAssertFalse(model.isPresentingAddGroupMembers)
+
+        // Re-running the add for the same now-present recipient (as a realtime ChannelGroupJoin
+        // echo would trigger through the same optimistic-append guard) must not duplicate.
+        model.openAddGroupMembers(for: groupID)
+        model.toggleAddGroupMemberCandidate("phase58-friend-a")
+        await model.addSelectedGroupMembers()
+        XCTAssertEqual(model.snapshot.channelsByID[groupID]?.recipients, [currentUser.id, "phase58-friend-a"])
+    }
+
+    @MainActor
+    func testPhase58AddGroupMemberFailureKeepsSheetOpenAndReportsSafeError() async {
+        let currentUser = User(id: "phase58-me", username: "me", relationship: .user)
+        let groupID = ChannelID(rawValue: "phase58-group")
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[currentUser.id] = currentUser
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id])
+        let api = RecordingAPIClient(currentUser: currentUser, addGroupRecipientError: StoatAPIError.forbidden)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        model.openAddGroupMembers(for: groupID)
+        model.toggleAddGroupMemberCandidate("phase58-not-a-friend")
+        await model.addSelectedGroupMembers()
+
+        guard case .failed = model.groupMembershipActionState else {
+            XCTFail("Expected failed state, got \(model.groupMembershipActionState)")
+            return
+        }
+        XCTAssertTrue(model.isPresentingAddGroupMembers)
+        XCTAssertEqual(model.snapshot.channelsByID[groupID]?.recipients, [currentUser.id])
+    }
+
+    @MainActor
+    func testPhase58RemoveGroupMemberIsOwnerGatedAndConfirmed() async {
+        let currentUser = User(id: "phase58-owner", username: "owner", relationship: .user)
+        let groupID = ChannelID(rawValue: "phase58-group")
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[currentUser.id] = currentUser
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id, "phase58-member-a"])
+        let api = RecordingAPIClient(currentUser: currentUser)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        // Self-removal must never be requestable through this path.
+        model.requestRemoveGroupMember(currentUser.id, from: groupID, displayName: "Me")
+        XCTAssertNil(model.pendingGroupMemberRemoval)
+
+        model.requestRemoveGroupMember("phase58-member-a", from: groupID, displayName: "Member A")
+        XCTAssertEqual(model.pendingGroupMemberRemoval?.userID, "phase58-member-a")
+
+        await model.confirmRemoveGroupMember()
+
+        let removed = await api.removedGroupRecipients
+        XCTAssertEqual(removed.count, 1)
+        XCTAssertEqual(removed.first?.0, groupID)
+        XCTAssertEqual(removed.first?.1, "phase58-member-a")
+        XCTAssertEqual(model.snapshot.channelsByID[groupID]?.recipients, [currentUser.id])
+        XCTAssertNil(model.pendingGroupMemberRemoval)
+    }
+
+    @MainActor
+    func testPhase58RemoveGroupMemberBlockedForNonOwner() async {
+        let currentUser = User(id: "phase58-non-owner", username: "notowner", relationship: .user)
+        let ownerID = UserID(rawValue: "phase58-owner")
+        let groupID = ChannelID(rawValue: "phase58-group")
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[currentUser.id] = currentUser
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: ownerID, active: true, recipients: [ownerID, currentUser.id, "phase58-member-a"])
+        let api = RecordingAPIClient(currentUser: currentUser)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, communityAPIClient: api)
+
+        model.requestRemoveGroupMember("phase58-member-a", from: groupID, displayName: "Member A")
+        XCTAssertNil(model.pendingGroupMemberRemoval, "Only the group owner may request removal of another member")
+
+        let removed = await api.removedGroupRecipients
+        XCTAssertTrue(removed.isEmpty)
+    }
+
+    @MainActor
+    func testPhase58AddCandidatesExcludeExistingRecipients() {
+        let currentUser = User(id: "phase58-me", username: "me", relationship: .user)
+        let existingFriend = User(id: "phase58-friend-existing", username: "already-in", relationship: .user)
+        let newFriend = User(id: "phase58-friend-new", username: "not-in-yet", relationship: .user)
+        let groupID = ChannelID(rawValue: "phase58-group")
+        var friendedCurrentUser = currentUser
+        friendedCurrentUser.relations = [
+            Relationship(id: existingFriend.id, status: .friend),
+            Relationship(id: newFriend.id, status: .friend)
+        ]
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[currentUser.id] = friendedCurrentUser
+        snapshot.usersByID[existingFriend.id] = existingFriend
+        snapshot.usersByID[newFriend.id] = newFriend
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id, existingFriend.id])
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: friendedCurrentUser, communityAPIClient: MockStoatAPIClient())
+
+        let candidates = model.addGroupMemberCandidates(for: groupID)
+        XCTAssertEqual(candidates.map(\.user.id), [newFriend.id])
+    }
+
+    func testPhase58RowPresentationResolvesMentionItemsCacheOnly() {
+        let authorID: UserID = "phase58-author"
+        let mentionedID: UserID = "01FD58YK5W7QRV5H3D64KTQYX3"
+        let channelID: ChannelID = "phase58-mention-channel"
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[mentionedID] = User(id: mentionedID, username: "enka", displayName: "Enka")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, name: "general")
+        let message = Message(
+            id: "01J00000000000000000580001",
+            channelID: channelID,
+            authorID: authorID,
+            content: "hi <@\(mentionedID.rawValue)>"
+        )
+
+        let context = Phase52TimelineAssetContext(snapshot: snapshot, imageDataByKey: [:])
+        let items = context.inlineReferenceItems(
+            for: message,
+            identitySnapshots: Phase43IdentitySnapshotStore(),
+            currentUserID: authorID
+        )
+
+        let item = try? XCTUnwrap(items["<@\(mentionedID.rawValue)>"])
+        XCTAssertEqual(item?.displayName, "Enka")
+        XCTAssertEqual(item?.isFallback, false)
+        XCTAssertEqual(item?.isCurrentUser, false)
+    }
+
+    func testPhase58UnresolvedMentionInPipelineProducesFallbackItem() {
+        let channelID: ChannelID = "phase58-mention-channel-2"
+        var snapshot = RealtimeSnapshot()
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, name: "general")
+        let unknownID = "01FD58YK5W7QRV5H3D64KTQYX9"
+        let message = Message(
+            id: "01J00000000000000000580002",
+            channelID: channelID,
+            authorID: "phase58-author",
+            content: "hi <@\(unknownID)>"
+        )
+
+        let context = Phase52TimelineAssetContext(snapshot: snapshot, imageDataByKey: [:])
+        let items = context.inlineReferenceItems(
+            for: message,
+            identitySnapshots: Phase43IdentitySnapshotStore(),
+            currentUserID: nil
+        )
+
+        let item = try? XCTUnwrap(items["<@\(unknownID)>"])
+        XCTAssertEqual(item?.displayName, "Unknown member")
+        XCTAssertEqual(item?.isFallback, true)
+    }
+
+    func testPhase58SelfMentionRowAccentFlagComputedFromMessageMentions() {
+        let currentUserID: UserID = "phase58-current"
+        let otherUserID: UserID = "phase58-other"
+        let channelID: ChannelID = "phase58-accent-channel"
+        let mentioningCurrentUser = Message(
+            id: "01J00000000000000000580003",
+            channelID: channelID,
+            authorID: otherUserID,
+            content: "hi <@\(currentUserID.rawValue)>",
+            mentions: [currentUserID]
+        )
+        let mentioningSomeoneElse = Message(
+            id: "01J00000000000000000580004",
+            channelID: channelID,
+            authorID: otherUserID,
+            content: "hi <@\(otherUserID.rawValue)>",
+            mentions: [otherUserID]
+        )
+        let noMentions = Message(id: "01J00000000000000000580005", channelID: channelID, authorID: otherUserID, content: "hi")
+
+        XCTAssertTrue(Phase52TimelineInteractionPreparer.mentionsCurrentUser(mentioningCurrentUser, currentUserID: currentUserID))
+        XCTAssertFalse(Phase52TimelineInteractionPreparer.mentionsCurrentUser(mentioningSomeoneElse, currentUserID: currentUserID))
+        XCTAssertFalse(Phase52TimelineInteractionPreparer.mentionsCurrentUser(noMentions, currentUserID: currentUserID))
+        XCTAssertFalse(Phase52TimelineInteractionPreparer.mentionsCurrentUser(mentioningCurrentUser, currentUserID: nil))
+    }
+
+    @MainActor
+    func testPhase58MentionCandidateIndexRebuildsOnlyOnGenerationChange() {
+        let currentUser = User(id: "phase58-idx-me", username: "me", relationship: .user)
+        let alice = User(id: "phase58-idx-alice", username: "alice", displayName: "Alice")
+        let bob = User(id: "phase58-idx-bob", username: "bob", displayName: "Bob")
+        let groupID = ChannelID(rawValue: "phase58-idx-group")
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[currentUser.id] = currentUser
+        snapshot.usersByID[alice.id] = alice
+        snapshot.usersByID[bob.id] = bob
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id, alice.id, bob.id])
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser)
+
+        model.composerInlineTriggerChanged(InlineComposerTrigger(utf16Location: 0, utf16Length: 1, query: ""), for: groupID)
+        XCTAssertEqual(Set(model.composerMentionCandidates.map(\.name)), ["Alice", "Bob"])
+
+        var updatedSnapshot = model.snapshot
+        let carol = User(id: "phase58-idx-carol", username: "carol", displayName: "Carol")
+        updatedSnapshot.usersByID[carol.id] = carol
+        if var channel = updatedSnapshot.channelsByID[groupID] {
+            channel.recipients.append(carol.id)
+            updatedSnapshot.channelsByID[groupID] = channel
+        }
+        model.replaceSnapshotForTesting(updatedSnapshot)
+
+        model.composerInlineTriggerChanged(InlineComposerTrigger(utf16Location: 0, utf16Length: 1, query: ""), for: groupID)
+        XCTAssertEqual(Set(model.composerMentionCandidates.map(\.name)), ["Alice", "Bob", "Carol"])
+    }
+
+    @MainActor
+    func testPhase58AutocompleteQueryIsCancellableAndCapped() {
+        let currentUser = User(id: "phase58-cap-me", username: "me", relationship: .user)
+        let groupID = ChannelID(rawValue: "phase58-cap-group")
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[currentUser.id] = currentUser
+        var recipients = [currentUser.id]
+        for index in 0..<15 {
+            let user = User(id: UserID(rawValue: "phase58-cap-user-\(index)"), username: "user\(index)", displayName: "Match\(index)")
+            snapshot.usersByID[user.id] = user
+            recipients.append(user.id)
+        }
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Big Crew", ownerID: currentUser.id, active: true, recipients: recipients)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser)
+
+        model.composerInlineTriggerChanged(InlineComposerTrigger(utf16Location: 0, utf16Length: 1, query: "match"), for: groupID)
+        XCTAssertEqual(model.composerMentionCandidates.count, 10)
+        XCTAssertTrue(model.composerMentionCandidates.allSatisfy { $0.name.lowercased().hasPrefix("match") })
+    }
+
+    @MainActor
+    func testPhase58MentionInsertionProducesVerifiedTokenSyntax() {
+        let currentUser = User(id: "phase58-ins-me", username: "me", relationship: .user)
+        let alice = User(id: "phase58-ins-alice", username: "alice", displayName: "Alice")
+        let groupID = ChannelID(rawValue: "phase58-ins-group")
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[currentUser.id] = currentUser
+        snapshot.usersByID[alice.id] = alice
+        snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id, alice.id])
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser)
+
+        model.updateDraft("hi @al", for: groupID)
+        model.composerInlineTriggerChanged(InlineComposerTrigger(utf16Location: 3, utf16Length: 3, query: "al"), for: groupID)
+        guard let candidate = model.composerMentionCandidates.first(where: { $0.userID == alice.id }) else {
+            XCTFail("expected Alice among candidates")
+            return
+        }
+        model.selectComposerMentionCandidate(candidate, for: groupID)
+
+        let expectedToken = "hi <@\(alice.id.rawValue)> "
+        XCTAssertEqual(model.draft(for: groupID), expectedToken)
+        XCTAssertNil(model.composerMentionTrigger)
+        XCTAssertTrue(model.composerMentionCandidates.isEmpty)
+        XCTAssertEqual(model.composerCursorRequest?.utf16Offset, (expectedToken as NSString).length)
+    }
+
+    @MainActor
     func testPhase55CloudPreferencesFetchAppliesNewerRemote() async throws {
         var snapshot = RealtimeSnapshot()
         let currentUser = User(id: "phase55-me", username: "me", relationship: .user)
@@ -6267,7 +6585,8 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(fetchCount, 1)
         XCTAssertEqual(model.userProfilesByID[userID]?.content, "**hello**")
         XCTAssertFalse(model.title.contains("checkmark"))
-        XCTAssertTrue(model.notificationBuildReadinessDiagnostics.codeSigningAllowed.contains("NO"))
+        // Phase 58 flips CODE_SIGNING_ALLOWED to YES (ad-hoc) in project.pbxproj.
+        XCTAssertTrue(model.notificationBuildReadinessDiagnostics.codeSigningAllowed.contains("YES"))
         XCTAssertEqual(model.notificationBuildReadinessDiagnostics.bundleIdentifier.isEmpty, false)
     }
 
@@ -6639,6 +6958,28 @@ final class StoatFeaturesTests: XCTestCase {
         }
         return String(chars) + "0000000000000000"
     }
+
+    // MARK: - Phase 58 Notification Signature Detection
+
+    func testPhase58SignatureStatusDetectionReportsSignedBuild() {
+        XCTAssertEqual(
+            NotificationSignatureChecker.detectedSignatureStatus(
+                bundleURL: URL(fileURLWithPath: "/nonexistent/does-not-exist.app"),
+                overrideAsSigned: true
+            ),
+            "user marked signed build",
+            "the manual override must short-circuit before any real signature check runs"
+        )
+    }
+
+    func testPhase58SignatureStatusDetectionReportsInvalidForNonexistentPath() {
+        let status = NotificationSignatureChecker.detectedSignatureStatus(
+            bundleURL: URL(fileURLWithPath: "/nonexistent/does-not-exist.app"),
+            overrideAsSigned: false
+        )
+        XCTAssertNotEqual(status, "signed and valid")
+        XCTAssertTrue(status.contains("unsigned") || status.contains("invalid"), "expected an error/invalid classification, got \(status)")
+    }
 }
 
 private final class TestStreamHub<Element: Sendable>: @unchecked Sendable {
@@ -6788,6 +7129,8 @@ private actor RecordingAPIClient: StoatAPIClient {
     private(set) var createdGroupDrafts: [GroupChannelCreateDraft] = []
     private(set) var fetchedSettingsKeys: [[String]] = []
     private(set) var setSettingsPayloads: [(values: [String: String], timestamp: Int64)] = []
+    private(set) var addedGroupRecipients: [(ChannelID, UserID)] = []
+    private(set) var removedGroupRecipients: [(ChannelID, UserID)] = []
 
     private let currentUser: User
     private var messagesByChannel: [ChannelID: [Message]]
@@ -6810,6 +7153,8 @@ private actor RecordingAPIClient: StoatAPIClient {
     private let createGroupError: (any Error & Sendable)?
     private var syncedSettings: [String: SyncedSettingValue]
     private let settingsSyncError: (any Error & Sendable)?
+    private let addGroupRecipientError: (any Error & Sendable)?
+    private let removeGroupRecipientError: (any Error & Sendable)?
 
     init(
         currentUser: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
@@ -6831,7 +7176,9 @@ private actor RecordingAPIClient: StoatAPIClient {
         uploadedFileIDsByTag: [UploadTag: FileID] = [:],
         createGroupError: (any Error & Sendable)? = nil,
         syncedSettings: [String: SyncedSettingValue] = [:],
-        settingsSyncError: (any Error & Sendable)? = nil
+        settingsSyncError: (any Error & Sendable)? = nil,
+        addGroupRecipientError: (any Error & Sendable)? = nil,
+        removeGroupRecipientError: (any Error & Sendable)? = nil
     ) {
         self.currentUser = currentUser
         self.messagesByChannel = messagesByChannel
@@ -6853,6 +7200,8 @@ private actor RecordingAPIClient: StoatAPIClient {
         self.createGroupError = createGroupError
         self.syncedSettings = syncedSettings
         self.settingsSyncError = settingsSyncError
+        self.addGroupRecipientError = addGroupRecipientError
+        self.removeGroupRecipientError = removeGroupRecipientError
     }
 
     func overrideSyncedSetting(key: String, value: SyncedSettingValue) {
@@ -6901,6 +7250,20 @@ private actor RecordingAPIClient: StoatAPIClient {
             active: true,
             recipients: recipients
         )
+    }
+
+    func addGroupRecipient(channelID: ChannelID, userID: UserID) async throws {
+        addedGroupRecipients.append((channelID, userID))
+        if let addGroupRecipientError {
+            throw addGroupRecipientError
+        }
+    }
+
+    func removeGroupRecipient(channelID: ChannelID, userID: UserID) async throws {
+        removedGroupRecipients.append((channelID, userID))
+        if let removeGroupRecipientError {
+            throw removeGroupRecipientError
+        }
     }
 
     func editUser(userID: UserID, draft: UserEditDraft) async throws -> User {

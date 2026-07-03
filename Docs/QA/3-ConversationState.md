@@ -25,18 +25,21 @@ Categorical outcomes only. DM diagnostics stay redacted; no participant IDs or m
 | 8 | Search loaded messages locally, then run selected-channel remote search for an unloaded message; open a result | Result opens via unified jump with highlight; remote authors resolve | | |
 | 9 | Jump from reply, pin, search, and unread entry points in one session | All routes go through the unified coordinator; unloaded targets fetch around-message; failures degrade to channel | | |
 | 10 | With history loaded, rapidly switch server channel → DM → group DM → Saved Notes while reactions and avatar/media loads arrive | Each route retains or prepares only its own groups, never shows the previous conversation, and does not restart completed history fetches for message mutations | | |
-| 11 | Copy Developer Verification diagnostics after this lane | DM trace, timeline presentation, realtime coalescing, and identity diagnostics stay redacted | | |
+| 11 | In an existing group DM, use "Add Members" to add a friend not already in the group | Second account receives the group in their DM list (`ChannelCreate`); both accounts see the new participant (`ChannelGroupJoin`); a friends-only non-friend attempt fails with a safe error | | |
+| 12 | As the group owner, right-click a non-self participant and choose "Remove from Group" | Confirmation appears; on confirm the participant disappears from both accounts' participant lists (`ChannelGroupLeave`) | | |
+| 13 | From a non-owner account in the same group, check the participant context menu | No "Remove from Group" option is offered for other members | | |
+| 14 | Copy Developer Verification diagnostics after this lane | DM trace, timeline presentation, realtime coalescing, and identity diagnostics stay redacted | | |
 
 ## Matrix Rows Unlocked
 
 | ParityMatrix row | Promotion condition |
 | --- | --- |
 | Core chat / DMs | Steps 1-3 pass (list/load/send/attachments/participants live proof) |
-| Core chat / group DMs | Step 4 passes (creation stays a separate gap until the create route ships) |
+| Core chat / group DMs | Step 4 passes (creation) and steps 11-13 pass (add/remove) |
 | Core chat / saved messages | Step 5 passes with live availability |
 | Core chat / typing indicators | Step 6 passes across server, DM, group |
 | Core chat / read ack/unreads | Step 7 passes server + DM |
 | Core chat / search | Step 8 passes (global search stays blocked) |
 | Core chat / jump to message | Step 9 passes cross-context |
 
-Group DM `partial` note: creation flow lands with Phase 55 item 3; this lane only proves existing-group behavior.
+Group DM `partial` note: creation flow lands with Phase 55 item 3; add/remove lands with Phase 58; this lane proves existing-group, creation, and add/remove behavior together.

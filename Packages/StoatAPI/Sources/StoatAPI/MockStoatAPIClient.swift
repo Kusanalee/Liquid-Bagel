@@ -601,6 +601,39 @@ public actor MockStoatAPIClient: StoatAPIClient {
         return channel
     }
 
+    public func addGroupRecipient(channelID: ChannelID, userID: UserID) async throws {
+        guard let index = channels.firstIndex(where: { $0.id == channelID }), channels[index].kind == .group else {
+            throw StoatAPIError.notFound
+        }
+        guard users[userID]?.relationship == .friend else {
+            throw StoatAPIError.forbidden
+        }
+        var recipients = channels[index].recipients
+        guard !recipients.contains(userID) else {
+            throw StoatAPIError.serverError(statusCode: 409, message: "AlreadyInGroup")
+        }
+        recipients.append(userID)
+        channels[index].recipients = recipients
+    }
+
+    public func removeGroupRecipient(channelID: ChannelID, userID: UserID) async throws {
+        guard let index = channels.firstIndex(where: { $0.id == channelID }), channels[index].kind == .group else {
+            throw StoatAPIError.notFound
+        }
+        guard channels[index].ownerID == currentUser.id else {
+            throw StoatAPIError.forbidden
+        }
+        guard userID != currentUser.id else {
+            throw StoatAPIError.serverError(statusCode: 400, message: "CannotRemoveYourself")
+        }
+        var recipients = channels[index].recipients
+        guard let recipientIndex = recipients.firstIndex(of: userID) else {
+            throw StoatAPIError.notFound
+        }
+        recipients.remove(at: recipientIndex)
+        channels[index].recipients = recipients
+    }
+
     public func fetchServer(id: ServerID, includeChannels: Bool = false) async throws -> ServerFetchResponse {
         guard let server = servers.first(where: { $0.id == id }) else {
             throw StoatAPIError.notFound

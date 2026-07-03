@@ -82,6 +82,11 @@ public enum AppCommand: Hashable, Sendable {
     case editAndRetrySelectedFailedMessage
     case pinOrUnpinSelectedMessage
     case closeTransientUI
+    /// Phase 58: verified against the official macOS keybind table (Docs/Research.md Phase 58
+    /// Notes) -- `CHAT_JUMP_END` (Escape): mark channel read, jump to newest, focus composer.
+    case markSelectedChannelRead
+    /// Phase 58: verified `CHAT_MARK_SERVER_AS_READ` (Shift-Escape).
+    case markSelectedServerRead
 }
 
 @MainActor
@@ -476,7 +481,9 @@ public final class QuickSwitcherViewModel {
             commandResult(.openAccountSettings, title: "Account Settings", subtitle: "Open Account & Connection settings"),
             commandResult(.openConnectionSettings, title: "Connection Settings", subtitle: "Open connection settings"),
             commandResult(.openAppearanceSettings, title: "Appearance Settings", subtitle: "Adjust Liquid Glass and message density"),
-            commandResult(.openNotificationSettings, title: "Notification Settings", subtitle: "Open notification settings")
+            commandResult(.openNotificationSettings, title: "Notification Settings", subtitle: "Open notification settings"),
+            commandResult(.markSelectedChannelRead, title: "Mark Channel Read", subtitle: "Mark the selected channel read and focus the composer"),
+            commandResult(.markSelectedServerRead, title: "Mark Server Read", subtitle: "Mark every channel in the selected server read")
         ]
     }
 

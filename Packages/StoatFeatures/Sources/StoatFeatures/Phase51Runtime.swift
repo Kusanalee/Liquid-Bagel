@@ -107,10 +107,12 @@ public struct TimelineRowPresentation: Hashable, Sendable, Identifiable {
     public var preparedMarkdownContent: PreparedMarkdownContent?
     public var attachmentItems: [AttachmentDisplayItem]
     public var customEmojiItems: [MessageInlineCustomEmojiItem]
+    public var referenceItems: [String: MessageInlineReferenceItem]
     public var embedItems: [MessageEmbedDisplayItem]
     public var actionItems: [MessageActionItem]
     public var reactionItems: [MessageReactionDisplayItem]
     public var systemEventPresentation: SystemEventPresentation?
+    public var mentionsCurrentUser: Bool
 
     public init(
         messageID: MessageID,
@@ -119,10 +121,12 @@ public struct TimelineRowPresentation: Hashable, Sendable, Identifiable {
         preparedMarkdownContent: PreparedMarkdownContent? = nil,
         attachmentItems: [AttachmentDisplayItem] = [],
         customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        referenceItems: [String: MessageInlineReferenceItem] = [:],
         embedItems: [MessageEmbedDisplayItem] = [],
         actionItems: [MessageActionItem] = [],
         reactionItems: [MessageReactionDisplayItem] = [],
-        systemEventPresentation: SystemEventPresentation? = nil
+        systemEventPresentation: SystemEventPresentation? = nil,
+        mentionsCurrentUser: Bool = false
     ) {
         self.messageID = messageID
         self.authorDisplay = authorDisplay
@@ -130,10 +134,12 @@ public struct TimelineRowPresentation: Hashable, Sendable, Identifiable {
         self.preparedMarkdownContent = preparedMarkdownContent
         self.attachmentItems = attachmentItems
         self.customEmojiItems = customEmojiItems
+        self.referenceItems = referenceItems
         self.embedItems = embedItems
         self.actionItems = actionItems
         self.reactionItems = reactionItems
         self.systemEventPresentation = systemEventPresentation
+        self.mentionsCurrentUser = mentionsCurrentUser
     }
 }
 

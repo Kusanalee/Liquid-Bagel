@@ -340,6 +340,31 @@ final class StoatAPITests: XCTestCase {
         }
     }
 
+    func testPhase58GroupRecipientAddAndRemoveRequestShape() async throws {
+        let addTransport = RecordingHTTPTransport(statusCode: 204)
+        let addClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: addTransport
+        )
+        try await addClient.addGroupRecipient(channelID: "group-1", userID: "user-2")
+        let capturedAddRequest = await addTransport.lastRequest()
+        let addRequest = try XCTUnwrap(capturedAddRequest)
+        XCTAssertEqual(addRequest.httpMethod, "PUT")
+        XCTAssertEqual(addRequest.url?.path, "/channels/group-1/recipients/user-2")
+        XCTAssertNil(addRequest.httpBody?.isEmpty == false ? addRequest.httpBody : nil)
+
+        let removeTransport = RecordingHTTPTransport(statusCode: 204)
+        let removeClient = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: removeTransport
+        )
+        try await removeClient.removeGroupRecipient(channelID: "group-1", userID: "user-2")
+        let capturedRemoveRequest = await removeTransport.lastRequest()
+        let removeRequest = try XCTUnwrap(capturedRemoveRequest)
+        XCTAssertEqual(removeRequest.httpMethod, "DELETE")
+        XCTAssertEqual(removeRequest.url?.path, "/channels/group-1/recipients/user-2")
+    }
+
     func testPhase55SettingsSyncEndpointRequests() async throws {
         let fetchTransport = RecordingHTTPTransport(data: Data(#"{"liquidbagel:preferences":[1700000000000,"{}"]}"#.utf8))
         let fetchClient = LiveStoatAPIClient(
