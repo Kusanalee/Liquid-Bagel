@@ -653,6 +653,17 @@ public enum MemberListDeriver {
     }
 }
 
+public enum MemberPanelRowLimiter {
+    public static let defaultOfflineCap = 200
+
+    public static func visibleItems(for group: MemberListGroup, cap: Int = defaultOfflineCap) -> (items: [MemberListItem], remainder: Int) {
+        guard group.id == "offline", group.items.count > cap else {
+            return (group.items, 0)
+        }
+        return (Array(group.items.prefix(cap)), group.items.count - cap)
+    }
+}
+
 public struct TimelinePerformanceDiagnostics: Hashable, Sendable {
     public var loadedMessageCount: Int
     public var renderedMessageEstimate: Int

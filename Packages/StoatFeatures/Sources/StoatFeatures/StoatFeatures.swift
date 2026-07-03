@@ -489,7 +489,12 @@ public final class MainShellViewModel {
     public private(set) var snapshot: RealtimeSnapshot {
         didSet {
             snapshotRevision &+= 1
-            memberListGroupCacheKey = nil
+            // Do NOT unconditionally nil memberListGroupCacheKey here: it fires on every
+            // realtime event (including pure message traffic), and eagerly clearing it defeats
+            // the fingerprint-based cache in memberListCacheKey(serverID:query:), forcing a full
+            // re-derivation of the member list on every event. memberListGroups/
+            // prepareMemberListGroups already recompute correctly whenever the fingerprint
+            // (member/role/identity fields) actually changes.
             schedulePhase51ShellPresentationRefresh()
             if isServerOverviewPresented {
                 schedulePhase51ServerSettingsPreparation()
@@ -592,6 +597,7 @@ public final class MainShellViewModel {
     public var lastServerSettingsButtonAction: String?
     public var memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics()
     public var memberRoleSortDiagnostics = RoleSortDiagnostics()
+    public private(set) var memberListGroupsRevision = 0
     public var visibleIdentityDiagnostics = VisibleIdentityDiagnostics()
     @ObservationIgnored public var phase43IdentitySnapshots = Phase43IdentitySnapshotStore()
     public var phase43IdentityGeneration = 0
@@ -767,6 +773,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var queuedInlinePreviewItems: [AttachmentDisplayItem] = []
     @ObservationIgnored private var lastRequestedDockBadgeValue: Int?
     @ObservationIgnored private var dockBadgeApplyTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingTimelineMediaInvalidation = false
     @ObservationIgnored public var phase43HydrationPolicy = Phase43HydrationPolicy()
     @ObservationIgnored private var phase43IdentityHydrationTasks: [UserID: Task<Void, Never>] = [:]
     @ObservationIgnored private var phase43QueuedIdentityHydration: [UserID: Phase43IdentityHydrationSource] = [:]
@@ -1321,9 +1328,6 @@ public final class MainShellViewModel {
         let snapshot = snapshot
         let identitySnapshots = phase43IdentitySnapshots
         let imageDataByKey = loadedImageResources
-        let attachmentStates = attachmentPreviewStates
-        let loadedAttachments = loadedAttachmentData
-        let localAttachmentIDs = Set(attachmentLocalFiles.keys)
         let currentUserID = currentUserID
         let isRuntimeSendCapable = isRuntimeSendCapable
         let developerControlsEnabled = isDeveloperControlsEnabled
@@ -1339,10 +1343,7 @@ public final class MainShellViewModel {
         let worker = Task.detached(priority: .userInitiated) {
             let assetContext = Phase52TimelineAssetContext(
                 snapshot: snapshot,
-                imageDataByKey: imageDataByKey,
-                attachmentStates: attachmentStates,
-                loadedAttachments: loadedAttachments,
-                localAttachmentIDs: localAttachmentIDs
+                imageDataByKey: imageDataByKey
             )
             return Dictionary(uniqueKeysWithValues: messages.map { timelineMessage in
                 let message = timelineMessage.message
@@ -1699,7 +1700,15 @@ public final class MainShellViewModel {
             return
         }
         do {
-            let user = try await apiClient.fetchUser(userID: userID)
+            var user = try await apiClient.fetchUser(userID: userID)
+            if let existingUser = snapshot.usersByID[userID] {
+                // A single-user profile REST fetch can lag behind the gateway's live
+                // presence; the gateway is never staler while connected, so don't let this
+                // regress an already-known user's online/status (previously caused offline
+                // members to show a stale green presence dot after their profile loaded).
+                user.online = existingUser.online
+                user.status = existingUser.status
+            }
             upsertUser(user, source: .hydrationFetch)
             phase43IdentityHydrationFailuresByUserID.removeValue(forKey: userID)
             phase43IdentityHydrationSuccessCount += 1
@@ -1818,6 +1827,7 @@ public final class MainShellViewModel {
         memberGroupingCount += 1
         memberListGroupCacheKey = key
         memberListGroupCache = groups
+        memberListGroupsRevision &+= 1
         memberListDiagnosticsCache = result.diagnostics
         memberRoleSortDiagnostics = result.diagnostics
         memberListLastGroupingElapsed = Date().timeIntervalSince(started)
@@ -1842,7 +1852,9 @@ public final class MainShellViewModel {
     }
 
     public var memberListPresentationToken: String {
-        "\(selection.serverID?.rawValue ?? "none")|\(snapshotRevision)|\(phase43IdentityGeneration)"
+        guard let serverID = selection.serverID else { return "none" }
+        let key = memberListCacheKey(serverID: serverID, query: "")
+        return "\(serverID.rawValue)|\(key.membersFingerprint)|\(key.identityGeneration)"
     }
 
     public func cachedMemberListGroups(for serverID: ServerID?) -> [MemberListGroup] {
@@ -1878,11 +1890,12 @@ public final class MainShellViewModel {
             return
         }
         guard !Task.isCancelled,
-              snapshotRevision == key.snapshotRevision,
-              selection.serverID == serverID
+              selection.serverID == serverID,
+              memberListCacheKey(serverID: serverID, query: query) == key
         else { return }
         memberListGroupCacheKey = key
         memberListGroupCache = preparation.groups
+        memberListGroupsRevision &+= 1
         memberListLastGroupingServerID = serverID
         memberListDiagnosticsCache = preparation.roleDiagnostics
         memberRoleSortDiagnostics = preparation.roleDiagnostics
@@ -2282,14 +2295,65 @@ public final class MainShellViewModel {
         timelineRowPresentationCacheKey = nil
     }
 
+    /// Coalesces a burst of media-load completions (custom emoji/reactions still baked into
+    /// the row cache) into a single timeline row rebuild instead of one per image. Without
+    /// this, loading N images in a media-heavy channel forced N full timeline row rebuilds.
+    /// Uses a pending flag + a single `Task.yield()` hop (no timers/sleep) so any number of
+    /// synchronous store/remove calls within one main-actor turn collapse into one rebuild.
+    private func scheduleTimelineMediaInvalidation() {
+        guard !pendingTimelineMediaInvalidation else { return }
+        pendingTimelineMediaInvalidation = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, self.pendingTimelineMediaInvalidation else { return }
+            self.pendingTimelineMediaInvalidation = false
+            self.invalidateTimelineMediaPresentation()
+        }
+    }
+
     private struct MemberListCacheKey: Hashable {
         let serverID: ServerID
         let normalizedQuery: String
-        let snapshotRevision: Int
+        let membersFingerprint: Int
+        let identityGeneration: Int
     }
 
     private func memberListCacheKey(serverID: ServerID, query: String) -> MemberListCacheKey {
-        MemberListCacheKey(serverID: serverID, normalizedQuery: query, snapshotRevision: snapshotRevision)
+        MemberListCacheKey(
+            serverID: serverID,
+            normalizedQuery: query,
+            membersFingerprint: memberListFingerprint(for: serverID),
+            identityGeneration: phase43IdentityGeneration
+        )
+    }
+
+    /// Cheap, order-independent digest of the member/role fields that actually affect
+    /// grouping and sort order, so unrelated snapshot churn (e.g. new messages) doesn't
+    /// force a full re-derivation of a multi-thousand-member list.
+    private func memberListFingerprint(for serverID: ServerID) -> Int {
+        guard let server = snapshot.serversByID[serverID] else { return 0 }
+        var combined = 0
+        for member in snapshot.membersByServerAndUserID.values where member.id.serverID == serverID {
+            let user = snapshot.usersByID[member.id.userID]
+            var hasher = Hasher()
+            hasher.combine(member.id.userID)
+            hasher.combine(user?.online ?? false)
+            hasher.combine(user?.username)
+            hasher.combine(user?.displayName)
+            hasher.combine(member.nickname)
+            hasher.combine(member.roles)
+            hasher.combine(user?.bot != nil)
+            combined ^= hasher.finalize()
+        }
+        var roleHasher = Hasher()
+        for role in server.roles.values.sorted(by: { $0.id.rawValue < $1.id.rawValue }) {
+            roleHasher.combine(role.id)
+            roleHasher.combine(role.name)
+            roleHasher.combine(role.rank)
+            roleHasher.combine(role.hoist)
+        }
+        combined ^= roleHasher.finalize()
+        return combined
     }
 
     private func updateTimelinePerformanceDiagnostics(messages: [TimelineMessage], groups: [TimelineMessageGroup], elapsed: TimeInterval? = nil) {
@@ -5951,12 +6015,6 @@ public final class MainShellViewModel {
         syncFromSessionCoordinator()
     }
 
-    public func startMockSession() async {
-        guard let sessionCoordinator else { return }
-        await sessionCoordinator.startMockSession()
-        syncFromSessionCoordinator()
-    }
-
     public func connectLiveManually() async {
         guard let sessionCoordinator else { return }
         await sessionCoordinator.connectLiveManually()
@@ -5973,12 +6031,6 @@ public final class MainShellViewModel {
     public func disconnectLive() async {
         guard let sessionCoordinator else { return }
         await sessionCoordinator.disconnectLive()
-        syncFromSessionCoordinator()
-    }
-
-    public func resetToMock() async {
-        guard let sessionCoordinator else { return }
-        await sessionCoordinator.resetToMock()
         syncFromSessionCoordinator()
     }
 
@@ -6603,58 +6655,48 @@ public final class MainShellViewModel {
 
     public func attachmentDisplayItems(for message: Message) -> [AttachmentDisplayItem] {
         (message.attachments ?? []).map { file in
-            var item = AttachmentDisplayItem(file: file, previewState: attachmentPreviewStates["file-\(file.id.rawValue)"] ?? .notLoaded)
-            if item.kind == .video,
-               case let .remote(fileID, tag, .none) = item.source,
-               let baseURL = sessionCoordinator?.environment.mediaBaseURL ?? StoatAPIEnvironment.production.mediaBaseURL,
-               let url = try? LiveRemoteAttachmentLoader.mediaURL(baseURL: baseURL, tag: tag, fileID: fileID, filename: nil) {
-                item.source = .remote(fileID: fileID, tag: tag, url: url)
-            }
-            if let loaded = loadedAttachmentData[item.id] {
-                item.previewState = .readyRemote
-                item.previewData = loaded.data
-            }
-            if attachmentLocalFiles[item.id] != nil {
-                item.previewState = .readyLocal
-            }
-            return item
+            hydrateAttachmentPreviewState(AttachmentDisplayItem(file: file))
         }
     }
 
     public func embedDisplayItems(for message: Message) -> [MessageEmbedDisplayItem] {
         (message.embeds ?? []).enumerated().map { index, embed in
-            let mediaItem = embed.media.map { embedMediaDisplayItem(for: $0) } ?? externalEmbedMediaItem(for: embed)
-            return MessageEmbedDisplayItem(
-                id: "embed-\(message.id.rawValue)-\(index)",
-                embed: embed,
-                mediaItem: mediaItem,
-                mediaPreviewData: mediaItem?.previewData
-            )
+            hydratedEmbedDisplayItem(embed: embed, id: "embed-\(message.id.rawValue)-\(index)")
         }
     }
 
-    private func externalEmbedMediaItem(for embed: Embed) -> AttachmentDisplayItem? {
-        guard var item = ExternalEmbedMediaFactory.mediaItem(for: embed) else { return nil }
-        if let state = attachmentPreviewStates[item.id] {
+    private func hydratedEmbedDisplayItem(embed: Embed, id: String) -> MessageEmbedDisplayItem {
+        let baseMediaItem = embed.media.map { AttachmentDisplayItem(file: $0) } ?? ExternalEmbedMediaFactory.mediaItem(for: embed)
+        let mediaItem = baseMediaItem.map { hydrateAttachmentPreviewState($0) }
+        return MessageEmbedDisplayItem(
+            id: id,
+            embed: embed,
+            mediaItem: mediaItem,
+            mediaPreviewData: mediaItem?.previewData
+        )
+    }
+
+    /// Overlays current load state (progress/data/local-file) onto an already-constructed
+    /// display item. Shared by the live per-message builders above and by
+    /// `hydratedAttachmentItems`/`hydratedEmbedItems`, which apply the same overlay to items
+    /// coming from the cached `TimelineRowPresentation` so images can appear as soon as they
+    /// finish loading without forcing a full timeline row rebuild.
+    private func hydrateAttachmentPreviewState(_ item: AttachmentDisplayItem) -> AttachmentDisplayItem {
+        var item = item
+        if item.kind == .video,
+           case let .remote(fileID, tag, .none) = item.source,
+           let baseURL = sessionCoordinator?.environment.mediaBaseURL ?? StoatAPIEnvironment.production.mediaBaseURL,
+           let url = try? LiveRemoteAttachmentLoader.mediaURL(baseURL: baseURL, tag: tag, fileID: fileID, filename: nil) {
+            item.source = .remote(fileID: fileID, tag: tag, url: url)
+        }
+        let imageKey = item.fileID.map { ImageCacheKey(id: $0.rawValue, kind: .attachmentPreview) }
+        if let state = attachmentPreviewStates[item.id] ?? imageKey.flatMap({ imageResourceStates[$0] }) {
             item.previewState = state
         }
         if let loaded = loadedAttachmentData[item.id] {
             item.previewState = .readyRemote
             item.previewData = loaded.data
-        }
-        return item
-    }
-
-    private func embedMediaDisplayItem(for file: File) -> AttachmentDisplayItem {
-        let imageKey = ImageCacheKey(id: file.id.rawValue, kind: .attachmentPreview)
-        var item = AttachmentDisplayItem(
-            file: file,
-            previewState: attachmentPreviewStates["file-\(file.id.rawValue)"] ?? imageResourceStates[imageKey] ?? .notLoaded
-        )
-        if let loaded = loadedAttachmentData[item.id] {
-            item.previewState = .readyRemote
-            item.previewData = loaded.data
-        } else if let data = imageData(for: file, kind: .attachmentPreview) {
+        } else if let imageKey, let data = loadedImageResources[imageKey] {
             item.previewState = .readyRemote
             item.previewData = data
         }
@@ -6662,6 +6704,28 @@ public final class MainShellViewModel {
             item.previewState = .readyLocal
         }
         return item
+    }
+
+    /// Hydrates attachment items that came from the cached `TimelineRowPresentation` (which
+    /// intentionally omits preview data/state so it isn't pinned in the row cache) with the
+    /// current live load state. Call this at render time instead of reading
+    /// `TimelineRowPresentation.attachmentItems` directly.
+    public func hydratedAttachmentItems(_ items: [AttachmentDisplayItem]) -> [AttachmentDisplayItem] {
+        items.map(hydrateAttachmentPreviewState)
+    }
+
+    /// Embed counterpart of `hydratedAttachmentItems(_:)`.
+    public func hydratedEmbedItems(_ items: [MessageEmbedDisplayItem]) -> [MessageEmbedDisplayItem] {
+        items.map { item in
+            guard let mediaItem = item.mediaItem else { return item }
+            let hydrated = hydrateAttachmentPreviewState(mediaItem)
+            return MessageEmbedDisplayItem(
+                id: item.id,
+                embed: item.embed,
+                mediaItem: hydrated,
+                mediaPreviewData: hydrated.previewData
+            )
+        }
     }
 
     public func loadInlineImagePreviews(for message: Message) {
@@ -6693,7 +6757,7 @@ public final class MainShellViewModel {
                 guard item.kind == .image else { continue }
                 guard item.byteCount.map({ $0 <= 8 * 1024 * 1024 }) ?? true else { continue }
                 loadImageResource(for: media, kind: .attachmentPreview)
-            } else if let item = externalEmbedMediaItem(for: embed), item.kind == .image, shouldAutoLoadInlineImage(item) {
+            } else if let item = ExternalEmbedMediaFactory.mediaItem(for: embed).map(hydrateAttachmentPreviewState), item.kind == .image, shouldAutoLoadInlineImage(item) {
                 guard attachmentLoadTasks[item.id] == nil else { continue }
                 guard !queuedInlinePreviewItems.contains(where: { $0.id == item.id }) else { continue }
                 queuedInlinePreviewItems.append(item)
@@ -6781,7 +6845,7 @@ public final class MainShellViewModel {
                 imagePresentationByteCount -= removed.count
             }
         }
-        invalidateTimelineMediaPresentation()
+        scheduleTimelineMediaInvalidation()
     }
 
     private func removeImagePresentationData(for key: ImageCacheKey) {
@@ -6789,7 +6853,7 @@ public final class MainShellViewModel {
         if let removed = loadedImageResources.removeValue(forKey: key) {
             imagePresentationByteCount -= removed.count
         }
-        invalidateTimelineMediaPresentation()
+        scheduleTimelineMediaInvalidation()
     }
 
     private func storeAttachmentPreviewData(_ data: RemoteAttachmentData, for id: String) {
@@ -6808,7 +6872,7 @@ public final class MainShellViewModel {
                 attachmentPreviewStates[oldest] = .notLoaded
             }
         }
-        invalidateTimelineMediaPresentation()
+        scheduleTimelineMediaInvalidation()
     }
 
     private func removeAttachmentPreviewData(for id: String) {
@@ -6816,7 +6880,7 @@ public final class MainShellViewModel {
         if let removed = loadedAttachmentData.removeValue(forKey: id) {
             attachmentPreviewByteCount -= removed.data.count
         }
-        invalidateTimelineMediaPresentation()
+        scheduleTimelineMediaInvalidation()
     }
 
     public func loadImageResource(for file: File?, kind: ImageResourceKind) {
@@ -6979,10 +7043,11 @@ public final class MainShellViewModel {
                 loadImageResource(for: resolvedUserDisplay(for: snapshot.usersByID[userID], fallbackID: userID).avatarFile, kind: .userAvatar)
             }
         } else if let serverID = selection.serverID {
-            for group in cachedMemberListGroups(for: serverID).prefix(4) {
-                for item in group.items.prefix(24) {
-                    loadImageResource(for: item.avatar, kind: .userAvatar)
-                }
+            // Flattened rather than "first N groups": with hoisted-role sections ahead of the
+            // Online/Offline fallback groups, capping by group count could pre-queue only a
+            // handful of small role sections and miss the bulk of visible members.
+            for item in cachedMemberListGroups(for: serverID).flatMap(\.items).prefix(48) {
+                loadImageResource(for: item.avatar, kind: .userAvatar)
             }
         }
     }
@@ -10438,8 +10503,6 @@ extension MainShellViewModel: AppCommandHandling {
             return sessionCoordinator?.hasSavedCredential == true && !isConnecting
         case .disconnect:
             return isDisconnectable
-        case .resetToMock:
-            return isDeveloperControlsEnabled && (effectiveRuntimeMode != .mock || effectiveConnectionState != .idle)
         case .toggleDeveloperControls:
             return sessionCoordinator != nil
         case let .selectServer(index):
@@ -10525,8 +10588,6 @@ extension MainShellViewModel: AppCommandHandling {
             return sessionCoordinator?.hasSavedCredential == true ? "Realtime is already connecting." : "No saved credential for this environment."
         case .disconnect:
             return "No live realtime session is connected."
-        case .resetToMock:
-            return isDeveloperControlsEnabled ? "Already using preview data." : "Developer controls are disabled."
         case .selectServer:
             return "That server shortcut has no visible server."
         case .selectChannel:
@@ -10575,8 +10636,6 @@ extension MainShellViewModel: AppCommandHandling {
             Task { [weak self] in await self?.reconnectLiveManually() }
         case .disconnect:
             Task { [weak self] in await self?.disconnectLive() }
-        case .resetToMock:
-            Task { [weak self] in await self?.resetToMock() }
         case .openAccountSettings:
             showAccountSessions()
         case .openConnectionSettings:
@@ -13481,10 +13540,10 @@ public struct TimelineMessageGroupView: View {
                             isCompactDensity: viewModel.messageDensity == .compact,
                             searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
                             replyPreviewItem: viewModel.replyPreviewItem(for: timelineMessage.message),
-                            attachmentItems: rowPresentation?.attachmentItems ?? [],
+                            attachmentItems: viewModel.hydratedAttachmentItems(rowPresentation?.attachmentItems ?? []),
                             customEmojiItems: rowPresentation?.customEmojiItems ?? [],
                             preparedMarkdownContent: rowPresentation?.preparedMarkdownContent,
-                            embedItems: rowPresentation?.embedItems ?? [],
+                            embedItems: viewModel.hydratedEmbedItems(rowPresentation?.embedItems ?? []),
                             authorAvatarData: viewModel.imageData(for: rowPresentation?.authorDisplay.avatarFile ?? viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
                             actionItems: rowActionItems(for: timelineMessage, presentation: rowPresentation),
                             reactionItems: rowReactionItems(for: timelineMessage, presentation: rowPresentation),
@@ -13844,6 +13903,7 @@ public struct MemberPanelView: View {
 
     private var serverMemberGroups: [MemberListGroup] {
         guard case let .serverMembers(serverID, _) = context else { return [] }
+        _ = viewModel.memberListGroupsRevision
         return viewModel.cachedMemberListGroups(for: serverID)
     }
 
@@ -13908,20 +13968,33 @@ public struct MemberPanelView: View {
                 .frame(maxWidth: .infinity)
         } else {
             // Phase 46: moderation cache prewarm is lifecycle-driven; never trigger it from SwiftUI body/view builders.
+            // Member rows are nested in `Section` (not a plain VStack) so they remain direct
+            // lazy children of the LazyVStack; a plain VStack would force SwiftUI to realize
+            // every row in a group at once, which froze the app on servers with thousands of
+            // offline members in a single "Offline" group.
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                LazyVStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
                     ForEach(groups) { group in
-                        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-                            Text(group.title.uppercased())
-                                .font(StoatTypography.section)
-                                .foregroundStyle(.secondary)
-                            ForEach(group.items) { item in
+                        let limited = MemberPanelRowLimiter.visibleItems(for: group)
+                        Section {
+                            ForEach(limited.items) { item in
                                 memberListRow(item)
                                     .onAppear {
                                         viewModel.noteVisibleIdentity(userID: item.userID, user: item.user, member: item.member, serverID: item.member?.id.serverID, source: .visibleMember)
                                         viewModel.loadImageResource(for: item.avatar, kind: .userAvatar)
                                     }
                             }
+                            if limited.remainder > 0 {
+                                Text("and \(limited.remainder) more offline members")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.vertical, StoatSpacing.xxSmall)
+                            }
+                        } header: {
+                            Text(group.title.uppercased())
+                                .font(StoatTypography.section)
+                                .foregroundStyle(.secondary)
+                                .padding(.top, StoatSpacing.medium)
                         }
                     }
                 }

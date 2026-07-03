@@ -246,7 +246,6 @@ private struct AccountSettingsTab: View {
                 if let coordinator = viewModel.sessionCoordinator {
                     LabeledContent("Health", value: Phase6UIHelpers.connectionHealthText(state: coordinator.connectionState, diagnostics: coordinator.diagnostics, hydration: coordinator.hydrationStatus))
                     LabeledContent("Hydration", value: Phase6UIHelpers.hydrationLabel(coordinator.hydrationStatus))
-                    LabeledContent("Mode", value: viewModel.effectiveRuntimeMode == .liveManual ? "Live" : "Preview Data")
                     LabeledContent("Ready", value: coordinator.hydrationStatus.readyReceived ? "Received" : "Waiting")
                     LabeledContent("Servers", value: "\(coordinator.hydrationStatus.serverCount)")
                     LabeledContent("Channels", value: "\(coordinator.hydrationStatus.channelCount)")

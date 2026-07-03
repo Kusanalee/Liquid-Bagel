@@ -79,6 +79,40 @@ final class StoatUITests: XCTestCase {
         XCTAssertNil(item.playbackURL)
     }
 
+    func testPhase56PresenceDotGatesOnOfflineRegardlessOfStoredPresence() {
+        // An offline member whose stored (configured) presence is still "Online" must show
+        // as offline — `status.presence` persists after disconnect and must not override a
+        // known-false `isOnline`.
+        let offlineWithOnlinePresence = PresenceDot.resolve(presence: .online, isOnline: false)
+        XCTAssertEqual(offlineWithOnlinePresence.color, .secondary)
+        XCTAssertEqual(offlineWithOnlinePresence.label, "Offline")
+
+        let offlineWithIdlePresence = PresenceDot.resolve(presence: .idle, isOnline: false)
+        XCTAssertEqual(offlineWithIdlePresence.color, .secondary)
+        XCTAssertEqual(offlineWithIdlePresence.label, "Offline")
+
+        let onlineWithIdlePresence = PresenceDot.resolve(presence: .idle, isOnline: true)
+        XCTAssertEqual(onlineWithIdlePresence.color, .orange)
+        XCTAssertEqual(onlineWithIdlePresence.label, "Idle")
+
+        let onlineNoPresence = PresenceDot.resolve(presence: nil, isOnline: true)
+        XCTAssertEqual(onlineNoPresence.color, .green)
+        XCTAssertEqual(onlineNoPresence.label, "Online")
+
+        // isOnline unknown (nil): some call sites don't have it, fall back to presence-first.
+        let unknownOnlineWithPresence = PresenceDot.resolve(presence: .online, isOnline: nil)
+        XCTAssertEqual(unknownOnlineWithPresence.color, .green)
+        XCTAssertEqual(unknownOnlineWithPresence.label, "Online")
+
+        let unknownOnlineNoPresence = PresenceDot.resolve(presence: nil, isOnline: nil)
+        XCTAssertEqual(unknownOnlineNoPresence.color, .secondary)
+        XCTAssertEqual(unknownOnlineNoPresence.label, "Offline")
+
+        let invisibleButOnline = PresenceDot.resolve(presence: .invisible, isOnline: true)
+        XCTAssertEqual(invisibleButOnline.color, .secondary)
+        XCTAssertEqual(invisibleButOnline.label, "Invisible")
+    }
+
     func testPhase55ExternalEmbedMediaFactorySynthesizesSafeItems() {
         let imageEmbed = Embed(kind: .website, url: "https://tenor.com/view", image: EmbedImage(url: "https://media1.tenor.com/m/abc/dance.gif", width: 200, height: 200))
         let imageItem = ExternalEmbedMediaFactory.mediaItem(for: imageEmbed)

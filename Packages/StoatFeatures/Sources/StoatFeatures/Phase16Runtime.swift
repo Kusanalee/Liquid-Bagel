@@ -157,6 +157,10 @@ public actor FileImageDiskCache: ImageDiskCaching {
     private let directory: URL
     private let maxBytes: Int
     private var isPrepared = false
+    /// Running total of bytes on disk, seeded lazily by one directory scan and maintained
+    /// incrementally thereafter so `store` doesn't have to re-enumerate the whole cache
+    /// directory (with a `resourceValues` stat per file) on every single call.
+    private var totalBytes: Int?
 
     public init(directory: URL? = nil, maxBytes: Int = 256 * 1024 * 1024) {
         if let directory {
@@ -179,13 +183,25 @@ public actor FileImageDiskCache: ImageDiskCaching {
     public func store(_ data: Data, for key: ImageCacheKey) async {
         guard data.count <= maxBytes else { return }
         prepareIfNeeded()
-        try? data.write(to: fileURL(for: key), options: .atomic)
+        seedByteCountIfNeeded()
+        let url = fileURL(for: key)
+        let previousSize = existingFileSize(at: url)
+        try? data.write(to: url, options: .atomic)
+        totalBytes = (totalBytes ?? 0) - previousSize + data.count
         evictIfNeeded()
     }
 
     public func removeAll() async {
         try? FileManager.default.removeItem(at: directory)
         isPrepared = false
+        totalBytes = 0
+    }
+
+    /// Current known cache size in bytes, for diagnostics/tests. Triggers the lazy seed scan
+    /// if it hasn't run yet.
+    public func byteCount() async -> Int {
+        seedByteCountIfNeeded()
+        return totalBytes ?? 0
     }
 
     private func prepareIfNeeded() {
@@ -200,21 +216,42 @@ public actor FileImageDiskCache: ImageDiskCaching {
         return directory.appendingPathComponent("\(name).img", isDirectory: false)
     }
 
+    private func existingFileSize(at url: URL) -> Int {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? Int
+        else { return 0 }
+        return size
+    }
+
+    private func seedByteCountIfNeeded() {
+        guard totalBytes == nil else { return }
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey]) else {
+            totalBytes = 0
+            return
+        }
+        totalBytes = urls.reduce(0) { sum, url in
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            return sum + size
+        }
+    }
+
     private func evictIfNeeded() {
+        guard let currentTotal = totalBytes, currentTotal > maxBytes else { return }
         let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
         guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys) else { return }
         var entries: [(url: URL, size: Int, modified: Date)] = urls.compactMap { url in
             guard let values = try? url.resourceValues(forKeys: Set(keys)) else { return nil }
             return (url, values.fileSize ?? 0, values.contentModificationDate ?? .distantPast)
         }
-        var totalBytes = entries.reduce(0) { $0 + $1.size }
-        guard totalBytes > maxBytes else { return }
         entries.sort { $0.modified < $1.modified }
+        var runningTotal = currentTotal
+        let evictionTarget = Int(Double(maxBytes) * 0.8)
         for entry in entries {
-            guard totalBytes > maxBytes else { break }
+            guard runningTotal > evictionTarget else { break }
             try? FileManager.default.removeItem(at: entry.url)
-            totalBytes -= entry.size
+            runningTotal -= entry.size
         }
+        totalBytes = runningTotal
     }
 }
 

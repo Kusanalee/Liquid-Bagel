@@ -39,11 +39,6 @@ public enum PersistenceError: Error, Equatable, Sendable, LocalizedError {
     public var errorDescription: String? { message }
 }
 
-public enum PreferredLaunchMode: String, Codable, Hashable, Sendable {
-    case mock
-    case rememberLastButDoNotConnect
-}
-
 public enum InlineImagePreviewPolicy: String, Codable, Hashable, Sendable, CaseIterable {
     case automaticSmallImages
     case explicitClickOnly
@@ -307,7 +302,6 @@ public struct EnvironmentProfile: Codable, Hashable, Identifiable, Sendable {
 public struct AppPreferences: Codable, Hashable, Sendable {
     public var lastSelectedEnvironmentID: String?
     public var environmentProfiles: [EnvironmentProfile]
-    public var preferredLaunchMode: PreferredLaunchMode
     public var showDeveloperRuntimeControls: Bool
     public var lastSelectedServerID: ServerID?
     public var lastSelectedChannelID: ChannelID?
@@ -323,7 +317,6 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case lastSelectedEnvironmentID
         case environmentProfiles
-        case preferredLaunchMode
         case showDeveloperRuntimeControls
         case lastSelectedServerID
         case lastSelectedChannelID
@@ -340,7 +333,6 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public init(
         lastSelectedEnvironmentID: String? = nil,
         environmentProfiles: [EnvironmentProfile] = [EnvironmentProfile.production()],
-        preferredLaunchMode: PreferredLaunchMode = .mock,
         showDeveloperRuntimeControls: Bool = true,
         lastSelectedServerID: ServerID? = nil,
         lastSelectedChannelID: ChannelID? = nil,
@@ -355,7 +347,6 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     ) {
         self.lastSelectedEnvironmentID = lastSelectedEnvironmentID
         self.environmentProfiles = Self.normalizedProfiles(environmentProfiles)
-        self.preferredLaunchMode = preferredLaunchMode
         self.showDeveloperRuntimeControls = showDeveloperRuntimeControls
         self.lastSelectedServerID = lastSelectedServerID
         self.lastSelectedChannelID = lastSelectedChannelID
@@ -375,7 +366,6 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.init(
             lastSelectedEnvironmentID: try container.decodeIfPresent(String.self, forKey: .lastSelectedEnvironmentID),
             environmentProfiles: try container.decodeIfPresent([EnvironmentProfile].self, forKey: .environmentProfiles) ?? [EnvironmentProfile.production()],
-            preferredLaunchMode: try container.decodeIfPresent(PreferredLaunchMode.self, forKey: .preferredLaunchMode) ?? .mock,
             showDeveloperRuntimeControls: try container.decodeIfPresent(Bool.self, forKey: .showDeveloperRuntimeControls) ?? true,
             lastSelectedServerID: try container.decodeIfPresent(ServerID.self, forKey: .lastSelectedServerID),
             lastSelectedChannelID: try container.decodeIfPresent(ChannelID.self, forKey: .lastSelectedChannelID),
@@ -394,7 +384,6 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(lastSelectedEnvironmentID, forKey: .lastSelectedEnvironmentID)
         try container.encode(environmentProfiles, forKey: .environmentProfiles)
-        try container.encode(preferredLaunchMode, forKey: .preferredLaunchMode)
         try container.encode(showDeveloperRuntimeControls, forKey: .showDeveloperRuntimeControls)
         try container.encodeIfPresent(lastSelectedServerID, forKey: .lastSelectedServerID)
         try container.encodeIfPresent(lastSelectedChannelID, forKey: .lastSelectedChannelID)

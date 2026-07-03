@@ -14,7 +14,6 @@ final class StoatPersistenceTests: XCTestCase {
     func testDefaultPreferencesIncludeProductionProfile() throws {
         let preferences = try AppPreferences.defaults.validated()
 
-        XCTAssertEqual(preferences.preferredLaunchMode, .mock)
         XCTAssertEqual(preferences.selectedEnvironmentProfile.id, "production")
         XCTAssertTrue(preferences.environmentProfiles.contains { $0.isProduction && $0.environment == .production })
         XCTAssertEqual(preferences.liquidGlassTransparency, 1.0)
@@ -59,7 +58,6 @@ final class StoatPersistenceTests: XCTestCase {
         try await store.resetPreferences()
         let loaded = try await store.loadPreferences()
 
-        XCTAssertEqual(loaded.preferredLaunchMode, .mock)
         XCTAssertTrue(loaded.memberPanelVisible)
         XCTAssertEqual(loaded.environmentProfiles.map(\.id), ["production"])
     }

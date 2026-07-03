@@ -11,7 +11,6 @@ public enum AppCommand: Hashable, Sendable {
     case refresh
     case reconnect
     case disconnect
-    case resetToMock
     case openAccountSettings
     case openConnectionSettings
     case openAppearanceSettings

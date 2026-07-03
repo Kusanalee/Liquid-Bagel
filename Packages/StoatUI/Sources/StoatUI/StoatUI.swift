@@ -1694,36 +1694,37 @@ public struct PresenceDot: View {
 
     public var body: some View {
         Circle()
-            .fill(color)
+            .fill(Self.resolve(presence: presence, isOnline: isOnline).color)
             .frame(width: 9, height: 9)
             .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 2))
-            .accessibilityLabel(label)
+            .accessibilityLabel(Self.resolve(presence: presence, isOnline: isOnline).label)
     }
 
-    private var color: Color {
+    /// `presence` (`User.status.presence`) is the user's *configured* status and persists
+    /// while they're offline, so it must not be trusted on its own: an offline user with a
+    /// stored "Online" presence would otherwise render a green dot. When `isOnline` is known
+    /// to be `false`, always render offline styling regardless of `presence`. When `isOnline`
+    /// is `nil` (some call sites don't know), fall back to presence-first styling.
+    static func resolve(presence: Presence?, isOnline: Bool?) -> (color: Color, label: String) {
+        if isOnline == false {
+            return (.secondary, "Offline")
+        }
         switch presence {
         case .online:
-            return .green
+            return (.green, Presence.online.displayName)
         case .idle:
-            return .orange
+            return (.orange, Presence.idle.displayName)
         case .focus:
-            return .blue
+            return (.blue, Presence.focus.displayName)
         case .busy:
-            return .red
+            return (.red, Presence.busy.displayName)
         case .invisible:
-            return .secondary
-        case .unknown:
-            return isOnline == true ? .green : .secondary
+            return (.secondary, Presence.invisible.displayName)
+        case let .unknown(value):
+            return isOnline == true ? (.green, "Online") : (.secondary, Presence.unknown(value).displayName)
         case nil:
-            return isOnline == true ? .green : .secondary
+            return isOnline == true ? (.green, "Online") : (.secondary, "Offline")
         }
-    }
-
-    private var label: String {
-        if let presence {
-            return presence.displayName
-        }
-        return isOnline == true ? "Online" : "Offline"
     }
 }
 

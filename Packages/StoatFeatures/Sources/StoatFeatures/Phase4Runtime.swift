@@ -1808,8 +1808,7 @@ public final class AppSessionCoordinator {
             startupAuthDiagnostics.lastErrorCategory = .environmentError
             return
         }
-        var updated = preferences.withSelectedEnvironmentID(profile.id)
-        updated.preferredLaunchMode = .rememberLastButDoNotConnect
+        let updated = preferences.withSelectedEnvironmentID(profile.id)
         await savePreferences(updated)
         await setEnvironment(profile.environment)
     }

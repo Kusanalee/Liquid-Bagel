@@ -2621,6 +2621,80 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase56TimelineRowCacheDoesNotPinPreviewDataAndHydratesLiveState() async throws {
+        let serverID: ServerID = "phase56-media-server"
+        let channelID: ChannelID = "phase56-media-channel"
+        var snapshot = RealtimeSnapshot()
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "phase56-owner", name: "Phase56 Media", channelIDs: [channelID])
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "media")
+        let file = File(id: "phase56-image", tag: "attachments", filename: "photo.png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
+        let message = Message(id: "01J00000000000000000560001", channelID: channelID, authorID: "phase56-author", content: "look", attachments: [file])
+        snapshot.messagesByChannelID[channelID] = [message]
+        let data = Data("png-bytes".utf8)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, imageResourceLoader: loader)
+
+        await model.prepareSelectedTimelinePresentation()
+        let cachedBefore = model.timelineRowPresentation(for: message.id)
+        XCTAssertNil(cachedBefore?.attachmentItems.first?.previewData, "row cache must not pin preview data")
+        let hydratedBefore = model.hydratedAttachmentItems(cachedBefore?.attachmentItems ?? [])
+        XCTAssertEqual(hydratedBefore.first?.previewState, .notLoaded)
+
+        model.loadImageResource(for: file, kind: .attachmentPreview)
+        for _ in 0..<40 {
+            if model.imageData(for: file, kind: .attachmentPreview) != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let cachedAfter = model.timelineRowPresentation(for: message.id)
+        XCTAssertNil(cachedAfter?.attachmentItems.first?.previewData, "row cache must still not pin preview data after a load completes")
+        let hydratedAfter = model.hydratedAttachmentItems(cachedAfter?.attachmentItems ?? [])
+        XCTAssertEqual(hydratedAfter.first?.previewData, data)
+        XCTAssertEqual(hydratedAfter.first?.previewState, .readyRemote)
+    }
+
+    @MainActor
+    func testPhase56TimelineMediaInvalidationCoalescesIntoOneRebuild() async throws {
+        let serverID: ServerID = "phase56-coalesce-server"
+        let channelID: ChannelID = "phase56-coalesce-channel"
+        var snapshot = RealtimeSnapshot()
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "phase56-owner", name: "Phase56 Coalesce", channelIDs: [channelID])
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "media")
+        let files = (0..<3).map { index in
+            File(id: FileID(rawValue: "phase56-coalesce-\(index)"), tag: "attachments", filename: "\(index).png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
+        }
+        let message = Message(id: "01J00000000000000000560002", channelID: channelID, authorID: "phase56-author", content: "look", attachments: files)
+        snapshot.messagesByChannelID[channelID] = [message]
+        let loader = MockImageResourceLoader(result: .success(Data("png-bytes".utf8)))
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, imageResourceLoader: loader)
+
+        await model.prepareSelectedTimelinePresentation()
+        let rowBuildCountBeforeLoads = model.timelinePresentationDiagnostics.rowBuildCount
+
+        for file in files {
+            model.loadImageResource(for: file, kind: .attachmentPreview)
+        }
+        for _ in 0..<40 {
+            if files.allSatisfy({ model.imageData(for: $0, kind: .attachmentPreview) != nil }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        // Give the coalesced Task.yield()-based rebuild a chance to run and settle.
+        for _ in 0..<10 {
+            await model.prepareSelectedTimelinePresentation()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let rowBuildCountAfterLoads = model.timelinePresentationDiagnostics.rowBuildCount
+        XCTAssertLessThanOrEqual(
+            rowBuildCountAfterLoads - rowBuildCountBeforeLoads,
+            2,
+            "three near-simultaneous image loads should coalesce into at most one extra row rebuild, not one per image"
+        )
+        let hydrated = model.hydratedAttachmentItems(model.timelineRowPresentation(for: message.id)?.attachmentItems ?? [])
+        XCTAssertTrue(hydrated.allSatisfy { $0.previewState == .readyRemote })
+    }
+
+    @MainActor
     func testPhase21ExplicitInlinePolicyDoesNotAutoLoadImages() async {
         let loader = MockRemoteAttachmentLoader()
         let model = MainShellViewModel(snapshot: MockShellData.snapshot, remoteAttachmentLoader: loader)
@@ -2946,6 +3020,104 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(result.groups.first { $0.id == "offline" }?.items.map(\.userID), ["phase55-sleepy", "phase55-sleepy-admin"])
     }
 
+    func testPhase56MemberPanelRowLimiterCapsOnlyOfflineGroup() {
+        let items = (0..<2000).map { index in
+            MemberListItem(userID: UserID(rawValue: "phase56-user-\(index)"), user: nil, member: nil)
+        }
+        let offlineGroup = MemberListGroup(id: "offline", title: "Offline - 2000", items: items)
+        let limitedOffline = MemberPanelRowLimiter.visibleItems(for: offlineGroup)
+        XCTAssertEqual(limitedOffline.items.count, 200)
+        XCTAssertEqual(limitedOffline.remainder, 1800)
+
+        let onlineGroup = MemberListGroup(id: "online", title: "Online - 2000", items: items)
+        let limitedOnline = MemberPanelRowLimiter.visibleItems(for: onlineGroup)
+        XCTAssertEqual(limitedOnline.items.count, 2000)
+        XCTAssertEqual(limitedOnline.remainder, 0)
+
+        let smallOffline = MemberListGroup(id: "offline", title: "Offline - 5", items: Array(items.prefix(5)))
+        let limitedSmallOffline = MemberPanelRowLimiter.visibleItems(for: smallOffline)
+        XCTAssertEqual(limitedSmallOffline.items.count, 5)
+        XCTAssertEqual(limitedSmallOffline.remainder, 0)
+    }
+
+    @MainActor
+    func testPhase56AvatarPreQueueFlattensAcrossGroupsInsteadOfCappingByGroupCount() async throws {
+        let serverID: ServerID = "phase56-prequeue-server"
+        let hoistedRoleID: RoleID = "phase56-prequeue-role"
+        var snapshot = RealtimeSnapshot()
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "phase56-prequeue-owner", name: "Phase56 PreQueue", roles: [
+            hoistedRoleID: Role(id: hoistedRoleID, name: "Staff", permissions: PermissionOverride(), hoist: true, rank: 1)
+        ])
+        snapshot.usersByID["phase56-prequeue-owner"] = User(id: "phase56-prequeue-owner", username: "owner", online: true)
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: "phase56-prequeue-owner")] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: "phase56-prequeue-owner"), joinedAt: Date())
+        // A couple of small hoisted-role groups that would previously exhaust a "first 4
+        // groups" cap before reaching the much larger Online fallback group below.
+        for index in 0..<2 {
+            let userID = UserID(rawValue: "phase56-staff-\(index)")
+            snapshot.usersByID[userID] = User(id: userID, username: "staff\(index)", online: true)
+            snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date(), roles: [hoistedRoleID])
+        }
+        for index in 0..<60 {
+            let userID = UserID(rawValue: "phase56-online-\(index)")
+            let file = File(id: FileID(rawValue: "phase56-online-avatar-\(index)"), tag: "avatars", filename: "a\(index).png", contentType: "image/png", size: 10)
+            snapshot.usersByID[userID] = User(id: userID, username: "online\(index)", avatar: file, online: true)
+            snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date())
+        }
+        let loader = MockImageResourceLoader(result: .success(Data("avatar".utf8)))
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, imageResourceLoader: loader)
+        await model.prepareMemberListGroups(for: serverID)
+
+        model.reloadVisibleImages()
+        for _ in 0..<40 {
+            let calls = await loader.calls
+            if calls.contains(where: { $0.id == "phase56-online-avatar-30" }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let calls = await loader.calls
+        let requestedIDs = Set(calls.map(\.id))
+        XCTAssertTrue(requestedIDs.contains("phase56-online-avatar-30"), "avatar pre-queue should flatten across groups, not stop after the first few small role sections")
+    }
+
+    @MainActor
+    func testPhase56MessageOnlySnapshotChangeDoesNotForceMemberListRederivation() async throws {
+        let serverID: ServerID = "phase56-fp-server"
+        let channelID: ChannelID = "phase56-fp-channel"
+        var snapshot = RealtimeSnapshot()
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "phase56-owner", name: "Phase56")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        for index in 0..<5 {
+            let userID = UserID(rawValue: "phase56-user-\(index)")
+            snapshot.usersByID[userID] = User(id: userID, username: "user\(index)", online: true)
+            snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(
+                id: MemberCompositeKey(serverID: serverID, userID: userID),
+                joinedAt: Date()
+            )
+        }
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot)
+
+        await model.prepareMemberListGroups(for: serverID)
+        let revisionAfterFirstPrepare = model.memberListGroupsRevision
+        XCTAssertEqual(revisionAfterFirstPrepare, 1)
+
+        var messageOnlySnapshot = model.snapshot
+        messageOnlySnapshot.messagesByChannelID[channelID, default: []].append(
+            Message(id: MessageID(rawValue: ulid(milliseconds: 1)), channelID: channelID, authorID: "phase56-user-0", content: "hi")
+        )
+        model.replaceSnapshotForTesting(messageOnlySnapshot, changes: RealtimeSnapshotChangeSet(messageChannelIDs: [channelID]))
+        await model.prepareMemberListGroups(for: serverID)
+        XCTAssertEqual(model.memberListGroupsRevision, revisionAfterFirstPrepare, "message-only snapshot churn must not force a full member re-derivation")
+
+        let flippedUserID = UserID(rawValue: "phase56-user-0")
+        var presenceOnlySnapshot = model.snapshot
+        presenceOnlySnapshot.usersByID[flippedUserID]?.online = false
+        model.replaceSnapshotForTesting(presenceOnlySnapshot, changes: RealtimeSnapshotChangeSet(userIDs: [flippedUserID]))
+        await model.prepareMemberListGroups(for: serverID)
+        XCTAssertGreaterThan(model.memberListGroupsRevision, revisionAfterFirstPrepare, "a member's online status changing must trigger re-derivation")
+        let groups = model.cachedMemberListGroups(for: serverID)
+        XCTAssertTrue(groups.first { $0.id == "offline" }?.items.map(\.userID).contains(UserID(rawValue: "phase56-user-0")) == true)
+    }
+
     @MainActor
     func testPhase55MediaSafeModeResetsAfterImageQueueDrains() async throws {
         let loader = SlowImageResourceLoader(delayNanoseconds: 10_000_000)
@@ -3061,6 +3233,40 @@ final class StoatFeaturesTests: XCTestCase {
         await disk.removeAll()
         let cleared = await disk.data(for: key)
         XCTAssertNil(cleared)
+    }
+
+    func testPhase56FileImageDiskCacheTracksByteCountAndEvictsOldestWhenOverCap() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("phase56-disk-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let disk = FileImageDiskCache(directory: directory, maxBytes: 100)
+
+        let oldKey = ImageCacheKey(id: "phase56-old", kind: .userAvatar)
+        await disk.store(Data(repeating: 0, count: 40), for: oldKey)
+        let afterFirstStore = await disk.byteCount()
+        XCTAssertEqual(afterFirstStore, 40)
+
+        // A later modification time ensures the eviction below removes the OLD entry first.
+        try await Task.sleep(for: .milliseconds(20))
+        let newKey = ImageCacheKey(id: "phase56-new", kind: .userAvatar)
+        await disk.store(Data(repeating: 0, count: 40), for: newKey)
+        let afterSecondStore = await disk.byteCount()
+        XCTAssertEqual(afterSecondStore, 80)
+
+        // Overwriting an existing key must adjust the running total by the size delta, not double-count it.
+        await disk.store(Data(repeating: 0, count: 10), for: newKey)
+        let afterOverwrite = await disk.byteCount()
+        XCTAssertEqual(afterOverwrite, 50)
+
+        // Pushing past the 100-byte cap should evict down toward 80% (80 bytes), removing the oldest entry.
+        try await Task.sleep(for: .milliseconds(20))
+        let thirdKey = ImageCacheKey(id: "phase56-third", kind: .userAvatar)
+        await disk.store(Data(repeating: 0, count: 60), for: thirdKey)
+        let finalCount = await disk.byteCount()
+        XCTAssertLessThanOrEqual(finalCount, 80)
+        let oldData = await disk.data(for: oldKey)
+        XCTAssertNil(oldData, "oldest entry should have been evicted first")
+        let thirdData = await disk.data(for: thirdKey)
+        XCTAssertNotNil(thirdData, "newest entry should survive eviction")
     }
 
     @MainActor
@@ -3365,6 +3571,38 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.memberHydrationDiagnostics.returnedCount, 3)
         XCTAssertEqual(model.memberHydrationDiagnostics.mergedUserCount, 2)
         XCTAssertEqual(model.memberHydrationDiagnostics.missingUserCount, 1)
+    }
+
+    @MainActor
+    func testPhase56MemberHydrationPreservesGatewayFreshPresenceOverStaleRestSnapshot() async {
+        var snapshot = RealtimeSnapshot()
+        let serverID: ServerID = "phase56-hydration-server"
+        let channelID: ChannelID = "phase56-hydration-channel"
+        let onlineUserID: UserID = "phase56-online-user"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: onlineUserID, name: "Phase56 Hydration")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        // The gateway has already told us this user is online with an idle status.
+        snapshot.usersByID[onlineUserID] = User(id: onlineUserID, username: "gatewayfresh", status: UserStatus(text: nil, presence: .idle), online: true)
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: onlineUserID)] = ServerMember(
+            id: MemberCompositeKey(serverID: serverID, userID: onlineUserID),
+            joinedAt: Date()
+        )
+        // The REST member list response is a stale snapshot: it thinks the user is offline.
+        let restMembers = [ServerMember(id: MemberCompositeKey(serverID: serverID, userID: onlineUserID), joinedAt: Date())]
+        let restUsers = [User(id: onlineUserID, username: "gatewayfresh", displayName: "Updated Name", online: false)]
+        let api = RecordingAPIClient(membersByServer: [serverID: restMembers], usersByServer: [serverID: restUsers])
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            communityAPIClient: api
+        )
+
+        await model.hydrateServerMembers(serverID: serverID, force: true, reason: "test")
+
+        XCTAssertEqual(model.snapshot.usersByID[onlineUserID]?.online, true, "REST hydration must not clobber gateway-fresh online status")
+        XCTAssertEqual(model.snapshot.usersByID[onlineUserID]?.status?.presence, .idle, "REST hydration must not clobber gateway-fresh presence")
+        XCTAssertEqual(model.snapshot.usersByID[onlineUserID]?.displayName, "Updated Name", "other REST-sourced fields should still update normally")
     }
 
     @MainActor

@@ -117,7 +117,16 @@ public enum Phase52MemberHydrationPreparer {
                     invalidatedAvatarKeys.insert(ImageCacheKey(id: avatar.id.rawValue, kind: .userAvatar))
                 }
             }
-            nextSnapshot.usersByID[user.id] = user
+            var mergedUser = user
+            if let existingUser = snapshot.usersByID[user.id] {
+                // The member-list REST response can lag behind the gateway; while connected,
+                // the gateway is never staler for online/status than a REST snapshot, so keep
+                // it rather than letting this hydration overwrite it with stale data (which
+                // manifested as offline members showing a green presence dot).
+                mergedUser.online = existingUser.online
+                mergedUser.status = existingUser.status
+            }
+            nextSnapshot.usersByID[user.id] = mergedUser
             if index.isMultiple(of: 128) {
                 try Task.checkCancellation()
             }
@@ -348,22 +357,13 @@ public struct Phase52TimelineAssetContext: Sendable {
     private var snapshot: RealtimeSnapshot
     private var customEmojiByShortcode: [String: [CustomEmojiDisplayItem]]
     private var imageDataByKey: [ImageCacheKey: Data]
-    private var attachmentStates: [String: AttachmentPreviewState]
-    private var loadedAttachments: [String: RemoteAttachmentData]
-    private var localAttachmentIDs: Set<String>
 
     public init(
         snapshot: RealtimeSnapshot,
-        imageDataByKey: [ImageCacheKey: Data],
-        attachmentStates: [String: AttachmentPreviewState],
-        loadedAttachments: [String: RemoteAttachmentData],
-        localAttachmentIDs: Set<String>
+        imageDataByKey: [ImageCacheKey: Data]
     ) {
         self.snapshot = snapshot
         self.imageDataByKey = imageDataByKey
-        self.attachmentStates = attachmentStates
-        self.loadedAttachments = loadedAttachments
-        self.localAttachmentIDs = localAttachmentIDs
         self.customEmojiByShortcode = Dictionary(
             grouping: snapshot.emojisByID.values.map(CustomEmojiDisplayItem.init(emoji:)),
             by: { $0.shortcode.lowercased() }
@@ -396,50 +396,28 @@ public struct Phase52TimelineAssetContext: Sendable {
         return result
     }
 
+    /// Returns base items only — no preview data/state. Baking loaded image bytes into these
+    /// (previously cached in `TimelineRowPresentation`) pinned multi-MB blobs in memory for
+    /// every message in the channel, since the row cache doesn't evict independently of the
+    /// image caches. Callers must overlay live load state at render time via
+    /// `MainShellViewModel.hydratedAttachmentItems(_:)`.
     public func attachmentItems(for message: Message) -> [AttachmentDisplayItem] {
         (message.attachments ?? []).map { file in
-            let id = "file-\(file.id.rawValue)"
-            var item = AttachmentDisplayItem(
-                file: file,
-                previewState: attachmentStates[id] ?? .notLoaded
-            )
-            if let loaded = loadedAttachments[id] {
-                item.previewState = .readyRemote
-                item.previewData = loaded.data
-            }
-            if localAttachmentIDs.contains(id) {
-                item.previewState = .readyLocal
-            }
-            return item
+            AttachmentDisplayItem(file: file)
         }
     }
 
+    /// Base items only; see `attachmentItems(for:)`. External embed media (e.g. a Tenor image
+    /// URL with no `File`) is still synthesized here so its identity/kind is stable across
+    /// hydration, matching `MainShellViewModel.embedDisplayItems(for:)`.
     public func embedItems(for message: Message) -> [MessageEmbedDisplayItem] {
         (message.embeds ?? []).enumerated().map { index, embed in
-            let mediaItem = embed.media.map { file -> AttachmentDisplayItem in
-                let id = "file-\(file.id.rawValue)"
-                let imageKey = ImageCacheKey(id: file.id.rawValue, kind: .attachmentPreview)
-                var item = AttachmentDisplayItem(
-                    file: file,
-                    previewState: attachmentStates[id] ?? .notLoaded
-                )
-                if let loaded = loadedAttachments[id] {
-                    item.previewState = .readyRemote
-                    item.previewData = loaded.data
-                } else if let data = imageDataByKey[imageKey] {
-                    item.previewState = .readyRemote
-                    item.previewData = data
-                }
-                if localAttachmentIDs.contains(id) {
-                    item.previewState = .readyLocal
-                }
-                return item
-            }
+            let mediaItem = embed.media.map { AttachmentDisplayItem(file: $0) } ?? ExternalEmbedMediaFactory.mediaItem(for: embed)
             return MessageEmbedDisplayItem(
                 id: "embed-\(message.id.rawValue)-\(index)",
                 embed: embed,
                 mediaItem: mediaItem,
-                mediaPreviewData: mediaItem?.previewData
+                mediaPreviewData: nil
             )
         }
     }
