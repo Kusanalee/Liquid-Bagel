@@ -739,6 +739,11 @@ public struct FreezePerformanceDiagnostics: Hashable, Sendable {
     public var lastStateLoopSuspicion: String?
     public var mediaSafeModeEnabled: Bool
     public var capabilityCacheUpdateCount: Int
+    public var visibleImageResourceCount: Int
+    public var imagePresentationEvictionCount: Int
+    public var imageReloadAfterEvictionCount: Int
+    public var imageQueueEnqueueCount: Int
+    public var timelineMediaInvalidationCount: Int
 
     public init(
         lastMainThreadMarker: String? = nil,
@@ -758,7 +763,12 @@ public struct FreezePerformanceDiagnostics: Hashable, Sendable {
         diagnosticsPublishCount: Int = 0,
         lastStateLoopSuspicion: String? = nil,
         mediaSafeModeEnabled: Bool = false,
-        capabilityCacheUpdateCount: Int = 0
+        capabilityCacheUpdateCount: Int = 0,
+        visibleImageResourceCount: Int = 0,
+        imagePresentationEvictionCount: Int = 0,
+        imageReloadAfterEvictionCount: Int = 0,
+        imageQueueEnqueueCount: Int = 0,
+        timelineMediaInvalidationCount: Int = 0
     ) {
         self.lastMainThreadMarker = lastMainThreadMarker
         self.timelineRenderPassCount = timelineRenderPassCount
@@ -778,6 +788,11 @@ public struct FreezePerformanceDiagnostics: Hashable, Sendable {
         self.lastStateLoopSuspicion = lastStateLoopSuspicion
         self.mediaSafeModeEnabled = mediaSafeModeEnabled
         self.capabilityCacheUpdateCount = capabilityCacheUpdateCount
+        self.visibleImageResourceCount = visibleImageResourceCount
+        self.imagePresentationEvictionCount = imagePresentationEvictionCount
+        self.imageReloadAfterEvictionCount = imageReloadAfterEvictionCount
+        self.imageQueueEnqueueCount = imageQueueEnqueueCount
+        self.timelineMediaInvalidationCount = timelineMediaInvalidationCount
     }
 }
 

@@ -71,6 +71,51 @@ public struct DecodedImageDiagnostics: Hashable, Sendable {
 }
 
 #if canImport(AppKit)
+@MainActor
+private final class DecodedImageFrontCache {
+    static let shared = DecodedImageFrontCache()
+
+    private var images: [DecodedImageKey: CGImage] = [:]
+    private var costs: [DecodedImageKey: Int] = [:]
+    private var order: [DecodedImageKey] = []
+    private var byteCount = 0
+    private let maxEntries = 96
+    private let maxBytes = 128 * 1024 * 1024
+
+    func image(for key: DecodedImageKey) -> CGImage? {
+        guard let image = images[key] else { return nil }
+        order.removeAll { $0 == key }
+        order.append(key)
+        return image
+    }
+
+    func store(_ image: CGImage, for key: DecodedImageKey) {
+        byteCount -= costs[key] ?? 0
+        let cost = image.bytesPerRow * image.height
+        images[key] = image
+        costs[key] = cost
+        byteCount += cost
+        order.removeAll { $0 == key }
+        order.append(key)
+        while (order.count > maxEntries || byteCount > maxBytes), let oldest = order.first {
+            order.removeFirst()
+            images.removeValue(forKey: oldest)
+            byteCount -= costs.removeValue(forKey: oldest) ?? 0
+        }
+    }
+
+    func contains(_ key: DecodedImageKey) -> Bool {
+        images[key] != nil
+    }
+
+    func reset() {
+        images.removeAll()
+        costs.removeAll()
+        order.removeAll()
+        byteCount = 0
+    }
+}
+
 private actor DecodedImageStore {
     static let shared = DecodedImageStore()
 
@@ -89,6 +134,7 @@ private actor DecodedImageStore {
     func image(for key: DecodedImageKey, data: Data) async -> CGImage? {
         if let image = images[key] {
             cacheHitCount += 1
+            await DecodedImageFrontCache.shared.store(image, for: key)
             return image
         }
         if let task = inFlight[key] {
@@ -115,6 +161,7 @@ private actor DecodedImageStore {
                 byteCount -= costs.removeValue(forKey: oldest) ?? 0
                 evictionCount += 1
             }
+            await DecodedImageFrontCache.shared.store(image, for: key)
         }
         return image
     }
@@ -174,9 +221,19 @@ public enum DecodedImagePipeline {
         #endif
     }
 
+    @MainActor
+    public static func hasSynchronouslyCachedImage(for key: DecodedImageKey) -> Bool {
+        #if canImport(AppKit)
+        DecodedImageFrontCache.shared.contains(key)
+        #else
+        false
+        #endif
+    }
+
     public static func reset() async {
         #if canImport(AppKit)
         await DecodedImageStore.shared.reset()
+        await DecodedImageFrontCache.shared.reset()
         #endif
     }
 }
@@ -191,6 +248,9 @@ public struct DecodedDataImage: View {
     public init(data: Data, key: DecodedImageKey? = nil, pixelSize: Int = 256) {
         self.data = data
         self.key = key ?? DecodedImageKey(data: data, pixelSize: pixelSize)
+        #if canImport(AppKit)
+        _decodedImage = State(initialValue: DecodedImageFrontCache.shared.image(for: self.key))
+        #endif
     }
 
     public var body: some View {
@@ -2003,6 +2063,8 @@ public struct MessageRow: View {
                 messageActionBar
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .onHover { isHovering = $0 }
         .padding(.vertical, (showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall) + searchStyle.verticalPaddingAdjustment)
         .background(searchBackground(searchStyle), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))

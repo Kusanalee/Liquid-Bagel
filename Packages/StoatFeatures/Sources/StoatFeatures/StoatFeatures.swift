@@ -523,7 +523,10 @@ public final class MainShellViewModel {
     public var messageController: ChannelMessageController
     public var isQuickSwitcherPresented = false
     public var quickSwitcherViewModel: QuickSwitcherViewModel
-    public var placeholderStatus: String?
+    public var placeholderStatus: String? {
+        didSet { routeLegacyStatusToNotice(placeholderStatus) }
+    }
+    public private(set) var transientNotice: TransientAppNotice?
     public var shouldFocusComposer = false
     public var composerFocusRequestID = 0
     public var emojiPickerDiagnostics: String?
@@ -764,6 +767,13 @@ public final class MainShellViewModel {
     @ObservationIgnored private var imagePresentationOrder: [ImageCacheKey] = []
     @ObservationIgnored private var imagePresentationByteCount = 0
     @ObservationIgnored private let maxImagePresentationBytes = 64 * 1024 * 1024
+    @ObservationIgnored private var visibleImageResourceRequestsByConsumer: [String: ImageResourceRequest] = [:]
+    @ObservationIgnored private var imagePresentationEvictedKeys: Set<ImageCacheKey> = []
+    @ObservationIgnored private var imagePresentationEvictedOrder: [ImageCacheKey] = []
+    @ObservationIgnored private var imagePresentationEvictionCount = 0
+    @ObservationIgnored private var imageReloadAfterEvictionCount = 0
+    @ObservationIgnored private var imageQueueEnqueueCount = 0
+    @ObservationIgnored private var timelineMediaInvalidationCount = 0
     @ObservationIgnored private var attachmentPreviewOrder: [String] = []
     @ObservationIgnored private var attachmentPreviewByteCount = 0
     @ObservationIgnored private let maxAttachmentPreviewBytes = 64 * 1024 * 1024
@@ -771,8 +781,6 @@ public final class MainShellViewModel {
     @ObservationIgnored private let maxConcurrentInlinePreviewLoads = 6
     @ObservationIgnored private var imageResourceFailureCounts: [ImageCacheKey: Int] = [:]
     @ObservationIgnored private var queuedInlinePreviewItems: [AttachmentDisplayItem] = []
-    @ObservationIgnored private var deferredImageResourceRequests: [ImageCacheKey: ImageResourceRequest] = [:]
-    @ObservationIgnored private var deferredImageResourceDrainScheduled = false
     @ObservationIgnored private var lastRequestedDockBadgeValue: Int?
     @ObservationIgnored private var dockBadgeApplyTask: Task<Void, Never>?
     @ObservationIgnored private var pendingTimelineMediaInvalidation = false
@@ -860,6 +868,7 @@ public final class MainShellViewModel {
     public private(set) var phase46MemberPanelPrewarmState = Phase46MemberPanelPrewarmState()
     public private(set) var phase46FreezePreventionDiagnostics = Phase46FreezePreventionDiagnostics()
     @ObservationIgnored private var transientStatusTask: Task<Void, Never>?
+    @ObservationIgnored private var transientNoticeTask: Task<Void, Never>?
     @ObservationIgnored private var openingDirectMessageUserIDs: Set<UserID> = []
 
     public init(
@@ -971,6 +980,7 @@ public final class MainShellViewModel {
         pinnedMessagesFetchTask?.cancel()
         pinnedMessageActionTasks.values.forEach { $0.cancel() }
         transientStatusTask?.cancel()
+        transientNoticeTask?.cancel()
         referenceFetchTasks.values.forEach { $0.cancel() }
         attachmentLoadTasks.values.forEach { $0.cancel() }
         imageResourceLoadTasks.values.forEach { $0.cancel() }
@@ -2305,6 +2315,7 @@ public final class MainShellViewModel {
             await Task.yield()
             guard let self, self.pendingTimelineMediaInvalidation else { return }
             self.pendingTimelineMediaInvalidation = false
+            self.timelineMediaInvalidationCount += 1
             self.invalidateTimelineMediaPresentation()
         }
     }
@@ -3717,7 +3728,12 @@ public final class MainShellViewModel {
             diagnosticsPublishCount: diagnosticsPublishCount,
             lastStateLoopSuspicion: freezePerformanceDiagnostics.lastStateLoopSuspicion,
             mediaSafeModeEnabled: freezePerformanceDiagnostics.mediaSafeModeEnabled,
-            capabilityCacheUpdateCount: capabilityCacheUpdateCount
+            capabilityCacheUpdateCount: capabilityCacheUpdateCount,
+            visibleImageResourceCount: visibleImageResourceKeys.count,
+            imagePresentationEvictionCount: imagePresentationEvictionCount,
+            imageReloadAfterEvictionCount: imageReloadAfterEvictionCount,
+            imageQueueEnqueueCount: imageQueueEnqueueCount,
+            timelineMediaInvalidationCount: timelineMediaInvalidationCount
         )
     }
 
@@ -3775,6 +3791,41 @@ public final class MainShellViewModel {
                 self?[keyPath: keyPath] = nil
             }
         }
+    }
+
+    public func presentNotice(
+        _ message: String,
+        severity: TransientAppNoticeSeverity,
+        duration: Duration? = nil
+    ) {
+        let notice = TransientAppNotice(message: message, severity: severity)
+        transientNoticeTask?.cancel()
+        transientNotice = notice
+        transientNoticeTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: duration ?? severity.defaultDuration)
+            } catch {
+                return
+            }
+            guard let self, self.transientNotice?.id == notice.id else { return }
+            self.transientNotice = nil
+            self.transientNoticeTask = nil
+        }
+    }
+
+    public func dismissTransientNotice() {
+        transientNoticeTask?.cancel()
+        transientNoticeTask = nil
+        transientNotice = nil
+    }
+
+    private func routeLegacyStatusToNotice(_ status: String?) {
+        guard let status else { return }
+        guard let severity = TransientAppNoticePolicy.severity(for: status) else {
+            dismissTransientNotice()
+            return
+        }
+        presentNotice(status, severity: severity)
     }
 
     private func relationshipSuccessMessage(for kind: RelationshipActionKind) -> String {
@@ -6835,29 +6886,47 @@ public final class MainShellViewModel {
 
     public func imageData(for file: File?, kind: ImageResourceKind) -> Data? {
         guard let file else { return nil }
-        let key = ImageCacheKey(id: file.id.rawValue, kind: kind)
-        if let data = loadedImageResources[key] {
-            return data
-        }
-        if let request = imageResourceRequest(for: file, kind: kind) {
-            scheduleDeferredImageResourceRequest(request)
-        }
-        return nil
+        return loadedImageResources[ImageCacheKey(id: file.id.rawValue, kind: kind)]
     }
 
-    private func scheduleDeferredImageResourceRequest(_ request: ImageResourceRequest) {
-        deferredImageResourceRequests[request.cacheKey] = request
-        guard !deferredImageResourceDrainScheduled else { return }
-        deferredImageResourceDrainScheduled = true
-        Task { @MainActor [weak self] in
-            await Task.yield()
-            guard let self else { return }
-            let requests = Array(self.deferredImageResourceRequests.values)
-            self.deferredImageResourceRequests.removeAll()
-            self.deferredImageResourceDrainScheduled = false
-            for request in requests {
-                self.enqueueImageResourceRequest(request)
+    public func imageResourceBecameVisible(_ file: File?, kind: ImageResourceKind, consumerID: String) {
+        guard let request = imageResourceRequest(for: file, kind: kind) else {
+            visibleImageResourceRequestsByConsumer.removeValue(forKey: consumerID)
+            return
+        }
+        visibleImageResourceRequestsByConsumer[consumerID] = request
+        enqueueImageResourceRequest(request)
+    }
+
+    public func imageResourceBecameHidden(consumerID: String) {
+        visibleImageResourceRequestsByConsumer.removeValue(forKey: consumerID)
+    }
+
+    private var visibleImageResourceKeys: Set<ImageCacheKey> {
+        Set(visibleImageResourceRequestsByConsumer.values.map(\.cacheKey))
+    }
+
+    private func notePresentationEviction(_ key: ImageCacheKey) {
+        imagePresentationEvictionCount += 1
+        imagePresentationEvictedKeys.insert(key)
+        imagePresentationEvictedOrder.removeAll { $0 == key }
+        imagePresentationEvictedOrder.append(key)
+        while imagePresentationEvictedOrder.count > 512, let oldest = imagePresentationEvictedOrder.first {
+            imagePresentationEvictedOrder.removeFirst()
+            imagePresentationEvictedKeys.remove(oldest)
+        }
+    }
+
+    private func shouldInvalidateTimeline(for key: ImageCacheKey) -> Bool {
+        switch key.kind {
+        case .attachmentPreview, .customEmoji:
+            return true
+        case .userAvatar:
+            return visibleImageResourceRequestsByConsumer.contains { consumer, request in
+                consumer.hasPrefix("timeline-avatar-") && request.cacheKey == key
             }
+        case .attachmentOriginal, .serverIcon, .serverBanner, .profileBackground:
+            return false
         }
     }
 
@@ -6869,14 +6938,19 @@ public final class MainShellViewModel {
         imagePresentationByteCount += data.count
         imagePresentationOrder.removeAll { $0 == key }
         imagePresentationOrder.append(key)
-        while imagePresentationByteCount > maxImagePresentationBytes,
-              let oldest = imagePresentationOrder.first {
-            imagePresentationOrder.removeFirst()
-            if let removed = loadedImageResources.removeValue(forKey: oldest) {
+        while imagePresentationByteCount > maxImagePresentationBytes, !imagePresentationOrder.isEmpty {
+            let visibleKeys = visibleImageResourceKeys
+            let evictionIndex = imagePresentationOrder.firstIndex { !visibleKeys.contains($0) } ?? imagePresentationOrder.startIndex
+            let evicted = imagePresentationOrder.remove(at: evictionIndex)
+            if let removed = loadedImageResources.removeValue(forKey: evicted) {
                 imagePresentationByteCount -= removed.count
+                imageResourceStates[evicted] = .notLoaded
+                notePresentationEviction(evicted)
             }
         }
-        scheduleTimelineMediaInvalidation()
+        if shouldInvalidateTimeline(for: key) {
+            scheduleTimelineMediaInvalidation()
+        }
     }
 
     private func removeImagePresentationData(for key: ImageCacheKey) {
@@ -6884,7 +6958,9 @@ public final class MainShellViewModel {
         if let removed = loadedImageResources.removeValue(forKey: key) {
             imagePresentationByteCount -= removed.count
         }
-        scheduleTimelineMediaInvalidation()
+        if shouldInvalidateTimeline(for: key) {
+            scheduleTimelineMediaInvalidation()
+        }
     }
 
     private func storeAttachmentPreviewData(_ data: RemoteAttachmentData, for id: String) {
@@ -6931,6 +7007,10 @@ public final class MainShellViewModel {
               imageResourceLoadTasks[key] == nil,
               queuedImageResourceRequests[key] == nil
         else { return }
+        if imagePresentationEvictedKeys.remove(key) != nil {
+            imagePresentationEvictedOrder.removeAll { $0 == key }
+            imageReloadAfterEvictionCount += 1
+        }
         if case .failed = imageResourceStates[key] {
             let failureCount = max(1, imageResourceFailureCounts[key] ?? 1)
             let retryDelay = min(60.0, 5.0 * pow(2.0, Double(failureCount - 1)))
@@ -6944,6 +7024,7 @@ public final class MainShellViewModel {
         }
         imageResourceStates[key] = .loading
         queuedImageResourceRequests[key] = request
+        imageQueueEnqueueCount += 1
         drainImageResourceQueue()
     }
 
@@ -6957,12 +7038,16 @@ public final class MainShellViewModel {
         imageResourceFailureDates.removeAll()
         imageResourceFailureCounts.removeAll()
         queuedImageResourceRequests.removeAll()
-        deferredImageResourceRequests.removeAll()
+        imagePresentationEvictedKeys.removeAll()
+        imagePresentationEvictedOrder.removeAll()
         invalidateTimelineMediaPresentation()
         lastImageResourceAction = "Cleared image memory cache"
     }
 
     public func reloadVisibleImages() {
+        for request in visibleImageResourceRequestsByConsumer.values {
+            enqueueImageResourceRequest(request)
+        }
         for message in selectedTimelineMessages.map(\.message) {
             loadInlineImagePreviews(for: message)
             loadModeledEmbedMediaPreviews(for: message)
@@ -6992,7 +7077,12 @@ public final class MainShellViewModel {
                 if case .failed = state { return key.kind }
                 return nil
             }),
-            mediaSafeModeEnabled: freezePerformanceDiagnostics.mediaSafeModeEnabled
+            mediaSafeModeEnabled: freezePerformanceDiagnostics.mediaSafeModeEnabled,
+            visibleResourceCount: visibleImageResourceKeys.count,
+            presentationEvictionCount: imagePresentationEvictionCount,
+            reloadAfterEvictionCount: imageReloadAfterEvictionCount,
+            queueEnqueueCount: imageQueueEnqueueCount,
+            timelineMediaInvalidationCount: timelineMediaInvalidationCount
         )
     }
 
@@ -7013,7 +7103,7 @@ public final class MainShellViewModel {
             let loaded = try await imageResourceLoader.loadImage(request)
             await MainActor.run {
                 self.storeImagePresentationData(loaded.data, for: request.cacheKey)
-                self.imageResourceStates[request.cacheKey] = .readyRemote
+                self.imageResourceStates[request.cacheKey] = self.loadedImageResources[request.cacheKey] == nil ? .notLoaded : .readyRemote
                 self.imageResourceFailureDates.removeValue(forKey: request.cacheKey)
                 self.imageResourceFailureCounts.removeValue(forKey: request.cacheKey)
                 self.imageCompletedCount += 1
@@ -7071,19 +7161,9 @@ public final class MainShellViewModel {
             loadImageResource(for: server.icon, kind: .serverIcon)
             loadImageResource(for: server.banner, kind: .serverBanner)
         }
-        for message in selectedTimelineMessages.prefix(80).map(\.message) {
-            loadImageResource(for: avatarFile(for: message), kind: .userAvatar)
-        }
         if let channel = selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
             for userID in channel.recipients.prefix(12) {
                 loadImageResource(for: resolvedUserDisplay(for: snapshot.usersByID[userID], fallbackID: userID).avatarFile, kind: .userAvatar)
-            }
-        } else if let serverID = selection.serverID {
-            // Flattened rather than "first N groups": with hoisted-role sections ahead of the
-            // Online/Offline fallback groups, capping by group count could pre-queue only a
-            // handful of small role sections and miss the bulk of visible members.
-            for item in cachedMemberListGroups(for: serverID).flatMap(\.items).prefix(48) {
-                loadImageResource(for: item.avatar, kind: .userAvatar)
             }
         }
     }
@@ -8624,6 +8704,8 @@ public final class MainShellViewModel {
         capabilityCacheUpdates: \(freeze.capabilityCacheUpdateCount)
         markdownParse/cacheHits: \(freeze.markdownParseCount)/\(freeze.markdownCacheHitCount)
         imageActiveQueuedFailed: \(freeze.imageActiveCount)/\(freeze.imageQueuedCount)/\(freeze.imageFailedCount)
+        imageVisible/evicted/reloaded: \(freeze.visibleImageResourceCount)/\(freeze.imagePresentationEvictionCount)/\(freeze.imageReloadAfterEvictionCount)
+        imageEnqueued/timelineInvalidations: \(freeze.imageQueueEnqueueCount)/\(freeze.timelineMediaInvalidationCount)
         mediaSafeMode: \(freeze.mediaSafeModeEnabled ? "yes" : "no")
         visibleRangeUpdates: \(freeze.visibleRangeUpdateCount)
         lastMarker: \(freeze.lastMainThreadMarker ?? "-")
@@ -11436,6 +11518,7 @@ private extension AppLifecyclePhase {
 }
 
 public struct MainShellView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Bindable private var viewModel: MainShellViewModel
 
     public init(viewModel: MainShellViewModel) {
@@ -11642,17 +11725,44 @@ public struct MainShellView: View {
                 Text("Liquid Bagel will apply this action to \(viewModel.displayName(for: viewModel.snapshot.usersByID[pending.member.id.userID], member: pending.member, fallbackID: pending.member.id.userID)) only after confirmation.")
             }
         }
-        .overlay(alignment: .bottom) {
-            if let status = viewModel.placeholderStatus ?? viewModel.phase24Status ?? viewModel.phase23Status ?? viewModel.relationshipActionStatus ?? viewModel.messageActionStatus ?? viewModel.composerError ?? viewModel.sessionCoordinator?.lastErrorMessage {
-                Text(status)
-                    .font(.caption)
-                    .padding(.horizontal, StoatSpacing.medium)
-                    .padding(.vertical, StoatSpacing.small)
-                    .background(.regularMaterial, in: Capsule())
-                    .padding(.bottom, StoatSpacing.medium)
-                    .transition(.opacity)
+        .overlay(alignment: .top) {
+            if let notice = viewModel.transientNotice {
+                HStack(spacing: StoatSpacing.small) {
+                    Image(systemName: notice.severity.systemImage)
+                        .foregroundStyle(notice.severity == .error ? Color.red : Color.orange)
+                        .accessibilityHidden(true)
+                    Text(notice.message)
+                        .font(.callout)
+                        .lineLimit(3)
+                    Button {
+                        viewModel.dismissTransientNotice()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss notice")
+                }
+                .padding(.horizontal, StoatSpacing.medium)
+                .padding(.vertical, StoatSpacing.small)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                        .strokeBorder(
+                            (notice.severity == .error ? Color.red : Color.orange).opacity(0.28),
+                            lineWidth: 1
+                        )
+                }
+                .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
+                .padding(.top, StoatSpacing.small)
+                .padding(.horizontal, StoatSpacing.large)
+                .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
             }
         }
+        .animation(
+            reduceMotion ? .easeOut(duration: 0.12) : .snappy(duration: 0.22),
+            value: viewModel.transientNotice?.id
+        )
         .overlay(alignment: .topTrailing) {
             VStack(alignment: .trailing, spacing: StoatSpacing.small) {
                 ForEach(viewModel.notificationBanners) { event in
@@ -12453,6 +12563,7 @@ public struct CredentialSetupView: View {
             LabeledContent("Phase 51 diagnostics", value: "published \(phase51.diagnosticsPublishCount), throttled \(phase51.diagnosticsThrottleCount), budget violations \(phase51.mainThreadBudgetViolationCount)")
             LabeledContent("Markdown cache", value: "parsed \(freeze.markdownParseCount), hits \(freeze.markdownCacheHitCount)")
             LabeledContent("Image queue", value: "active \(freeze.imageActiveCount), queued \(freeze.imageQueuedCount), completed \(freeze.imageCompletedCount), failed \(freeze.imageFailedCount), safe \(freeze.mediaSafeModeEnabled ? "yes" : "no")")
+            LabeledContent("Image churn", value: "visible \(freeze.visibleImageResourceCount), evicted \(freeze.imagePresentationEvictionCount), reloaded \(freeze.imageReloadAfterEvictionCount), enqueued \(freeze.imageQueueEnqueueCount), timeline invalidations \(freeze.timelineMediaInvalidationCount)")
             LabeledContent("Member source", value: "\(memberHydration.source.rawValue), server \(TimelineCopyFormatter.shortID(memberHydration.lastMemberFetchServerID?.rawValue))")
             LabeledContent("Member REST", value: "requested \(memberHydration.requestedCount), returned \(memberHydration.returnedCount), merged \(memberHydration.mergedMemberCount), users \(memberHydration.mergedUserCount)")
             LabeledContent("Member stale/error", value: "stale \(memberHydration.staleFetchDiscarded ? "yes" : "no"), loading \(memberHydration.isLoading ? "yes" : "no"), error \(memberHydration.error ?? "-")")
@@ -13665,6 +13776,8 @@ public struct TimelineMessageGroupView: View {
                             }
                         )
                         .id(timelineMessage.message.id)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                         .onAppear {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
                             let display = viewModel.resolvedUserDisplay(for: timelineMessage.message)
@@ -13677,12 +13790,21 @@ public struct TimelineMessageGroupView: View {
                             )
                             viewModel.loadInlineImagePreviews(for: timelineMessage.message)
                             viewModel.loadModeledEmbedMediaPreviews(for: timelineMessage.message)
-                            viewModel.loadImageResource(for: viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar)
+                            if index == 0 {
+                                viewModel.imageResourceBecameVisible(
+                                    viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile,
+                                    kind: .userAvatar,
+                                    consumerID: timelineAvatarConsumerID(for: timelineMessage)
+                                )
+                            }
                             viewModel.loadCustomEmojiImages(for: timelineMessage.message)
                             viewModel.prepareReplyPreview(for: timelineMessage.message)
                         }
                         .onDisappear {
                             viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
+                            if index == 0 {
+                                viewModel.imageResourceBecameHidden(consumerID: timelineAvatarConsumerID(for: timelineMessage))
+                            }
                         }
                         .onTapGesture {
                             select(timelineMessage)
@@ -13709,6 +13831,10 @@ public struct TimelineMessageGroupView: View {
     private func select(_ timelineMessage: TimelineMessage, source: MessageFocusSource = .mouse) {
         viewModel.timelineSelection = TimelineSelection(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, source: source)
         viewModel.requestFocus(.timeline)
+    }
+
+    private func timelineAvatarConsumerID(for timelineMessage: TimelineMessage) -> String {
+        "timeline-avatar-\(timelineMessage.message.channelID.rawValue)-\(timelineMessage.message.id.rawValue)"
     }
 
     @ViewBuilder private func systemEventRow(_ timelineMessage: TimelineMessage) -> some View {
@@ -14058,7 +14184,14 @@ public struct MemberPanelView: View {
                                 memberListRow(item)
                                     .onAppear {
                                         viewModel.noteVisibleIdentity(userID: item.userID, user: item.user, member: item.member, serverID: item.member?.id.serverID, source: .visibleMember)
-                                        viewModel.loadImageResource(for: item.avatar, kind: .userAvatar)
+                                        viewModel.imageResourceBecameVisible(
+                                            item.avatar,
+                                            kind: .userAvatar,
+                                            consumerID: memberAvatarConsumerID(item)
+                                        )
+                                    }
+                                    .onDisappear {
+                                        viewModel.imageResourceBecameHidden(consumerID: memberAvatarConsumerID(item))
                                     }
                             }
                             if limited.remainder > 0 {
@@ -14108,7 +14241,14 @@ public struct MemberPanelView: View {
                         memberListRow(item)
                             .onAppear {
                                 viewModel.noteVisibleIdentity(userID: item.userID, user: item.user, member: item.member, serverID: item.member?.id.serverID, source: .visibleMember)
-                                viewModel.loadImageResource(for: item.avatar, kind: .userAvatar)
+                                viewModel.imageResourceBecameVisible(
+                                    item.avatar,
+                                    kind: .userAvatar,
+                                    consumerID: memberAvatarConsumerID(item)
+                                )
+                            }
+                            .onDisappear {
+                                viewModel.imageResourceBecameHidden(consumerID: memberAvatarConsumerID(item))
                             }
                     }
                 }
@@ -14195,6 +14335,13 @@ public struct MemberPanelView: View {
                 .help(moderationState[.ban].disabledReasonText ?? "Ban")
             }
         }
+    }
+
+    private func memberAvatarConsumerID(_ item: MemberListItem) -> String {
+        let contextID = item.member?.id.serverID.rawValue
+            ?? viewModel.selectedConversationChannelID?.rawValue
+            ?? "home"
+        return "member-panel-avatar-\(contextID)-\(item.userID.rawValue)"
     }
 
     private func roleForeground(_ color: ResolvedRoleColor?) -> Color {
@@ -16247,7 +16394,16 @@ public struct ServerOverviewView: View {
                                     Button { viewModel.openMemberDetail(item.member) } label: { Label("Details", systemImage: "person.text.rectangle") }
                                 }
                                 .onAppear {
-                                    viewModel.loadImageResource(for: item.member.avatar ?? item.user?.avatar, kind: .userAvatar)
+                                    viewModel.imageResourceBecameVisible(
+                                        item.member.avatar ?? item.user?.avatar,
+                                        kind: .userAvatar,
+                                        consumerID: "server-settings-avatar-\(item.member.id.serverID.rawValue)-\(item.member.id.userID.rawValue)"
+                                    )
+                                }
+                                .onDisappear {
+                                    viewModel.imageResourceBecameHidden(
+                                        consumerID: "server-settings-avatar-\(item.member.id.serverID.rawValue)-\(item.member.id.userID.rawValue)"
+                                    )
                                 }
                             }
                             if viewModel.isDeveloperControlsEnabled {

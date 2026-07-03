@@ -3067,7 +3067,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase56AvatarPreQueueFlattensAcrossGroupsInsteadOfCappingByGroupCount() async throws {
+    func testPhase57LargeMemberAvatarLoadingIsVisibilityDrivenInsteadOfBulkPrequeued() async throws {
         let serverID: ServerID = "phase56-prequeue-server"
         let hoistedRoleID: RoleID = "phase56-prequeue-role"
         var snapshot = RealtimeSnapshot()
@@ -3094,15 +3094,20 @@ final class StoatFeaturesTests: XCTestCase {
         await model.prepareMemberListGroups(for: serverID)
 
         model.reloadVisibleImages()
+        try await Task.sleep(for: .milliseconds(20))
+        var calls = await loader.calls
+        XCTAssertFalse(calls.contains(where: { $0.id == "phase56-online-avatar-30" }), "large member lists must not bulk-prequeue offscreen avatars")
+
+        let visibleAvatar = snapshot.usersByID["phase56-online-30"]?.avatar
+        model.imageResourceBecameVisible(visibleAvatar, kind: .userAvatar, consumerID: "member-panel-avatar-phase56-online-30")
         for _ in 0..<40 {
-            let calls = await loader.calls
+            calls = await loader.calls
             if calls.contains(where: { $0.id == "phase56-online-avatar-30" }) { break }
             try await Task.sleep(for: .milliseconds(10))
         }
-
-        let calls = await loader.calls
-        let requestedIDs = Set(calls.map(\.id))
-        XCTAssertTrue(requestedIDs.contains("phase56-online-avatar-30"), "avatar pre-queue should flatten across groups, not stop after the first few small role sections")
+        XCTAssertTrue(calls.contains(where: { $0.id == "phase56-online-avatar-30" }))
+        let diagnostics = await model.imageResourceDiagnostics()
+        XCTAssertEqual(diagnostics.visibleResourceCount, 1)
     }
 
     @MainActor
@@ -3210,7 +3215,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase56ImageDataMissDefersAndDeduplicatesResourceReload() async throws {
+    func testPhase57ImageDataMissIsCacheOnlyAndExplicitVisibilityDeduplicatesReload() async throws {
         let data = Data("avatar".utf8)
         let loader = MockImageResourceLoader(result: .success(data))
         let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
@@ -3218,15 +3223,110 @@ final class StoatFeaturesTests: XCTestCase {
 
         XCTAssertNil(model.imageData(for: file, kind: .userAvatar))
         XCTAssertNil(model.imageData(for: file, kind: .userAvatar))
+        try await Task.sleep(for: .milliseconds(20))
+        var callCount = await loader.callCount()
+        XCTAssertEqual(callCount, 0)
 
+        model.imageResourceBecameVisible(file, kind: .userAvatar, consumerID: "timeline-avatar-test")
+        model.imageResourceBecameVisible(file, kind: .userAvatar, consumerID: "timeline-avatar-test")
         for _ in 0..<50 {
             if model.imageData(for: file, kind: .userAvatar) == data { break }
             try await Task.sleep(for: .milliseconds(5))
         }
 
         XCTAssertEqual(model.imageData(for: file, kind: .userAvatar), data)
-        let callCount = await loader.callCount()
+        callCount = await loader.callCount()
         XCTAssertEqual(callCount, 1)
+    }
+
+    @MainActor
+    func testPhase57VisibleImageSurvivesPressureAndEvictedImageDoesNotReloadLoop() async throws {
+        let data = Data(repeating: 7, count: 40 * 1024 * 1024)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let pinned = File(id: "phase57-pinned", tag: "avatars", filename: "pinned.png", contentType: "image/png", size: data.count)
+        let unpinned = File(id: "phase57-unpinned", tag: "avatars", filename: "unpinned.png", contentType: "image/png", size: data.count)
+
+        model.imageResourceBecameVisible(pinned, kind: .userAvatar, consumerID: "member-panel-avatar-pinned")
+        for _ in 0..<80 {
+            if model.imageData(for: pinned, kind: .userAvatar) != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        model.loadImageResource(for: unpinned, kind: .userAvatar)
+        for _ in 0..<80 {
+            let diagnostics = await model.imageResourceDiagnostics()
+            if diagnostics.presentationEvictionCount > 0 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertNotNil(model.imageData(for: pinned, kind: .userAvatar))
+        XCTAssertNil(model.imageData(for: unpinned, kind: .userAvatar))
+        var diagnostics = await model.imageResourceDiagnostics()
+        XCTAssertEqual(diagnostics.presentationEvictionCount, 1)
+        XCTAssertEqual(diagnostics.reloadAfterEvictionCount, 0)
+
+        model.imageResourceBecameVisible(unpinned, kind: .userAvatar, consumerID: "member-panel-avatar-unpinned")
+        for _ in 0..<80 {
+            diagnostics = await model.imageResourceDiagnostics()
+            if diagnostics.reloadAfterEvictionCount == 1,
+               diagnostics.activeTaskCount == 0,
+               diagnostics.queuedTaskCount == 0 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        diagnostics = await model.imageResourceDiagnostics()
+        XCTAssertEqual(diagnostics.reloadAfterEvictionCount, 1)
+        XCTAssertEqual(diagnostics.activeTaskCount, 0)
+        XCTAssertEqual(diagnostics.queuedTaskCount, 0)
+        let loaderCallCount = await loader.callCount()
+        XCTAssertEqual(loaderCallCount, 3)
+    }
+
+    @MainActor
+    func testPhase57MemberOnlyAvatarCompletionDoesNotInvalidateTimeline() async throws {
+        let data = Data("avatar".utf8)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let memberAvatar = File(id: "phase57-member-avatar", tag: "avatars", filename: "member.png", contentType: "image/png", size: data.count)
+        let timelineAvatar = File(id: "phase57-timeline-avatar", tag: "avatars", filename: "timeline.png", contentType: "image/png", size: data.count)
+
+        model.imageResourceBecameVisible(memberAvatar, kind: .userAvatar, consumerID: "member-panel-avatar-one")
+        for _ in 0..<40 {
+            if model.imageData(for: memberAvatar, kind: .userAvatar) != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        var diagnostics = await model.imageResourceDiagnostics()
+        XCTAssertEqual(diagnostics.timelineMediaInvalidationCount, 0)
+
+        model.imageResourceBecameVisible(timelineAvatar, kind: .userAvatar, consumerID: "timeline-avatar-one")
+        for _ in 0..<40 {
+            diagnostics = await model.imageResourceDiagnostics()
+            if diagnostics.timelineMediaInvalidationCount == 1 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(diagnostics.timelineMediaInvalidationCount, 1)
+    }
+
+    @MainActor
+    func testPhase57TransientNoticePolicyKeepsSuccessSilentAndExpiresFailures() async throws {
+        let model = MainShellViewModel(runtimeMode: .mock)
+
+        model.placeholderStatus = "Custom status set."
+        XCTAssertNil(model.transientNotice)
+        model.placeholderStatus = "Refreshed 2329 members and 2329 users."
+        XCTAssertNil(model.transientNotice)
+
+        model.placeholderStatus = "Message action is unavailable."
+        XCTAssertEqual(model.transientNotice?.severity, .error)
+        model.dismissTransientNotice()
+        XCTAssertNil(model.transientNotice)
+
+        model.presentNotice("Reconnect before retrying.", severity: .warning, duration: .milliseconds(20))
+        XCTAssertEqual(model.transientNotice?.severity, .warning)
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertNil(model.transientNotice)
     }
 
     @MainActor

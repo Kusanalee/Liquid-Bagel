@@ -264,5 +264,9 @@ final class StoatUITests: XCTestCase {
         XCTAssertEqual(diagnostics.decodeCount, 1)
         XCTAssertGreaterThanOrEqual(diagnostics.dedupeCount + diagnostics.cacheHitCount, 2)
         XCTAssertEqual(diagnostics.cacheCount, 1)
+        let isSynchronouslyCached = await MainActor.run {
+            DecodedImagePipeline.hasSynchronouslyCachedImage(for: key)
+        }
+        XCTAssertTrue(isSynchronouslyCached)
     }
 }

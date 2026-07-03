@@ -851,6 +851,11 @@ public struct ImageResourceDiagnostics: Hashable, Sendable {
     public var queuedCountByKind: [ImageResourceKind: Int]
     public var failedCountByKind: [ImageResourceKind: Int]
     public var mediaSafeModeEnabled: Bool
+    public var visibleResourceCount: Int
+    public var presentationEvictionCount: Int
+    public var reloadAfterEvictionCount: Int
+    public var queueEnqueueCount: Int
+    public var timelineMediaInvalidationCount: Int
 
     public init(
         loadedCount: Int = 0,
@@ -863,7 +868,12 @@ public struct ImageResourceDiagnostics: Hashable, Sendable {
         activeCountByKind: [ImageResourceKind: Int] = [:],
         queuedCountByKind: [ImageResourceKind: Int] = [:],
         failedCountByKind: [ImageResourceKind: Int] = [:],
-        mediaSafeModeEnabled: Bool = false
+        mediaSafeModeEnabled: Bool = false,
+        visibleResourceCount: Int = 0,
+        presentationEvictionCount: Int = 0,
+        reloadAfterEvictionCount: Int = 0,
+        queueEnqueueCount: Int = 0,
+        timelineMediaInvalidationCount: Int = 0
     ) {
         self.loadedCount = loadedCount
         self.failedCount = failedCount
@@ -876,6 +886,11 @@ public struct ImageResourceDiagnostics: Hashable, Sendable {
         self.queuedCountByKind = queuedCountByKind
         self.failedCountByKind = failedCountByKind
         self.mediaSafeModeEnabled = mediaSafeModeEnabled
+        self.visibleResourceCount = visibleResourceCount
+        self.presentationEvictionCount = presentationEvictionCount
+        self.reloadAfterEvictionCount = reloadAfterEvictionCount
+        self.queueEnqueueCount = queueEnqueueCount
+        self.timelineMediaInvalidationCount = timelineMediaInvalidationCount
     }
 }
 

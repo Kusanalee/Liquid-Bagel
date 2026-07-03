@@ -23,12 +23,13 @@ Record categorical outcomes only. No credentials, MFA material, payload bodies, 
 | 5 | During preparation (channel/server switches), interact continuously | Typing, scrolling, menus stay responsive; member presentation stays coherent (last interactive view retained) | | |
 | 6 | While a loaded timeline is visible, let avatars, attachment previews, custom emoji, and identity hydration finish | Existing message groups never disappear; first-time preparation shows an explicit progress state instead of a blank timeline | | |
 | 7 | Copy Developer Verification diagnostics after the run | Main-thread budget-violation counter is zero or explained; timeline cancellation/stale counts are bounded; no redaction leaks | | |
+| 8 | After the Phase 57 large-member/media scenario settles, leave the app untouched for 30 seconds and capture Activity Monitor plus an Instruments sample | CPU averages below 10% on the same machine; image queues settle at zero; eviction/reload and timeline-media-invalidation counters stop increasing; no repeating image/decode/presentation loop | | |
 
 ## Matrix Rows Unlocked
 
 | ParityMatrix row | Promotion condition |
 | --- | --- |
-| UI/platform / performance with large channels | Steps 1, 2, 4-6 pass on the large-thread repeat |
-| UI/platform / performance with large servers | Steps 1, 2, 3, 5 pass with the member panel open |
+| UI/platform / performance with large channels | Steps 1, 2, 4-6, 8 pass on the large-thread repeat |
+| UI/platform / performance with large servers | Steps 1, 2, 3, 5, 8 pass with the member panel open |
 
 Both rows stay `partial` if any step fails; record the failing step and file the fix in the owning Phase 52 seam before re-running.
