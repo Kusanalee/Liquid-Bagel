@@ -480,7 +480,10 @@ public final class MainShellViewModel {
             phase46ModerationVersions.bumpSelectionVersions()
             invalidateCapabilityCache()
             phase51SelectionRevision &+= 1
-            schedulePhase51ShellPresentationRefresh()
+            schedulePhase51ShellPresentationRefresh(reason: "selection")
+            if effectiveRuntimeMode == .liveManual, effectiveSessionState == .connected {
+                warmIdentityImagesForCurrentSelection()
+            }
             if isServerOverviewPresented {
                 schedulePhase51ServerSettingsPreparation()
             }
@@ -495,7 +498,6 @@ public final class MainShellViewModel {
             // re-derivation of the member list on every event. memberListGroups/
             // prepareMemberListGroups already recompute correctly whenever the fingerprint
             // (member/role/identity fields) actually changes.
-            schedulePhase51ShellPresentationRefresh()
             if isServerOverviewPresented {
                 schedulePhase51ServerSettingsPreparation()
             }
@@ -511,12 +513,14 @@ public final class MainShellViewModel {
     }
     public var currentUser: User? {
         didSet {
+            guard oldValue != currentUser else { return }
             if let currentUser {
                 mergePhase43User(currentUser, source: .readyUser)
             }
             phase46ModerationVersions.bumpMemberVersion()
             invalidateCapabilityCache()
-            schedulePhase51ShellPresentationRefresh()
+            phase51ShellDataRevision &+= 1
+            schedulePhase51ShellPresentationRefresh(reason: "current user")
         }
     }
     public var sessionCoordinator: AppSessionCoordinator?
@@ -540,7 +544,11 @@ public final class MainShellViewModel {
     public var timelineSelection = TimelineSelection()
     public var timelineViewport = TimelineViewportState()
     public var localReadStates: [ChannelID: LocalReadState] = [:] {
-        didSet { schedulePhase51ShellPresentationRefresh() }
+        didSet {
+            guard oldValue != localReadStates else { return }
+            phase51ShellDataRevision &+= 1
+            schedulePhase51ShellPresentationRefresh(reason: "local read state")
+        }
     }
     public var messageActionStatus: String?
     public var isCredentialSetupPresented = false
@@ -606,6 +614,7 @@ public final class MainShellViewModel {
     public var phase43IdentityGeneration = 0
     public var freezePerformanceDiagnostics = FreezePerformanceDiagnostics()
     public private(set) var phase51PerformanceDiagnostics = Phase51PerformanceDiagnostics()
+    public private(set) var phase59ReactionDiagnostics = Phase59ReactionDiagnostics()
     public private(set) var phase52FreezeDiagnostics = Phase52FreezeDiagnostics()
     public private(set) var timelinePresentationState: TimelinePresentationState = .idle
     public private(set) var timelinePresentationDiagnostics = TimelinePresentationDiagnostics()
@@ -771,10 +780,12 @@ public final class MainShellViewModel {
     @ObservationIgnored private var targetHighlightClearTask: Task<Void, Never>?
     @ObservationIgnored private var pinnedMessagesFetchTask: Task<Void, Never>?
     @ObservationIgnored private var pinnedMessageActionTasks: [MessageID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var inFlightReactionMutations: Set<ReactionMutationKey> = []
     @ObservationIgnored private var referenceFetchTasks: [MessageID: Task<Void, Never>] = [:]
     @ObservationIgnored private var attachmentLoadTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var imageResourceLoadTasks: [ImageCacheKey: Task<Void, Never>] = [:]
-    @ObservationIgnored private var queuedImageResourceRequests: [ImageCacheKey: ImageResourceRequest] = [:]
+    @ObservationIgnored private var queuedImageResourceRequests: [ImageCacheKey: PrioritizedImageResourceRequest] = [:]
+    @ObservationIgnored private var imageResourceQueueSequence: UInt64 = 0
     @ObservationIgnored private var imageResourceFailureDates: [ImageCacheKey: Date] = [:]
     @ObservationIgnored private var imagePresentationOrder: [ImageCacheKey] = []
     @ObservationIgnored private var imagePresentationByteCount = 0
@@ -841,7 +852,11 @@ public final class MainShellViewModel {
     @ObservationIgnored private var snapshotRevision: Int = 0
     @ObservationIgnored private var phase51SelectionRevision: Int = 0
     @ObservationIgnored private var phase51MediaRevision: Int = 0
+    @ObservationIgnored private var phase51ShellDataRevision: Int = 0
     @ObservationIgnored private var phase51ShellGeneration: Int = 0
+    @ObservationIgnored private var phase51ShellBuiltKey: Phase51PresentationRevision?
+    @ObservationIgnored private var phase51ShellActiveKey: Phase51PresentationRevision?
+    @ObservationIgnored private var phase51ShellDesiredKey: Phase51PresentationRevision?
     @ObservationIgnored private var phase51ServerSettingsGeneration: Int = 0
     @ObservationIgnored private var phase51LastDiagnosticsPublishAt = Date.distantPast
     @ObservationIgnored private var freezeDiagnosticsPublishTask: Task<Void, Never>?
@@ -972,6 +987,9 @@ public final class MainShellViewModel {
             notificationPreferences: self.notificationPreferences
         )) ?? ShellPresentationSnapshot()
         self.phase51PerformanceDiagnostics.shellBuildCount = 1
+        self.phase51PerformanceDiagnostics.shellRelationshipCandidateCount = self.shellPresentationSnapshot.allFriendItems.count
+        self.phase51ShellBuiltKey = Phase51PresentationRevision()
+        self.phase51ShellDesiredKey = Phase51PresentationRevision()
         if let snapshotSource {
             observe(snapshotSource: snapshotSource)
         }
@@ -1010,15 +1028,31 @@ public final class MainShellViewModel {
         shellPresentationSnapshot.serverRailItemsByID[serverID]
     }
 
-    private func schedulePhase51ShellPresentationRefresh() {
+    private func schedulePhase51ShellPresentationRefresh(reason: String = "state") {
+        phase51PerformanceDiagnostics.shellRequestCount += 1
+        phase51PerformanceDiagnostics.lastShellInvalidationReason = reason
+        let revision = Phase51PresentationRevision(
+            snapshot: phase51ShellDataRevision,
+            selection: phase51SelectionRevision,
+            identity: 0,
+            media: 0
+        )
+        phase51ShellDesiredKey = revision
+        guard revision != phase51ShellBuiltKey else {
+            phase51PerformanceDiagnostics.shellCacheHitCount += 1
+            return
+        }
+        guard phase51ShellPresentationTask == nil else {
+            if revision != phase51ShellActiveKey {
+                phase51PerformanceDiagnostics.shellCoalescedCount += 1
+            } else {
+                phase51PerformanceDiagnostics.shellCacheHitCount += 1
+            }
+            return
+        }
         phase51ShellGeneration &+= 1
         let generation = phase51ShellGeneration
-        let revision = Phase51PresentationRevision(
-            snapshot: snapshotRevision,
-            selection: phase51SelectionRevision,
-            identity: phase43IdentityGeneration,
-            media: phase51MediaRevision
-        )
+        phase51ShellActiveKey = revision
         let snapshot = snapshot
         let selection = selection
         let currentUserID = currentUserID
@@ -1026,7 +1060,6 @@ public final class MainShellViewModel {
         let localReadStates = localReadStates
         let locallyCleared = locallyClearedUnreadChannelIDs
         let preferences = notificationPreferences
-        phase51ShellPresentationTask?.cancel()
         phase51ShellPresentationTask = Task { [weak self] in
             let started = ContinuousClock.now
             let worker = Task.detached(priority: .userInitiated) {
@@ -1053,12 +1086,31 @@ public final class MainShellViewModel {
             } catch {
                 return
             }
-            guard !Task.isCancelled, let self, generation == self.phase51ShellGeneration else { return }
-            self.shellPresentationSnapshot = result
-            self.quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
-            self.phase51PerformanceDiagnostics.shellBuildCount += 1
-            self.recordPhase51Operation("shell-presentation", started: started)
+            guard let self else { return }
+            let isCurrent = !Task.isCancelled
+                && generation == self.phase51ShellGeneration
+                && revision == self.phase51ShellDesiredKey
+            if isCurrent {
+                self.shellPresentationSnapshot = result
+                self.quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
+                self.phase51ShellBuiltKey = revision
+                self.phase51PerformanceDiagnostics.shellBuildCount += 1
+                self.phase51PerformanceDiagnostics.shellRelationshipCandidateCount = result.allFriendItems.count
+                self.recordPhase51Operation("shell-presentation", started: started)
+            } else {
+                self.phase51PerformanceDiagnostics.shellDiscardedCount += 1
+            }
+            self.phase51ShellPresentationTask = nil
+            self.phase51ShellActiveKey = nil
+            if self.phase51ShellDesiredKey != self.phase51ShellBuiltKey {
+                self.schedulePhase51ShellPresentationRefresh(reason: "coalesced latest")
+            }
         }
+    }
+
+    private func invalidateShellPresentation(reason: String) {
+        phase51ShellDataRevision &+= 1
+        schedulePhase51ShellPresentationRefresh(reason: reason)
     }
 
     private func schedulePhase51ServerSettingsPreparation(debounce: Bool = false) {
@@ -2629,6 +2681,7 @@ public final class MainShellViewModel {
         if let failureMessage {
             groupMembershipActionState = .failed(failureMessage)
         } else {
+            invalidateShellPresentation(reason: "group recipients added")
             groupMembershipActionState = .idle
             isPresentingAddGroupMembers = false
             addGroupMembersSearch = ""
@@ -2662,6 +2715,7 @@ public final class MainShellViewModel {
                 channel.recipients.removeAll { $0 == pending.userID }
                 snapshot.channelsByID[pending.channelID] = channel
             }
+            invalidateShellPresentation(reason: "group recipient removed")
             groupMembershipActionState = .idle
             pendingGroupMemberRemoval = nil
         } catch {
@@ -3566,6 +3620,9 @@ public final class MainShellViewModel {
             }
             snapshot.channelsByID[channel.id] = mergedDMChannel(existing: existing, incoming: channel)
         }
+        if result.insertedCount > 0 || result.updatedCount > 0 {
+            invalidateShellPresentation(reason: "DM merge")
+        }
         refreshDMDiagnosticsSnapshot()
         return result
     }
@@ -3726,6 +3783,12 @@ public final class MainShellViewModel {
         if source == .currentUserEdit {
             phase43CurrentUserEditSnapshotMergeCount += 1
         }
+        if currentUser?.relations.contains(where: { $0.id == user.id }) == true
+            || snapshot.channelsByID.values.contains(where: {
+                DMChannelClassifier.isDirectMessageLike($0) && $0.recipients.contains(user.id)
+            }) {
+            invalidateShellPresentation(reason: "relationship or DM user")
+        }
         invalidateIdentityPresentationCaches()
     }
 
@@ -3815,7 +3878,7 @@ public final class MainShellViewModel {
             return false
         }.count
         let avatarActive = imageResourceLoadTasks.values.filter { $0.isCancelled == false }.count
-        let avatarQueued = queuedImageResourceRequests.values.filter { $0.kind == .userAvatar }.count
+        let avatarQueued = queuedImageResourceRequests.values.filter { $0.request.kind == .userAvatar }.count
         let avatarFailed = imageResourceStates.filter { key, state in
             key.kind == .userAvatar && {
                 if case .failed = state { return true }
@@ -3823,8 +3886,10 @@ public final class MainShellViewModel {
             }()
         }.count
         let emojiActive = imageResourceLoadTasks.values.count
-        let emojiQueued = queuedImageResourceRequests.values.filter { $0.kind == .customEmoji }.count
-        let profileQueued = queuedImageResourceRequests.values.filter { $0.kind == .profileBackground || $0.kind == .userAvatar }.count
+        let emojiQueued = queuedImageResourceRequests.values.filter { $0.request.kind == .customEmoji }.count
+        let profileQueued = queuedImageResourceRequests.values.filter {
+            $0.request.kind == .profileBackground || $0.request.kind == .userAvatar
+        }.count
         let markdown = MarkdownMessageContent.cacheDiagnostics()
         freezePerformanceDiagnostics = FreezePerformanceDiagnostics(
             lastMainThreadMarker: marker ?? freezePerformanceDiagnostics.lastMainThreadMarker,
@@ -5790,6 +5855,7 @@ public final class MainShellViewModel {
             isCreateChannelPresented = false
             channelCreateForm = ChannelCreateForm()
             phase24Status = "Channel created"
+            invalidateShellPresentation(reason: "channel created")
             quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
             messageController.hydrate(from: snapshot)
         } catch {
@@ -5834,6 +5900,7 @@ public final class MainShellViewModel {
             channelEditState = .loaded(channel)
             isChannelSettingsPresented = false
             phase24Status = "Channel updated"
+            invalidateShellPresentation(reason: "channel updated")
             quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
         } catch {
             channelEditState = .failed(Phase23Safety.safeError(error))
@@ -5871,6 +5938,7 @@ public final class MainShellViewModel {
                 selection.channelID = nil
             }
             phase24Status = "Channel deleted"
+            invalidateShellPresentation(reason: "channel deleted")
             quickSwitcherViewModel.update(snapshot: snapshot, selection: selection)
             messageController.hydrate(from: snapshot)
         } catch {
@@ -6224,6 +6292,8 @@ public final class MainShellViewModel {
         inlineImagePreviewPolicy = sessionCoordinator.preferences.inlineImagePreviewPolicy
         timelineTuning = sessionCoordinator.preferences.timelineTuning.validated()
         snapshot = snapshotWithHydratedMemberOverlay(sessionCoordinator.snapshot)
+        phase51ShellDataRevision &+= 1
+        schedulePhase51ShellPresentationRefresh(reason: "session snapshot")
         if sessionCoordinator.mode == .liveManual,
            previousNotificationGeneration != sessionCoordinator.liveConnectionGeneration {
             seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
@@ -7105,7 +7175,10 @@ public final class MainShellViewModel {
             return
         }
         visibleImageResourceRequestsByConsumer[consumerID] = request
-        enqueueImageResourceRequest(request)
+        let priority: ImageResourceRequestPriority = consumerID.hasPrefix("timeline-avatar-")
+            ? .visibleTimeline
+            : .visibleMember
+        enqueueImageResourceRequest(request, priority: priority)
     }
 
     public func imageResourceBecameHidden(consumerID: String) {
@@ -7132,9 +7205,10 @@ public final class MainShellViewModel {
         case .attachmentPreview, .customEmoji:
             return true
         case .userAvatar:
-            return visibleImageResourceRequestsByConsumer.contains { consumer, request in
-                consumer.hasPrefix("timeline-avatar-") && request.cacheKey == key
-            }
+            // Avatar data is read directly by the row/member view. Rebuilding prepared
+            // Markdown, actions, embeds, and reactions for an avatar completion caused
+            // avoidable whole-timeline churn.
+            return false
         case .attachmentOriginal, .serverIcon, .serverBanner, .profileBackground:
             return false
         }
@@ -7202,10 +7276,13 @@ public final class MainShellViewModel {
 
     public func loadImageResource(for file: File?, kind: ImageResourceKind) {
         guard let request = imageResourceRequest(for: file, kind: kind) else { return }
-        enqueueImageResourceRequest(request)
+        enqueueImageResourceRequest(request, priority: defaultImagePriority(for: kind))
     }
 
-    private func enqueueImageResourceRequest(_ request: ImageResourceRequest) {
+    private func enqueueImageResourceRequest(
+        _ request: ImageResourceRequest,
+        priority: ImageResourceRequestPriority
+    ) {
         let key = request.cacheKey
         if freezePerformanceDiagnostics.mediaSafeModeEnabled,
            request.kind == .attachmentPreview || request.kind == .customEmoji || request.kind == .profileBackground,
@@ -7213,10 +7290,14 @@ public final class MainShellViewModel {
             lastImageResourceAction = "Media-heavy safe mode: tap-to-load placeholder"
             return
         }
-        guard loadedImageResources[key] == nil,
-              imageResourceLoadTasks[key] == nil,
-              queuedImageResourceRequests[key] == nil
-        else { return }
+        guard loadedImageResources[key] == nil, imageResourceLoadTasks[key] == nil else { return }
+        if var queued = queuedImageResourceRequests[key] {
+            if priority < queued.priority {
+                queued.priority = priority
+                queuedImageResourceRequests[key] = queued
+            }
+            return
+        }
         if imagePresentationEvictedKeys.remove(key) != nil {
             imagePresentationEvictedOrder.removeAll { $0 == key }
             imageReloadAfterEvictionCount += 1
@@ -7233,7 +7314,12 @@ public final class MainShellViewModel {
             }
         }
         imageResourceStates[key] = .loading
-        queuedImageResourceRequests[key] = request
+        imageResourceQueueSequence &+= 1
+        queuedImageResourceRequests[key] = PrioritizedImageResourceRequest(
+            request: request,
+            priority: priority,
+            sequence: imageResourceQueueSequence
+        )
         imageQueueEnqueueCount += 1
         drainImageResourceQueue()
     }
@@ -7256,7 +7342,7 @@ public final class MainShellViewModel {
 
     public func reloadVisibleImages() {
         for request in visibleImageResourceRequestsByConsumer.values {
-            enqueueImageResourceRequest(request)
+            enqueueImageResourceRequest(request, priority: .visibleMember)
         }
         for message in selectedTimelineMessages.map(\.message) {
             loadInlineImagePreviews(for: message)
@@ -7282,7 +7368,7 @@ public final class MainShellViewModel {
             cacheByteCount: snapshot.byteCount,
             lastAction: lastImageResourceAction,
             activeCountByKind: countKinds(imageResourceLoadTasks.keys.map(\.kind)),
-            queuedCountByKind: countKinds(queuedImageResourceRequests.values.map(\.kind)),
+            queuedCountByKind: countKinds(queuedImageResourceRequests.values.map(\.request.kind)),
             failedCountByKind: countKinds(imageResourceStates.compactMap { key, state in
                 if case .failed = state { return key.kind }
                 return nil
@@ -7311,6 +7397,12 @@ public final class MainShellViewModel {
         }
         do {
             let loaded = try await imageResourceLoader.loadImage(request)
+            if request.kind == .userAvatar {
+                for pixelSize in [64, 76] {
+                    let decodedKey = DecodedImageKey(data: loaded.data, pixelSize: pixelSize)
+                    _ = await DecodedImagePipeline.prepare(data: loaded.data, key: decodedKey)
+                }
+            }
             await MainActor.run {
                 self.storeImagePresentationData(loaded.data, for: request.cacheKey)
                 self.imageResourceStates[request.cacheKey] = self.loadedImageResources[request.cacheKey] == nil ? .notLoaded : .readyRemote
@@ -7345,7 +7437,7 @@ public final class MainShellViewModel {
               let next = nextQueuedImageResourceRequest() {
             queuedImageResourceRequests.removeValue(forKey: next.key)
             imageResourceLoadTasks[next.key] = Task { [weak self] in
-                await self?.loadImageResource(next.value)
+                await self?.loadImageResource(next.value.request)
             }
         }
         if queuedImageResourceRequests.count > maxConcurrentImageResourceLoads * 2 {
@@ -7358,23 +7450,57 @@ public final class MainShellViewModel {
         updateFreezePerformanceDiagnostics(marker: lastImageResourceAction)
     }
 
-    private func nextQueuedImageResourceRequest() -> (key: ImageCacheKey, value: ImageResourceRequest)? {
-        let identityKinds: Set<ImageResourceKind> = [.userAvatar, .serverIcon, .customEmoji]
-        if let identity = queuedImageResourceRequests.first(where: { identityKinds.contains($0.key.kind) }) {
-            return identity
+    private func nextQueuedImageResourceRequest() -> (key: ImageCacheKey, value: PrioritizedImageResourceRequest)? {
+        queuedImageResourceRequests.min { lhs, rhs in
+            if lhs.value.priority != rhs.value.priority {
+                return lhs.value.priority < rhs.value.priority
+            }
+            return lhs.value.sequence < rhs.value.sequence
         }
-        return queuedImageResourceRequests.first
     }
 
     private func loadVisibleIdentityImagesForCurrentSelection() {
-        if let server = selectedServer {
-            loadImageResource(for: server.icon, kind: .serverIcon)
-            loadImageResource(for: server.banner, kind: .serverBanner)
+        warmIdentityImagesForCurrentSelection()
+    }
+
+    private func warmIdentityImagesForCurrentSelection(limit: Int = 32) {
+        var requests: [(ImageResourceRequest, ImageResourceRequestPriority)] = []
+        var seen: Set<ImageCacheKey> = []
+
+        func append(_ file: File?, kind: ImageResourceKind, priority: ImageResourceRequestPriority) {
+            guard requests.count < limit,
+                  let request = imageResourceRequest(for: file, kind: kind),
+                  seen.insert(request.cacheKey).inserted
+            else { return }
+            requests.append((request, priority))
         }
-        if let channel = selectedConversationChannel, DMChannelClassifier.isDirectMessageLike(channel) {
-            for userID in channel.recipients.prefix(12) {
-                loadImageResource(for: resolvedUserDisplay(for: snapshot.usersByID[userID], fallbackID: userID).avatarFile, kind: .userAvatar)
-            }
+
+        append(currentUser?.avatar, kind: .userAvatar, priority: .shellCritical)
+        if let server = selectedServer {
+            append(server.icon, kind: .serverIcon, priority: .shellCritical)
+        }
+        for timelineMessage in selectedTimelineMessages.reversed() where requests.count < limit {
+            append(avatarFile(for: timelineMessage.message), kind: .userAvatar, priority: .identity)
+        }
+        for (request, priority) in requests {
+            enqueueImageResourceRequest(request, priority: priority)
+        }
+        if let banner = selectedServer?.banner {
+            guard let request = imageResourceRequest(for: banner, kind: .serverBanner) else { return }
+            enqueueImageResourceRequest(request, priority: .background)
+        }
+    }
+
+    private func defaultImagePriority(for kind: ImageResourceKind) -> ImageResourceRequestPriority {
+        switch kind {
+        case .userAvatar, .serverIcon:
+            .identity
+        case .customEmoji:
+            .media
+        case .attachmentPreview, .attachmentOriginal:
+            .media
+        case .serverBanner, .profileBackground:
+            .background
         }
     }
 
@@ -8027,19 +8153,80 @@ public final class MainShellViewModel {
     }
 
     public func toggleReaction(_ emoji: String, on timelineMessage: TimelineMessage) async {
-        guard canReact(to: timelineMessage.message), let currentUserID else { return }
+        phase59ReactionDiagnostics.attemptCount += 1
+        guard timelineMessage.status == .confirmed else {
+            rejectReaction("Wait for the message to finish sending before reacting.")
+            return
+        }
+        guard let currentUserID else {
+            rejectReaction("Reaction unavailable because the current account is unresolved.")
+            return
+        }
+        guard canReact(to: timelineMessage.message) else {
+            rejectReaction(
+                isRuntimeSendCapable
+                    ? "Reaction unavailable in this channel."
+                    : "Reconnect before reacting."
+            )
+            return
+        }
+        let mutationKey = ReactionMutationKey(
+            channelID: timelineMessage.message.channelID,
+            messageID: timelineMessage.message.id,
+            emoji: emoji
+        )
+        guard inFlightReactionMutations.insert(mutationKey).inserted else {
+            phase59ReactionDiagnostics.deduplicatedCount += 1
+            phase59ReactionDiagnostics.lastOutcome = "duplicate in-flight mutation"
+            return
+        }
+        defer { inFlightReactionMutations.remove(mutationKey) }
         let hasReacted = timelineMessage.message.reactions[emoji]?.contains(currentUserID) == true
+        messageController.applyReaction(
+            channelID: timelineMessage.message.channelID,
+            messageID: timelineMessage.message.id,
+            emoji: emoji,
+            userID: currentUserID,
+            isAdding: !hasReacted
+        )
+        phase59ReactionDiagnostics.optimisticMutationCount += 1
+        phase59ReactionDiagnostics.lastOutcome = hasReacted ? "optimistic remove" : "optimistic add"
         do {
             if hasReacted {
                 try await messageActionHandler.removeReaction(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, emoji: emoji)
             } else {
                 try await messageActionHandler.addReaction(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, emoji: emoji)
             }
-            messageController.applyReaction(channelID: timelineMessage.message.channelID, messageID: timelineMessage.message.id, emoji: emoji, userID: currentUserID, isAdding: !hasReacted)
             messageActionStatus = nil
+            phase59ReactionDiagnostics.successCount += 1
+            phase59ReactionDiagnostics.lastOutcome = hasReacted ? "remove confirmed" : "add confirmed"
         } catch {
+            messageController.applyReaction(
+                channelID: timelineMessage.message.channelID,
+                messageID: timelineMessage.message.id,
+                emoji: emoji,
+                userID: currentUserID,
+                isAdding: hasReacted
+            )
             messageActionStatus = "Reaction failed: \(error.userFacingMessage)"
+            phase59ReactionDiagnostics.rollbackCount += 1
+            phase59ReactionDiagnostics.lastOutcome = "rolled back after failure"
+            presentNotice("Reaction failed: \(error.userFacingMessage)", severity: .error)
         }
+    }
+
+    private func rejectReaction(_ message: String) {
+        messageActionStatus = message
+        phase59ReactionDiagnostics.unavailableCount += 1
+        phase59ReactionDiagnostics.lastOutcome = "unavailable"
+        presentNotice(message, severity: .warning)
+    }
+
+    public func currentReactionItems(for message: Message) -> [MessageReactionDisplayItem] {
+        Phase52TimelineAssetContext(
+            snapshot: snapshot,
+            imageDataByKey: loadedImageResources
+        ).reactionItems(for: message, currentUserID: currentUserID)
     }
 
     public func togglePin(_ timelineMessage: TimelineMessage) async {
@@ -8920,6 +9107,10 @@ public final class MainShellViewModel {
         visibleRangeUpdates: \(freeze.visibleRangeUpdateCount)
         lastMarker: \(freeze.lastMainThreadMarker ?? "-")
         phase51ShellBuilds: \(phase51.shellBuildCount)
+        phase59ShellRequests/builds/skips: \(phase51.shellRequestCount)/\(phase51.shellBuildCount)/\(phase51.shellCacheHitCount)
+        phase59ShellCoalesced/discarded: \(phase51.shellCoalescedCount)/\(phase51.shellDiscardedCount)
+        phase59RelationshipCandidates: \(phase51.shellRelationshipCandidateCount)
+        phase59LastShellReason: \(phase51.lastShellInvalidationReason ?? "-")
         phase51TimelineBuilds/cacheHits: \(phase51.timelineBuildCount)/\(phase51.timelineCacheHitCount)
         phase51ServerSettingsBuilds/cancellations: \(phase51.serverSettingsBuildCount)/\(phase51.serverSettingsCancellationCount)
         phase51DiagnosticsPublished/throttled: \(phase51.diagnosticsPublishCount)/\(phase51.diagnosticsThrottleCount)
@@ -10053,9 +10244,14 @@ public final class MainShellViewModel {
         let oldSnapshot = self.snapshot
         reconcileHydratedMemberOverlay(with: update)
         let mergedSnapshot = snapshotWithHydratedMemberOverlay(update.snapshot)
+        let refreshesShell = snapshotChangesAffectShell(update.changes, snapshot: mergedSnapshot)
         mergePhase43IdentityChanges(update.changes, snapshot: mergedSnapshot, previous: oldSnapshot)
         updateMemberSourceDiagnostics(changes: update.changes, current: mergedSnapshot)
         self.snapshot = mergedSnapshot
+        if refreshesShell {
+            phase51ShellDataRevision &+= 1
+            schedulePhase51ShellPresentationRefresh(reason: "realtime shell change")
+        }
         applyPhase46ModerationChanges(update.changes)
         if update.changes.isFullReplacement {
             messageController.hydrate(from: mergedSnapshot)
@@ -10096,6 +10292,33 @@ public final class MainShellViewModel {
            effectiveSessionState == .connected {
             loadVisibleIdentityImagesForCurrentSelection()
         }
+    }
+
+    private func snapshotChangesAffectShell(
+        _ changes: RealtimeSnapshotChangeSet,
+        snapshot: RealtimeSnapshot
+    ) -> Bool {
+        if changes.isFullReplacement
+            || !changes.serverIDs.isEmpty
+            || !changes.channelIDs.isEmpty
+            || !changes.unreadChannelIDs.isEmpty {
+            return true
+        }
+        if !changes.messageChannelIDs.isEmpty {
+            let dmChannelIDs = Set(snapshot.channelsByID.values.lazy.filter(DMChannelClassifier.isDirectMessageLike).map(\.id))
+            if !changes.messageChannelIDs.isDisjoint(with: dmChannelIDs) {
+                return true
+            }
+        }
+        guard !changes.userIDs.isEmpty else { return false }
+        var shellUserIDs = Set(currentUser?.relations.map(\.id) ?? [])
+        if let currentUserID {
+            shellUserIDs.insert(currentUserID)
+        }
+        for channel in snapshot.channelsByID.values where DMChannelClassifier.isDirectMessageLike(channel) {
+            shellUserIDs.formUnion(channel.recipients)
+        }
+        return !changes.userIDs.isDisjoint(with: shellUserIDs)
     }
 
     func replaceSnapshotForTesting(
@@ -12801,6 +13024,7 @@ public struct CredentialSetupView: View {
         let identity = viewModel.visibleIdentityDiagnostics
         let freeze = viewModel.freezePerformanceDiagnostics
         let phase51 = viewModel.phase51PerformanceDiagnostics
+        let phase59Reactions = viewModel.phase59ReactionDiagnostics
         let presentation = viewModel.timelinePresentationDiagnostics
         let roleSort = viewModel.memberRoleSortDiagnostics
         let dmConversation = viewModel.dmDiagnostics
@@ -12830,6 +13054,8 @@ public struct CredentialSetupView: View {
             LabeledContent("Freeze markers", value: freeze.lastMainThreadMarker ?? "-")
             LabeledContent("Freeze counts", value: "timeline \(freeze.timelineRenderPassCount), grouping \(freeze.memberGroupingCount), grouping cache \(freeze.memberGroupingCacheHitCount), visible \(freeze.visibleRangeUpdateCount), capability cache \(freeze.capabilityCacheUpdateCount)")
             LabeledContent("Phase 51 presentations", value: "shell \(phase51.shellBuildCount), timeline \(phase51.timelineBuildCount), cache \(phase51.timelineCacheHitCount), settings \(phase51.serverSettingsBuildCount), cancelled \(phase51.serverSettingsCancellationCount)")
+            LabeledContent("Phase 59 shell", value: "requests \(phase51.shellRequestCount), skips \(phase51.shellCacheHitCount), coalesced \(phase51.shellCoalescedCount), discarded \(phase51.shellDiscardedCount), relationship users \(phase51.shellRelationshipCandidateCount)")
+            LabeledContent("Phase 59 reactions", value: "attempts \(phase59Reactions.attemptCount), optimistic \(phase59Reactions.optimisticMutationCount), success \(phase59Reactions.successCount), rollback \(phase59Reactions.rollbackCount), deduped \(phase59Reactions.deduplicatedCount), unavailable \(phase59Reactions.unavailableCount)")
             LabeledContent("Timeline presentation", value: "groups \(presentation.groupingBuildCount), rows \(presentation.rowBuildCount), visible \(presentation.visibleMessageCount)/\(presentation.visibleGroupCount), cancelled \(presentation.cancellationCount), stale \(presentation.staleResultDiscardCount)")
             LabeledContent("Realtime coalescing", value: "\(viewModel.sessionCoordinator?.coalescedRealtimeUpdateCount ?? 0) pending updates merged")
             LabeledContent("Phase 51 diagnostics", value: "published \(phase51.diagnosticsPublishCount), throttled \(phase51.diagnosticsThrottleCount), budget violations \(phase51.mainThreadBudgetViolationCount)")
@@ -14176,7 +14402,9 @@ public struct TimelineMessageGroupView: View {
         for timelineMessage: TimelineMessage,
         presentation: TimelineRowPresentation?
     ) -> [MessageReactionDisplayItem] {
-        presentation?.reactionItems ?? []
+        // Reactions are tiny to derive and must reflect the optimistic controller state
+        // immediately, without waiting for the detached full-row presentation rebuild.
+        viewModel.currentReactionItems(for: timelineMessage.message)
     }
 
     private func buttonRole(for item: MessageActionItem) -> ButtonRole? {

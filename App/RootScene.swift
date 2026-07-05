@@ -2,7 +2,7 @@ import StoatFeatures
 import SwiftUI
 
 struct RootScene: Scene {
-    @State private var appModel = LiquidBagelAppModel()
+    let appModel: LiquidBagelAppModel
 
     var body: some Scene {
         WindowGroup("Liquid Bagel") {

@@ -3332,7 +3332,7 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase57MemberOnlyAvatarCompletionDoesNotInvalidateTimeline() async throws {
+    func testPhase59AvatarCompletionDoesNotInvalidatePreparedTimelineRows() async throws {
         let data = Data("avatar".utf8)
         let loader = MockImageResourceLoader(result: .success(data))
         let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
@@ -3350,10 +3350,131 @@ final class StoatFeaturesTests: XCTestCase {
         model.imageResourceBecameVisible(timelineAvatar, kind: .userAvatar, consumerID: "timeline-avatar-one")
         for _ in 0..<40 {
             diagnostics = await model.imageResourceDiagnostics()
-            if diagnostics.timelineMediaInvalidationCount == 1 { break }
+            if model.imageData(for: timelineAvatar, kind: .userAvatar) != nil { break }
             try await Task.sleep(for: .milliseconds(5))
         }
-        XCTAssertEqual(diagnostics.timelineMediaInvalidationCount, 1)
+        diagnostics = await model.imageResourceDiagnostics()
+        XCTAssertEqual(diagnostics.timelineMediaInvalidationCount, 0)
+    }
+
+    @MainActor
+    func testPhase59LargeMemberChurnDoesNotRebuildShellOrSortMembersAsFriends() async throws {
+        let serverID: ServerID = "phase59-large-server"
+        let currentUserID: UserID = "phase59-current"
+        let friendID: UserID = "phase59-friend"
+        let currentUser = User(
+            id: currentUserID,
+            username: "current",
+            relations: [Relationship(id: friendID, status: .friend)]
+        )
+        var snapshot = RealtimeSnapshot()
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: currentUserID, name: "Large")
+        snapshot.usersByID[currentUserID] = currentUser
+        snapshot.usersByID[friendID] = User(id: friendID, username: "friend", relationship: .friend)
+        for index in 0..<2_324 {
+            let userID = UserID(rawValue: "phase59-member-\(index)")
+            snapshot.usersByID[userID] = User(id: userID, username: "member\(index)")
+            snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(
+                id: MemberCompositeKey(serverID: serverID, userID: userID),
+                joinedAt: Date()
+            )
+        }
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID),
+            snapshot: snapshot,
+            currentUser: currentUser
+        )
+        XCTAssertEqual(model.shellPresentationSnapshot.allFriendItems.map(\.user.id), [friendID])
+        XCTAssertEqual(model.phase51PerformanceDiagnostics.shellRelationshipCandidateCount, 1)
+        let requestsBefore = model.phase51PerformanceDiagnostics.shellRequestCount
+        let buildsBefore = model.phase51PerformanceDiagnostics.shellBuildCount
+
+        var replacement = snapshot
+        let changedKey = ServerMemberKey(serverID: serverID, userID: "phase59-member-100")
+        replacement.membersByServerAndUserID[changedKey]?.nickname = "updated"
+        model.replaceSnapshotForTesting(
+            replacement,
+            changes: RealtimeSnapshotChangeSet(memberKeys: [changedKey])
+        )
+        try await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(model.phase51PerformanceDiagnostics.shellRequestCount, requestsBefore)
+        XCTAssertEqual(model.phase51PerformanceDiagnostics.shellBuildCount, buildsBefore)
+    }
+
+    @MainActor
+    func testPhase59VisibleAvatarPromotesAheadOfQueuedBackgroundAndIdentityWork() async throws {
+        let loader = SlowImageResourceLoader(delayNanoseconds: 120_000_000)
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        for index in 0..<8 {
+            model.loadImageResource(
+                for: File(id: FileID(rawValue: "phase59-background-\(index)"), tag: "banners", filename: "b.png", contentType: "image/png", size: 5),
+                kind: .serverBanner
+            )
+        }
+        let ordinary = File(id: "phase59-ordinary-avatar", tag: "avatars", filename: "ordinary.png", contentType: "image/png", size: 5)
+        let visible = File(id: "phase59-visible-avatar", tag: "avatars", filename: "visible.png", contentType: "image/png", size: 5)
+        model.loadImageResource(for: ordinary, kind: .userAvatar)
+        model.imageResourceBecameVisible(visible, kind: .userAvatar, consumerID: "timeline-avatar-phase59-visible")
+
+        for _ in 0..<80 {
+            let calls = await loader.calls
+            if calls.count >= 10 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let calls = await loader.calls
+        XCTAssertGreaterThanOrEqual(calls.count, 10)
+        XCTAssertEqual(calls[8].id, visible.id.rawValue)
+        XCTAssertEqual(calls[9].id, ordinary.id.rawValue)
+    }
+
+    @MainActor
+    func testPhase59ReactionIsOptimisticAndDeduplicatesWhileInFlight() async throws {
+        let handler = Phase59ReactionHandler(delay: .milliseconds(80))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        model.selectServer(model.servers[0].id)
+        let message = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
+
+        let first = Task { await model.toggleReaction("✅", on: message) }
+        try await Task.sleep(for: .milliseconds(5))
+        XCTAssertEqual(
+            model.selectedTimelineMessages.first { $0.message.id == message.message.id }?.message.reactions["✅"],
+            [MockShellData.currentUserID]
+        )
+        let duplicate = Task { await model.toggleReaction("✅", on: message) }
+        await first.value
+        await duplicate.value
+
+        let addCallCount = await handler.addCallCount
+        XCTAssertEqual(addCallCount, 1)
+        XCTAssertEqual(model.phase59ReactionDiagnostics.optimisticMutationCount, 1)
+        XCTAssertEqual(model.phase59ReactionDiagnostics.deduplicatedCount, 1)
+        XCTAssertEqual(model.phase59ReactionDiagnostics.successCount, 1)
+    }
+
+    @MainActor
+    func testPhase59ReactionFailureRollsBackAndShowsTransientError() async throws {
+        let handler = Phase59ReactionHandler(
+            delay: .milliseconds(30),
+            error: MessageActionError.unavailable("server rejected reaction")
+        )
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        model.selectServer(model.servers[0].id)
+        let message = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
+
+        let task = Task { await model.toggleReaction("🚀", on: message) }
+        try await Task.sleep(for: .milliseconds(5))
+        XCTAssertEqual(
+            model.selectedTimelineMessages.first { $0.message.id == message.message.id }?.message.reactions["🚀"],
+            [MockShellData.currentUserID]
+        )
+        await task.value
+
+        XCTAssertNil(
+            model.selectedTimelineMessages.first { $0.message.id == message.message.id }?.message.reactions["🚀"]
+        )
+        XCTAssertEqual(model.phase59ReactionDiagnostics.rollbackCount, 1)
+        XCTAssertEqual(model.transientNotice?.severity, .error)
     }
 
     @MainActor
@@ -7581,6 +7702,45 @@ private actor DelayedMessageActionHandler: MessageActionHandling {
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
     func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {}
     func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {}
+    func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+    func beginTyping(channelID: ChannelID) async throws {}
+    func endTyping(channelID: ChannelID) async throws {}
+}
+
+private actor Phase59ReactionHandler: MessageActionHandling {
+    let delay: Duration
+    let error: (any Error & Sendable)?
+    private(set) var addCallCount = 0
+    private(set) var removeCallCount = 0
+
+    init(delay: Duration, error: (any Error & Sendable)? = nil) {
+        self.delay = delay
+        self.error = error
+    }
+
+    func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?, attachments: [FileID]?) async throws -> Message {
+        Message(id: "phase59-send", channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+    }
+
+    func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
+        Message(id: messageID, channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+    }
+
+    func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
+
+    func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
+        addCallCount += 1
+        try await Task.sleep(for: delay)
+        if let error { throw error }
+    }
+
+    func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
+        removeCallCount += 1
+        try await Task.sleep(for: delay)
+        if let error { throw error }
+    }
+
     func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
     func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {}
     func beginTyping(channelID: ChannelID) async throws {}

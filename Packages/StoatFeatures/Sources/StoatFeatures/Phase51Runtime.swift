@@ -175,8 +175,13 @@ public struct TimelinePresentationDiagnostics: Hashable, Sendable {
 }
 
 public struct Phase51PerformanceDiagnostics: Hashable, Sendable {
+    public var shellRequestCount: Int
     public var shellBuildCount: Int
     public var shellCacheHitCount: Int
+    public var shellCoalescedCount: Int
+    public var shellDiscardedCount: Int
+    public var shellRelationshipCandidateCount: Int
+    public var lastShellInvalidationReason: String?
     public var timelineBuildCount: Int
     public var timelineCacheHitCount: Int
     public var serverSettingsBuildCount: Int
@@ -188,8 +193,13 @@ public struct Phase51PerformanceDiagnostics: Hashable, Sendable {
     public var mainThreadBudgetViolationCount: Int
 
     public init(
+        shellRequestCount: Int = 0,
         shellBuildCount: Int = 0,
         shellCacheHitCount: Int = 0,
+        shellCoalescedCount: Int = 0,
+        shellDiscardedCount: Int = 0,
+        shellRelationshipCandidateCount: Int = 0,
+        lastShellInvalidationReason: String? = nil,
         timelineBuildCount: Int = 0,
         timelineCacheHitCount: Int = 0,
         serverSettingsBuildCount: Int = 0,
@@ -200,8 +210,13 @@ public struct Phase51PerformanceDiagnostics: Hashable, Sendable {
         lastOperationMilliseconds: Int? = nil,
         mainThreadBudgetViolationCount: Int = 0
     ) {
+        self.shellRequestCount = shellRequestCount
         self.shellBuildCount = shellBuildCount
         self.shellCacheHitCount = shellCacheHitCount
+        self.shellCoalescedCount = shellCoalescedCount
+        self.shellDiscardedCount = shellDiscardedCount
+        self.shellRelationshipCandidateCount = shellRelationshipCandidateCount
+        self.lastShellInvalidationReason = lastShellInvalidationReason
         self.timelineBuildCount = timelineBuildCount
         self.timelineCacheHitCount = timelineCacheHitCount
         self.serverSettingsBuildCount = serverSettingsBuildCount

@@ -196,7 +196,16 @@ public enum Phase22Derivations {
     ) -> [FriendListItem] {
         let dmChannelsByRecipient = directMessageChannelsByRecipient(currentUserID: currentUserID, snapshot: snapshot)
         let relationshipByUserID = relationshipStatusMap(currentUser: currentUser)
-        let items: [FriendListItem] = snapshot.usersByID.values
+        // Ready can contain thousands of server members. The Friends surface only needs
+        // explicitly related users; walking and locale-sorting every hydrated server user
+        // made an otherwise idle app continuously consume a core on large servers.
+        let candidateIDs = Set(relationshipByUserID.keys).union(
+            snapshot.usersByID.values.lazy
+                .filter { $0.relationship != .none && $0.relationship != .user }
+                .map(\.id)
+        )
+        let items: [FriendListItem] = candidateIDs
+            .compactMap { snapshot.usersByID[$0] }
             .filter { user in currentUserID.map { user.id != $0 } ?? true }
             .map { user in
                 let dm = dmChannelsByRecipient[user.id]
@@ -212,9 +221,11 @@ public enum Phase22Derivations {
                 )
             }
         // Decorate-sort-undecorate: compute each display name once instead of twice per comparison.
-        let decorated: [(item: FriendListItem, sortKey: String)] = items.map { ($0, displayName($0.user)) }
+        let decorated: [(item: FriendListItem, sortKey: String)] = items.map {
+            ($0, displayName($0.user).folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current))
+        }
         return decorated
-            .sorted { $0.sortKey.localizedCaseInsensitiveCompare($1.sortKey) == .orderedAscending }
+            .sorted { $0.sortKey < $1.sortKey }
             .map(\.item)
     }
 
