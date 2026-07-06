@@ -207,6 +207,67 @@ final class StoatAPITests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-Session-Token"), "secret")
     }
 
+    func testPhase60ReactionRequestsUseSinglePercentEncoding() async throws {
+        let cases: [(emoji: String, encoded: String)] = [
+            ("🥯", "%F0%9F%A5%AF"),
+            ("❤️", "%E2%9D%A4%EF%B8%8F"),
+            ("01J00000000000000000000001", "01J00000000000000000000001")
+        ]
+
+        for item in cases {
+            let addTransport = RecordingHTTPTransport(statusCode: 204)
+            let addClient = LiveStoatAPIClient(
+                credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+                transport: addTransport
+            )
+            try await addClient.addReaction(
+                channelID: "channel-1",
+                messageID: "message-1",
+                emoji: item.emoji
+            )
+            let capturedAddRequest = await addTransport.lastRequest()
+            let addRequest = try XCTUnwrap(capturedAddRequest)
+            let addComponents = try XCTUnwrap(
+                URLComponents(url: try XCTUnwrap(addRequest.url), resolvingAgainstBaseURL: false)
+            )
+
+            XCTAssertEqual(addRequest.httpMethod, "PUT")
+            XCTAssertEqual(
+                addComponents.percentEncodedPath,
+                "/channels/channel-1/messages/message-1/reactions/\(item.encoded)"
+            )
+            XCTAssertFalse(addComponents.percentEncodedPath.contains("%25"))
+
+            let removeTransport = RecordingHTTPTransport(statusCode: 204)
+            let removeClient = LiveStoatAPIClient(
+                credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+                transport: removeTransport
+            )
+            try await removeClient.removeReaction(
+                channelID: "channel-1",
+                messageID: "message-1",
+                emoji: item.emoji,
+                removeAll: true
+            )
+            let capturedRemoveRequest = await removeTransport.lastRequest()
+            let removeRequest = try XCTUnwrap(capturedRemoveRequest)
+            let removeComponents = try XCTUnwrap(
+                URLComponents(url: try XCTUnwrap(removeRequest.url), resolvingAgainstBaseURL: false)
+            )
+
+            XCTAssertEqual(removeRequest.httpMethod, "DELETE")
+            XCTAssertEqual(
+                removeComponents.percentEncodedPath,
+                "/channels/channel-1/messages/message-1/reactions/\(item.encoded)"
+            )
+            XCTAssertEqual(
+                removeComponents.queryItems?.first(where: { $0.name == "remove_all" })?.value,
+                "true"
+            )
+            XCTAssertFalse(removeComponents.percentEncodedPath.contains("%25"))
+        }
+    }
+
     func testPhase24ServerAndChannelManagementEndpointRequests() async throws {
         let serverJSON = Data(#"{"server":{"_id":"server-1","owner":"user-1","name":"Lab","channels":["channel-1"],"default_permissions":0},"channels":[{"_id":"channel-1","channel_type":"TextChannel","server":"server-1","name":"general"}]}"#.utf8)
         let fetchTransport = RecordingHTTPTransport(data: serverJSON)

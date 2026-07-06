@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 #if canImport(AppKit)
 import AppKit
 import ImageIO
+import QuartzCore
 #endif
 
 #if canImport(AVKit)
@@ -2202,47 +2203,305 @@ public struct ErrorStateView: View {
     }
 }
 
+public enum TimelineSkeletonAnimationPolicy {
+    public static func usesShimmer(reduceMotion: Bool) -> Bool {
+        !reduceMotion
+    }
+}
+
+public struct TimelineSkeletonRow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private let showsAvatar: Bool
+
+    public init(showsAvatar: Bool = true) {
+        self.showsAvatar = showsAvatar
+    }
+
+    public var body: some View {
+        HStack(alignment: .top, spacing: StoatSpacing.medium) {
+            Circle()
+                .fill(Color.secondary.opacity(0.14))
+                .frame(width: StoatSize.avatar, height: StoatSize.avatar)
+                .opacity(showsAvatar ? 1 : 0)
+            VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                    .fill(Color.secondary.opacity(0.14))
+                    .frame(width: 156, height: 11)
+                RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                    .fill(Color.secondary.opacity(0.11))
+                    .frame(maxWidth: 420)
+                    .frame(height: 10)
+            }
+            .padding(.top, StoatSpacing.xSmall)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay {
+            #if canImport(AppKit)
+            TimelineCoreAnimationShimmer(isActive: TimelineSkeletonAnimationPolicy.usesShimmer(reduceMotion: reduceMotion))
+                .mask {
+                    HStack(alignment: .top, spacing: StoatSpacing.medium) {
+                        Circle()
+                            .frame(width: StoatSize.avatar, height: StoatSize.avatar)
+                            .opacity(showsAvatar ? 1 : 0)
+                        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+                            RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                                .frame(width: 156, height: 11)
+                            RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
+                                .frame(maxWidth: 420)
+                                .frame(height: 10)
+                        }
+                        .padding(.top, StoatSpacing.xSmall)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            #endif
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Preparing message")
+    }
+}
+
+#if canImport(AppKit)
+private struct TimelineCoreAnimationShimmer: NSViewRepresentable {
+    var isActive: Bool
+
+    func makeNSView(context: Context) -> TimelineShimmerHostView {
+        let view = TimelineShimmerHostView()
+        view.setActive(isActive)
+        return view
+    }
+
+    func updateNSView(_ nsView: TimelineShimmerHostView, context: Context) {
+        nsView.setActive(isActive)
+    }
+
+    static func dismantleNSView(_ nsView: TimelineShimmerHostView, coordinator: ()) {
+        nsView.stop()
+    }
+}
+
+private final class TimelineShimmerHostView: NSView {
+    private let shimmerLayer = CAGradientLayer()
+    private var isActive = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        shimmerLayer.colors = [
+            NSColor.clear.cgColor,
+            NSColor.white.withAlphaComponent(0.24).cgColor,
+            NSColor.clear.cgColor
+        ]
+        shimmerLayer.locations = [0, 0.5, 1]
+        shimmerLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        shimmerLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        layer?.addSublayer(shimmerLayer)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func layout() {
+        super.layout()
+        shimmerLayer.frame = bounds.insetBy(dx: -bounds.width, dy: 0)
+        if isActive {
+            start()
+        }
+    }
+
+    func setActive(_ active: Bool) {
+        guard active != isActive else { return }
+        isActive = active
+        if active {
+            start()
+        } else {
+            stop()
+        }
+    }
+
+    private func start() {
+        guard bounds.width > 0 else { return }
+        let animation = CABasicAnimation(keyPath: "transform.translation.x")
+        animation.fromValue = -bounds.width
+        animation.toValue = bounds.width
+        animation.duration = 1.15
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        shimmerLayer.add(animation, forKey: "phase60-shimmer")
+    }
+
+    func stop() {
+        isActive = false
+        shimmerLayer.removeAllAnimations()
+    }
+}
+#endif
+
+private final class MessageRowStorage {
+    let message: Message
+    let author: User?
+    let authorDisplayNameOverride: String?
+    let authorDisplayColor: Color?
+    let showsHeader: Bool
+    let statusText: String?
+    let isSelected: Bool
+    let isFocused: Bool
+    let isSearchHighlighted: Bool
+    let isCurrentSearchResult: Bool
+    let isTargetHighlighted: Bool
+    let isCompactDensity: Bool
+    let searchAccessibilityStatus: String?
+    let replyPreview: String?
+    let replyPreviewItem: MessageRowReplyPreviewItem?
+    let attachmentItems: [AttachmentDisplayItem]?
+    let customEmojiItems: [MessageInlineCustomEmojiItem]
+    let referenceItems: [String: MessageInlineReferenceItem]
+    let preparedMarkdownContent: PreparedMarkdownContent?
+    let embedItems: [MessageEmbedDisplayItem]?
+    let authorAvatarData: Data?
+    let actionItems: [MessageRowActionItem]
+    let reactionItems: [MessageReactionDisplayItem]
+    let mentionsCurrentUser: Bool
+    let onMessageAction: (String) -> Void
+    let onToggleReaction: (String) -> Void
+    let onPreviewAttachment: (AttachmentDisplayItem) -> Void
+    let onDownloadAttachment: (AttachmentDisplayItem) -> Void
+    let onOpenAttachment: (AttachmentDisplayItem) -> Void
+    let onRetryAttachment: (AttachmentDisplayItem) -> Void
+    let onPreviewEmbedMedia: (AttachmentDisplayItem) -> Void
+    let onDownloadEmbedMedia: (AttachmentDisplayItem) -> Void
+    let onOpenEmbedMedia: (AttachmentDisplayItem) -> Void
+    let onRetryEmbedMedia: (AttachmentDisplayItem) -> Void
+    let onOpenAuthorProfile: () -> Void
+    let onOpenReplyPreview: () -> Void
+    let onOpenMention: (UserID) -> Void
+
+    init(
+        message: Message,
+        author: User?,
+        authorDisplayNameOverride: String?,
+        authorDisplayColor: Color?,
+        showsHeader: Bool,
+        statusText: String?,
+        isSelected: Bool,
+        isFocused: Bool,
+        isSearchHighlighted: Bool,
+        isCurrentSearchResult: Bool,
+        isTargetHighlighted: Bool,
+        isCompactDensity: Bool,
+        searchAccessibilityStatus: String?,
+        replyPreview: String?,
+        replyPreviewItem: MessageRowReplyPreviewItem?,
+        attachmentItems: [AttachmentDisplayItem]?,
+        customEmojiItems: [MessageInlineCustomEmojiItem],
+        referenceItems: [String: MessageInlineReferenceItem],
+        preparedMarkdownContent: PreparedMarkdownContent?,
+        embedItems: [MessageEmbedDisplayItem]?,
+        authorAvatarData: Data?,
+        actionItems: [MessageRowActionItem],
+        reactionItems: [MessageReactionDisplayItem],
+        mentionsCurrentUser: Bool,
+        onMessageAction: @escaping (String) -> Void,
+        onToggleReaction: @escaping (String) -> Void,
+        onPreviewAttachment: @escaping (AttachmentDisplayItem) -> Void,
+        onDownloadAttachment: @escaping (AttachmentDisplayItem) -> Void,
+        onOpenAttachment: @escaping (AttachmentDisplayItem) -> Void,
+        onRetryAttachment: @escaping (AttachmentDisplayItem) -> Void,
+        onPreviewEmbedMedia: @escaping (AttachmentDisplayItem) -> Void,
+        onDownloadEmbedMedia: @escaping (AttachmentDisplayItem) -> Void,
+        onOpenEmbedMedia: @escaping (AttachmentDisplayItem) -> Void,
+        onRetryEmbedMedia: @escaping (AttachmentDisplayItem) -> Void,
+        onOpenAuthorProfile: @escaping () -> Void,
+        onOpenReplyPreview: @escaping () -> Void,
+        onOpenMention: @escaping (UserID) -> Void
+    ) {
+        self.message = message
+        self.author = author
+        self.authorDisplayNameOverride = authorDisplayNameOverride
+        self.authorDisplayColor = authorDisplayColor
+        self.showsHeader = showsHeader
+        self.statusText = statusText
+        self.isSelected = isSelected
+        self.isFocused = isFocused
+        self.isSearchHighlighted = isSearchHighlighted
+        self.isCurrentSearchResult = isCurrentSearchResult
+        self.isTargetHighlighted = isTargetHighlighted
+        self.isCompactDensity = isCompactDensity
+        self.searchAccessibilityStatus = searchAccessibilityStatus
+        self.replyPreview = replyPreview
+        self.replyPreviewItem = replyPreviewItem
+        self.attachmentItems = attachmentItems
+        self.customEmojiItems = customEmojiItems
+        self.referenceItems = referenceItems
+        self.preparedMarkdownContent = preparedMarkdownContent
+        self.embedItems = embedItems
+        self.authorAvatarData = authorAvatarData
+        self.actionItems = actionItems
+        self.reactionItems = reactionItems
+        self.mentionsCurrentUser = mentionsCurrentUser
+        self.onMessageAction = onMessageAction
+        self.onToggleReaction = onToggleReaction
+        self.onPreviewAttachment = onPreviewAttachment
+        self.onDownloadAttachment = onDownloadAttachment
+        self.onOpenAttachment = onOpenAttachment
+        self.onRetryAttachment = onRetryAttachment
+        self.onPreviewEmbedMedia = onPreviewEmbedMedia
+        self.onDownloadEmbedMedia = onDownloadEmbedMedia
+        self.onOpenEmbedMedia = onOpenEmbedMedia
+        self.onRetryEmbedMedia = onRetryEmbedMedia
+        self.onOpenAuthorProfile = onOpenAuthorProfile
+        self.onOpenReplyPreview = onOpenReplyPreview
+        self.onOpenMention = onOpenMention
+    }
+}
+
 public struct MessageRow: View {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var isHovering = false
-    private let message: Message
-    private let author: User?
-    private let authorDisplayNameOverride: String?
-    private let authorDisplayColor: Color?
-    private let showsHeader: Bool
-    private let statusText: String?
-    private let isSelected: Bool
-    private let isFocused: Bool
-    private let isSearchHighlighted: Bool
-    private let isCurrentSearchResult: Bool
-    private let isTargetHighlighted: Bool
-    private let isCompactDensity: Bool
-    private let searchAccessibilityStatus: String?
-    private let replyPreview: String?
-    private let replyPreviewItem: MessageRowReplyPreviewItem?
-    private let attachmentItems: [AttachmentDisplayItem]?
-    private let customEmojiItems: [MessageInlineCustomEmojiItem]
-    private let referenceItems: [String: MessageInlineReferenceItem]
-    private let preparedMarkdownContent: PreparedMarkdownContent?
-    private let embedItems: [MessageEmbedDisplayItem]?
-    private let authorAvatarData: Data?
-    private let actionItems: [MessageRowActionItem]
-    private let reactionItems: [MessageReactionDisplayItem]
-    private let mentionsCurrentUser: Bool
-    private let onMessageAction: (String) -> Void
-    private let onToggleReaction: (String) -> Void
-    private let onPreviewAttachment: (AttachmentDisplayItem) -> Void
-    private let onDownloadAttachment: (AttachmentDisplayItem) -> Void
-    private let onOpenAttachment: (AttachmentDisplayItem) -> Void
-    private let onRetryAttachment: (AttachmentDisplayItem) -> Void
-    private let onPreviewEmbedMedia: (AttachmentDisplayItem) -> Void
-    private let onDownloadEmbedMedia: (AttachmentDisplayItem) -> Void
-    private let onOpenEmbedMedia: (AttachmentDisplayItem) -> Void
-    private let onRetryEmbedMedia: (AttachmentDisplayItem) -> Void
-    private let onOpenAuthorProfile: () -> Void
-    private let onOpenReplyPreview: () -> Void
-    private let onOpenMention: (UserID) -> Void
+    private let storage: MessageRowStorage
+    private var message: Message { storage.message }
+    private var author: User? { storage.author }
+    private var authorDisplayNameOverride: String? { storage.authorDisplayNameOverride }
+    private var authorDisplayColor: Color? { storage.authorDisplayColor }
+    private var showsHeader: Bool { storage.showsHeader }
+    private var statusText: String? { storage.statusText }
+    private var isSelected: Bool { storage.isSelected }
+    private var isFocused: Bool { storage.isFocused }
+    private var isSearchHighlighted: Bool { storage.isSearchHighlighted }
+    private var isCurrentSearchResult: Bool { storage.isCurrentSearchResult }
+    private var isTargetHighlighted: Bool { storage.isTargetHighlighted }
+    private var isCompactDensity: Bool { storage.isCompactDensity }
+    private var searchAccessibilityStatus: String? { storage.searchAccessibilityStatus }
+    private var replyPreview: String? { storage.replyPreview }
+    private var replyPreviewItem: MessageRowReplyPreviewItem? { storage.replyPreviewItem }
+    private var attachmentItems: [AttachmentDisplayItem]? { storage.attachmentItems }
+    private var customEmojiItems: [MessageInlineCustomEmojiItem] { storage.customEmojiItems }
+    private var referenceItems: [String: MessageInlineReferenceItem] { storage.referenceItems }
+    private var preparedMarkdownContent: PreparedMarkdownContent? { storage.preparedMarkdownContent }
+    private var embedItems: [MessageEmbedDisplayItem]? { storage.embedItems }
+    private var authorAvatarData: Data? { storage.authorAvatarData }
+    private var actionItems: [MessageRowActionItem] { storage.actionItems }
+    private var reactionItems: [MessageReactionDisplayItem] { storage.reactionItems }
+    private var mentionsCurrentUser: Bool { storage.mentionsCurrentUser }
+    private var onMessageAction: (String) -> Void { storage.onMessageAction }
+    private var onToggleReaction: (String) -> Void { storage.onToggleReaction }
+    private var onPreviewAttachment: (AttachmentDisplayItem) -> Void { storage.onPreviewAttachment }
+    private var onDownloadAttachment: (AttachmentDisplayItem) -> Void { storage.onDownloadAttachment }
+    private var onOpenAttachment: (AttachmentDisplayItem) -> Void { storage.onOpenAttachment }
+    private var onRetryAttachment: (AttachmentDisplayItem) -> Void { storage.onRetryAttachment }
+    private var onPreviewEmbedMedia: (AttachmentDisplayItem) -> Void { storage.onPreviewEmbedMedia }
+    private var onDownloadEmbedMedia: (AttachmentDisplayItem) -> Void { storage.onDownloadEmbedMedia }
+    private var onOpenEmbedMedia: (AttachmentDisplayItem) -> Void { storage.onOpenEmbedMedia }
+    private var onRetryEmbedMedia: (AttachmentDisplayItem) -> Void { storage.onRetryEmbedMedia }
+    private var onOpenAuthorProfile: () -> Void { storage.onOpenAuthorProfile }
+    private var onOpenReplyPreview: () -> Void { storage.onOpenReplyPreview }
+    private var onOpenMention: (UserID) -> Void { storage.onOpenMention }
 
     public init(
         message: Message,
@@ -2283,43 +2542,45 @@ public struct MessageRow: View {
         onOpenReplyPreview: @escaping () -> Void = {},
         onOpenMention: @escaping (UserID) -> Void = { _ in }
     ) {
-        self.message = message
-        self.author = author
-        self.authorDisplayNameOverride = authorDisplayNameOverride
-        self.authorDisplayColor = authorDisplayColor
-        self.showsHeader = showsHeader
-        self.statusText = statusText
-        self.isSelected = isSelected
-        self.isFocused = isFocused
-        self.isSearchHighlighted = isSearchHighlighted
-        self.isCurrentSearchResult = isCurrentSearchResult
-        self.isTargetHighlighted = isTargetHighlighted
-        self.isCompactDensity = isCompactDensity
-        self.searchAccessibilityStatus = searchAccessibilityStatus
-        self.replyPreview = replyPreview
-        self.replyPreviewItem = replyPreviewItem
-        self.attachmentItems = attachmentItems
-        self.customEmojiItems = customEmojiItems
-        self.referenceItems = referenceItems
-        self.preparedMarkdownContent = preparedMarkdownContent
-        self.embedItems = embedItems
-        self.authorAvatarData = authorAvatarData
-        self.actionItems = actionItems
-        self.reactionItems = reactionItems
-        self.mentionsCurrentUser = mentionsCurrentUser
-        self.onMessageAction = onMessageAction
-        self.onToggleReaction = onToggleReaction
-        self.onPreviewAttachment = onPreviewAttachment
-        self.onDownloadAttachment = onDownloadAttachment
-        self.onOpenAttachment = onOpenAttachment
-        self.onRetryAttachment = onRetryAttachment
-        self.onPreviewEmbedMedia = onPreviewEmbedMedia
-        self.onDownloadEmbedMedia = onDownloadEmbedMedia
-        self.onOpenEmbedMedia = onOpenEmbedMedia
-        self.onRetryEmbedMedia = onRetryEmbedMedia
-        self.onOpenAuthorProfile = onOpenAuthorProfile
-        self.onOpenReplyPreview = onOpenReplyPreview
-        self.onOpenMention = onOpenMention
+        self.storage = MessageRowStorage(
+            message: message,
+            author: author,
+            authorDisplayNameOverride: authorDisplayNameOverride,
+            authorDisplayColor: authorDisplayColor,
+            showsHeader: showsHeader,
+            statusText: statusText,
+            isSelected: isSelected,
+            isFocused: isFocused,
+            isSearchHighlighted: isSearchHighlighted,
+            isCurrentSearchResult: isCurrentSearchResult,
+            isTargetHighlighted: isTargetHighlighted,
+            isCompactDensity: isCompactDensity,
+            searchAccessibilityStatus: searchAccessibilityStatus,
+            replyPreview: replyPreview,
+            replyPreviewItem: replyPreviewItem,
+            attachmentItems: attachmentItems,
+            customEmojiItems: customEmojiItems,
+            referenceItems: referenceItems,
+            preparedMarkdownContent: preparedMarkdownContent,
+            embedItems: embedItems,
+            authorAvatarData: authorAvatarData,
+            actionItems: actionItems,
+            reactionItems: reactionItems,
+            mentionsCurrentUser: mentionsCurrentUser,
+            onMessageAction: onMessageAction,
+            onToggleReaction: onToggleReaction,
+            onPreviewAttachment: onPreviewAttachment,
+            onDownloadAttachment: onDownloadAttachment,
+            onOpenAttachment: onOpenAttachment,
+            onRetryAttachment: onRetryAttachment,
+            onPreviewEmbedMedia: onPreviewEmbedMedia,
+            onDownloadEmbedMedia: onDownloadEmbedMedia,
+            onOpenEmbedMedia: onOpenEmbedMedia,
+            onRetryEmbedMedia: onRetryEmbedMedia,
+            onOpenAuthorProfile: onOpenAuthorProfile,
+            onOpenReplyPreview: onOpenReplyPreview,
+            onOpenMention: onOpenMention
+        )
     }
 
     public var body: some View {

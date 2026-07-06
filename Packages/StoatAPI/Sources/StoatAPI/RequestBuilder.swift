@@ -94,9 +94,13 @@ public struct StoatRequestBuilder: Sendable {
             throw StoatAPIError.invalidURL
         }
 
-        let basePath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let requestPath = request.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        components.path = "/" + [basePath, requestPath].filter { !$0.isEmpty }.joined(separator: "/")
+        // Route call sites escape individual path components before they reach the builder.
+        // Combining through `path` would escape the existing percent signs a second time
+        // (`%F0...` -> `%25F0...`). Keep the already-escaped route intact while allowing
+        // URLComponents to continue owning query-item encoding below.
+        components.percentEncodedPath = "/" + [basePath, requestPath].filter { !$0.isEmpty }.joined(separator: "/")
         if !request.queryItems.isEmpty {
             components.queryItems = request.queryItems
         }
@@ -161,4 +165,3 @@ extension String {
         return addingPercentEncoding(withAllowedCharacters: allowed) ?? self
     }
 }
-

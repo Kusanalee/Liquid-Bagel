@@ -3666,6 +3666,7 @@ final class StoatFeaturesTests: XCTestCase {
         let messageID = try XCTUnwrap(model.selectedTimelineMessages.first?.message.id)
 
         model.updateTimelineVisibility(messageID: messageID, channelID: channelID, isVisible: true)
+        try await Task.sleep(for: .milliseconds(140))
         await model.prepareSelectedTimelinePresentation()
         for _ in 0..<20 {
             if model.timelinePerformanceDiagnostics.loadedMessageCount > 0 { break }
@@ -7069,6 +7070,187 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertTrue(model.newDirectMessageCandidates.isEmpty)
     }
 
+    func testPhase60FlattensTwoHundredFiftyGroupedMessagesIntoStableDirectItems() {
+        let channelID: ChannelID = "phase60-flat-channel"
+        let authorID: UserID = "phase60-flat-author"
+        let timeline = (0..<250).map { index in
+            TimelineMessage(
+                message: Message(
+                    id: MessageID(rawValue: String(format: "01K%023d", index)),
+                    channelID: channelID,
+                    authorID: authorID,
+                    content: "Message \(index)"
+                )
+            )
+        }
+
+        let groups = TimelineMessageGrouping.group(timeline)
+        let items = TimelineRenderItemBuilder.flatten(groups)
+
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(items.count, 250)
+        XCTAssertEqual(items.map(\.id), timeline.map(\.message.id))
+        XCTAssertTrue(items[0].showsHeader)
+        XCTAssertTrue(items[0].startsGroup)
+        XCTAssertTrue(items.dropFirst().allSatisfy { !$0.showsHeader && !$0.startsGroup })
+        XCTAssertEqual(Set(items.map(\.id)).count, 250)
+    }
+
+    func testPhase60PreparationPlannerBoundsStartupAndPromotesVisibleLookahead() {
+        let channelID: ChannelID = "phase60-plan-channel"
+        let authorID: UserID = "phase60-plan-author"
+        let items = (0..<250).map { index in
+            TimelineRenderItem(
+                timelineMessage: TimelineMessage(
+                    message: Message(
+                        id: MessageID(rawValue: String(format: "01L%023d", index)),
+                        channelID: channelID,
+                        authorID: authorID,
+                        content: "\(index)"
+                    )
+                ),
+                groupID: "group",
+                authorID: authorID,
+                showsHeader: index == 0,
+                startsGroup: index == 0
+            )
+        }
+
+        let newest = TimelineRowPreparationPlanner.startupTargets(items: items, anchorMessageID: nil)
+        XCTAssertEqual(newest.count, 32)
+        XCTAssertEqual(newest.first?.messageID, items[218].id)
+        XCTAssertEqual(newest.last?.messageID, items[249].id)
+
+        let anchored = TimelineRowPreparationPlanner.startupTargets(
+            items: items,
+            anchorMessageID: items[100].id
+        )
+        XCTAssertEqual(anchored.count, 32)
+        XCTAssertTrue(anchored.map(\.messageID).contains(items[100].id))
+
+        let promoted = TimelineRowPreparationPlanner.visibleTargets(
+            items: items,
+            visibleMessageIDs: [items[100].id, items[101].id]
+        )
+        XCTAssertEqual(promoted.prefix(2).map(\.priority), [.visible, .visible])
+        XCTAssertEqual(promoted.filter { $0.priority == .lookahead }.count, 16)
+        XCTAssertEqual(Set(promoted.map(\.messageID)).count, promoted.count)
+        XCTAssertTrue(promoted.map(\.messageID).contains(items[92].id))
+        XCTAssertTrue(promoted.map(\.messageID).contains(items[109].id))
+
+        var reacted = items[100].timelineMessage
+        let originalRevision = TimelineRowRevision.value(for: reacted)
+        reacted.message.reactions["🥯"] = [authorID]
+        XCTAssertEqual(TimelineRowRevision.value(for: reacted), originalRevision)
+    }
+
+    @MainActor
+    func testPhase60PreparationIsBoundedAndPublishesOnlyRequestedRowStates() async {
+        let channelID: ChannelID = "phase60-state-channel"
+        let authorID: UserID = "phase60-state-author"
+        let messages = (0..<250).map { index in
+            Message(
+                id: MessageID(rawValue: String(format: "01M%023d", index)),
+                channelID: channelID,
+                authorID: authorID,
+                content: "Message \(index)"
+            )
+        }
+        let snapshot = RealtimeSnapshot(
+            usersByID: [authorID: User(id: authorID, username: "author")],
+            channelsByID: [
+                channelID: Channel(id: channelID, kind: .directMessage, recipients: [authorID])
+            ],
+            messagesByChannelID: [channelID: messages]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
+            snapshot: snapshot
+        )
+
+        await model.prepareSelectedTimelinePresentation()
+
+        XCTAssertEqual(model.selectedTimelineRenderItems.count, 250)
+        XCTAssertEqual(model.phase60Diagnostics.rowCompletionCount, 32)
+        XCTAssertLessThanOrEqual(model.phase60Diagnostics.maximumQueueDepth, 32)
+        XCTAssertNil(model.timelineRowPresentation(for: messages[0].id))
+        XCTAssertNotNil(model.timelineRowPresentation(for: messages[249].id))
+        let firstState = model.timelineRowPresentationState(for: messages[0].id)
+        let newestState = model.timelineRowPresentationState(for: messages[249].id)
+        XCTAssertNotNil(firstState)
+        XCTAssertNotNil(newestState)
+        XCTAssertFalse(firstState === newestState)
+    }
+
+    @MainActor
+    func testPhase60VisibleRangeBurstCoalescesAndChannelSwitchCancelsStaleFlush() async throws {
+        let firstChannelID: ChannelID = "phase60-visible-first"
+        let secondChannelID: ChannelID = "phase60-visible-second"
+        let authorID: UserID = "phase60-visible-author"
+        let firstMessage = Message(
+            id: "01N00000000000000000000001",
+            channelID: firstChannelID,
+            authorID: authorID,
+            content: "first"
+        )
+        let secondMessage = Message(
+            id: "01N00000000000000000000002",
+            channelID: secondChannelID,
+            authorID: authorID,
+            content: "second"
+        )
+        let snapshot = RealtimeSnapshot(
+            usersByID: [authorID: User(id: authorID, username: "author")],
+            channelsByID: [
+                firstChannelID: Channel(id: firstChannelID, kind: .directMessage, recipients: [authorID]),
+                secondChannelID: Channel(id: secondChannelID, kind: .directMessage, recipients: [authorID])
+            ],
+            messagesByChannelID: [
+                firstChannelID: [firstMessage],
+                secondChannelID: [secondMessage]
+            ]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .directMessages, dmChannelID: firstChannelID),
+            snapshot: snapshot
+        )
+        await model.prepareSelectedTimelinePresentation()
+
+        for _ in 0..<200 {
+            model.updateTimelineVisibility(
+                messageID: firstMessage.id,
+                channelID: firstChannelID,
+                isVisible: true
+            )
+            model.updateTimelineVisibility(
+                messageID: firstMessage.id,
+                channelID: firstChannelID,
+                isVisible: false
+            )
+        }
+        model.updateTimelineVisibility(
+            messageID: firstMessage.id,
+            channelID: firstChannelID,
+            isVisible: true
+        )
+        try await Task.sleep(for: .milliseconds(150))
+
+        XCTAssertEqual(model.phase60Diagnostics.visibilityEventCount, 401)
+        XCTAssertEqual(model.phase60Diagnostics.coalescedViewportFlushCount, 1)
+        XCTAssertTrue(
+            model.timelineViewport.visibleRange?.visibleMessageIDs.contains(firstMessage.id) == true
+        )
+
+        model.updateTimelineVisibility(
+            messageID: firstMessage.id,
+            channelID: firstChannelID,
+            isVisible: false
+        )
+        model.selectChannel(secondChannelID)
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(model.phase60Diagnostics.coalescedViewportFlushCount, 1)
+    }
+
     private func ulid(milliseconds: UInt64) -> String {
         let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
         var value = milliseconds
@@ -8540,7 +8722,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
 
         XCTAssertFalse(model.selectedTimelineMessageGroups.isEmpty)
         XCTAssertFalse(
-            model.timelineRowPresentation(for: messages[0].id)?.actionItems.isEmpty ?? true
+            model.timelineRowPresentation(for: messages[249].id)?.actionItems.isEmpty ?? true
         )
         XCTAssertEqual(model.phase51PerformanceDiagnostics.timelineBuildCount, firstBuildCount)
         XCTAssertGreaterThanOrEqual(model.phase51PerformanceDiagnostics.timelineCacheHitCount, 1)

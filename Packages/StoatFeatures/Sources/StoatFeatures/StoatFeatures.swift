@@ -475,8 +475,14 @@ public final class MainShellViewModel {
         didSet {
             guard oldValue.serverID != selection.serverID
                 || oldValue.channelID != selection.channelID
+                || oldValue.dmChannelID != selection.dmChannelID
                 || oldValue.space != selection.space
             else { return }
+            let oldConversationID = ActiveConversation.resolve(selection: oldValue, snapshot: snapshot).channelID
+            let newConversationID = ActiveConversation.resolve(selection: selection, snapshot: snapshot).channelID
+            if oldConversationID != newConversationID {
+                resetPhase60TimelineWork(previousChannelID: oldConversationID)
+            }
             phase46ModerationVersions.bumpSelectionVersions()
             invalidateCapabilityCache()
             phase51SelectionRevision &+= 1
@@ -615,6 +621,7 @@ public final class MainShellViewModel {
     public var freezePerformanceDiagnostics = FreezePerformanceDiagnostics()
     public private(set) var phase51PerformanceDiagnostics = Phase51PerformanceDiagnostics()
     public private(set) var phase59ReactionDiagnostics = Phase59ReactionDiagnostics()
+    @ObservationIgnored public private(set) var phase60Diagnostics = Phase60Diagnostics()
     public private(set) var phase52FreezeDiagnostics = Phase52FreezeDiagnostics()
     public private(set) var timelinePresentationState: TimelinePresentationState = .idle
     public private(set) var timelinePresentationDiagnostics = TimelinePresentationDiagnostics()
@@ -823,6 +830,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var lastTypingBeginAt: [ChannelID: Date] = [:]
     @ObservationIgnored private var lastAckedMessageByChannelID: [ChannelID: MessageID] = [:]
     @ObservationIgnored private var visibleMessageIDsByChannelID: [ChannelID: Set<MessageID>] = [:]
+    @ObservationIgnored private var pendingVisibleMessageIDsByChannelID: [ChannelID: Set<MessageID>] = [:]
     @ObservationIgnored private var resolvedReferencesByChannelID: [ChannelID: [MessageID: MessageReferenceResolution]] = [:]
     @ObservationIgnored private var locallyClearedUnreadChannelIDs: Set<ChannelID> = []
     @ObservationIgnored private var restoredLiveConnectionGeneration: Int?
@@ -843,9 +851,17 @@ public final class MainShellViewModel {
     @ObservationIgnored private var selectedTimelineGroupCacheKey: String?
     @ObservationIgnored private var selectedTimelineGroupCacheChannelID: ChannelID?
     @ObservationIgnored private var selectedTimelineGroupCache: [TimelineMessageGroup] = []
+    @ObservationIgnored private var selectedTimelineRenderItemCache: [TimelineRenderItem] = []
     @ObservationIgnored private var timelineRowPresentationCacheKey: String?
     @ObservationIgnored private var timelineRowPresentationCacheChannelID: ChannelID?
     @ObservationIgnored private var timelineRowPresentationCache: [MessageID: TimelineRowPresentation] = [:]
+    @ObservationIgnored private var phase60RowPresentationStates: [MessageID: TimelineRowPresentationState] = [:]
+    @ObservationIgnored private var phase60DesiredRowKeys: [MessageID: TimelineRowPreparationKey] = [:]
+    @ObservationIgnored private var phase60QueuedRows: [TimelineRowPreparationKey: Phase60QueuedRowPreparation] = [:]
+    @ObservationIgnored private var phase60RowQueueSequence: UInt64 = 0
+    @ObservationIgnored private var phase60RowWorkerTask: Task<Void, Never>?
+    @ObservationIgnored private var phase60ActiveRowKey: TimelineRowPreparationKey?
+    @ObservationIgnored private var phase60VisibleSkeletonIDs: Set<MessageID> = []
     @ObservationIgnored private var memberListGroupCacheKey: MemberListCacheKey?
     @ObservationIgnored private var memberListGroupCache: [MemberListGroup] = []
     @ObservationIgnored private var memberListDiagnosticsCache = RoleSortDiagnostics()
@@ -1000,12 +1016,14 @@ public final class MainShellViewModel {
         phase51ShellPresentationTask?.cancel()
         phase51ServerSettingsTask?.cancel()
         phase51TimelinePresentationTask?.cancel()
+        phase60RowWorkerTask?.cancel()
         phase51DiagnosticsPublishTask?.cancel()
         freezeDiagnosticsPublishTask?.cancel()
         selectedChannelLoadTask?.cancel()
         typingEndTask?.cancel()
         typingCleanupTask?.cancel()
         ackTasksByChannelID.values.forEach { $0.cancel() }
+        visibleRangeUpdateTasks.values.forEach { $0.cancel() }
         targetHighlightClearTask?.cancel()
         pinnedMessagesFetchTask?.cancel()
         pinnedMessageActionTasks.values.forEach { $0.cancel() }
@@ -1327,6 +1345,11 @@ public final class MainShellViewModel {
         cachedSelectedTimelineMessageGroups()
     }
 
+    public var selectedTimelineRenderItems: [TimelineRenderItem] {
+        guard selectedTimelineGroupCacheChannelID == selectedConversationChannelID else { return [] }
+        return selectedTimelineRenderItemCache
+    }
+
     public var selectedTimelinePresentationRevision: Int {
         messageController.presentationRevision(for: selectedConversationChannelID)
     }
@@ -1385,6 +1408,8 @@ public final class MainShellViewModel {
         selectedTimelineGroupCacheKey = key
         selectedTimelineGroupCacheChannelID = channelID
         selectedTimelineGroupCache = groups
+        selectedTimelineRenderItemCache = TimelineRenderItemBuilder.flatten(groups)
+        synchronizeTimelineRowStates(items: selectedTimelineRenderItemCache, channelID: channelID)
         timelinePresentationState = .ready(
             channelID: channelID,
             messageCount: messages.count,
@@ -1399,101 +1424,265 @@ public final class MainShellViewModel {
     }
 
     public func prepareSelectedTimelineRows() async {
-        let messages = selectedTimelineMessages
-        let key = timelineRowPresentationCacheKeyValue()
-        guard key != timelineRowPresentationCacheKey else { return }
         guard let channelID = selectedConversationChannelID else { return }
-        let snapshot = snapshot
-        let identitySnapshots = phase43IdentitySnapshots
-        let imageDataByKey = loadedImageResources
-        let currentUserID = currentUserID
-        let isRuntimeSendCapable = isRuntimeSendCapable
-        let developerControlsEnabled = isDeveloperControlsEnabled
-        let permissionsByChannelID = Dictionary(
-            uniqueKeysWithValues: Set(messages.map(\.message.channelID)).compactMap { channelID in
-                snapshot.channelsByID[channelID].map { channel in
-                    (channelID, channel.permissions ?? channel.serverID.flatMap {
-                        snapshot.serversByID[$0]?.defaultPermissions
-                    })
-                }
-            }
+        if selectedTimelineRenderItems.isEmpty, !selectedTimelineMessages.isEmpty {
+            await prepareSelectedTimelineGrouping()
+        }
+        let items = selectedTimelineRenderItems
+        synchronizeTimelineRowStates(items: items, channelID: channelID)
+        let anchor = initialTimelinePreparationAnchor()
+        let startupTargets = TimelineRowPreparationPlanner.startupTargets(
+            items: items,
+            anchorMessageID: anchor
         )
-        let worker = Task.detached(priority: .userInitiated) {
-            let assetContext = Phase52TimelineAssetContext(
-                snapshot: snapshot,
-                imageDataByKey: imageDataByKey
-            )
-            return Dictionary(uniqueKeysWithValues: messages.map { timelineMessage in
-                let message = timelineMessage.message
-                let customEmojiItems = assetContext.inlineCustomEmojiItems(for: message)
-                let referenceItems = assetContext.inlineReferenceItems(
-                    for: message,
-                    identitySnapshots: identitySnapshots,
-                    currentUserID: currentUserID
-                )
-                let server = snapshot.channelsByID[message.channelID]?.serverID.flatMap { snapshot.serversByID[$0] }
-                let channel = snapshot.channelsByID[message.channelID]
-                let display = identitySnapshots.resolvedDisplay(
-                    userID: message.authorID,
-                    user: message.user ?? snapshot.usersByID[message.authorID],
-                    member: message.member,
-                    server: server
-                )
-                let row = TimelineRowPresentation(
-                    messageID: message.id,
-                    authorDisplay: display,
-                    isSystemEvent: message.system != nil,
-                    preparedMarkdownContent: message.content.map {
-                        MarkdownContentPreparer.prepare($0, customEmojiItems: customEmojiItems, referenceItems: referenceItems)
-                    },
-                    attachmentItems: assetContext.attachmentItems(for: message),
-                    customEmojiItems: customEmojiItems,
-                    referenceItems: referenceItems,
-                    embedItems: assetContext.embedItems(for: message),
-                    actionItems: Phase52TimelineInteractionPreparer.actionItems(
-                        for: timelineMessage,
-                        currentUserID: currentUserID,
-                        channel: channel,
-                        permissions: permissionsByChannelID[message.channelID] ?? nil,
-                        isRuntimeSendCapable: isRuntimeSendCapable,
-                        developerControlsEnabled: developerControlsEnabled
-                    ),
-                    reactionItems: assetContext.reactionItems(
-                        for: message,
-                        currentUserID: currentUserID
-                    ),
-                    systemEventPresentation: Phase52TimelineInteractionPreparer.systemEventPresentation(
-                        for: message,
-                        snapshot: snapshot,
-                        identitySnapshots: identitySnapshots
-                    ),
-                    mentionsCurrentUser: Phase52TimelineInteractionPreparer.mentionsCurrentUser(message, currentUserID: currentUserID)
-                )
-                return (message.id, row)
-            })
-        }
-        let rows = await withTaskCancellationHandler {
-            await worker.value
-        } onCancel: {
-            worker.cancel()
-        }
-        guard !Task.isCancelled else {
-            timelinePresentationDiagnostics.cancellationCount += 1
-            return
-        }
-        guard key == timelineRowPresentationCacheKeyValue(), selectedConversationChannelID == channelID else {
-            timelinePresentationDiagnostics.staleResultDiscardCount += 1
-            return
-        }
-        timelineRowPresentationCacheKey = key
-        timelineRowPresentationCacheChannelID = channelID
-        timelineRowPresentationCache = rows
-        timelinePresentationDiagnostics.rowBuildCount += 1
+        let visibleTargets = TimelineRowPreparationPlanner.visibleTargets(
+            items: items,
+            visibleMessageIDs: pendingVisibleMessageIDsByChannelID[channelID]
+                ?? visibleMessageIDsByChannelID[channelID]
+                ?? []
+        )
+        enqueueTimelineRowPreparation(
+            visibleTargets + startupTargets,
+            channelID: channelID
+        )
+        await phase60RowWorkerTask?.value
     }
 
     public func timelineRowPresentation(for messageID: MessageID) -> TimelineRowPresentation? {
-        guard timelineRowPresentationCacheChannelID == selectedConversationChannelID else { return nil }
-        return timelineRowPresentationCache[messageID]
+        timelineRowPresentationState(for: messageID)?.presentation
+    }
+
+    public func timelineRowPresentationState(for messageID: MessageID) -> TimelineRowPresentationState? {
+        guard let channelID = selectedConversationChannelID,
+              let state = phase60RowPresentationStates[messageID],
+              state.channelID == channelID
+        else { return nil }
+        return state
+    }
+
+    private func synchronizeTimelineRowStates(items: [TimelineRenderItem], channelID: ChannelID) {
+        let validIDs = Set(items.map(\.id))
+        phase60RowPresentationStates = phase60RowPresentationStates.filter {
+            validIDs.contains($0.key) && $0.value.channelID == channelID
+        }
+        phase60DesiredRowKeys = phase60DesiredRowKeys.filter {
+            validIDs.contains($0.key) && $0.value.channelID == channelID
+        }
+        for item in items {
+            let revision = TimelineRowRevision.value(
+                for: item.timelineMessage,
+                inlineMediaRevision: phase51MediaRevision
+            )
+            let key = TimelineRowPreparationKey(
+                channelID: channelID,
+                messageID: item.id,
+                revision: revision
+            )
+            phase60DesiredRowKeys[item.id] = key
+            if let state = phase60RowPresentationStates[item.id] {
+                let wasPrepared = state.presentation != nil
+                state.request(revision: revision)
+                let visible = pendingVisibleMessageIDsByChannelID[channelID]
+                    ?? visibleMessageIDsByChannelID[channelID]
+                    ?? []
+                if wasPrepared,
+                   state.presentation == nil,
+                   visible.contains(item.id) {
+                    phase60VisibleSkeletonIDs.insert(item.id)
+                }
+            } else {
+                phase60RowPresentationStates[item.id] = TimelineRowPresentationState(
+                    messageID: item.id,
+                    channelID: channelID,
+                    revision: revision
+                )
+            }
+        }
+        let staleQueuedKeys = phase60QueuedRows.keys.filter {
+            phase60DesiredRowKeys[$0.messageID] != $0
+        }
+        for key in staleQueuedKeys {
+            phase60QueuedRows[key] = nil
+        }
+        phase60Diagnostics.staleRowDiscardCount += staleQueuedKeys.count
+        phase60Diagnostics.activeSkeletonCount = phase60VisibleSkeletonIDs.count
+    }
+
+    private func initialTimelinePreparationAnchor() -> MessageID? {
+        switch timelineViewport.pendingScrollIntent {
+        case let .message(messageID, _, _):
+            return messageID
+        case let .firstUnread(messageID):
+            return messageID
+        case let .preservePositionAfterPrepend(messageID), let .preserveVisibleAnchor(messageID):
+            return messageID
+        case .newest, .none:
+            break
+        }
+        guard let channelID = selectedConversationChannelID else { return nil }
+        return firstUnreadMessageID(for: channelID)
+    }
+
+    private func enqueueTimelineRowPreparation(
+        _ targets: [TimelineRowPreparationTarget],
+        channelID: ChannelID
+    ) {
+        guard channelID == selectedConversationChannelID else { return }
+        let itemsByID = Dictionary(uniqueKeysWithValues: selectedTimelineRenderItems.map { ($0.id, $0) })
+        for target in targets {
+            guard let item = itemsByID[target.messageID],
+                  let key = phase60DesiredRowKeys[target.messageID],
+                  key.channelID == channelID,
+                  let state = phase60RowPresentationStates[target.messageID]
+            else { continue }
+            phase60Diagnostics.rowRequestCount += 1
+            if state.revision == key.revision, state.presentation != nil {
+                phase60Diagnostics.rowDedupeCount += 1
+                continue
+            }
+            if phase60ActiveRowKey == key {
+                phase60Diagnostics.rowDedupeCount += 1
+                continue
+            }
+            if var queued = phase60QueuedRows[key] {
+                if target.priority.rawValue < queued.priority.rawValue {
+                    queued.priority = target.priority
+                    phase60QueuedRows[key] = queued
+                }
+                phase60Diagnostics.rowDedupeCount += 1
+                continue
+            }
+
+            let message = item.timelineMessage.message
+            let channel = snapshot.channelsByID[message.channelID]
+            let permissions = channel?.permissions ?? channel?.serverID.flatMap {
+                snapshot.serversByID[$0]?.defaultPermissions
+            }
+            phase60RowQueueSequence &+= 1
+            phase60QueuedRows[key] = Phase60QueuedRowPreparation(
+                key: key,
+                timelineMessage: item.timelineMessage,
+                priority: target.priority,
+                sequence: phase60RowQueueSequence,
+                snapshot: snapshot,
+                identitySnapshots: phase43IdentitySnapshots,
+                imageDataByKey: loadedImageResources,
+                currentUserID: currentUserID,
+                permissions: permissions,
+                isRuntimeSendCapable: isRuntimeSendCapable,
+                developerControlsEnabled: isDeveloperControlsEnabled
+            )
+            phase60Diagnostics.maximumQueueDepth = max(
+                phase60Diagnostics.maximumQueueDepth,
+                phase60QueuedRows.count + (phase60ActiveRowKey == nil ? 0 : 1)
+            )
+        }
+        startTimelineRowPreparationWorkerIfNeeded()
+    }
+
+    private func startTimelineRowPreparationWorkerIfNeeded() {
+        guard phase60RowWorkerTask == nil, !phase60QueuedRows.isEmpty else { return }
+        phase60RowWorkerTask = Task { [weak self] in
+            await self?.drainTimelineRowPreparationQueue()
+        }
+    }
+
+    private func drainTimelineRowPreparationQueue() async {
+        defer {
+            phase60ActiveRowKey = nil
+            phase60RowWorkerTask = nil
+            if !phase60QueuedRows.isEmpty {
+                startTimelineRowPreparationWorkerIfNeeded()
+            }
+        }
+        while !Task.isCancelled {
+            guard let next = phase60QueuedRows.values.min(by: {
+                if $0.priority.rawValue != $1.priority.rawValue {
+                    return $0.priority.rawValue < $1.priority.rawValue
+                }
+                return $0.sequence < $1.sequence
+            }) else { return }
+            phase60QueuedRows[next.key] = nil
+            phase60ActiveRowKey = next.key
+            let worker = Task.detached(priority: .userInitiated) {
+                Phase60TimelineRowPreparer.prepare(
+                    timelineMessage: next.timelineMessage,
+                    snapshot: next.snapshot,
+                    identitySnapshots: next.identitySnapshots,
+                    imageDataByKey: next.imageDataByKey,
+                    currentUserID: next.currentUserID,
+                    permissions: next.permissions,
+                    isRuntimeSendCapable: next.isRuntimeSendCapable,
+                    developerControlsEnabled: next.developerControlsEnabled
+                )
+            }
+            let presentation = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled else { return }
+            guard selectedConversationChannelID == next.key.channelID,
+                  phase60DesiredRowKeys[next.key.messageID] == next.key,
+                  let state = phase60RowPresentationStates[next.key.messageID],
+                  state.channelID == next.key.channelID,
+                  state.revision == next.key.revision
+            else {
+                phase60Diagnostics.staleRowDiscardCount += 1
+                continue
+            }
+            if phase60VisibleSkeletonIDs.remove(next.key.messageID) != nil {
+                phase60Diagnostics.activeSkeletonCount = max(
+                    0,
+                    phase60Diagnostics.activeSkeletonCount - 1
+                )
+            }
+            state.publish(presentation, revision: next.key.revision)
+            phase60Diagnostics.rowCompletionCount += 1
+            phase60ActiveRowKey = nil
+        }
+    }
+
+    private func requestVisibleTimelineRows() {
+        guard let channelID = selectedConversationChannelID else { return }
+        let visibleIDs = pendingVisibleMessageIDsByChannelID[channelID] ?? []
+        enqueueTimelineRowPreparation(
+            TimelineRowPreparationPlanner.visibleTargets(
+                items: selectedTimelineRenderItems,
+                visibleMessageIDs: visibleIDs
+            ),
+            channelID: channelID
+        )
+    }
+
+    public func timelineSkeletonVisibilityChanged(messageID: MessageID, isVisible: Bool) {
+        if isVisible {
+            guard phase60RowPresentationStates[messageID]?.presentation == nil,
+                  phase60VisibleSkeletonIDs.insert(messageID).inserted
+            else { return }
+            phase60Diagnostics.activeSkeletonCount = phase60VisibleSkeletonIDs.count
+        } else {
+            phase60VisibleSkeletonIDs.remove(messageID)
+            phase60Diagnostics.activeSkeletonCount = phase60VisibleSkeletonIDs.count
+        }
+    }
+
+    private func resetPhase60TimelineWork(previousChannelID: ChannelID?) {
+        if let previousChannelID {
+            visibleRangeUpdateTasks[previousChannelID]?.cancel()
+            visibleRangeUpdateTasks[previousChannelID] = nil
+            pendingVisibleMessageIDsByChannelID[previousChannelID] = nil
+        }
+        phase60Diagnostics.staleRowDiscardCount += phase60QueuedRows.count
+            + (phase60ActiveRowKey == nil ? 0 : 1)
+        phase60RowWorkerTask?.cancel()
+        phase60ActiveRowKey = nil
+        phase60QueuedRows.removeAll(keepingCapacity: true)
+        phase60DesiredRowKeys.removeAll(keepingCapacity: true)
+        phase60RowPresentationStates.removeAll(keepingCapacity: true)
+        phase60VisibleSkeletonIDs.removeAll(keepingCapacity: true)
+        selectedTimelineRenderItemCache.removeAll(keepingCapacity: true)
+        phase60Diagnostics.activeSkeletonCount = 0
     }
 
     public var selectedChannelMessageState: ChannelMessageState {
@@ -8606,7 +8795,9 @@ public final class MainShellViewModel {
 
     public func updateTimelineVisibility(messageID: MessageID, channelID: ChannelID, isVisible: Bool) {
         guard channelID == selectedConversationChannelID else { return }
-        var visible = visibleMessageIDsByChannelID[channelID] ?? []
+        var visible = pendingVisibleMessageIDsByChannelID[channelID]
+            ?? visibleMessageIDsByChannelID[channelID]
+            ?? []
         let wasVisible = visible.contains(messageID)
         guard wasVisible != isVisible else { return }
         if isVisible {
@@ -8617,9 +8808,31 @@ public final class MainShellViewModel {
                 cancelInlineImagePreviews(for: message)
             }
         }
-        timelineVisibleRangeUpdateCount += 1
-        updateFreezePerformanceDiagnostics(marker: "visible range updated")
+        pendingVisibleMessageIDsByChannelID[channelID] = visible
+        phase60Diagnostics.visibilityEventCount += 1
+        requestVisibleTimelineRows()
+
+        visibleRangeUpdateTasks[channelID]?.cancel()
+        let delay = timelineTuning.visibleRangeUpdateDebounceMilliseconds
+        visibleRangeUpdateTasks[channelID] = Task { [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(for: .milliseconds(delay))
+            }
+            guard !Task.isCancelled else { return }
+            self?.flushTimelineVisibility(channelID: channelID)
+        }
+    }
+
+    private func flushTimelineVisibility(channelID: ChannelID) {
+        visibleRangeUpdateTasks[channelID] = nil
+        guard channelID == selectedConversationChannelID,
+              let visible = pendingVisibleMessageIDsByChannelID[channelID]
+        else { return }
+        pendingVisibleMessageIDsByChannelID[channelID] = nil
         visibleMessageIDsByChannelID[channelID] = visible
+        timelineVisibleRangeUpdateCount += 1
+        phase60Diagnostics.coalescedViewportFlushCount += 1
+        updateFreezePerformanceDiagnostics(marker: "visible range coalesced")
         let loadedIDs = selectedTimelineMessages.map(\.message.id)
         timelineViewport = viewportReducer.visibleRangeChanged(
             timelineViewport,
@@ -8986,6 +9199,15 @@ public final class MainShellViewModel {
         reactionGroups: \(actions.reactionGroupCount)
         currentUserReactions: \(actions.currentUserReactionCount)
         pendingDeleteConfirmation: \(actions.hasPendingDeleteConfirmation ? "yes" : "no")
+        Phase 60 timeline hardening
+        visibilityEvents: \(phase60Diagnostics.visibilityEventCount)
+        coalescedViewportFlushes: \(phase60Diagnostics.coalescedViewportFlushCount)
+        rowRequests: \(phase60Diagnostics.rowRequestCount)
+        rowDedupes: \(phase60Diagnostics.rowDedupeCount)
+        rowCompletions: \(phase60Diagnostics.rowCompletionCount)
+        staleRowDiscards: \(phase60Diagnostics.staleRowDiscardCount)
+        activeSkeletons: \(phase60Diagnostics.activeSkeletonCount)
+        maximumQueueDepth: \(phase60Diagnostics.maximumQueueDepth)
         DM route diagnostics
         clickedChannel: \(TimelineCopyFormatter.shortID(dm.clickedChannelID?.rawValue))
         selectedConversation: \(TimelineCopyFormatter.shortID(dm.selectedConversationChannelID?.rawValue))
@@ -13025,6 +13247,7 @@ public struct CredentialSetupView: View {
         let freeze = viewModel.freezePerformanceDiagnostics
         let phase51 = viewModel.phase51PerformanceDiagnostics
         let phase59Reactions = viewModel.phase59ReactionDiagnostics
+        let phase60 = viewModel.phase60Diagnostics
         let presentation = viewModel.timelinePresentationDiagnostics
         let roleSort = viewModel.memberRoleSortDiagnostics
         let dmConversation = viewModel.dmDiagnostics
@@ -13056,6 +13279,8 @@ public struct CredentialSetupView: View {
             LabeledContent("Phase 51 presentations", value: "shell \(phase51.shellBuildCount), timeline \(phase51.timelineBuildCount), cache \(phase51.timelineCacheHitCount), settings \(phase51.serverSettingsBuildCount), cancelled \(phase51.serverSettingsCancellationCount)")
             LabeledContent("Phase 59 shell", value: "requests \(phase51.shellRequestCount), skips \(phase51.shellCacheHitCount), coalesced \(phase51.shellCoalescedCount), discarded \(phase51.shellDiscardedCount), relationship users \(phase51.shellRelationshipCandidateCount)")
             LabeledContent("Phase 59 reactions", value: "attempts \(phase59Reactions.attemptCount), optimistic \(phase59Reactions.optimisticMutationCount), success \(phase59Reactions.successCount), rollback \(phase59Reactions.rollbackCount), deduped \(phase59Reactions.deduplicatedCount), unavailable \(phase59Reactions.unavailableCount)")
+            LabeledContent("Phase 60 viewport", value: "events \(phase60.visibilityEventCount), flushes \(phase60.coalescedViewportFlushCount)")
+            LabeledContent("Phase 60 rows", value: "requests \(phase60.rowRequestCount), dedupes \(phase60.rowDedupeCount), completed \(phase60.rowCompletionCount), stale \(phase60.staleRowDiscardCount), skeletons \(phase60.activeSkeletonCount), max queue \(phase60.maximumQueueDepth)")
             LabeledContent("Timeline presentation", value: "groups \(presentation.groupingBuildCount), rows \(presentation.rowBuildCount), visible \(presentation.visibleMessageCount)/\(presentation.visibleGroupCount), cancelled \(presentation.cancellationCount), stale \(presentation.staleResultDiscardCount)")
             LabeledContent("Realtime coalescing", value: "\(viewModel.sessionCoordinator?.coalescedRealtimeUpdateCount ?? 0) pending updates merged")
             LabeledContent("Phase 51 diagnostics", value: "published \(phase51.diagnosticsPublishCount), throttled \(phase51.diagnosticsThrottleCount), budget violations \(phase51.mainThreadBudgetViolationCount)")
@@ -13842,7 +14067,7 @@ public struct MessageTimelineView: View {
     public var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: viewModel.messageDensity == .compact ? StoatSpacing.small : StoatSpacing.medium) {
+                LazyVStack(alignment: .leading, spacing: 0) {
                     if viewModel.selectedConversationChannel == nil {
                         EmptyStateView(title: emptyTitle, message: emptyMessage)
                             .frame(maxWidth: .infinity)
@@ -13986,8 +14211,8 @@ public struct MessageTimelineView: View {
                 .frame(maxWidth: .infinity)
         }
         unreadSeparator
-        let groups = viewModel.selectedTimelineMessageGroups
-        if groups.isEmpty, !viewModel.selectedTimelineMessages.isEmpty {
+        let renderItems = viewModel.selectedTimelineRenderItems
+        if renderItems.isEmpty, !viewModel.selectedTimelineMessages.isEmpty {
             HStack(spacing: StoatSpacing.small) {
                 ProgressView()
                     .controlSize(.small)
@@ -13998,8 +14223,14 @@ public struct MessageTimelineView: View {
             .frame(maxWidth: .infinity)
             .accessibilityLabel("Preparing loaded messages")
         } else {
-            ForEach(groups) { group in
-                TimelineMessageGroupView(group: group, author: viewModel.snapshot.usersByID[group.authorID], viewModel: viewModel)
+            ForEach(renderItems) { item in
+                TimelineRenderItemView(item: item, viewModel: viewModel)
+                    .padding(
+                        .top,
+                        item.startsGroup
+                            ? (viewModel.messageDensity == .compact ? StoatSpacing.small : StoatSpacing.medium)
+                            : 0
+                    )
             }
         }
         newestIndicator
@@ -14207,148 +14438,152 @@ private struct Phase43SystemEventRow: View {
     }
 }
 
-public struct TimelineMessageGroupView: View {
+public struct TimelineRenderItemView: View {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
-    private let group: TimelineMessageGroup
-    private let author: User?
+    private let item: TimelineRenderItem
     private let viewModel: MainShellViewModel
 
-    public init(group: TimelineMessageGroup, author: User?, viewModel: MainShellViewModel) {
-        self.group = group
-        self.author = author
+    public init(item: TimelineRenderItem, viewModel: MainShellViewModel) {
+        self.item = item
         self.viewModel = viewModel
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(group.messages.enumerated()), id: \.element.id) { index, timelineMessage in
-                VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-                    if viewModel.inlineEditState?.messageID == timelineMessage.message.id {
-                        InlineMessageEditor(viewModel: viewModel)
-                            .padding(.leading, index == 0 ? 0 : StoatSize.avatar + StoatSpacing.medium)
-                    } else if timelineMessage.message.system != nil {
-                        systemEventRow(timelineMessage)
-                    } else {
-                        let rowPresentation = viewModel.timelineRowPresentation(for: timelineMessage.message.id)
-                        MessageRow(
-                            message: timelineMessage.message,
-                            author: author,
-                            authorDisplayNameOverride: rowPresentation?.authorDisplay.displayName ?? viewModel.resolvedUserDisplay(for: timelineMessage.message).displayName,
-                            authorDisplayColor: roleColor(for: timelineMessage.message),
-                            showsHeader: index == 0,
-                            statusText: accessibilityStatus(for: timelineMessage),
-                            isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id,
-                            isFocused: viewModel.timelineSelection.focus.messageID == timelineMessage.message.id && viewModel.timelineSelection.focus.mode != .none,
-                            isSearchHighlighted: viewModel.isSearchHighlighted(timelineMessage.message.id),
-                            isCurrentSearchResult: viewModel.isCurrentSearchResult(timelineMessage.message.id),
-                            isTargetHighlighted: viewModel.isTargetMessageHighlighted(timelineMessage.message.id, channelID: timelineMessage.message.channelID),
-                            isCompactDensity: viewModel.messageDensity == .compact,
-                            searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
-                            replyPreviewItem: viewModel.replyPreviewItem(for: timelineMessage.message),
-                            attachmentItems: viewModel.hydratedAttachmentItems(rowPresentation?.attachmentItems ?? []),
-                            customEmojiItems: rowPresentation?.customEmojiItems ?? [],
-                            referenceItems: rowPresentation?.referenceItems ?? [:],
-                            preparedMarkdownContent: rowPresentation?.preparedMarkdownContent,
-                            embedItems: viewModel.hydratedEmbedItems(rowPresentation?.embedItems ?? []),
-                            authorAvatarData: viewModel.imageData(for: rowPresentation?.authorDisplay.avatarFile ?? viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile, kind: .userAvatar),
-                            actionItems: rowActionItems(for: timelineMessage, presentation: rowPresentation),
-                            reactionItems: rowReactionItems(for: timelineMessage, presentation: rowPresentation),
-                            mentionsCurrentUser: rowPresentation?.mentionsCurrentUser ?? false,
-                            onMessageAction: { actionID in
-                                select(timelineMessage, source: .contextMenu)
-                                viewModel.performMessageAction(actionID, on: timelineMessage)
-                            },
-                            onToggleReaction: { emoji in
-                                select(timelineMessage)
-                                Task { await viewModel.toggleReaction(emoji, on: timelineMessage) }
-                            },
-                            onPreviewAttachment: { item in
-                                Task { await viewModel.previewAttachment(item) }
-                            },
-                            onDownloadAttachment: { item in
-                                Task { await viewModel.downloadAttachment(item) }
-                            },
-                            onOpenAttachment: { item in
-                                Task { await viewModel.openAttachmentExternally(item) }
-                            },
-                            onRetryAttachment: { item in
-                                Task { await viewModel.retryAttachmentPreview(item) }
-                            },
-                            onPreviewEmbedMedia: { item in
-                                Task { await viewModel.previewEmbedMedia(item) }
-                            },
-                            onDownloadEmbedMedia: { item in
-                                Task { await viewModel.downloadEmbedMedia(item) }
-                            },
-                            onOpenEmbedMedia: { item in
-                                Task { await viewModel.openEmbedMediaExternally(item) }
-                            },
-                            onRetryEmbedMedia: { item in
-                                Task { await viewModel.retryEmbedMediaPreview(item) }
-                            },
-                            onOpenAuthorProfile: {
-                                let display = rowPresentation?.authorDisplay ?? viewModel.resolvedUserDisplay(for: timelineMessage.message)
-                                viewModel.showUserProfile(display.userID, source: .messageName, serverID: display.serverContextID)
-                            },
-                            onOpenReplyPreview: {
-                                Task { await viewModel.openReplyPreview(for: timelineMessage.message) }
-                            },
-                            onOpenMention: { mentionedUserID in
-                                let serverID = rowPresentation?.authorDisplay.serverContextID
-                                viewModel.showUserProfile(mentionedUserID, source: .mention, serverID: serverID)
-                            }
+        let timelineMessage = item.timelineMessage
+        let rowState = viewModel.timelineRowPresentationState(for: timelineMessage.message.id)
+        let rowPresentation = rowState?.presentation
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            if viewModel.inlineEditState?.messageID == timelineMessage.message.id {
+                InlineMessageEditor(viewModel: viewModel)
+                    .padding(.leading, item.showsHeader ? 0 : StoatSize.avatar + StoatSpacing.medium)
+            } else if rowPresentation == nil {
+                TimelineSkeletonRow(showsAvatar: item.showsHeader)
+            } else if timelineMessage.message.system != nil {
+                systemEventRow(timelineMessage, presentation: rowPresentation)
+            } else {
+                MessageRow(
+                    message: timelineMessage.message,
+                    author: viewModel.snapshot.usersByID[item.authorID],
+                    authorDisplayNameOverride: rowPresentation?.authorDisplay.displayName,
+                    authorDisplayColor: roleColor(for: timelineMessage.message),
+                    showsHeader: item.showsHeader,
+                    statusText: accessibilityStatus(for: timelineMessage),
+                    isSelected: viewModel.timelineSelection.messageID == timelineMessage.message.id,
+                    isFocused: viewModel.timelineSelection.focus.messageID == timelineMessage.message.id && viewModel.timelineSelection.focus.mode != .none,
+                    isSearchHighlighted: viewModel.isSearchHighlighted(timelineMessage.message.id),
+                    isCurrentSearchResult: viewModel.isCurrentSearchResult(timelineMessage.message.id),
+                    isTargetHighlighted: viewModel.isTargetMessageHighlighted(timelineMessage.message.id, channelID: timelineMessage.message.channelID),
+                    isCompactDensity: viewModel.messageDensity == .compact,
+                    searchAccessibilityStatus: viewModel.searchHighlightStatus(for: timelineMessage.message.id),
+                    replyPreviewItem: viewModel.replyPreviewItem(for: timelineMessage.message),
+                    attachmentItems: viewModel.hydratedAttachmentItems(rowPresentation?.attachmentItems ?? []),
+                    customEmojiItems: rowPresentation?.customEmojiItems ?? [],
+                    referenceItems: rowPresentation?.referenceItems ?? [:],
+                    preparedMarkdownContent: rowPresentation?.preparedMarkdownContent,
+                    embedItems: viewModel.hydratedEmbedItems(rowPresentation?.embedItems ?? []),
+                    authorAvatarData: viewModel.imageData(for: rowPresentation?.authorDisplay.avatarFile, kind: .userAvatar),
+                    actionItems: rowActionItems(for: timelineMessage, presentation: rowPresentation),
+                    reactionItems: rowReactionItems(for: timelineMessage, presentation: rowPresentation),
+                    mentionsCurrentUser: rowPresentation?.mentionsCurrentUser ?? false,
+                    onMessageAction: { actionID in
+                        select(timelineMessage, source: .contextMenu)
+                        viewModel.performMessageAction(actionID, on: timelineMessage)
+                    },
+                    onToggleReaction: { emoji in
+                        select(timelineMessage)
+                        Task { await viewModel.toggleReaction(emoji, on: timelineMessage) }
+                    },
+                    onPreviewAttachment: { value in Task { await viewModel.previewAttachment(value) } },
+                    onDownloadAttachment: { value in Task { await viewModel.downloadAttachment(value) } },
+                    onOpenAttachment: { value in Task { await viewModel.openAttachmentExternally(value) } },
+                    onRetryAttachment: { value in Task { await viewModel.retryAttachmentPreview(value) } },
+                    onPreviewEmbedMedia: { value in Task { await viewModel.previewEmbedMedia(value) } },
+                    onDownloadEmbedMedia: { value in Task { await viewModel.downloadEmbedMedia(value) } },
+                    onOpenEmbedMedia: { value in Task { await viewModel.openEmbedMediaExternally(value) } },
+                    onRetryEmbedMedia: { value in Task { await viewModel.retryEmbedMediaPreview(value) } },
+                    onOpenAuthorProfile: {
+                        guard let display = rowPresentation?.authorDisplay else { return }
+                        viewModel.showUserProfile(display.userID, source: .messageName, serverID: display.serverContextID)
+                    },
+                    onOpenReplyPreview: {
+                        Task { await viewModel.openReplyPreview(for: timelineMessage.message) }
+                    },
+                    onOpenMention: { mentionedUserID in
+                        viewModel.showUserProfile(
+                            mentionedUserID,
+                            source: .mention,
+                            serverID: rowPresentation?.authorDisplay.serverContextID
                         )
-                        .id(timelineMessage.message.id)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                        .onAppear {
-                            viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
-                            let display = viewModel.resolvedUserDisplay(for: timelineMessage.message)
-                            viewModel.noteVisibleIdentity(
-                                userID: display.userID,
-                                user: timelineMessage.message.user,
-                                member: timelineMessage.message.member,
-                                serverID: display.serverContextID,
-                                source: .visibleMessage
-                            )
-                            viewModel.loadInlineImagePreviews(for: timelineMessage.message)
-                            viewModel.loadModeledEmbedMediaPreviews(for: timelineMessage.message)
-                            if index == 0 {
-                                viewModel.imageResourceBecameVisible(
-                                    viewModel.resolvedUserDisplay(for: timelineMessage.message).avatarFile,
-                                    kind: .userAvatar,
-                                    consumerID: timelineAvatarConsumerID(for: timelineMessage)
-                                )
-                            }
-                            viewModel.loadCustomEmojiImages(for: timelineMessage.message)
-                            viewModel.prepareReplyPreview(for: timelineMessage.message)
-                        }
-                        .onDisappear {
-                            viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
-                            if index == 0 {
-                                viewModel.imageResourceBecameHidden(consumerID: timelineAvatarConsumerID(for: timelineMessage))
-                            }
-                        }
-                        .onTapGesture {
-                            select(timelineMessage)
-                        }
-                        .contextMenu {
-                            ForEach(rowPresentation?.actionItems ?? []) { item in
-                                Button(role: buttonRole(for: item)) {
-                                    select(timelineMessage, source: .contextMenu)
-                                    viewModel.performMessageAction(item.id, on: timelineMessage)
-                                } label: {
-                                    Label(item.title, systemImage: item.systemImage)
-                                }
-                                .disabled(!item.availability.isAvailable)
-                            }
-                        }
                     }
-                    statusView(for: timelineMessage)
+                )
+            }
+            statusView(for: timelineMessage)
+        }
+        .id(timelineMessage.message.id)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onAppear {
+            viewModel.updateTimelineVisibility(
+                messageID: timelineMessage.message.id,
+                channelID: timelineMessage.message.channelID,
+                isVisible: true
+            )
+            viewModel.timelineSkeletonVisibilityChanged(
+                messageID: timelineMessage.message.id,
+                isVisible: true
+            )
+            if timelineMessage.message.system != nil {
+                viewModel.noteVisibleSystemEvent(timelineMessage.message)
+            } else {
+                let display = viewModel.resolvedUserDisplay(for: timelineMessage.message)
+                viewModel.noteVisibleIdentity(
+                    userID: display.userID,
+                    user: timelineMessage.message.user,
+                    member: timelineMessage.message.member,
+                    serverID: display.serverContextID,
+                    source: .visibleMessage
+                )
+                viewModel.loadInlineImagePreviews(for: timelineMessage.message)
+                viewModel.loadModeledEmbedMediaPreviews(for: timelineMessage.message)
+                if item.showsHeader {
+                    viewModel.imageResourceBecameVisible(
+                        display.avatarFile,
+                        kind: .userAvatar,
+                        consumerID: timelineAvatarConsumerID(for: timelineMessage)
+                    )
                 }
+                viewModel.loadCustomEmojiImages(for: timelineMessage.message)
+                viewModel.prepareReplyPreview(for: timelineMessage.message)
             }
         }
-        .id(group.id)
+        .onDisappear {
+            viewModel.updateTimelineVisibility(
+                messageID: timelineMessage.message.id,
+                channelID: timelineMessage.message.channelID,
+                isVisible: false
+            )
+            viewModel.timelineSkeletonVisibilityChanged(
+                messageID: timelineMessage.message.id,
+                isVisible: false
+            )
+            if item.showsHeader {
+                viewModel.imageResourceBecameHidden(
+                    consumerID: timelineAvatarConsumerID(for: timelineMessage)
+                )
+            }
+        }
+        .onTapGesture { select(timelineMessage) }
+        .contextMenu {
+            ForEach(rowPresentation?.actionItems ?? []) { action in
+                Button(role: buttonRole(for: action)) {
+                    select(timelineMessage, source: .contextMenu)
+                    viewModel.performMessageAction(action.id, on: timelineMessage)
+                } label: {
+                    Label(action.title, systemImage: action.systemImage)
+                }
+                .disabled(!action.availability.isAvailable)
+            }
+        }
     }
 
     private func select(_ timelineMessage: TimelineMessage, source: MessageFocusSource = .mouse) {
@@ -14360,9 +14595,12 @@ public struct TimelineMessageGroupView: View {
         "timeline-avatar-\(timelineMessage.message.channelID.rawValue)-\(timelineMessage.message.id.rawValue)"
     }
 
-    @ViewBuilder private func systemEventRow(_ timelineMessage: TimelineMessage) -> some View {
+    @ViewBuilder private func systemEventRow(
+        _ timelineMessage: TimelineMessage,
+        presentation: TimelineRowPresentation?
+    ) -> some View {
         Phase43SystemEventRow(
-            presentation: viewModel.timelineRowPresentation(for: timelineMessage.message.id)?.systemEventPresentation
+            presentation: presentation?.systemEventPresentation
                 ?? SystemEventPresentation.text("System event"),
             onOpenParticipant: { participant in
                 viewModel.showUserProfile(
@@ -14373,13 +14611,6 @@ public struct TimelineMessageGroupView: View {
             }
         )
         .id(timelineMessage.message.id)
-        .onAppear {
-            viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: true)
-            viewModel.noteVisibleSystemEvent(timelineMessage.message)
-        }
-        .onDisappear {
-            viewModel.updateTimelineVisibility(messageID: timelineMessage.message.id, channelID: timelineMessage.message.channelID, isVisible: false)
-        }
     }
 
     private func rowActionItems(

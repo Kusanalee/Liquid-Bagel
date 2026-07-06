@@ -361,4 +361,20 @@ final class StoatUITests: XCTestCase {
         }
         XCTAssertTrue(isSynchronouslyCached)
     }
+
+    @MainActor
+    func testPhase60TimelineSkeletonHonorsReduceMotionPolicy() {
+        XCTAssertTrue(TimelineSkeletonAnimationPolicy.usesShimmer(reduceMotion: false))
+        XCTAssertFalse(TimelineSkeletonAnimationPolicy.usesShimmer(reduceMotion: true))
+        _ = TimelineSkeletonRow()
+        _ = MessageRow(
+            message: Message(
+                id: "phase60-row",
+                channelID: "phase60-channel",
+                authorID: "phase60-author",
+                content: "Prepared only"
+            ),
+            author: nil
+        )
+    }
 }
