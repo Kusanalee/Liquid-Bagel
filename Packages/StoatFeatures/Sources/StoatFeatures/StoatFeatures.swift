@@ -8105,6 +8105,7 @@ public final class MainShellViewModel {
         recordMessageSendDiagnostics(channelID: channelID, stage: .buildingPayload, result: .pending, error: nil)
         let content = uploadedState.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let draftState = uploadedState
+        let authorIdentity = localSendAuthorIdentity(for: channelID)
         let replies = draftState.replyContext.map { [MessageReply(id: $0.messageID, mention: draftState.shouldMentionReplyAuthor)] }
         let attachmentIDs = draftState.attachments.compactMap(\.uploadedFileID)
         let attachmentFiles = draftState.attachments.compactMap { draft -> File? in
@@ -8122,7 +8123,16 @@ public final class MainShellViewModel {
         composerError = nil
         recordMessageSendDiagnostics(channelID: channelID, stage: .creatingOptimisticMessage, result: .pending, error: nil)
         recordMessageSendDiagnostics(channelID: channelID, stage: .sendingRequest, result: .pending, error: nil)
-        let didSend = await messageController.sendMessage(channelID: channelID, content: content, replies: replies, attachments: attachmentIDs, attachmentFiles: attachmentFiles, handler: messageActionHandler)
+        let didSend = await messageController.sendMessage(
+            channelID: channelID,
+            content: content,
+            replies: replies,
+            attachments: attachmentIDs,
+            attachmentFiles: attachmentFiles,
+            authorUser: authorIdentity.user,
+            authorMember: authorIdentity.member,
+            handler: messageActionHandler
+        )
         if didSend {
             composerDrafts[channelID] = ComposerDraftState(channelID: channelID)
             phase44Diagnostics.replyComposerClearedAfterSendCount += draftState.replyContext == nil ? 0 : 1
@@ -8151,6 +8161,45 @@ public final class MainShellViewModel {
     private func localImagePreviewData(for draft: ComposerAttachmentDraft) -> Data? {
         guard draft.kind == .image else { return nil }
         return draft.previewData
+    }
+
+    private func localSendAuthorIdentity(for channelID: ChannelID) -> (user: User?, member: ServerMember?) {
+        guard let currentUserID else { return (nil, nil) }
+        let snapshotUser = snapshot.usersByID[currentUserID]
+        let presentationUser = currentUserForPresentation?.id == currentUserID ? currentUserForPresentation : nil
+        let serverID = snapshot.channelsByID[channelID]?.serverID
+        return (
+            user: snapshotUser ?? presentationUser,
+            member: member(for: currentUserID, serverID: serverID)
+        )
+    }
+
+    func localSendFallbackPresentation(for timelineMessage: TimelineMessage) -> TimelineRowPresentation? {
+        guard timelineMessage.message.nonce != nil,
+              timelineMessage.message.authorID == currentUserID
+        else { return nil }
+        let message = timelineMessage.message
+        return TimelineRowPresentation(
+            messageID: message.id,
+            authorDisplay: resolvedUserDisplay(for: message),
+            isSystemEvent: message.system != nil,
+            attachmentItems: message.attachments?.map { AttachmentDisplayItem(file: $0) } ?? [],
+            embedItems: message.embeds?.enumerated().map { index, embed in
+                MessageEmbedDisplayItem(
+                    id: "embed-\(message.id.rawValue)-\(index)",
+                    embed: embed,
+                    mediaItem: embed.media.map { AttachmentDisplayItem(file: $0) }
+                )
+            } ?? [],
+            reactionItems: Phase17MessageActions.reactionSummaries(for: message, currentUserID: currentUserID).map { summary in
+                MessageReactionDisplayItem(
+                    emoji: summary.emoji,
+                    count: summary.count,
+                    hasCurrentUserReacted: summary.hasCurrentUserReacted
+                )
+            },
+            mentionsCurrentUser: Phase52TimelineInteractionPreparer.mentionsCurrentUser(message, currentUserID: currentUserID)
+        )
     }
 
     private func uploadAttachment(_ attachmentID: UUID, in channelID: ChannelID?) async {
@@ -13998,10 +14047,10 @@ public struct ChatPlaceholderView: View {
                         viewModel.insertEmoji(emoji, in: channel.id)
                     },
                     onPasteImageData: { data in
-                        viewModel.reviewPastedImageData(data, to: channel.id)
+                        viewModel.addPastedImageData(data, to: channel.id)
                     },
                     onPasteFileURLs: { urls in
-                        viewModel.reviewDroppedAttachmentURLs(urls, to: channel.id)
+                        viewModel.addAttachmentURLs(urls, to: channel.id)
                     },
                     onSend: {
                         Task { await viewModel.sendDraft(for: channel.id) }
@@ -14451,7 +14500,7 @@ public struct TimelineRenderItemView: View {
     public var body: some View {
         let timelineMessage = item.timelineMessage
         let rowState = viewModel.timelineRowPresentationState(for: timelineMessage.message.id)
-        let rowPresentation = rowState?.presentation
+        let rowPresentation = rowState?.presentation ?? viewModel.localSendFallbackPresentation(for: timelineMessage)
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
             if viewModel.inlineEditState?.messageID == timelineMessage.message.id {
                 InlineMessageEditor(viewModel: viewModel)

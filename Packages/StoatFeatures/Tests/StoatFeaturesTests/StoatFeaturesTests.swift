@@ -746,6 +746,39 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase61LocalSendPreservesWarmAvatarIdentityAcrossReconciliation() async throws {
+        var snapshot = MockShellData.snapshot
+        let server = try XCTUnwrap(snapshot.serversByID.values.first { $0.name == "Bagel Lab" })
+        let channelID = try XCTUnwrap(snapshot.channelsByID.values.first { $0.displayName == "general" }?.id)
+        let userAvatar = File(id: "phase61-user-avatar", tag: "avatars", filename: "user.png", contentType: "image/png", size: 8)
+        let memberAvatar = File(id: "phase61-member-avatar", tag: "avatars", filename: "member.png", contentType: "image/png", size: 8)
+        snapshot.usersByID[MockShellData.currentUserID]?.avatar = userAvatar
+        snapshot.membersByServerAndUserID[ServerMemberKey(serverID: server.id, userID: MockShellData.currentUserID)]?.avatar = memberAvatar
+
+        let handler = DelayedMessageActionHandler(delay: .milliseconds(80))
+        let model = MainShellViewModel(snapshot: snapshot, messageActionHandler: handler)
+        model.selectServer(server.id)
+        model.updateDraft("avatar continuity", for: channelID)
+
+        let sendTask = Task { await model.sendDraft(for: channelID) }
+        try await Task.sleep(for: .milliseconds(10))
+
+        let pending = try XCTUnwrap(model.selectedTimelineMessages.first { $0.message.content == "avatar continuity" })
+        XCTAssertEqual(pending.status, .pending)
+        XCTAssertEqual(pending.message.user?.avatar?.id, userAvatar.id)
+        XCTAssertEqual(pending.message.member?.avatar?.id, memberAvatar.id)
+        XCTAssertEqual(model.localSendFallbackPresentation(for: pending)?.authorDisplay.avatarFile?.id, memberAvatar.id)
+
+        await sendTask.value
+
+        let confirmed = try XCTUnwrap(model.selectedTimelineMessages.first { $0.message.content == "avatar continuity" })
+        XCTAssertEqual(confirmed.status, .confirmed)
+        XCTAssertEqual(confirmed.message.user?.avatar?.id, userAvatar.id)
+        XCTAssertEqual(confirmed.message.member?.avatar?.id, memberAvatar.id)
+        XCTAssertEqual(model.localSendFallbackPresentation(for: confirmed)?.authorDisplay.avatarFile?.id, memberAvatar.id)
+    }
+
+    @MainActor
     func testFailedSendMarksTimelineMessageFailed() async {
         let handler = MockMessageActionHandler(sendError: MessageActionError.unavailable("send failed"))
         let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
@@ -892,18 +925,71 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase33PastedImageOpensReviewBeforeQueueing() async throws {
+    func testPhase61PastedImageQueuesComposerAttachmentWithoutUploading() async throws {
         let uploader = MockAttachmentUploadHandler()
         let model = MainShellViewModel(snapshot: MockShellData.snapshot, attachmentUploadHandler: uploader)
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
 
-        model.reviewPastedImageData(Data(repeating: 2, count: 32), to: channelID)
+        model.addPastedImageData(Data(repeating: 2, count: 32), to: channelID)
 
-        let review = try XCTUnwrap(model.pendingAttachmentDrop)
-        XCTAssertEqual(review.attachableItems.first?.filename, "Pasted Image.png")
-        XCTAssertTrue(model.composerDraftState(for: channelID).attachments.isEmpty)
+        XCTAssertNil(model.pendingAttachmentDrop)
+        let attachment = try XCTUnwrap(model.composerDraftState(for: channelID).attachments.first)
+        XCTAssertEqual(attachment.filename, "Pasted Image.png")
+        XCTAssertEqual(attachment.kind, .image)
+        XCTAssertEqual(attachment.previewData, Data(repeating: 2, count: 32))
         let uploadCount = await uploader.uploadCount()
         XCTAssertEqual(uploadCount, 0)
+    }
+
+    @MainActor
+    func testPhase61PastedImageCanSendAttachmentOnly() async throws {
+        let uploader = MockAttachmentUploadHandler()
+        let handler = RecordingAttachmentMessageActionHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler, attachmentUploadHandler: uploader)
+        let server = model.servers.first { $0.name == "Bagel Lab" }!
+        model.selectServer(server.id)
+        let channelID = model.selection.channelID!
+
+        model.addPastedImageData(Data([137, 80, 78, 71]), to: channelID)
+        await model.sendDraft(for: channelID)
+
+        let uploadCount = await uploader.uploadCount()
+        let sent = await handler.sentSnapshot()
+        XCTAssertEqual(uploadCount, 1)
+        XCTAssertEqual(sent.first?.content, "")
+        XCTAssertEqual(sent.first?.attachments?.count, 1)
+        XCTAssertTrue(model.composerDraftState(for: channelID).attachments.isEmpty)
+    }
+
+    @MainActor
+    func testPhase61PastedFileURLsQueueComposerAttachmentsWithoutReviewOrUpload() async throws {
+        let uploader = MockAttachmentUploadHandler()
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, attachmentUploadHandler: uploader)
+        let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
+        let url = try makeTemporaryAttachment(name: "pasted-file.txt", contents: Data("paste".utf8))
+
+        model.addAttachmentURLs([url], to: channelID)
+
+        XCTAssertNil(model.pendingAttachmentDrop)
+        XCTAssertTrue(model.composerDraftState(for: channelID).attachments.first?.filename.hasSuffix("pasted-file.txt") == true)
+        let uploadCount = await uploader.uploadCount()
+        XCTAssertEqual(uploadCount, 0)
+    }
+
+    @MainActor
+    func testPhase61InvalidPastedImageAndMissingChannelStayOutOfComposer() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
+
+        model.addPastedImageData(Data(repeating: 1, count: AttachmentUploadLimits.maxFileBytes + 1), to: channelID)
+
+        XCTAssertTrue(model.composerDraftState(for: channelID).attachments.isEmpty)
+        XCTAssertEqual(model.composerError, "File too large. Liquid Bagel currently supports files up to 20 MB.")
+
+        model.addPastedImageData(Data(repeating: 2, count: 32), to: nil)
+
+        XCTAssertTrue(model.composerDraftState(for: nil).attachments.isEmpty)
+        XCTAssertEqual(model.composerError, "Select a channel or DM before attaching files.")
     }
 
     @MainActor

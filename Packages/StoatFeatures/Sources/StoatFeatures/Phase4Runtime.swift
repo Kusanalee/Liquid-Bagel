@@ -1237,6 +1237,8 @@ public final class ChannelMessageController {
         replies: [MessageReply]? = nil,
         attachments: [FileID] = [],
         attachmentFiles: [File] = [],
+        authorUser: User? = nil,
+        authorMember: ServerMember? = nil,
         handler: any MessageActionHandling
     ) async -> Bool {
         guard let currentUserID else {
@@ -1252,6 +1254,8 @@ public final class ChannelMessageController {
                 authorID: currentUserID,
                 content: content,
                 nonce: nonce,
+                user: authorUser?.id == currentUserID ? authorUser : nil,
+                member: authorMember?.id.userID == currentUserID ? authorMember : nil,
                 attachments: attachmentFiles.isEmpty ? nil : attachmentFiles,
                 replies: replies?.map(\.id)
             ),
@@ -1263,7 +1267,17 @@ public final class ChannelMessageController {
         do {
             let confirmed = try await handler.sendMessage(channelID: channelID, content: content, nonce: nonce, replies: replies, attachments: attachments.isEmpty ? nil : attachments)
             sendingChannelIDs.remove(channelID)
-            apply(.sendConfirmed(message: confirmed, nonce: nonce), channelID: channelID)
+            apply(
+                .sendConfirmed(
+                    message: Self.messagePreservingLocalAuthorIdentity(
+                        confirmed,
+                        fallbackUser: authorUser,
+                        fallbackMember: authorMember
+                    ),
+                    nonce: nonce
+                ),
+                channelID: channelID
+            )
             lastErrorByChannelID[channelID] = nil
             return true
         } catch {
@@ -1290,6 +1304,21 @@ public final class ChannelMessageController {
             lastErrorByChannelID[channelID] = error.userFacingMessage
             return false
         }
+    }
+
+    private static func messagePreservingLocalAuthorIdentity(
+        _ message: Message,
+        fallbackUser: User?,
+        fallbackMember: ServerMember?
+    ) -> Message {
+        var enriched = message
+        if enriched.user == nil, fallbackUser?.id == message.authorID {
+            enriched.user = fallbackUser
+        }
+        if enriched.member == nil, fallbackMember?.id.userID == message.authorID {
+            enriched.member = fallbackMember
+        }
+        return enriched
     }
 
     public func retrySend(_ timelineMessage: TimelineMessage, handler: any MessageActionHandling) async -> Bool {
