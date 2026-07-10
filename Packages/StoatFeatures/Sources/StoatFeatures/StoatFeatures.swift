@@ -618,6 +618,8 @@ public final class MainShellViewModel {
     public var loadedAttachmentOriginalData: [String: RemoteAttachmentData] = [:]
     public var attachmentLocalFiles: [String: URL] = [:]
     public var lastAttachmentAction: String?
+    private var clipboardPasteQueuedAttachment = false
+    private var clipboardPasteRejectedAttachment = false
     public var inlineImagePreviewPolicy: InlineImagePreviewPolicy = .automaticSmallImages
     public var loadedImageResources: [ImageCacheKey: Data] = [:]
     public var imageResourceStates: [ImageCacheKey: AttachmentPreviewState] = [:]
@@ -6972,6 +6974,63 @@ public final class MainShellViewModel {
             composerError = error.userFacingMessage
         }
         composerDrafts[channelID] = state
+    }
+
+    /// Records whether the immediate native paste path made it through the existing attachment
+    /// validation policy. The next coordinator diagnostic consumes this aggregate result, so the
+    /// developer-only log can distinguish a queued paste from a limit/size rejection.
+    public func addPastedImageDataFromClipboard(_ data: Data, to channelID: ChannelID?) {
+        let attachmentCountBefore = channelID.map { composerDraftState(for: $0).attachments.count } ?? 0
+        addPastedImageData(data, to: channelID)
+        recordClipboardPasteQueueMutation(
+            attachmentCountBefore: attachmentCountBefore,
+            channelID: channelID
+        )
+    }
+
+    public func addAttachmentURLsFromClipboard(_ urls: [URL], to channelID: ChannelID?) {
+        let attachmentCountBefore = channelID.map { composerDraftState(for: $0).attachments.count } ?? 0
+        addAttachmentURLs(urls, to: channelID)
+        recordClipboardPasteQueueMutation(
+            attachmentCountBefore: attachmentCountBefore,
+            channelID: channelID
+        )
+    }
+
+    public func recordComposerPasteDiagnostic(_ diagnostic: ComposerPasteDiagnostic) {
+        var resolvedDiagnostic = diagnostic
+        if diagnostic.outcome == .queued,
+           !clipboardPasteQueuedAttachment,
+           clipboardPasteRejectedAttachment {
+            resolvedDiagnostic.outcome = .rejected
+        }
+        clipboardPasteQueuedAttachment = false
+        clipboardPasteRejectedAttachment = false
+        lastAttachmentAction = resolvedDiagnostic.redactedDescription
+        switch resolvedDiagnostic.outcome {
+        case .rejected:
+            placeholderStatus = composerError
+        case .loadFailed:
+            composerError = "Could not read the clipboard attachment. Try copying it again."
+            placeholderStatus = composerError
+        case .unsupported:
+            composerError = "Clipboard media could not be read as an attachment."
+            placeholderStatus = composerError
+        case .queued, .duplicateSuppressed:
+            break
+        }
+    }
+
+    private func recordClipboardPasteQueueMutation(
+        attachmentCountBefore: Int,
+        channelID: ChannelID?
+    ) {
+        let attachmentCountAfter = channelID.map { composerDraftState(for: $0).attachments.count } ?? 0
+        if attachmentCountAfter > attachmentCountBefore {
+            clipboardPasteQueuedAttachment = true
+        } else {
+            clipboardPasteRejectedAttachment = true
+        }
     }
 
     public func pasteAttachmentFromClipboard() {
@@ -14093,10 +14152,13 @@ public struct ChatPlaceholderView: View {
                         viewModel.insertEmoji(emoji, in: channel.id)
                     },
                     onPasteImageData: { data in
-                        viewModel.addPastedImageData(data, to: channel.id)
+                        viewModel.addPastedImageDataFromClipboard(data, to: channel.id)
                     },
                     onPasteFileURLs: { urls in
-                        viewModel.addAttachmentURLs(urls, to: channel.id)
+                        viewModel.addAttachmentURLsFromClipboard(urls, to: channel.id)
+                    },
+                    onPasteDiagnostic: { diagnostic in
+                        viewModel.recordComposerPasteDiagnostic(diagnostic)
                     },
                     onSend: {
                         Task { await viewModel.sendDraft(for: channel.id) }

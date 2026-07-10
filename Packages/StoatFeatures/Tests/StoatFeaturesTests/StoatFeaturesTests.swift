@@ -7420,6 +7420,46 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertNil(history.messages.first { $0.message.id == foreignID }?.message.user)
     }
 
+    @MainActor
+    func testPhase62ComposerPasteDiagnosticsAreCategoricalAndSurfaceLoaderFailure() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.recordComposerPasteDiagnostic(
+            ComposerPasteDiagnostic(source: .swiftUI, outcome: .loadFailed, providerCount: 1)
+        )
+
+        let diagnostics = model.attachmentDiagnostics()
+        XCTAssertEqual(diagnostics.lastAttachmentAction, "Composer paste SwiftUI: unknown, loadFailed, providers 1, items 0")
+        XCTAssertEqual(model.composerError, "Could not read the clipboard attachment. Try copying it again.")
+        XCTAssertFalse(diagnostics.lastAttachmentAction?.contains("/") == true)
+        XCTAssertFalse(diagnostics.lastAttachmentAction?.contains("public.") == true)
+    }
+
+    @MainActor
+    func testPhase62ComposerPasteDiagnosticMarksValidationLimitAsRejected() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
+
+        model.addPastedImageDataFromClipboard(
+            Data(repeating: 1, count: AttachmentUploadLimits.maxFileBytes + 1),
+            to: channelID
+        )
+        model.recordComposerPasteDiagnostic(
+            ComposerPasteDiagnostic(
+                source: .swiftUI,
+                outcome: .queued,
+                mediaCategory: .image,
+                providerCount: 1,
+                itemCount: 1
+            )
+        )
+
+        XCTAssertEqual(
+            model.attachmentDiagnostics().lastAttachmentAction,
+            "Composer paste SwiftUI: image, rejected, providers 1, items 1"
+        )
+        XCTAssertEqual(model.composerError, "File too large. Liquid Bagel currently supports files up to 20 MB.")
+    }
+
     func testPhase61RenderIdentityStaysStableAcrossPendingToConfirmedForLocalSend() {
         let channelID: ChannelID = "phase61-render-channel"
         let userID: UserID = "phase61-render-user"

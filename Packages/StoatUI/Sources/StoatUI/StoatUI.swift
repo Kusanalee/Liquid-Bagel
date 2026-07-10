@@ -1178,6 +1178,54 @@ public struct ComposerMentionCandidate: Identifiable, Hashable, Sendable {
     }
 }
 
+/// A redacted, developer-only outcome for a media paste attempt. It deliberately carries only
+/// delivery categories and counts: never clipboard contents, filenames, paths, or type IDs.
+public struct ComposerPasteDiagnostic: Hashable, Sendable {
+    public enum Source: String, Hashable, Sendable {
+        case swiftUI = "SwiftUI"
+        case nativeTextView = "AppKit"
+    }
+
+    public enum Outcome: String, Hashable, Sendable {
+        case queued
+        case rejected
+        case unsupported
+        case loadFailed
+        case duplicateSuppressed
+    }
+
+    public enum MediaCategory: String, Hashable, Sendable {
+        case file
+        case image
+        case mixed
+        case unknown
+    }
+
+    public var source: Source
+    public var outcome: Outcome
+    public var mediaCategory: MediaCategory
+    public var providerCount: Int
+    public var itemCount: Int
+
+    public init(
+        source: Source,
+        outcome: Outcome,
+        mediaCategory: MediaCategory = .unknown,
+        providerCount: Int,
+        itemCount: Int = 0
+    ) {
+        self.source = source
+        self.outcome = outcome
+        self.mediaCategory = mediaCategory
+        self.providerCount = max(0, providerCount)
+        self.itemCount = max(0, itemCount)
+    }
+
+    public var redactedDescription: String {
+        "Composer paste \(source.rawValue): \(mediaCategory.rawValue), \(outcome.rawValue), providers \(providerCount), items \(itemCount)"
+    }
+}
+
 public struct GlassComposer: View {
     @State private var isEmojiPopoverPresented = false
     @Binding private var text: String
@@ -1204,6 +1252,7 @@ public struct GlassComposer: View {
     private let onInsertEmoji: (String) -> Void
     private let onPasteImageData: (Data) -> Void
     private let onPasteFileURLs: ([URL]) -> Void
+    private let onPasteDiagnostic: (ComposerPasteDiagnostic) -> Void
     private let onSend: () -> Void
     private let onFocus: () -> Void
     private let mentionAutocompleteCandidates: [ComposerMentionCandidate]
@@ -1240,6 +1289,7 @@ public struct GlassComposer: View {
         onInsertEmoji: @escaping (String) -> Void = { _ in },
         onPasteImageData: @escaping (Data) -> Void = { _ in },
         onPasteFileURLs: @escaping ([URL]) -> Void = { _ in },
+        onPasteDiagnostic: @escaping (ComposerPasteDiagnostic) -> Void = { _ in },
         onSend: @escaping () -> Void = {},
         onFocus: @escaping () -> Void = {},
         mentionAutocompleteCandidates: [ComposerMentionCandidate] = [],
@@ -1275,6 +1325,7 @@ public struct GlassComposer: View {
         self.onInsertEmoji = onInsertEmoji
         self.onPasteImageData = onPasteImageData
         self.onPasteFileURLs = onPasteFileURLs
+        self.onPasteDiagnostic = onPasteDiagnostic
         self.onSend = onSend
         self.onFocus = onFocus
         self.mentionAutocompleteCandidates = mentionAutocompleteCandidates
@@ -1350,6 +1401,7 @@ public struct GlassComposer: View {
                             onFocus: onFocus,
                             onPasteImageData: onPasteImageData,
                             onPasteFileURLs: onPasteFileURLs,
+                            onPasteDiagnostic: onPasteDiagnostic,
                             hasMentionCandidates: !mentionAutocompleteCandidates.isEmpty,
                             cursorRequest: cursorRequest,
                             onInlineTriggerChange: onInlineTriggerChange,
@@ -1449,6 +1501,8 @@ extension GlassComposer {
         let resultingText: String
         let pastedFileURLs: [URL]?
         let pastedImageData: Data?
+        let pastedImageDataList: [Data]
+        let diagnostics: [ComposerPasteDiagnostic]
     }
 
     /// Drives the composer's native paste entry points against a scratch pasteboard (never
@@ -1491,7 +1545,39 @@ extension GlassComposer {
 
         invoke(textView, pasteboard)
 
-        return TestPasteOutcome(resultingText: textView.string, pastedFileURLs: pastedFileURLs, pastedImageData: pastedImageData)
+        return TestPasteOutcome(
+            resultingText: textView.string,
+            pastedFileURLs: pastedFileURLs,
+            pastedImageData: pastedImageData,
+            pastedImageDataList: pastedImageData.map { [$0] } ?? [],
+            diagnostics: []
+        )
+    }
+
+    @MainActor
+    static func _testSwiftUIPaste(existingText: String, providers: [NSItemProvider]) async -> TestPasteOutcome {
+        let coordinator = ComposerPasteCoordinator()
+        var pastedFileURLs: [URL] = []
+        var pastedImageData: [Data] = []
+        var diagnostics: [ComposerPasteDiagnostic] = []
+        await withCheckedContinuation { continuation in
+            coordinator.beginSwiftUIPaste(
+                providers: providers,
+                onPasteFileURLs: { pastedFileURLs.append(contentsOf: $0) },
+                onPasteImageData: { pastedImageData.append($0) },
+                onDiagnostic: { diagnostic in
+                    diagnostics.append(diagnostic)
+                    continuation.resume()
+                }
+            )
+        }
+        return TestPasteOutcome(
+            resultingText: existingText,
+            pastedFileURLs: pastedFileURLs.isEmpty ? nil : pastedFileURLs,
+            pastedImageData: pastedImageData.first,
+            pastedImageDataList: pastedImageData,
+            diagnostics: diagnostics
+        )
     }
 }
 #endif
@@ -1769,12 +1855,17 @@ private struct ComposerTextInput: View {
     let onFocus: () -> Void
     let onPasteImageData: (Data) -> Void
     let onPasteFileURLs: ([URL]) -> Void
+    let onPasteDiagnostic: (ComposerPasteDiagnostic) -> Void
     var hasMentionCandidates: Bool = false
     var cursorRequest: ComposerCursorRequest? = nil
     var onInlineTriggerChange: (InlineComposerTrigger?) -> Void = { _ in }
     var onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void = { _ in }
     var onSelectHighlightedMentionCandidate: () -> Void = {}
     var onCancelMentionAutocomplete: () -> Void = {}
+
+    #if canImport(AppKit)
+    @State private var pasteCoordinator = ComposerPasteCoordinator()
+    #endif
 
     var body: some View {
         #if canImport(AppKit)
@@ -1786,6 +1877,8 @@ private struct ComposerTextInput: View {
             onFocus: onFocus,
             onPasteImageData: onPasteImageData,
             onPasteFileURLs: onPasteFileURLs,
+            onPasteDiagnostic: onPasteDiagnostic,
+            pasteCoordinator: pasteCoordinator,
             hasMentionCandidates: hasMentionCandidates,
             cursorRequest: cursorRequest,
             onInlineTriggerChange: onInlineTriggerChange,
@@ -1794,6 +1887,14 @@ private struct ComposerTextInput: View {
             onCancelMentionAutocomplete: onCancelMentionAutocomplete
         )
             .font(.body)
+            .onPasteCommand(of: [.fileURL, .image]) { providers in
+                pasteCoordinator.beginSwiftUIPaste(
+                    providers: providers,
+                    onPasteFileURLs: onPasteFileURLs,
+                    onPasteImageData: onPasteImageData,
+                    onDiagnostic: onPasteDiagnostic
+                )
+            }
         #else
         TextEditor(text: $text)
             .font(.body)
@@ -1833,12 +1934,300 @@ enum ComposerPastePayloadClassifier {
         // directly. AppKit knows how to decode their generic image representations; normalize
         // those to PNG so the composer queue has valid, accurately-labelled image bytes.
         if let image = NSImage(pasteboard: pasteboard),
-           let tiffData = image.tiffRepresentation,
-           let bitmap = NSBitmapImageRep(data: tiffData),
-           let pngData = bitmap.representation(using: .png, properties: [:]) {
+           let pngData = normalizedPNGData(from: image) {
             return .imageData(pngData)
         }
         return .none
+    }
+
+    static func normalizedPNGData(from sourceData: Data) -> Data? {
+        guard let image = NSImage(data: sourceData) else { return nil }
+        return normalizedPNGData(from: image)
+    }
+
+    private static func normalizedPNGData(from image: NSImage) -> Data? {
+        guard let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData)
+        else { return nil }
+        return bitmap.representation(using: .png, properties: [:])
+    }
+}
+
+private struct ComposerPasteProviderLoadResult {
+    var fileURLs: [URL] = []
+    var imageData: [Data] = []
+    var unsupportedProviderCount = 0
+    var failedProviderCount = 0
+    var mediaCategory: ComposerPasteDiagnostic.MediaCategory = .unknown
+
+    var itemCount: Int { fileURLs.count + imageData.count }
+}
+
+private enum ComposerPasteItemProviderUtilities {
+    static func imageTypeIdentifier(for provider: NSItemProvider) -> String? {
+        provider.registeredTypeIdentifiers.first { identifier in
+            guard let type = UTType(identifier) else { return false }
+            return type.conforms(to: .image)
+        }
+    }
+
+    static func fileURL(from item: NSSecureCoding?) -> URL? {
+        if let url = item as? URL, url.isFileURL {
+            return url
+        }
+        if let url = item as? NSURL as URL?, url.isFileURL {
+            return url
+        }
+        if let data = item as? Data,
+           let url = URL(dataRepresentation: data, relativeTo: nil),
+           url.isFileURL {
+            return url
+        }
+        return nil
+    }
+}
+
+/// Loads the representation advertised by each `NSItemProvider`, instead of assuming that a
+/// screenshot arrives as a direct PNG/TIFF pasteboard type. The operation is main-actor-owned;
+/// provider callbacks reduce their non-Sendable values to `URL`/`Data` before returning there.
+@MainActor
+private enum ComposerPasteItemProviderLoader {
+    static func load(
+        providers: [NSItemProvider],
+        completion: @escaping (ComposerPasteProviderLoadResult) -> Void
+    ) -> ComposerPasteItemProviderLoadOperation {
+        let operation = ComposerPasteItemProviderLoadOperation(providers: providers, completion: completion)
+        operation.start()
+        return operation
+    }
+}
+
+@MainActor
+private final class ComposerPasteItemProviderLoadOperation {
+    private let fileProviders: [NSItemProvider]
+    private let imageProviders: [(provider: NSItemProvider, typeIdentifier: String)]
+    private let completion: (ComposerPasteProviderLoadResult) -> Void
+    private var result: ComposerPasteProviderLoadResult
+
+    init(
+        providers: [NSItemProvider],
+        completion: @escaping (ComposerPasteProviderLoadResult) -> Void
+    ) {
+        fileProviders = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }
+        imageProviders = providers.compactMap { provider in
+            guard !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier),
+                  let typeIdentifier = ComposerPasteItemProviderUtilities.imageTypeIdentifier(for: provider)
+            else { return nil }
+            return (provider, typeIdentifier)
+        }
+        result = ComposerPasteProviderLoadResult(
+            unsupportedProviderCount: providers.count - fileProviders.count - imageProviders.count,
+            mediaCategory: Self.mediaCategory(
+                fileProviderCount: fileProviders.count,
+                imageProviderCount: imageProviders.count
+            )
+        )
+        self.completion = completion
+    }
+
+    func start() {
+        loadFile(at: 0)
+    }
+
+    private static func mediaCategory(
+        fileProviderCount: Int,
+        imageProviderCount: Int
+    ) -> ComposerPasteDiagnostic.MediaCategory {
+        return switch (fileProviderCount > 0, imageProviderCount > 0) {
+        case (true, true): .mixed
+        case (true, false): .file
+        case (false, true): .image
+        case (false, false): .unknown
+        }
+    }
+
+    private func loadFile(at index: Int) {
+        guard index < fileProviders.count else {
+            loadImage(at: 0)
+            return
+        }
+        let provider = fileProviders[index]
+        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] item, error in
+            let url = error == nil ? ComposerPasteItemProviderUtilities.fileURL(from: item) : nil
+            Task { @MainActor [weak self, url] in
+                guard let self else { return }
+                if let url {
+                    result.fileURLs.append(url)
+                } else {
+                    result.failedProviderCount += 1
+                }
+                loadFile(at: index + 1)
+            }
+        }
+    }
+
+    private func loadImage(at index: Int) {
+        guard index < imageProviders.count else {
+            completion(result)
+            return
+        }
+        let item = imageProviders[index]
+        item.provider.loadDataRepresentation(forTypeIdentifier: item.typeIdentifier) { [weak self] data, error in
+            let pngData: Data?
+            if error == nil, let data {
+                pngData = ComposerPastePayloadClassifier.normalizedPNGData(from: data)
+            } else {
+                pngData = nil
+            }
+            Task { @MainActor [weak self, pngData] in
+                guard let self else { return }
+                if let pngData {
+                    result.imageData.append(pngData)
+                } else {
+                    result.failedProviderCount += 1
+                }
+                loadImage(at: index + 1)
+            }
+        }
+    }
+}
+
+/// Coordinates the SwiftUI command route and the native text-view fallback. The general
+/// pasteboard change count identifies the same command only during a short hand-off window, so
+/// intentionally pasting the same clipboard contents again still queues a second attachment.
+@MainActor
+final class ComposerPasteCoordinator {
+    private struct PasteEvent {
+        var changeCount: Int
+        var occurredAt: Date
+    }
+
+    private var pendingSwiftUIPaste: PasteEvent?
+    private var recentlyHandledPaste: PasteEvent?
+    private var activeSwiftUIPasteLoad: ComposerPasteItemProviderLoadOperation?
+    private let duplicateWindow: TimeInterval = 0.5
+    private let pendingWindow: TimeInterval = 5
+
+    func beginSwiftUIPaste(
+        providers: [NSItemProvider],
+        onPasteFileURLs: @escaping ([URL]) -> Void,
+        onPasteImageData: @escaping (Data) -> Void,
+        onDiagnostic: @escaping (ComposerPasteDiagnostic) -> Void,
+        pasteboardChangeCount: Int = NSPasteboard.general.changeCount
+    ) {
+        expirePasteEvents()
+        if isRecentlyHandled(pasteboardChangeCount) {
+            onDiagnostic(ComposerPasteDiagnostic(
+                source: .swiftUI,
+                outcome: .duplicateSuppressed,
+                mediaCategory: mediaCategory(for: providers),
+                providerCount: providers.count
+            ))
+            return
+        }
+        pendingSwiftUIPaste = PasteEvent(changeCount: pasteboardChangeCount, occurredAt: Date())
+        activeSwiftUIPasteLoad = ComposerPasteItemProviderLoader.load(providers: providers) { [weak self] result in
+            guard let self else { return }
+            self.finishSwiftUIPaste(
+                changeCount: pasteboardChangeCount,
+                providerCount: providers.count,
+                result: result,
+                onPasteFileURLs: onPasteFileURLs,
+                onPasteImageData: onPasteImageData,
+                onDiagnostic: onDiagnostic
+            )
+        }
+    }
+
+    func shouldSuppressNativePaste(for pasteboard: NSPasteboard) -> Bool {
+        expirePasteEvents()
+        let changeCount = pasteboard.changeCount
+        return pendingSwiftUIPaste?.changeCount == changeCount || isRecentlyHandled(changeCount)
+    }
+
+    func recordNativePasteHandled(changeCount: Int) {
+        recentlyHandledPaste = PasteEvent(changeCount: changeCount, occurredAt: Date())
+    }
+
+    private func finishSwiftUIPaste(
+        changeCount: Int,
+        providerCount: Int,
+        result: ComposerPasteProviderLoadResult,
+        onPasteFileURLs: ([URL]) -> Void,
+        onPasteImageData: (Data) -> Void,
+        onDiagnostic: (ComposerPasteDiagnostic) -> Void
+    ) {
+        guard pendingSwiftUIPaste?.changeCount == changeCount else { return }
+        pendingSwiftUIPaste = nil
+        activeSwiftUIPasteLoad = nil
+        if isRecentlyHandled(changeCount) {
+            onDiagnostic(ComposerPasteDiagnostic(
+                source: .swiftUI,
+                outcome: .duplicateSuppressed,
+                mediaCategory: result.mediaCategory,
+                providerCount: providerCount
+            ))
+            return
+        }
+        guard result.itemCount > 0 else {
+            let outcome: ComposerPasteDiagnostic.Outcome = result.failedProviderCount > 0 ? .loadFailed : .unsupported
+            onDiagnostic(ComposerPasteDiagnostic(
+                source: .swiftUI,
+                outcome: outcome,
+                mediaCategory: result.mediaCategory,
+                providerCount: providerCount
+            ))
+            return
+        }
+        recordNativePasteHandled(changeCount: changeCount)
+        if !result.fileURLs.isEmpty {
+            onPasteFileURLs(result.fileURLs)
+        }
+        for imageData in result.imageData {
+            onPasteImageData(imageData)
+        }
+        onDiagnostic(ComposerPasteDiagnostic(
+            source: .swiftUI,
+            outcome: .queued,
+            mediaCategory: result.mediaCategory,
+            providerCount: providerCount,
+            itemCount: result.itemCount
+        ))
+    }
+
+    private func isRecentlyHandled(_ changeCount: Int) -> Bool {
+        guard let recentlyHandledPaste else { return false }
+        return recentlyHandledPaste.changeCount == changeCount
+            && Date().timeIntervalSince(recentlyHandledPaste.occurredAt) < duplicateWindow
+    }
+
+    private func expirePasteEvents() {
+        if let pendingSwiftUIPaste,
+           Date().timeIntervalSince(pendingSwiftUIPaste.occurredAt) >= pendingWindow {
+            self.pendingSwiftUIPaste = nil
+        }
+        if let recentlyHandledPaste,
+           Date().timeIntervalSince(recentlyHandledPaste.occurredAt) >= duplicateWindow {
+            self.recentlyHandledPaste = nil
+        }
+    }
+
+    private func mediaCategory(for providers: [NSItemProvider]) -> ComposerPasteDiagnostic.MediaCategory {
+        let hasFileProvider = providers.contains {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }
+        let hasImageProvider = providers.contains {
+            !($0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier))
+                && ComposerPasteItemProviderUtilities.imageTypeIdentifier(for: $0) != nil
+        }
+        return switch (hasFileProvider, hasImageProvider) {
+        case (true, true): .mixed
+        case (true, false): .file
+        case (false, true): .image
+        case (false, false): .unknown
+        }
     }
 }
 
@@ -1849,6 +2238,8 @@ enum ComposerPastePayloadClassifier {
 final class ComposerPasteInterceptingTextView: NSTextView {
     var onPasteFileURLs: (([URL]) -> Void)?
     var onPasteImageData: ((Data) -> Void)?
+    var onPasteDiagnostic: ((ComposerPasteDiagnostic) -> Void)?
+    weak var pasteCoordinator: ComposerPasteCoordinator?
     var pasteboardOverride: NSPasteboard?
 
     override func paste(_ sender: Any?) {
@@ -1879,12 +2270,36 @@ final class ComposerPasteInterceptingTextView: NSTextView {
     }
 
     private func consumeAttachmentPayload(from pasteboard: NSPasteboard) -> Bool {
+        if pasteCoordinator?.shouldSuppressNativePaste(for: pasteboard) == true {
+            onPasteDiagnostic?(ComposerPasteDiagnostic(
+                source: .nativeTextView,
+                outcome: .duplicateSuppressed,
+                providerCount: 1
+            ))
+            return true
+        }
         switch ComposerPastePayloadClassifier.classify(pasteboard: pasteboard) {
         case let .fileURLs(urls):
+            pasteCoordinator?.recordNativePasteHandled(changeCount: pasteboard.changeCount)
             onPasteFileURLs?(urls)
+            onPasteDiagnostic?(ComposerPasteDiagnostic(
+                source: .nativeTextView,
+                outcome: .queued,
+                mediaCategory: .file,
+                providerCount: 1,
+                itemCount: urls.count
+            ))
             return true
         case let .imageData(data):
+            pasteCoordinator?.recordNativePasteHandled(changeCount: pasteboard.changeCount)
             onPasteImageData?(data)
+            onPasteDiagnostic?(ComposerPasteDiagnostic(
+                source: .nativeTextView,
+                outcome: .queued,
+                mediaCategory: .image,
+                providerCount: 1,
+                itemCount: 1
+            ))
             return true
         case .none:
             return false
@@ -1900,6 +2315,8 @@ private struct ComposerTextView: NSViewRepresentable {
     let onFocus: () -> Void
     let onPasteImageData: (Data) -> Void
     let onPasteFileURLs: ([URL]) -> Void
+    let onPasteDiagnostic: (ComposerPasteDiagnostic) -> Void
+    let pasteCoordinator: ComposerPasteCoordinator
     var hasMentionCandidates: Bool = false
     var cursorRequest: ComposerCursorRequest? = nil
     var onInlineTriggerChange: (InlineComposerTrigger?) -> Void = { _ in }
@@ -1921,6 +2338,8 @@ private struct ComposerTextView: NSViewRepresentable {
         let textView = ComposerPasteInterceptingTextView(frame: .zero, textContainer: textContainer)
         textView.onPasteFileURLs = onPasteFileURLs
         textView.onPasteImageData = onPasteImageData
+        textView.onPasteDiagnostic = onPasteDiagnostic
+        textView.pasteCoordinator = pasteCoordinator
         textView.autoresizingMask = [.width]
         textView.delegate = context.coordinator
         textView.drawsBackground = false
@@ -1980,6 +2399,8 @@ private struct ComposerTextView: NSViewRepresentable {
         context.coordinator.onFocus = onFocus
         textView.onPasteImageData = onPasteImageData
         textView.onPasteFileURLs = onPasteFileURLs
+        textView.onPasteDiagnostic = onPasteDiagnostic
+        textView.pasteCoordinator = pasteCoordinator
         context.coordinator.hasMentionCandidates = hasMentionCandidates
         context.coordinator.onInlineTriggerChange = onInlineTriggerChange
         context.coordinator.onNavigateMentionAutocomplete = onNavigateMentionAutocomplete

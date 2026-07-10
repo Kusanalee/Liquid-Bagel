@@ -1,5 +1,7 @@
+import AppKit
 import StoatDesignSystem
 import StoatModels
+import UniformTypeIdentifiers
 import XCTest
 @testable import StoatUI
 
@@ -343,6 +345,93 @@ final class StoatUITests: XCTestCase {
     }
 
     @MainActor
+    func testPhase62SwiftUIPasteLoadsScreenshotProviderBeforeTextRepresentation() async {
+        let outcome = await GlassComposer._testSwiftUIPaste(
+            existingText: "Keep this",
+            providers: [screenshotProvider()]
+        )
+
+        XCTAssertNil(outcome.pastedFileURLs)
+        XCTAssertEqual(outcome.pastedImageDataList.count, 1)
+        XCTAssertEqual(outcome.pastedImageData?.prefix(8), Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+        XCTAssertEqual(outcome.resultingText, "Keep this")
+        XCTAssertEqual(outcome.diagnostics.last?.source, .swiftUI)
+        XCTAssertEqual(outcome.diagnostics.last?.outcome, .queued)
+        XCTAssertEqual(outcome.diagnostics.last?.mediaCategory, .image)
+    }
+
+    @MainActor
+    func testPhase62SwiftUIPastePrefersFileURLAndQueuesMultipleProviders() async {
+        let fileURL = URL(fileURLWithPath: "/tmp/phase62-provider-file.png")
+        let fileProvider = NSItemProvider()
+        fileProvider.registerDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier, visibility: .all) { completion in
+            completion(fileURL.dataRepresentation, nil)
+            return nil
+        }
+
+        let outcome = await GlassComposer._testSwiftUIPaste(
+            existingText: "Draft text",
+            providers: [screenshotProvider(), fileProvider]
+        )
+
+        XCTAssertEqual(outcome.pastedFileURLs, [fileURL])
+        XCTAssertEqual(outcome.pastedImageDataList.count, 1)
+        XCTAssertEqual(outcome.diagnostics.last?.itemCount, 2)
+        XCTAssertEqual(outcome.diagnostics.last?.mediaCategory, .mixed)
+        XCTAssertEqual(outcome.resultingText, "Draft text")
+    }
+
+    @MainActor
+    func testPhase62SwiftUIPasteReportsUnsupportedProviderWithoutChangingDraft() async {
+        let textProvider = NSItemProvider()
+        textProvider.registerDataRepresentation(forTypeIdentifier: UTType.plainText.identifier, visibility: .all) { completion in
+            completion(Data("plain clipboard text".utf8), nil)
+            return nil
+        }
+
+        let outcome = await GlassComposer._testSwiftUIPaste(existingText: "Keep this", providers: [textProvider])
+
+        XCTAssertNil(outcome.pastedFileURLs)
+        XCTAssertTrue(outcome.pastedImageDataList.isEmpty)
+        XCTAssertEqual(outcome.diagnostics.last?.outcome, .unsupported)
+        XCTAssertEqual(outcome.diagnostics.last?.mediaCategory, .unknown)
+        XCTAssertEqual(outcome.resultingText, "Keep this")
+    }
+
+    @MainActor
+    func testPhase62SwiftUIReservationSuppressesNativeDuplicateDelivery() async {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoatUITests.ComposerPaste.Dedupe.\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        let pngData = screenshotPNGData()
+        pasteboard.setData(pngData, forType: .png)
+
+        let coordinator = ComposerPasteCoordinator()
+        let nativeTextView = ComposerPasteInterceptingTextView()
+        nativeTextView.pasteboardOverride = pasteboard
+        nativeTextView.pasteCoordinator = coordinator
+        var nativeDeliveries = 0
+        var swiftUIDeliveries = 0
+        let delivery = expectation(description: "SwiftUI provider delivery")
+        nativeTextView.onPasteImageData = { _ in nativeDeliveries += 1 }
+        coordinator.beginSwiftUIPaste(
+            providers: [screenshotProvider()],
+            onPasteFileURLs: { _ in },
+            onPasteImageData: { _ in swiftUIDeliveries += 1 },
+            onDiagnostic: { diagnostic in
+                if diagnostic.source == .swiftUI, diagnostic.outcome == .queued {
+                    delivery.fulfill()
+                }
+            },
+            pasteboardChangeCount: pasteboard.changeCount
+        )
+
+        nativeTextView.paste(nil)
+        XCTAssertEqual(nativeDeliveries, 0)
+        await fulfillment(of: [delivery], timeout: 1)
+        XCTAssertEqual(swiftUIDeliveries, 1)
+    }
+
+    @MainActor
     func testPhase61PasteFallsBackToPlainTextWhenNoAttachmentPayload() {
         let outcome = GlassComposer._testPaste(existingText: "") { pasteboard in
             pasteboard.setString("plain clipboard text", forType: .string)
@@ -350,6 +439,46 @@ final class StoatUITests: XCTestCase {
         XCTAssertNil(outcome.pastedFileURLs)
         XCTAssertNil(outcome.pastedImageData)
         XCTAssertEqual(outcome.resultingText, "plain clipboard text")
+    }
+
+    private func screenshotProvider() -> NSItemProvider {
+        let provider = NSItemProvider()
+        let tiffData = screenshotTIFFData()
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.tiff.identifier, visibility: .all) { completion in
+            completion(tiffData, nil)
+            return nil
+        }
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.plainText.identifier, visibility: .all) { completion in
+            completion(Data("screenshot.tiff".utf8), nil)
+            return nil
+        }
+        return provider
+    }
+
+    private func screenshotPNGData() -> Data {
+        let bitmap = makeScreenshotBitmap()
+        return bitmap.representation(using: .png, properties: [:])!
+    }
+
+    private func screenshotTIFFData() -> Data {
+        makeScreenshotBitmap().tiffRepresentation!
+    }
+
+    private func makeScreenshotBitmap() -> NSBitmapImageRep {
+        let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 1,
+            pixelsHigh: 1,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        )!
+        bitmap.setColor(NSColor(calibratedRed: 0.95, green: 0.25, blue: 0.55, alpha: 1), atX: 0, y: 0)
+        return bitmap
     }
     #endif
 
