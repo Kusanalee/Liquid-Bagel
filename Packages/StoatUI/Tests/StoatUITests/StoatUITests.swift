@@ -330,6 +330,19 @@ final class StoatUITests: XCTestCase {
     }
 
     @MainActor
+    func testPhase62ReadSelectionInterceptsScreenshotDataBeforeTextFallback() {
+        let pngData = Data([0x89, 0x50, 0x4E, 0x47])
+        let outcome = GlassComposer._testReadSelection(existingText: "Keep this") { pasteboard in
+            pasteboard.setData(pngData, forType: .png)
+            pasteboard.setString("screenshot.png", forType: .string)
+        }
+
+        XCTAssertEqual(outcome.pastedImageData, pngData)
+        XCTAssertNil(outcome.pastedFileURLs)
+        XCTAssertEqual(outcome.resultingText, "Keep this")
+    }
+
+    @MainActor
     func testPhase61PasteFallsBackToPlainTextWhenNoAttachmentPayload() {
         let outcome = GlassComposer._testPaste(existingText: "") { pasteboard in
             pasteboard.setString("plain clipboard text", forType: .string)

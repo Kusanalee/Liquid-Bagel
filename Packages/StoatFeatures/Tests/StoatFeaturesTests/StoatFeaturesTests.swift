@@ -7182,6 +7182,47 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(Set(items.map(\.id)).count, 250)
     }
 
+    func testPhase62OptimisticSendKeepsItsAvatarGroupAfterConfirmation() {
+        let channelID: ChannelID = "phase62-avatar-channel"
+        let authorID: UserID = "phase62-avatar-author"
+        let nowMilliseconds = UInt64(Date().timeIntervalSince1970 * 1_000)
+        let prior = TimelineMessage(
+            message: Message(
+                id: MessageID(rawValue: ulid(milliseconds: nowMilliseconds - 1_000)),
+                channelID: channelID,
+                authorID: authorID,
+                content: "Earlier local message"
+            ),
+            status: .confirmed
+        )
+        let pending = TimelineMessage(
+            message: Message(
+                id: "pending-phase62-avatar",
+                channelID: channelID,
+                authorID: authorID,
+                content: "Optimistic local message",
+                nonce: "phase62-avatar-nonce"
+            ),
+            status: .pending
+        )
+        let confirmed = TimelineMessage(
+            message: Message(
+                id: MessageID(rawValue: ulid(milliseconds: nowMilliseconds)),
+                channelID: channelID,
+                authorID: authorID,
+                content: "Optimistic local message",
+                nonce: "phase62-avatar-nonce"
+            ),
+            status: .confirmed
+        )
+
+        let pendingItems = TimelineRenderItemBuilder.flatten(TimelineMessageGrouping.group([prior, pending]))
+        let confirmedItems = TimelineRenderItemBuilder.flatten(TimelineMessageGrouping.group([prior, confirmed]))
+
+        XCTAssertEqual(pendingItems.map(\.showsHeader), [true, false])
+        XCTAssertEqual(confirmedItems.map(\.showsHeader), [true, false])
+    }
+
     func testPhase60PreparationPlannerBoundsStartupAndPromotesVisibleLookahead() {
         let channelID: ChannelID = "phase60-plan-channel"
         let authorID: UserID = "phase60-plan-author"

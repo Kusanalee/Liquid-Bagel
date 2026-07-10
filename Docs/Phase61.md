@@ -26,6 +26,12 @@ The seventh live-QA pass failed the two rows above. This remediation fixes only 
 - Visibility/skeleton tracking moves from the old id to the new confirmed id directly inside row-state synchronization, never through `imageResourceBecameHidden`/`imageResourceBecameVisible`, so the avatar resource is never hidden or re-requested as part of reconciliation.
 - The reducer backfills nonce/user/member onto the confirmed message when the send response omits them, and again on any later snapshot merge or realtime echo of that same locally-sent message, so identity/avatar do not blank out after the fact.
 
+### P1 Follow-up: Real Pasteboard And Grouping Reconciliation
+
+- The live retest showed that some screenshot/image-provider representations bypassed the original command-level paste hook. The composer now also intercepts AppKit's lower-level `readSelection(from:type:)` path, accepts direct file-URL representations, and normalizes generic `NSImage` pasteboard content to PNG before queuing the existing validated attachment chip.
+- Optimistic messages do not yet have a server-issued ULID timestamp. Treating them as distant-future rows made a pending local message start its own group, then join the preceding local-message group on confirmation, which visibly removed its avatar. Timeline grouping now gives pending rows a current-pass timestamp and permits the same safe grouping rule as confirmed rows; the row also keeps its last decoded avatar bytes for its nonce-stable `renderIdentity` while the confirmed presentation is prepared.
+- This is implementation and regression-test proof only. Clipboard paste upload and local-send avatar continuity remain `partial` until the same live retest passes.
+
 ### Corrected Acceptance Criteria
 
 - `clipboard paste upload` (Docs/ParityMatrix.md) and the chat-parity avatar-continuity row stay `partial` until a live retest passes; this fix is not itself proof and does not promote either row.
@@ -36,8 +42,8 @@ The seventh live-QA pass failed the two rows above. This remediation fixes only 
 
 - Phase 60 performance: record as acceptable unless a fresh sample or Phase 60 counters show repeating viewport flushes, unbounded row queues, stale row churn, image/decode loops, or avoidable main-thread row preparation.
 - Reactions: Unicode add/remove/reload is green from live QA; custom emoji reactions are still not claimed.
-- Clipboard paste: fixed per the P1 remediation above; needs a live retest before this row can move off `partial`.
-- Avatar continuity: fixed per the P1 remediation above; retest repeated sends in a warmed channel and confirm no initials/fallback flash before this row can move off `partial`.
+- Clipboard paste: fixed per the P1 follow-up above; needs a live retest before this row can move off `partial`.
+- Avatar continuity: fixed per the P1 follow-up above; retest repeated sends in a warmed channel and confirm no initials/fallback flash before this row can move off `partial`.
 - Notifications: explicitly deferred in this pass. QA Lane 4 lives in Settings -> Notifications. Signature/build readiness is also summarized in Developer diagnostics as Notification build.
 
 ## Verification

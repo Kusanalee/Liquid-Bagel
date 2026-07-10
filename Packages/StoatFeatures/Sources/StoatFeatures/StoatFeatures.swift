@@ -385,12 +385,19 @@ public struct TimelineMessageGroup: Hashable, Sendable, Identifiable {
 
 public enum TimelineMessageGrouping {
     public static func group(_ messages: [TimelineMessage], threshold: TimeInterval = MessageGrouping.defaultThreshold) -> [TimelineMessageGroup] {
-        let sorted = messages.sorted { timestamp(for: $0.message) < timestamp(for: $1.message) }
+        // Optimistic messages have no server-issued ULID timestamp yet. Treat them as having
+        // been created during this grouping pass, rather than at distant future, so their
+        // position and group header do not jump when confirmation supplies the real ULID.
+        let optimisticSendDate = Date()
+        let sorted = messages.sorted {
+            timestamp(for: $0, optimisticSendDate: optimisticSendDate)
+                < timestamp(for: $1, optimisticSendDate: optimisticSendDate)
+        }
         var groups: [TimelineMessageGroup] = []
 
         for timelineMessage in sorted {
             let message = timelineMessage.message
-            let messageDate = timestamp(for: message)
+            let messageDate = timestamp(for: timelineMessage, optimisticSendDate: optimisticSendDate)
             guard var last = groups.last,
                   let previous = last.messages.last
             else {
@@ -399,15 +406,18 @@ public enum TimelineMessageGrouping {
             }
 
             let previousMessage = previous.message
-            let previousDate = timestamp(for: previousMessage)
+            let previousDate = timestamp(for: previous, optimisticSendDate: optimisticSendDate)
             let canGroup = previousMessage.authorID == message.authorID
                 && previousMessage.channelID == message.channelID
                 && previousMessage.system == nil
                 && message.system == nil
                 && previousMessage.replies?.isEmpty != false
                 && message.replies?.isEmpty != false
-                && previous.status == .confirmed
-                && timelineMessage.status == .confirmed
+                // Optimistic local sends must use the same grouping rule as their confirmed
+                // replacement. Otherwise a pending row renders its own avatar and loses it as
+                // soon as the server confirmation joins the preceding local-message group.
+                && isGroupableStatus(previous.status)
+                && isGroupableStatus(timelineMessage.status)
                 && messageDate.timeIntervalSince(previousDate) <= threshold
 
             if canGroup {
@@ -426,8 +436,18 @@ public enum TimelineMessageGrouping {
         return TimelineMessageGroup(id: "\(message.channelID.rawValue)-\(message.id.rawValue)", authorID: message.authorID, channelID: message.channelID, messages: [timelineMessage], startsAt: startsAt)
     }
 
-    private static func timestamp(for message: Message) -> Date {
-        message.createdAt ?? Date.distantFuture
+    private static func isGroupableStatus(_ status: TimelineMessageStatus) -> Bool {
+        switch status {
+        case .pending, .confirmed:
+            true
+        case .failed, .retrying, .deleting:
+            false
+        }
+    }
+
+    private static func timestamp(for timelineMessage: TimelineMessage, optimisticSendDate: Date) -> Date {
+        timelineMessage.message.createdAt
+            ?? (timelineMessage.status == .pending ? optimisticSendDate : Date.distantFuture)
     }
 }
 
@@ -14515,6 +14535,10 @@ private struct Phase43SystemEventRow: View {
 
 public struct TimelineRenderItemView: View {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    // `renderIdentity` keeps this state through optimistic-send reconciliation. Retaining the
+    // last decoded bytes prevents a momentary cache/read-state gap from replacing a visible
+    // local avatar with initials while the confirmed row is prepared.
+    @State private var retainedAuthorAvatarData: Data?
     private let item: TimelineRenderItem
     private let viewModel: MainShellViewModel
 
@@ -14527,6 +14551,8 @@ public struct TimelineRenderItemView: View {
         let timelineMessage = item.timelineMessage
         let rowState = viewModel.timelineRowPresentationState(for: timelineMessage.message.id)
         let rowPresentation = rowState?.presentation ?? viewModel.localSendFallbackPresentation(for: timelineMessage)
+        let currentAuthorAvatarData = viewModel.imageData(for: rowPresentation?.authorDisplay.avatarFile, kind: .userAvatar)
+        let authorAvatarData = currentAuthorAvatarData ?? retainedAuthorAvatarData
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
             if viewModel.inlineEditState?.messageID == timelineMessage.message.id {
                 InlineMessageEditor(viewModel: viewModel)
@@ -14556,7 +14582,7 @@ public struct TimelineRenderItemView: View {
                     referenceItems: rowPresentation?.referenceItems ?? [:],
                     preparedMarkdownContent: rowPresentation?.preparedMarkdownContent,
                     embedItems: viewModel.hydratedEmbedItems(rowPresentation?.embedItems ?? []),
-                    authorAvatarData: viewModel.imageData(for: rowPresentation?.authorDisplay.avatarFile, kind: .userAvatar),
+                    authorAvatarData: authorAvatarData,
                     actionItems: rowActionItems(for: timelineMessage, presentation: rowPresentation),
                     reactionItems: rowReactionItems(for: timelineMessage, presentation: rowPresentation),
                     mentionsCurrentUser: rowPresentation?.mentionsCurrentUser ?? false,
@@ -14598,6 +14624,9 @@ public struct TimelineRenderItemView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onAppear {
+            if let currentAuthorAvatarData {
+                retainedAuthorAvatarData = currentAuthorAvatarData
+            }
             viewModel.updateTimelineVisibility(
                 messageID: timelineMessage.message.id,
                 channelID: timelineMessage.message.channelID,
@@ -14629,6 +14658,11 @@ public struct TimelineRenderItemView: View {
                 }
                 viewModel.loadCustomEmojiImages(for: timelineMessage.message)
                 viewModel.prepareReplyPreview(for: timelineMessage.message)
+            }
+        }
+        .onChange(of: currentAuthorAvatarData) { newValue in
+            if let newValue {
+                retainedAuthorAvatarData = newValue
             }
         }
         .onDisappear {

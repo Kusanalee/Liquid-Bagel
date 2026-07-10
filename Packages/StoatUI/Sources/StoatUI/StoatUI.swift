@@ -1451,11 +1451,31 @@ extension GlassComposer {
         let pastedImageData: Data?
     }
 
-    /// Drives `ComposerPasteInterceptingTextView.paste(_:)` against a scratch pasteboard (never
+    /// Drives the composer's native paste entry points against a scratch pasteboard (never
     /// `NSPasteboard.general`) so tests can exercise attachment-vs-text precedence without
     /// touching the real system clipboard.
     @MainActor
     static func _testPaste(existingText: String, configurePasteboard: (NSPasteboard) -> Void) -> TestPasteOutcome {
+        testPaste(existingText: existingText, configurePasteboard: configurePasteboard) { textView, pasteboard in
+            textView.paste(nil)
+        }
+    }
+
+    /// `NSTextView` can reach this lower-level read path for paste services and rich clipboard
+    /// representations. Keep it covered separately from the command-selector paste path.
+    @MainActor
+    static func _testReadSelection(existingText: String, configurePasteboard: (NSPasteboard) -> Void) -> TestPasteOutcome {
+        testPaste(existingText: existingText, configurePasteboard: configurePasteboard) { textView, pasteboard in
+            _ = textView.readSelection(from: pasteboard, type: .string)
+        }
+    }
+
+    @MainActor
+    private static func testPaste(
+        existingText: String,
+        configurePasteboard: (NSPasteboard) -> Void,
+        invoke: (ComposerPasteInterceptingTextView, NSPasteboard) -> Void
+    ) -> TestPasteOutcome {
         let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoatUITests.ComposerPaste.\(UUID().uuidString)"))
         pasteboard.clearContents()
         configurePasteboard(pasteboard)
@@ -1469,7 +1489,7 @@ extension GlassComposer {
         textView.onPasteFileURLs = { pastedFileURLs = $0 }
         textView.onPasteImageData = { pastedImageData = $0 }
 
-        textView.paste(nil)
+        invoke(textView, pasteboard)
 
         return TestPasteOutcome(resultingText: textView.string, pastedFileURLs: pastedFileURLs, pastedImageData: pastedImageData)
     }
@@ -1784,9 +1804,9 @@ private struct ComposerTextInput: View {
 }
 
 #if canImport(AppKit)
-/// Classifies clipboard content for composer paste: an attachment payload (file URLs or
-/// PNG/TIFF image data) always wins over any accompanying text representation on the same
-/// pasteboard item, since Finder/screenshot copies commonly carry both.
+/// Classifies clipboard content for composer paste: an attachment payload (file URLs or image
+/// data) always wins over any accompanying text representation on the same pasteboard item,
+/// since Finder/screenshot copies commonly carry both.
 enum ComposerPastePayload: Equatable {
     case fileURLs([URL])
     case imageData(Data)
@@ -1795,12 +1815,28 @@ enum ComposerPastePayload: Equatable {
 
 enum ComposerPastePayloadClassifier {
     static func classify(pasteboard: NSPasteboard) -> ComposerPastePayload {
-        let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
+        let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
         if !urls.isEmpty {
             return .fileURLs(urls)
         }
+        if let fileURL = pasteboard.string(forType: .fileURL)
+            .flatMap(URL.init(string:)), fileURL.isFileURL {
+            return .fileURLs([fileURL])
+        }
         if let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
             return .imageData(data)
+        }
+        // Screenshot and image-provider pasteboards do not always advertise PNG or TIFF
+        // directly. AppKit knows how to decode their generic image representations; normalize
+        // those to PNG so the composer queue has valid, accurately-labelled image bytes.
+        if let image = NSImage(pasteboard: pasteboard),
+           let tiffData = image.tiffRepresentation,
+           let bitmap = NSBitmapImageRep(data: tiffData),
+           let pngData = bitmap.representation(using: .png, properties: [:]) {
+            return .imageData(pngData)
         }
         return .none
     }
@@ -1816,23 +1852,42 @@ final class ComposerPasteInterceptingTextView: NSTextView {
     var pasteboardOverride: NSPasteboard?
 
     override func paste(_ sender: Any?) {
-        switch ComposerPastePayloadClassifier.classify(pasteboard: pasteboardOverride ?? .general) {
+        let pasteboard = pasteboardOverride ?? .general
+        if consumeAttachmentPayload(from: pasteboard) {
+            return
+        }
+        // `super.paste(_:)` always reads `NSPasteboard.general` -- it has no notion of
+        // `pasteboardOverride`. Production never sets an override, so this only changes
+        // behavior for tests, which route text fallback through the overridden pasteboard
+        // instead of touching the real system clipboard.
+        if let pasteboardOverride {
+            if let string = pasteboardOverride.string(forType: .string) {
+                insertText(string, replacementRange: selectedRange())
+            }
+        } else {
+            super.paste(sender)
+        }
+    }
+
+    /// AppKit may bypass `paste(_:)` for Services and rich clipboard representations and read
+    /// the selected type directly. Intercept here too so media never falls through as text.
+    override func readSelection(from pasteboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        if consumeAttachmentPayload(from: pasteboard) {
+            return true
+        }
+        return super.readSelection(from: pasteboard, type: type)
+    }
+
+    private func consumeAttachmentPayload(from pasteboard: NSPasteboard) -> Bool {
+        switch ComposerPastePayloadClassifier.classify(pasteboard: pasteboard) {
         case let .fileURLs(urls):
             onPasteFileURLs?(urls)
+            return true
         case let .imageData(data):
             onPasteImageData?(data)
+            return true
         case .none:
-            // `super.paste(_:)` always reads `NSPasteboard.general` -- it has no notion of
-            // `pasteboardOverride`. Production never sets an override, so this only changes
-            // behavior for tests, which route text fallback through the overridden pasteboard
-            // instead of touching the real system clipboard.
-            if let pasteboardOverride {
-                if let string = pasteboardOverride.string(forType: .string) {
-                    insertText(string, replacementRange: selectedRange())
-                }
-            } else {
-                super.paste(sender)
-            }
+            return false
         }
     }
 }
