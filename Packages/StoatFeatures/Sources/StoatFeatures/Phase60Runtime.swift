@@ -58,6 +58,15 @@ public enum TimelineRenderItemBuilder {
     }
 }
 
+/// Timeline rows are identified in SwiftUI by `TimelineRenderItem.renderIdentity` (a `String`),
+/// not by `MessageID`, so every `ScrollViewProxy.scrollTo` target must be resolved to the row's
+/// actual render identity -- `scrollTo(MessageID)` silently matches nothing.
+public enum TimelineScrollTargetResolver {
+    public static func resolve(target: MessageID, renderItems: [TimelineRenderItem]) -> String {
+        renderItems.first { $0.id == target }?.renderIdentity ?? target.rawValue
+    }
+}
+
 public enum TimelineRowPreparationPriority: Int, Hashable, Sendable {
     case visible = 0
     case lookahead = 1

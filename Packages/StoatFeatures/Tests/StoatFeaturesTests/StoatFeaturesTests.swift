@@ -767,7 +767,7 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(pending.status, .pending)
         XCTAssertEqual(pending.message.user?.avatar?.id, userAvatar.id)
         XCTAssertEqual(pending.message.member?.avatar?.id, memberAvatar.id)
-        XCTAssertEqual(model.localSendFallbackPresentation(for: pending)?.authorDisplay.avatarFile?.id, memberAvatar.id)
+        XCTAssertEqual(model.pendingRowFallbackPresentation(for: pending)?.authorDisplay.avatarFile?.id, memberAvatar.id)
 
         await sendTask.value
 
@@ -775,7 +775,7 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(confirmed.status, .confirmed)
         XCTAssertEqual(confirmed.message.user?.avatar?.id, userAvatar.id)
         XCTAssertEqual(confirmed.message.member?.avatar?.id, memberAvatar.id)
-        XCTAssertEqual(model.localSendFallbackPresentation(for: confirmed)?.authorDisplay.avatarFile?.id, memberAvatar.id)
+        XCTAssertEqual(model.pendingRowFallbackPresentation(for: confirmed)?.authorDisplay.avatarFile?.id, memberAvatar.id)
     }
 
     @MainActor
@@ -7421,15 +7421,15 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
-    func testPhase62ComposerPasteDiagnosticsAreCategoricalAndSurfaceLoaderFailure() {
+    func testPhase62ComposerPasteDiagnosticsAreCategoricalAndSurfaceUnsupportedPayload() {
         let model = MainShellViewModel(snapshot: MockShellData.snapshot)
         model.recordComposerPasteDiagnostic(
-            ComposerPasteDiagnostic(source: .swiftUI, outcome: .loadFailed, providerCount: 1)
+            ComposerPasteDiagnostic(source: .keyEquivalent, outcome: .unsupported, providerCount: 1)
         )
 
         let diagnostics = model.attachmentDiagnostics()
-        XCTAssertEqual(diagnostics.lastAttachmentAction, "Composer paste SwiftUI: unknown, loadFailed, providers 1, items 0")
-        XCTAssertEqual(model.composerError, "Could not read the clipboard attachment. Try copying it again.")
+        XCTAssertEqual(diagnostics.lastAttachmentAction, "Composer paste Key equivalent: unknown, unsupported, providers 1, items 0")
+        XCTAssertEqual(model.composerError, "Clipboard media could not be read as an attachment.")
         XCTAssertFalse(diagnostics.lastAttachmentAction?.contains("/") == true)
         XCTAssertFalse(diagnostics.lastAttachmentAction?.contains("public.") == true)
     }
@@ -7445,7 +7445,7 @@ final class StoatFeaturesTests: XCTestCase {
         )
         model.recordComposerPasteDiagnostic(
             ComposerPasteDiagnostic(
-                source: .swiftUI,
+                source: .keyEquivalent,
                 outcome: .queued,
                 mediaCategory: .image,
                 providerCount: 1,
@@ -7455,7 +7455,7 @@ final class StoatFeaturesTests: XCTestCase {
 
         XCTAssertEqual(
             model.attachmentDiagnostics().lastAttachmentAction,
-            "Composer paste SwiftUI: image, rejected, providers 1, items 1"
+            "Composer paste Key equivalent: image, rejected, providers 1, items 1"
         )
         XCTAssertEqual(model.composerError, "File too large. Liquid Bagel currently supports files up to 20 MB.")
     }
@@ -7505,6 +7505,71 @@ final class StoatFeaturesTests: XCTestCase {
         )
         XCTAssertEqual(foreignItem.renderIdentity, foreignItem.id.rawValue)
         XCTAssertNotEqual(foreignItem.renderIdentity, confirmedItem.renderIdentity)
+    }
+
+    func testPhase62ScrollTargetResolverUsesRenderedIdentityForOptimisticRows() {
+        let channelID: ChannelID = "phase62-scroll-channel"
+        let currentUserID: UserID = "phase62-scroll-user"
+        let optimistic = TimelineRenderItem(
+            timelineMessage: TimelineMessage(
+                message: Message(
+                    id: "phase62-server-message-id",
+                    channelID: channelID,
+                    authorID: currentUserID,
+                    content: "sent",
+                    nonce: "phase62-local-nonce"
+                ),
+                status: .pending
+            ),
+            groupID: "phase62-scroll-group",
+            authorID: currentUserID,
+            showsHeader: true,
+            startsGroup: true,
+            currentUserID: currentUserID
+        )
+        let absentID: MessageID = "phase62-absent"
+
+        XCTAssertEqual(optimistic.renderIdentity, "local-send-phase62-local-nonce")
+        XCTAssertEqual(
+            TimelineScrollTargetResolver.resolve(target: optimistic.id, renderItems: [optimistic]),
+            optimistic.renderIdentity
+        )
+        XCTAssertEqual(
+            TimelineScrollTargetResolver.resolve(target: absentID, renderItems: [optimistic]),
+            absentID.rawValue
+        )
+    }
+
+    @MainActor
+    func testPhase62CurrentUserPresentationFillsPartialSnapshotIdentityFromReadyUser() {
+        let userID: UserID = "phase62-rail-user"
+        let avatar = File(
+            id: "phase62-rail-avatar",
+            tag: "avatars",
+            filename: "avatar.png",
+            contentType: "image/png",
+            size: 1,
+            userID: userID
+        )
+        let readyUser = User(
+            id: userID,
+            username: "ready-user",
+            displayName: "Ready display",
+            avatar: avatar,
+            status: UserStatus(text: nil, presence: .online)
+        )
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[userID] = User(
+            id: userID,
+            username: "gateway-user",
+            status: UserStatus(text: "Busy", presence: .idle)
+        )
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: readyUser)
+
+        XCTAssertEqual(model.currentUserForPresentation?.avatar?.id, avatar.id)
+        XCTAssertEqual(model.currentUserForPresentation?.displayName, "Ready display")
+        XCTAssertEqual(model.currentUserForPresentation?.status?.text, "Busy")
+        XCTAssertEqual(model.currentUserForPresentation?.status?.presence, .idle)
     }
 
     @MainActor

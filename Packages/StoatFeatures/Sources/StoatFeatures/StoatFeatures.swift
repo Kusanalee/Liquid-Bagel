@@ -569,6 +569,11 @@ public final class MainShellViewModel {
     public var pendingDeletion: TimelineMessage?
     public var timelineSelection = TimelineSelection()
     public var timelineViewport = TimelineViewportState()
+    /// Set just before a send inserts its optimistic message; consumed by the next grouping pass
+    /// for that channel, which fires an unconditional scroll-to-newest. The intent cannot be set
+    /// in `sendDraft` directly: the row only becomes scrollable after
+    /// `prepareSelectedTimelineGrouping` rebuilds `selectedTimelineRenderItems`.
+    @ObservationIgnored var pendingOwnSendScrollChannelID: ChannelID?
     public var localReadStates: [ChannelID: LocalReadState] = [:] {
         didSet {
             guard oldValue != localReadStates else { return }
@@ -1428,11 +1433,19 @@ public final class MainShellViewModel {
             timelinePresentationDiagnostics.staleResultDiscardCount += 1
             return
         }
+        let previousCacheChannelID = selectedTimelineGroupCacheChannelID
+        let previousNewestID = selectedTimelineGroupCache.last?.messages.last?.message.id
         selectedTimelineGroupCacheKey = key
         selectedTimelineGroupCacheChannelID = channelID
         selectedTimelineGroupCache = groups
         selectedTimelineRenderItemCache = TimelineRenderItemBuilder.flatten(groups, currentUserID: currentUserID)
         synchronizeTimelineRowStates(items: selectedTimelineRenderItemCache, channelID: channelID)
+        updateTimelineViewportAfterGroupingPass(
+            channelID: channelID,
+            previousCacheChannelID: previousCacheChannelID,
+            previousNewestID: previousNewestID,
+            newestID: groups.last?.messages.last?.message.id
+        )
         timelinePresentationState = .ready(
             channelID: channelID,
             messageCount: messages.count,
@@ -1444,6 +1457,37 @@ public final class MainShellViewModel {
         updateTimelinePerformanceDiagnostics(messages: messages, groups: groups)
         phase51PerformanceDiagnostics.timelineBuildCount += 1
         schedulePhase51DiagnosticsPublish()
+    }
+
+    /// Runs after every grouping rebuild, once the new rows are actually scrollable. An own send
+    /// scrolls to newest unconditionally (standard chat behavior, even when scrolled up reading
+    /// history); any other newest-message change flows through the reducer's `newMessage` rule --
+    /// auto-follow when pinned to the bottom, the Jump-to-Newest indicator otherwise.
+    private func updateTimelineViewportAfterGroupingPass(
+        channelID: ChannelID,
+        previousCacheChannelID: ChannelID?,
+        previousNewestID: MessageID?,
+        newestID: MessageID?
+    ) {
+        if let pending = pendingOwnSendScrollChannelID, pending != channelID {
+            pendingOwnSendScrollChannelID = nil
+        }
+        if pendingOwnSendScrollChannelID == channelID {
+            pendingOwnSendScrollChannelID = nil
+            timelineViewport = viewportReducer.jumpNewest(timelineViewport, newestMessageID: newestID)
+            return
+        }
+        guard let newestID,
+              previousCacheChannelID == channelID,
+              timelineViewport.channelID == channelID,
+              let previousNewestID,
+              previousNewestID != newestID
+        else { return }
+        timelineViewport = viewportReducer.newMessage(
+            timelineViewport,
+            newestMessageID: newestID,
+            isActiveChannel: true
+        )
     }
 
     public func prepareSelectedTimelineRows() async {
@@ -1800,10 +1844,23 @@ public final class MainShellViewModel {
     }
 
     public var currentUserForPresentation: User? {
-        if let currentUserID, let user = snapshot.usersByID[currentUserID] {
+        let sessionUser = sessionCoordinator?.currentUser ?? currentUser
+        if let currentUserID, var user = snapshot.usersByID[currentUserID] {
+            // Gateway events can wholesale-replace the snapshot user with a partial object that
+            // omits identity fields. Presence/status must keep flowing from the snapshot, but
+            // nil identity fields fill from the authenticated ready user -- otherwise the server
+            // rail renders initials forever even though the avatar bytes are already cached.
+            if let sessionUser, sessionUser.id == user.id {
+                if user.avatar == nil {
+                    user.avatar = sessionUser.avatar
+                }
+                if user.displayName == nil {
+                    user.displayName = sessionUser.displayName
+                }
+            }
             return user
         }
-        return sessionCoordinator?.currentUser ?? currentUser
+        return sessionUser
     }
 
     public var profilePresentationUser: User? {
@@ -7010,13 +7067,10 @@ public final class MainShellViewModel {
         switch resolvedDiagnostic.outcome {
         case .rejected:
             placeholderStatus = composerError
-        case .loadFailed:
-            composerError = "Could not read the clipboard attachment. Try copying it again."
-            placeholderStatus = composerError
         case .unsupported:
             composerError = "Clipboard media could not be read as an attachment."
             placeholderStatus = composerError
-        case .queued, .duplicateSuppressed:
+        case .queued:
             break
         }
     }
@@ -8228,6 +8282,7 @@ public final class MainShellViewModel {
         composerError = nil
         recordMessageSendDiagnostics(channelID: channelID, stage: .creatingOptimisticMessage, result: .pending, error: nil)
         recordMessageSendDiagnostics(channelID: channelID, stage: .sendingRequest, result: .pending, error: nil)
+        pendingOwnSendScrollChannelID = channelID
         let didSend = await messageController.sendMessage(
             channelID: channelID,
             content: content,
@@ -8252,6 +8307,9 @@ public final class MainShellViewModel {
             }
             acknowledgeSelectedChannel()
         } else {
+            // A failed send may never have inserted an optimistic row, so no grouping pass would
+            // consume the flag -- clear it rather than let a later incoming message trigger a jump.
+            pendingOwnSendScrollChannelID = nil
             let error = messageController.lastErrorByChannelID[channelID] ?? "Message send failed."
             recordMessageSendDiagnostics(channelID: channelID, stage: .failed, result: .failed, error: error)
             messageActionStatus = error
@@ -8279,10 +8337,14 @@ public final class MainShellViewModel {
         )
     }
 
-    func localSendFallbackPresentation(for timelineMessage: TimelineMessage) -> TimelineRowPresentation? {
-        guard timelineMessage.message.nonce != nil,
-              timelineMessage.message.authorID == currentUserID
-        else { return nil }
+    /// Synchronous fallback presentation for any row whose phase60 preparation hasn't completed
+    /// yet -- a just-sent local message, or any message re-entering a warmed channel after
+    /// `synchronizeTimelineRowStates` discarded the previous channel's prepared states. Built
+    /// entirely from live snapshot data (zero retention, cannot go stale); avatar bytes already
+    /// in `loadedImageResources` render immediately instead of flashing initials. System rows
+    /// return nil and keep the skeleton: they need prepared event pieces.
+    func pendingRowFallbackPresentation(for timelineMessage: TimelineMessage) -> TimelineRowPresentation? {
+        guard timelineMessage.message.system == nil else { return nil }
         let message = timelineMessage.message
         return TimelineRowPresentation(
             messageID: message.id,
@@ -14270,7 +14332,13 @@ public struct MessageTimelineView: View {
             anchor = .top
         }
         guard let target else { return }
-        let scroll = { proxy.scrollTo(target, anchor: anchor) }
+        // Rows are identified by `renderIdentity` (String); scrolling to the raw `MessageID`
+        // silently matches nothing.
+        let resolvedTarget = TimelineScrollTargetResolver.resolve(
+            target: target,
+            renderItems: viewModel.selectedTimelineRenderItems
+        )
+        let scroll = { proxy.scrollTo(resolvedTarget, anchor: anchor) }
         if reduceMotion {
             scroll()
         } else {
@@ -14612,7 +14680,7 @@ public struct TimelineRenderItemView: View {
     public var body: some View {
         let timelineMessage = item.timelineMessage
         let rowState = viewModel.timelineRowPresentationState(for: timelineMessage.message.id)
-        let rowPresentation = rowState?.presentation ?? viewModel.localSendFallbackPresentation(for: timelineMessage)
+        let rowPresentation = rowState?.presentation ?? viewModel.pendingRowFallbackPresentation(for: timelineMessage)
         let currentAuthorAvatarData = viewModel.imageData(for: rowPresentation?.authorDisplay.avatarFile, kind: .userAvatar)
         let authorAvatarData = currentAuthorAvatarData ?? retainedAuthorAvatarData
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
