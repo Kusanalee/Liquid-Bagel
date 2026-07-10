@@ -5,30 +5,44 @@ import StoatRealtime
 import StoatUI
 
 public struct TimelineRenderItem: Identifiable, Hashable, Sendable {
+    /// The real message id -- unchanged across pending -> confirmed reconciliation, and the one
+    /// preparation targeting, actions, acknowledgements, and navigation must keep using.
     public var id: MessageID { timelineMessage.message.id }
     public var timelineMessage: TimelineMessage
     public var groupID: String
     public var authorID: UserID
     public var showsHeader: Bool
     public var startsGroup: Bool
+    /// A view-identity key that stays stable across pending -> confirmed -> realtime-echo
+    /// reconciliation for a message the current user just sent (keyed by its nonce, which
+    /// survives that transition), so SwiftUI doesn't tear down and rebuild the row -- and its
+    /// avatar image view -- just because the real message id changed underneath it. Every other
+    /// message (including all incoming messages from other authors) keeps using the real id.
+    public var renderIdentity: String
 
     public init(
         timelineMessage: TimelineMessage,
         groupID: String,
         authorID: UserID,
         showsHeader: Bool,
-        startsGroup: Bool
+        startsGroup: Bool,
+        currentUserID: UserID? = nil
     ) {
         self.timelineMessage = timelineMessage
         self.groupID = groupID
         self.authorID = authorID
         self.showsHeader = showsHeader
         self.startsGroup = startsGroup
+        if let nonce = timelineMessage.message.nonce, timelineMessage.message.authorID == currentUserID {
+            self.renderIdentity = "local-send-\(nonce)"
+        } else {
+            self.renderIdentity = timelineMessage.message.id.rawValue
+        }
     }
 }
 
 public enum TimelineRenderItemBuilder {
-    public static func flatten(_ groups: [TimelineMessageGroup]) -> [TimelineRenderItem] {
+    public static func flatten(_ groups: [TimelineMessageGroup], currentUserID: UserID? = nil) -> [TimelineRenderItem] {
         groups.flatMap { group in
             group.messages.enumerated().map { index, message in
                 TimelineRenderItem(
@@ -36,7 +50,8 @@ public enum TimelineRenderItemBuilder {
                     groupID: group.id,
                     authorID: group.authorID,
                     showsHeader: index == 0,
-                    startsGroup: index == 0
+                    startsGroup: index == 0,
+                    currentUserID: currentUserID
                 )
             }
         }

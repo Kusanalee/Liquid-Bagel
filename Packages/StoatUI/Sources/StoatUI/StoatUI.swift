@@ -1444,6 +1444,35 @@ extension GlassComposer {
         textView.setSelectedRange(NSRange(location: caretUTF16Offset, length: 0))
         return ComposerTextView.Coordinator.detectInlineTrigger(in: textView)
     }
+
+    struct TestPasteOutcome {
+        let resultingText: String
+        let pastedFileURLs: [URL]?
+        let pastedImageData: Data?
+    }
+
+    /// Drives `ComposerPasteInterceptingTextView.paste(_:)` against a scratch pasteboard (never
+    /// `NSPasteboard.general`) so tests can exercise attachment-vs-text precedence without
+    /// touching the real system clipboard.
+    @MainActor
+    static func _testPaste(existingText: String, configurePasteboard: (NSPasteboard) -> Void) -> TestPasteOutcome {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoatUITests.ComposerPaste.\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        configurePasteboard(pasteboard)
+
+        let textView = ComposerPasteInterceptingTextView()
+        textView.string = existingText
+        textView.pasteboardOverride = pasteboard
+
+        var pastedFileURLs: [URL]?
+        var pastedImageData: Data?
+        textView.onPasteFileURLs = { pastedFileURLs = $0 }
+        textView.onPasteImageData = { pastedImageData = $0 }
+
+        textView.paste(nil)
+
+        return TestPasteOutcome(resultingText: textView.string, pastedFileURLs: pastedFileURLs, pastedImageData: pastedImageData)
+    }
 }
 #endif
 
@@ -1755,6 +1784,59 @@ private struct ComposerTextInput: View {
 }
 
 #if canImport(AppKit)
+/// Classifies clipboard content for composer paste: an attachment payload (file URLs or
+/// PNG/TIFF image data) always wins over any accompanying text representation on the same
+/// pasteboard item, since Finder/screenshot copies commonly carry both.
+enum ComposerPastePayload: Equatable {
+    case fileURLs([URL])
+    case imageData(Data)
+    case none
+}
+
+enum ComposerPastePayloadClassifier {
+    static func classify(pasteboard: NSPasteboard) -> ComposerPastePayload {
+        let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
+        if !urls.isEmpty {
+            return .fileURLs(urls)
+        }
+        if let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
+            return .imageData(data)
+        }
+        return .none
+    }
+}
+
+/// Overrides `paste(_:)` directly rather than relying solely on the delegate's
+/// `doCommandBySelector:` hook -- a menu-invoked or Services-invoked paste calls this method
+/// on the first responder directly and never reaches `doCommandBySelector:`, so intercepting
+/// only there missed those paths.
+final class ComposerPasteInterceptingTextView: NSTextView {
+    var onPasteFileURLs: (([URL]) -> Void)?
+    var onPasteImageData: ((Data) -> Void)?
+    var pasteboardOverride: NSPasteboard?
+
+    override func paste(_ sender: Any?) {
+        switch ComposerPastePayloadClassifier.classify(pasteboard: pasteboardOverride ?? .general) {
+        case let .fileURLs(urls):
+            onPasteFileURLs?(urls)
+        case let .imageData(data):
+            onPasteImageData?(data)
+        case .none:
+            // `super.paste(_:)` always reads `NSPasteboard.general` -- it has no notion of
+            // `pasteboardOverride`. Production never sets an override, so this only changes
+            // behavior for tests, which route text fallback through the overridden pasteboard
+            // instead of touching the real system clipboard.
+            if let pasteboardOverride {
+                if let string = pasteboardOverride.string(forType: .string) {
+                    insertText(string, replacementRange: selectedRange())
+                }
+            } else {
+                super.paste(sender)
+            }
+        }
+    }
+}
+
 private struct ComposerTextView: NSViewRepresentable {
     @Binding var text: String
     let isEnabled: Bool
@@ -1771,20 +1853,20 @@ private struct ComposerTextView: NSViewRepresentable {
     var onCancelMentionAutocomplete: () -> Void = {}
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, onSubmit: onSubmit, onFocus: onFocus, onPasteImageData: onPasteImageData, onPasteFileURLs: onPasteFileURLs)
+        Coordinator(text: $text, onSubmit: onSubmit, onFocus: onFocus)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSTextView.scrollableTextView()
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        guard let textView = scrollView.documentView as? NSTextView else {
-            return scrollView
-        }
+        let textContainer = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+        let layoutManager = NSLayoutManager()
+        layoutManager.addTextContainer(textContainer)
+        let textStorage = NSTextStorage()
+        textStorage.addLayoutManager(layoutManager)
+
+        let textView = ComposerPasteInterceptingTextView(frame: .zero, textContainer: textContainer)
+        textView.onPasteFileURLs = onPasteFileURLs
+        textView.onPasteImageData = onPasteImageData
+        textView.autoresizingMask = [.width]
         textView.delegate = context.coordinator
         textView.drawsBackground = false
         textView.isRichText = false
@@ -1797,6 +1879,16 @@ private struct ComposerTextView: NSViewRepresentable {
         textView.minSize = NSSize(width: 0, height: ComposerTextSizing.compactHeight)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.string = text
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.autoresizingMask = [.width, .height]
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.documentView = textView
         return scrollView
     }
 
@@ -1810,7 +1902,7 @@ private struct ComposerTextView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
-        guard let textView = nsView.documentView as? NSTextView else { return }
+        guard let textView = nsView.documentView as? ComposerPasteInterceptingTextView else { return }
         if textView.string != text {
             textView.string = text
         }
@@ -1831,8 +1923,8 @@ private struct ComposerTextView: NSViewRepresentable {
         context.coordinator.text = $text
         context.coordinator.onSubmit = onSubmit
         context.coordinator.onFocus = onFocus
-        context.coordinator.onPasteImageData = onPasteImageData
-        context.coordinator.onPasteFileURLs = onPasteFileURLs
+        textView.onPasteImageData = onPasteImageData
+        textView.onPasteFileURLs = onPasteFileURLs
         context.coordinator.hasMentionCandidates = hasMentionCandidates
         context.coordinator.onInlineTriggerChange = onInlineTriggerChange
         context.coordinator.onNavigateMentionAutocomplete = onNavigateMentionAutocomplete
@@ -1844,8 +1936,6 @@ private struct ComposerTextView: NSViewRepresentable {
         var text: Binding<String>
         var onSubmit: () -> Void
         var onFocus: () -> Void
-        var onPasteImageData: (Data) -> Void
-        var onPasteFileURLs: ([URL]) -> Void
         var lastFocusRequestID = 0
         var lastAppliedCursorRequestID = 0
         var hasMentionCandidates = false
@@ -1857,15 +1947,11 @@ private struct ComposerTextView: NSViewRepresentable {
         init(
             text: Binding<String>,
             onSubmit: @escaping () -> Void,
-            onFocus: @escaping () -> Void,
-            onPasteImageData: @escaping (Data) -> Void,
-            onPasteFileURLs: @escaping ([URL]) -> Void
+            onFocus: @escaping () -> Void
         ) {
             self.text = text
             self.onSubmit = onSubmit
             self.onFocus = onFocus
-            self.onPasteImageData = onPasteImageData
-            self.onPasteFileURLs = onPasteFileURLs
         }
 
         func textDidBeginEditing(_ notification: Notification) {
@@ -1902,9 +1988,6 @@ private struct ComposerTextView: NSViewRepresentable {
                     break
                 }
             }
-            if commandSelector == #selector(NSText.paste(_:)) {
-                return handlePaste()
-            }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else {
                 return false
             }
@@ -1915,23 +1998,6 @@ private struct ComposerTextView: NSViewRepresentable {
                 onSubmit()
             }
             return true
-        }
-
-        private func handlePaste() -> Bool {
-            let pasteboard = NSPasteboard.general
-            if pasteboard.string(forType: .string)?.isEmpty == false {
-                return false
-            }
-            let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
-            if !urls.isEmpty {
-                onPasteFileURLs(urls)
-                return true
-            }
-            if let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
-                onPasteImageData(data)
-                return true
-            }
-            return false
         }
 
         /// Phase 58: the `@token` immediately before the caret, scanning backward until

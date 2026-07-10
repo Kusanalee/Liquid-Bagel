@@ -10,12 +10,35 @@ Phase 61 responds to the sixth live-QA report. Phase 60 is accepted as direction
 - Local sends preserve the current user and selected-server member identity through pending and confirmed reconciliation, including avatar metadata.
 - Locally sent rows with a nonce can use a lightweight local-send presentation while Phase 60 prepares the full row, avoiding a brief generic skeleton/avatar fallback after confirmation.
 
+## P1 Remediation: Native Paste And Avatar Continuity
+
+The seventh live-QA pass failed the two rows above. This remediation fixes only those two confirmed regressions; Phase 60 CPU/performance and notifications are untouched and explicitly deferred.
+
+### Failed Live Proof
+
+- Clipboard paste: a Finder/screenshot copy that also exposes a plain-text representation (e.g. a filename or the image's text alias) fell through the delegate's `doCommandBySelector:` check for `paste:`, which tested for a non-empty string *before* checking for a file URL or image payload. Text always won -- the attachment was silently dropped -- and because that check only intercepted the key-binding-interpreted paste path, a menu- or Services-invoked Command-V bypassed the delegate entirely and fell straight through to `NSTextView`'s own default text paste.
+- Avatar continuity: the row view and its avatar consumer id were both keyed by `timelineMessage.message.id`, which changes at pending -> confirmed reconciliation (`pending-<nonce>` -> the real ULID). SwiftUI's `.id()` reset boundary on the row therefore tore down and rebuilt the entire row -- including the avatar image view -- forcing an `onDisappear`/`onAppear` pair that hid and re-requested the avatar resource under a new consumer id, producing the reported initials/skeleton flash even though the underlying identity data was already correct.
+
+### Fix
+
+- The composer now overrides `NSTextView.paste(_:)` directly on a dedicated `ComposerPasteInterceptingTextView` subclass instead of relying solely on the delegate's `doCommandBySelector:` hook, so every paste path (key equivalent, Edit menu, Services) runs the same classification: file URLs first, then PNG/TIFF image data, and only then falls through to normal text paste. When an attachment payload is present it wins outright -- the existing composer draft text is left untouched and no clipboard text is inserted, whether the draft was empty or not.
+- `TimelineRenderItem` adds a `renderIdentity` derived from the message's nonce for the current user's own locally-sent messages, falling back to the real message id for everything else (including all incoming messages). The timeline `ForEach`, the row's `.id()` reset boundary, and the avatar visibility consumer id all use `renderIdentity` instead of the real id, so a locally sent row's view -- and its avatar -- survives pending -> confirmed -> realtime-echo reconciliation without being torn down. The real `MessageID` is unchanged and still drives preparation targeting, actions, acknowledgements, and navigation.
+- Visibility/skeleton tracking moves from the old id to the new confirmed id directly inside row-state synchronization, never through `imageResourceBecameHidden`/`imageResourceBecameVisible`, so the avatar resource is never hidden or re-requested as part of reconciliation.
+- The reducer backfills nonce/user/member onto the confirmed message when the send response omits them, and again on any later snapshot merge or realtime echo of that same locally-sent message, so identity/avatar do not blank out after the fact.
+
+### Corrected Acceptance Criteria
+
+- `clipboard paste upload` (Docs/ParityMatrix.md) and the chat-parity avatar-continuity row stay `partial` until a live retest passes; this fix is not itself proof and does not promote either row.
+- Required retest, clipboard paste: Command-V with an empty draft and with a non-empty draft, pasting both a screenshot (image data) and a Finder file (file URL) where the clipboard also exposes a text representation -- a chip must appear immediately, the draft text must stay intact, and upload must wait for Send.
+- Required retest, avatar continuity: repeated sends in a warmed channel must show continuous avatar art through pending, confirmation, and realtime echo -- no initials or skeleton flash -- including at least one send while the row stays scrolled into view.
+
 ## QA Status
 
 - Phase 60 performance: record as acceptable unless a fresh sample or Phase 60 counters show repeating viewport flushes, unbounded row queues, stale row churn, image/decode loops, or avoidable main-thread row preparation.
 - Reactions: Unicode add/remove/reload is green from live QA; custom emoji reactions are still not claimed.
-- Avatar continuity: retest repeated sends in a warmed channel and confirm no initials/fallback flash.
-- Notifications: QA Lane 4 lives in Settings -> Notifications. Signature/build readiness is also summarized in Developer diagnostics as Notification build.
+- Clipboard paste: fixed per the P1 remediation above; needs a live retest before this row can move off `partial`.
+- Avatar continuity: fixed per the P1 remediation above; retest repeated sends in a warmed channel and confirm no initials/fallback flash before this row can move off `partial`.
+- Notifications: explicitly deferred in this pass. QA Lane 4 lives in Settings -> Notifications. Signature/build readiness is also summarized in Developer diagnostics as Notification build.
 
 ## Verification
 

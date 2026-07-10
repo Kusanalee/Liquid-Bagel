@@ -862,6 +862,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var phase60RowWorkerTask: Task<Void, Never>?
     @ObservationIgnored private var phase60ActiveRowKey: TimelineRowPreparationKey?
     @ObservationIgnored private var phase60VisibleSkeletonIDs: Set<MessageID> = []
+    @ObservationIgnored private var phase61LocalSendMessageIDByNonce: [ChannelID: [String: MessageID]] = [:]
     @ObservationIgnored private var memberListGroupCacheKey: MemberListCacheKey?
     @ObservationIgnored private var memberListGroupCache: [MemberListGroup] = []
     @ObservationIgnored private var memberListDiagnosticsCache = RoleSortDiagnostics()
@@ -1408,7 +1409,7 @@ public final class MainShellViewModel {
         selectedTimelineGroupCacheKey = key
         selectedTimelineGroupCacheChannelID = channelID
         selectedTimelineGroupCache = groups
-        selectedTimelineRenderItemCache = TimelineRenderItemBuilder.flatten(groups)
+        selectedTimelineRenderItemCache = TimelineRenderItemBuilder.flatten(groups, currentUserID: currentUserID)
         synchronizeTimelineRowStates(items: selectedTimelineRenderItemCache, channelID: channelID)
         timelinePresentationState = .ready(
             channelID: channelID,
@@ -1461,6 +1462,7 @@ public final class MainShellViewModel {
     }
 
     private func synchronizeTimelineRowStates(items: [TimelineRenderItem], channelID: ChannelID) {
+        migrateLocalSendTracking(items: items, channelID: channelID)
         let validIDs = Set(items.map(\.id))
         phase60RowPresentationStates = phase60RowPresentationStates.filter {
             validIDs.contains($0.key) && $0.value.channelID == channelID
@@ -1506,6 +1508,30 @@ public final class MainShellViewModel {
         }
         phase60Diagnostics.staleRowDiscardCount += staleQueuedKeys.count
         phase60Diagnostics.activeSkeletonCount = phase60VisibleSkeletonIDs.count
+    }
+
+    /// A locally-sent message keeps its nonce across pending -> confirmed -> realtime-echo
+    /// reconciliation, but its real `MessageID` changes at confirmation. Visibility/skeleton
+    /// tracking is keyed by that real id (preparation targeting needs it), so move the tracked
+    /// entry to the new id directly -- never through `imageResourceBecameHidden`/`Visible`,
+    /// which would evict and re-request the avatar resource for no reason.
+    private func migrateLocalSendTracking(items: [TimelineRenderItem], channelID: ChannelID) {
+        var messageIDByNonce = phase61LocalSendMessageIDByNonce[channelID] ?? [:]
+        for item in items {
+            guard let nonce = item.timelineMessage.message.nonce else { continue }
+            if let previousID = messageIDByNonce[nonce], previousID != item.id {
+                if visibleMessageIDsByChannelID[channelID]?.remove(previousID) != nil {
+                    visibleMessageIDsByChannelID[channelID]?.insert(item.id)
+                }
+                if pendingVisibleMessageIDsByChannelID[channelID]?.remove(previousID) != nil {
+                    pendingVisibleMessageIDsByChannelID[channelID]?.insert(item.id)
+                }
+                phase60VisibleSkeletonIDs.remove(previousID)
+            }
+            messageIDByNonce[nonce] = item.id
+        }
+        let currentNonces = Set(items.compactMap { $0.timelineMessage.message.nonce })
+        phase61LocalSendMessageIDByNonce[channelID] = messageIDByNonce.filter { currentNonces.contains($0.key) }
     }
 
     private func initialTimelinePreparationAnchor() -> MessageID? {
@@ -14272,7 +14298,7 @@ public struct MessageTimelineView: View {
             .frame(maxWidth: .infinity)
             .accessibilityLabel("Preparing loaded messages")
         } else {
-            ForEach(renderItems) { item in
+            ForEach(renderItems, id: \.renderIdentity) { item in
                 TimelineRenderItemView(item: item, viewModel: viewModel)
                     .padding(
                         .top,
@@ -14568,7 +14594,7 @@ public struct TimelineRenderItemView: View {
             }
             statusView(for: timelineMessage)
         }
-        .id(timelineMessage.message.id)
+        .id(item.renderIdentity)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onAppear {
@@ -14598,7 +14624,7 @@ public struct TimelineRenderItemView: View {
                     viewModel.imageResourceBecameVisible(
                         display.avatarFile,
                         kind: .userAvatar,
-                        consumerID: timelineAvatarConsumerID(for: timelineMessage)
+                        consumerID: timelineAvatarConsumerID(for: item)
                     )
                 }
                 viewModel.loadCustomEmojiImages(for: timelineMessage.message)
@@ -14617,7 +14643,7 @@ public struct TimelineRenderItemView: View {
             )
             if item.showsHeader {
                 viewModel.imageResourceBecameHidden(
-                    consumerID: timelineAvatarConsumerID(for: timelineMessage)
+                    consumerID: timelineAvatarConsumerID(for: item)
                 )
             }
         }
@@ -14640,8 +14666,8 @@ public struct TimelineRenderItemView: View {
         viewModel.requestFocus(.timeline)
     }
 
-    private func timelineAvatarConsumerID(for timelineMessage: TimelineMessage) -> String {
-        "timeline-avatar-\(timelineMessage.message.channelID.rawValue)-\(timelineMessage.message.id.rawValue)"
+    private func timelineAvatarConsumerID(for item: TimelineRenderItem) -> String {
+        "timeline-avatar-\(item.timelineMessage.message.channelID.rawValue)-\(item.renderIdentity)"
     }
 
     @ViewBuilder private func systemEventRow(
@@ -14659,7 +14685,7 @@ public struct TimelineRenderItemView: View {
                 )
             }
         )
-        .id(timelineMessage.message.id)
+        .id(item.renderIdentity)
     }
 
     private func rowActionItems(

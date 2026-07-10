@@ -7337,6 +7337,129 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.phase60Diagnostics.coalescedViewportFlushCount, 1)
     }
 
+    func testPhase61SendConfirmedAndLaterSnapshotBackfillOmittedNonceUserMember() {
+        let channelID: ChannelID = "phase61-identity-channel"
+        let userID: UserID = "phase61-identity-user"
+        let user = User(id: userID, username: "phase61-identity-author")
+        let member = ServerMember(id: MemberCompositeKey(serverID: "phase61-identity-server", userID: userID), joinedAt: Date())
+        let reducer = ChannelMessageHistoryReducer(messageCapPerChannel: 10)
+        var history = ChannelMessageHistory(channelID: channelID)
+
+        let pending = TimelineMessage(
+            message: Message(id: "pending-phase61-nonce", channelID: channelID, authorID: userID, content: "hi", nonce: "phase61-nonce", user: user, member: member),
+            status: .pending
+        )
+        history = reducer.reduce(history, event: .optimisticSendCreated(pending))
+
+        // The server's create response omits nonce/user/member entirely.
+        let confirmedID = MessageID(rawValue: ulid(milliseconds: 61_000))
+        let confirmedFromServer = Message(id: confirmedID, channelID: channelID, authorID: userID, content: "hi")
+        history = reducer.reduce(history, event: .sendConfirmed(message: confirmedFromServer, nonce: "phase61-nonce"))
+
+        let confirmedRow = history.messages.first { $0.message.id == confirmedID }
+        XCTAssertEqual(confirmedRow?.message.nonce, "phase61-nonce")
+        XCTAssertEqual(confirmedRow?.message.user?.id, userID)
+        XCTAssertEqual(confirmedRow?.message.member?.id, member.id)
+
+        // A later realtime echo / snapshot refresh of the same now-confirmed message also omits
+        // nonce/user/member -- it must not blank out identity that's already been established.
+        let laterEcho = Message(id: confirmedID, channelID: channelID, authorID: userID, content: "hi (edited elsewhere)")
+        history = reducer.reduce(history, event: .realtimeMessageReceived(laterEcho))
+
+        let echoedRow = history.messages.first { $0.message.id == confirmedID }
+        XCTAssertEqual(echoedRow?.message.nonce, "phase61-nonce")
+        XCTAssertEqual(echoedRow?.message.user?.id, userID)
+        XCTAssertEqual(echoedRow?.message.member?.id, member.id)
+        XCTAssertEqual(echoedRow?.message.content, "hi (edited elsewhere)")
+
+        // A foreign user's message is never backfilled from an unrelated locally-sent nonce.
+        let foreignID = MessageID(rawValue: ulid(milliseconds: 62_000))
+        let foreign = Message(id: foreignID, channelID: channelID, authorID: "phase61-identity-other-user", content: "hey")
+        history = reducer.reduce(history, event: .realtimeMessageReceived(foreign))
+        XCTAssertNil(history.messages.first { $0.message.id == foreignID }?.message.user)
+    }
+
+    func testPhase61RenderIdentityStaysStableAcrossPendingToConfirmedForLocalSend() {
+        let channelID: ChannelID = "phase61-render-channel"
+        let userID: UserID = "phase61-render-user"
+
+        let pendingItem = TimelineRenderItem(
+            timelineMessage: TimelineMessage(
+                message: Message(id: "pending-phase61-render-nonce", channelID: channelID, authorID: userID, content: "hi", nonce: "phase61-render-nonce"),
+                status: .pending
+            ),
+            groupID: "group",
+            authorID: userID,
+            showsHeader: true,
+            startsGroup: true,
+            currentUserID: userID
+        )
+        let confirmedItem = TimelineRenderItem(
+            timelineMessage: TimelineMessage(
+                message: Message(id: MessageID(rawValue: ulid(milliseconds: 63_000)), channelID: channelID, authorID: userID, content: "hi", nonce: "phase61-render-nonce"),
+                status: .confirmed
+            ),
+            groupID: "group",
+            authorID: userID,
+            showsHeader: true,
+            startsGroup: true,
+            currentUserID: userID
+        )
+
+        XCTAssertNotEqual(pendingItem.id, confirmedItem.id)
+        XCTAssertEqual(pendingItem.renderIdentity, confirmedItem.renderIdentity)
+
+        // A foreign author's message never gets a nonce-derived identity, even if -- implausibly
+        // -- it carried a matching nonce; only the sender's own row is stabilized.
+        let foreignItem = TimelineRenderItem(
+            timelineMessage: TimelineMessage(
+                message: Message(id: MessageID(rawValue: ulid(milliseconds: 64_000)), channelID: channelID, authorID: "phase61-render-other-user", content: "hi", nonce: "phase61-render-nonce"),
+                status: .confirmed
+            ),
+            groupID: "group",
+            authorID: "phase61-render-other-user",
+            showsHeader: true,
+            startsGroup: true,
+            currentUserID: userID
+        )
+        XCTAssertEqual(foreignItem.renderIdentity, foreignItem.id.rawValue)
+        XCTAssertNotEqual(foreignItem.renderIdentity, confirmedItem.renderIdentity)
+    }
+
+    @MainActor
+    func testPhase61VisibilityTrackingMigratesToConfirmedIDWithoutRetriggeringAvatarResource() async throws {
+        let handler = DelayedMessageActionHandler(delay: .milliseconds(80))
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let server = try XCTUnwrap(model.servers.first { $0.name == "Bagel Lab" })
+        model.selectServer(server.id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        model.updateDraft("phase61 visibility migration", for: channelID)
+
+        let sendTask = Task { await model.sendDraft(for: channelID) }
+        try await Task.sleep(for: .milliseconds(10))
+
+        await model.prepareSelectedTimelinePresentation()
+        let pendingItem = try XCTUnwrap(model.selectedTimelineRenderItems.first { $0.timelineMessage.message.content == "phase61 visibility migration" })
+        XCTAssertEqual(pendingItem.timelineMessage.status, .pending)
+        let stableRenderIdentity = pendingItem.renderIdentity
+        model.updateTimelineVisibility(messageID: pendingItem.id, channelID: channelID, isVisible: true)
+
+        await sendTask.value
+        await model.prepareSelectedTimelinePresentation()
+
+        let confirmedItem = try XCTUnwrap(model.selectedTimelineRenderItems.first { $0.timelineMessage.message.content == "phase61 visibility migration" })
+        XCTAssertEqual(confirmedItem.timelineMessage.status, .confirmed)
+        XCTAssertNotEqual(confirmedItem.id, pendingItem.id)
+        XCTAssertEqual(confirmedItem.renderIdentity, stableRenderIdentity)
+
+        // Visibility tracking moved to the confirmed id directly (not through a fresh
+        // onAppear/onDisappear pair), so toggling it off now registers as a real change instead
+        // of being silently ignored because the tracked id was still the stale pending one.
+        let eventCountBeforeToggle = model.phase60Diagnostics.visibilityEventCount
+        model.updateTimelineVisibility(messageID: confirmedItem.id, channelID: channelID, isVisible: false)
+        XCTAssertGreaterThan(model.phase60Diagnostics.visibilityEventCount, eventCountBeforeToggle)
+    }
+
     private func ulid(milliseconds: UInt64) -> String {
         let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
         var value = milliseconds

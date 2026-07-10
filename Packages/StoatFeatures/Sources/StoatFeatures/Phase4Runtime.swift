@@ -475,10 +475,18 @@ public struct ChannelMessageHistoryReducer: Sendable {
             history.loadedRange = Self.loadedRange(for: history.messages, hasMoreBefore: history.hasMoreBefore, hasMoreAfter: history.loadedRange.hasMoreAfter, error: history.loadedRange.lastPaginationError)
         case let .sendConfirmed(message, nonce):
             var messages = history.messages
-            messages.removeAll { timelineMessage in
-                timelineMessage.message.id == message.id || (nonce != nil && timelineMessage.message.nonce == nonce)
+            var confirmedMessage = message
+            if let nonce {
+                confirmedMessage.nonce = confirmedMessage.nonce ?? nonce
+                if let pendingMessage = messages.first(where: { $0.message.nonce == nonce })?.message {
+                    confirmedMessage.user = confirmedMessage.user ?? pendingMessage.user
+                    confirmedMessage.member = confirmedMessage.member ?? pendingMessage.member
+                }
             }
-            messages.append(TimelineMessage(message: message, status: .confirmed))
+            messages.removeAll { timelineMessage in
+                timelineMessage.message.id == confirmedMessage.id || (nonce != nil && timelineMessage.message.nonce == nonce)
+            }
+            messages.append(TimelineMessage(message: confirmedMessage, status: .confirmed))
             history.messages = sortedCapped(messages)
             history.loadedRange = Self.loadedRange(for: history.messages, hasMoreBefore: history.hasMoreBefore, hasMoreAfter: history.loadedRange.hasMoreAfter, error: history.loadedRange.lastPaginationError)
         case let .sendFailed(nonce, error):
@@ -605,11 +613,13 @@ public struct ChannelMessageHistoryReducer: Sendable {
     private func merge(current: [TimelineMessage], incoming messages: [Message]) -> [TimelineMessage] {
         var byID: [MessageID: TimelineMessage] = [:]
         let incomingNonces = Set(messages.compactMap(\.nonce))
+        var localSendByNonce: [String: Message] = [:]
 
         for timelineMessage in current {
             switch timelineMessage.status {
             case .pending, .failed, .retrying:
                 if let nonce = timelineMessage.message.nonce, incomingNonces.contains(nonce) {
+                    localSendByNonce[nonce] = timelineMessage.message
                     continue
                 }
                 byID[timelineMessage.message.id] = timelineMessage
@@ -618,8 +628,19 @@ public struct ChannelMessageHistoryReducer: Sendable {
             }
         }
 
+        // A realtime echo or refreshed snapshot of an already-known locally-sent message can
+        // omit the nonce/user/member it was confirmed with. Backfill from whatever we already
+        // know about that same send -- by nonce (temp id -> real id), else by real id (an
+        // already-confirmed row being refreshed) -- so its author identity/avatar doesn't blank.
         for message in messages {
-            byID[message.id] = TimelineMessage(message: message, status: .confirmed)
+            var merged = message
+            let priorLocalSend = merged.nonce.flatMap { localSendByNonce[$0] } ?? byID[message.id]?.message
+            if let priorLocalSend, priorLocalSend.nonce != nil {
+                merged.nonce = merged.nonce ?? priorLocalSend.nonce
+                merged.user = merged.user ?? priorLocalSend.user
+                merged.member = merged.member ?? priorLocalSend.member
+            }
+            byID[message.id] = TimelineMessage(message: merged, status: .confirmed)
         }
 
         return sortedCapped(Array(byID.values))

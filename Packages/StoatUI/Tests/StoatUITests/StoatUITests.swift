@@ -292,6 +292,52 @@ final class StoatUITests: XCTestCase {
         let emailLikeNoTrigger = GlassComposer._testDetectInlineTrigger(text: "a@b.com", caretUTF16Offset: 7)
         XCTAssertNil(emailLikeNoTrigger)
     }
+
+    @MainActor
+    func testPhase61PasteFileURLWinsOverAccompanyingTextRepresentation() {
+        let fileURL = URL(fileURLWithPath: "/tmp/phase61-example.png")
+        let outcome = GlassComposer._testPaste(existingText: "") { pasteboard in
+            pasteboard.writeObjects([fileURL as NSURL])
+            pasteboard.setString("phase61-example.png", forType: .string)
+        }
+        XCTAssertEqual(outcome.pastedFileURLs, [fileURL])
+        XCTAssertNil(outcome.pastedImageData)
+        XCTAssertEqual(outcome.resultingText, "")
+    }
+
+    @MainActor
+    func testPhase61PasteImageDataWinsOverAccompanyingTextRepresentation() {
+        let pngData = Data([0x89, 0x50, 0x4E, 0x47])
+        let outcome = GlassComposer._testPaste(existingText: "") { pasteboard in
+            pasteboard.setData(pngData, forType: .png)
+            pasteboard.setString("clipboard.png", forType: .string)
+        }
+        XCTAssertNil(outcome.pastedFileURLs)
+        XCTAssertEqual(outcome.pastedImageData, pngData)
+        XCTAssertEqual(outcome.resultingText, "")
+    }
+
+    @MainActor
+    func testPhase61PastePreservesExistingComposerTextWhenAttachmentWins() {
+        let pngData = Data([0x89, 0x50, 0x4E, 0x47])
+        let outcome = GlassComposer._testPaste(existingText: "Hello there") { pasteboard in
+            pasteboard.setData(pngData, forType: .png)
+            pasteboard.setString("clipboard.png", forType: .string)
+        }
+        XCTAssertEqual(outcome.pastedImageData, pngData)
+        XCTAssertNil(outcome.pastedFileURLs)
+        XCTAssertEqual(outcome.resultingText, "Hello there")
+    }
+
+    @MainActor
+    func testPhase61PasteFallsBackToPlainTextWhenNoAttachmentPayload() {
+        let outcome = GlassComposer._testPaste(existingText: "") { pasteboard in
+            pasteboard.setString("plain clipboard text", forType: .string)
+        }
+        XCTAssertNil(outcome.pastedFileURLs)
+        XCTAssertNil(outcome.pastedImageData)
+        XCTAssertEqual(outcome.resultingText, "plain clipboard text")
+    }
     #endif
 
     func testPhase47EmbedDisplayItemSanitizesURLsAndLabelsVariants() {
