@@ -3502,6 +3502,78 @@ final class StoatFeaturesTests: XCTestCase {
             Phase43AvatarCacheTransition.resolve(previous: original, incoming: nil, source: .currentUserEdit),
             .remove(previous: original)
         )
+        XCTAssertEqual(
+            Phase43ServerAvatarCacheTransition.resolve(previous: original, incoming: nil, source: .readyMember),
+            .preserve
+        )
+        XCTAssertEqual(
+            Phase43ServerAvatarCacheTransition.resolve(previous: original, incoming: replacement, source: .readyMember),
+            .replace(previous: original, next: replacement)
+        )
+        XCTAssertEqual(
+            Phase43ServerAvatarCacheTransition.resolve(previous: original, incoming: nil, source: .realtimeMemberUpdate),
+            .remove(previous: original)
+        )
+    }
+
+    @MainActor
+    func testPhase62MemberOverlayDoesNotOscillateGlobalAvatarCache() async throws {
+        let data = Data("phase62-member-avatar".utf8)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let userID = UserID(rawValue: "phase62-member-user")
+        let serverID = ServerID(rawValue: "phase62-member-server")
+        let globalAvatar = File(id: "phase62-global-avatar", tag: "avatars", filename: "global.png", contentType: "image/png", size: data.count)
+        let memberAvatar = File(id: "phase62-server-avatar", tag: "avatars", filename: "member.png", contentType: "image/png", size: data.count)
+        let user = User(id: userID, username: "phase62", avatar: globalAvatar)
+        let member = ServerMember(
+            id: MemberCompositeKey(serverID: serverID, userID: userID),
+            joinedAt: Date(),
+            avatar: memberAvatar
+        )
+
+        model.imageResourceBecameVisible(globalAvatar, kind: .userAvatar, consumerID: "phase62-global-consumer")
+        model.memberAvatarBecameVisible(memberAvatar, consumerID: "member-panel-avatar-\(serverID.rawValue)-\(userID.rawValue)")
+        for _ in 0..<80 {
+            if model.imageData(for: globalAvatar, kind: .userAvatar) != nil,
+               model.imageData(for: memberAvatar, kind: .userAvatar) != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let before = await model.imageResourceDiagnostics()
+
+        for _ in 0..<20 {
+            model.noteVisibleIdentity(userID: userID, user: user, member: member, serverID: serverID, source: .visibleMember)
+        }
+
+        let identity = model.phase43IdentitySnapshot(for: userID)
+        let after = await model.imageResourceDiagnostics()
+        XCTAssertEqual(identity?.avatarFile?.id, globalAvatar.id)
+        XCTAssertEqual(identity?.serverOverlays[serverID]?.avatarFile?.id, memberAvatar.id)
+        XCTAssertNotNil(model.imageData(for: globalAvatar, kind: .userAvatar))
+        XCTAssertNotNil(model.imageData(for: memberAvatar, kind: .userAvatar))
+        XCTAssertEqual(after.presentationEvictionCount, before.presentationEvictionCount)
+        XCTAssertEqual(after.reloadAfterEvictionCount, before.reloadAfterEvictionCount)
+    }
+
+    @MainActor
+    func testPhase62MemberAvatarVisibilityGraceCancelsAndClears() async throws {
+        let data = Data("phase62-member-grace".utf8)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let avatar = File(id: "phase62-member-grace", tag: "avatars", filename: "member.png", contentType: "image/png", size: data.count)
+        let consumerID = "member-panel-avatar-server-user"
+
+        model.memberAvatarBecameVisible(avatar, consumerID: consumerID)
+        model.memberAvatarBecameHidden(consumerID: consumerID)
+        XCTAssertEqual(model.pendingMemberAvatarHideCount, 1)
+        model.memberAvatarBecameVisible(avatar, consumerID: consumerID)
+        XCTAssertEqual(model.pendingMemberAvatarHideCount, 0)
+
+        model.memberAvatarBecameHidden(consumerID: consumerID)
+        model.clearMemberAvatarVisibility()
+        XCTAssertEqual(model.pendingMemberAvatarHideCount, 0)
+        try await Task.sleep(for: .milliseconds(800))
+        XCTAssertEqual(model.pendingMemberAvatarHideCount, 0)
     }
 
     func testPhase62ProfileBioDisclosureOnlyAppearsForOverflow() {
@@ -3509,6 +3581,21 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertFalse(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 133, collapsedHeight: 132))
         XCTAssertTrue(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 134, collapsedHeight: 132))
         XCTAssertEqual(ProfileBioDisclosurePolicy.contentWidth(cardWidth: 480, horizontalPadding: 24), 432)
+
+        var state = ProfileBioDisclosureState(contentKey: "long")
+        state.acceptMeasurement(220, contentKey: "long")
+        XCTAssertFalse(state.showsDisclosure(collapsedHeight: 132))
+        state.acceptPrepared(contentKey: "long")
+        state.acceptMeasurement(220, contentKey: "stale")
+        XCTAssertFalse(state.showsDisclosure(collapsedHeight: 132))
+        state.acceptMeasurement(220, contentKey: "long")
+        XCTAssertTrue(state.showsDisclosure(collapsedHeight: 132))
+        state.isExpanded = true
+        state.reset(contentKey: "short")
+        state.acceptPrepared(contentKey: "short")
+        state.acceptMeasurement(80, contentKey: "short")
+        XCTAssertFalse(state.isExpanded)
+        XCTAssertFalse(state.showsDisclosure(collapsedHeight: 132))
     }
 
     @MainActor

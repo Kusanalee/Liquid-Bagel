@@ -825,6 +825,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var imagePresentationByteCount = 0
     @ObservationIgnored private let maxImagePresentationBytes = 64 * 1024 * 1024
     @ObservationIgnored private var visibleImageResourceRequestsByConsumer: [String: ImageResourceRequest] = [:]
+    @ObservationIgnored private var memberAvatarHideTasksByConsumer: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var imagePresentationEvictedKeys: Set<ImageCacheKey> = []
     @ObservationIgnored private var imagePresentationEvictedOrder: [ImageCacheKey] = []
     @ObservationIgnored private var imagePresentationEvictionCount = 0
@@ -1956,13 +1957,11 @@ public final class MainShellViewModel {
     }
 
     private func mergePhase43Member(_ member: ServerMember, user: User?, source: Phase43IdentitySource) {
-        let previousAvatar = phase43IdentitySnapshots.snapshot(for: member.id.userID)?.avatarFile
-        if let memberAvatar = member.avatar {
-            applyPhase43AvatarCacheTransition(
-                .resolve(previous: previousAvatar, incoming: memberAvatar, source: source),
-                userID: member.id.userID
-            )
-        }
+        let previousAvatar = phase43IdentitySnapshots.snapshot(for: member.id.userID)?
+            .serverOverlays[member.id.serverID]?.avatarFile
+        applyPhase43ServerAvatarCacheTransition(
+            .resolve(previous: previousAvatar, incoming: member.avatar, source: source)
+        )
         if phase43IdentitySnapshots.merge(member: member, user: user, source: source, now: phase43Now()) {
             phase43IdentityGeneration = phase43IdentitySnapshots.generation
         }
@@ -2050,6 +2049,19 @@ public final class MainShellViewModel {
         imageResourceLoadTasks[key]?.cancel()
         imageResourceLoadTasks.removeValue(forKey: key)
         Task { await imageMemoryCache.remove(key) }
+    }
+
+    private func applyPhase43ServerAvatarCacheTransition(_ transition: Phase43ServerAvatarCacheTransition) {
+        switch transition {
+        case .preserve:
+            return
+        case let .replace(previous, _):
+            if let previous {
+                invalidatePhase43AvatarCache(previous)
+            }
+        case let .remove(previous):
+            invalidatePhase43AvatarCache(previous)
+        }
     }
 
     public func enqueuePhase43IdentityHydration(userID: UserID, source: Phase43IdentityHydrationSource = .visibleMessage) {
@@ -7557,6 +7569,33 @@ public final class MainShellViewModel {
 
     public func imageResourceBecameHidden(consumerID: String) {
         visibleImageResourceRequestsByConsumer.removeValue(forKey: consumerID)
+    }
+
+    func memberAvatarBecameVisible(_ file: File?, consumerID: String) {
+        memberAvatarHideTasksByConsumer.removeValue(forKey: consumerID)?.cancel()
+        imageResourceBecameVisible(file, kind: .userAvatar, consumerID: consumerID)
+    }
+
+    func memberAvatarBecameHidden(consumerID: String) {
+        memberAvatarHideTasksByConsumer.removeValue(forKey: consumerID)?.cancel()
+        memberAvatarHideTasksByConsumer[consumerID] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled else { return }
+            self?.visibleImageResourceRequestsByConsumer.removeValue(forKey: consumerID)
+            self?.memberAvatarHideTasksByConsumer.removeValue(forKey: consumerID)
+        }
+    }
+
+    func clearMemberAvatarVisibility() {
+        memberAvatarHideTasksByConsumer.values.forEach { $0.cancel() }
+        memberAvatarHideTasksByConsumer.removeAll()
+        visibleImageResourceRequestsByConsumer = visibleImageResourceRequestsByConsumer.filter {
+            !$0.key.hasPrefix("member-panel-avatar-")
+        }
+    }
+
+    var pendingMemberAvatarHideCount: Int {
+        memberAvatarHideTasksByConsumer.count
     }
 
     func currentUserRailAvatarBecameVisible(_ file: File?) {
@@ -15165,6 +15204,12 @@ public struct MemberPanelView: View {
         .task(id: viewModel.memberPanelModerationPrewarmToken) {
             await viewModel.memberPanelBecameVisibleForModerationPrewarm()
         }
+        .onChange(of: context) { _, _ in
+            viewModel.clearMemberAvatarVisibility()
+        }
+        .onDisappear {
+            viewModel.clearMemberAvatarVisibility()
+        }
     }
 
     private var serverMemberGroups: [MemberListGroup] {
@@ -15247,14 +15292,10 @@ public struct MemberPanelView: View {
                                 memberListRow(item)
                                     .onAppear {
                                         viewModel.noteVisibleIdentity(userID: item.userID, user: item.user, member: item.member, serverID: item.member?.id.serverID, source: .visibleMember)
-                                        viewModel.imageResourceBecameVisible(
-                                            item.avatar,
-                                            kind: .userAvatar,
-                                            consumerID: memberAvatarConsumerID(item)
-                                        )
+                                        viewModel.memberAvatarBecameVisible(item.avatar, consumerID: memberAvatarConsumerID(item))
                                     }
                                     .onDisappear {
-                                        viewModel.imageResourceBecameHidden(consumerID: memberAvatarConsumerID(item))
+                                        viewModel.memberAvatarBecameHidden(consumerID: memberAvatarConsumerID(item))
                                     }
                             }
                             if limited.remainder > 0 {
@@ -15305,14 +15346,10 @@ public struct MemberPanelView: View {
                         memberListRow(item, groupRemoval: isRemovableGroup && item.userID != viewModel.currentUserID ? (channelID: channel.id, displayName: item.displayName) : nil)
                             .onAppear {
                                 viewModel.noteVisibleIdentity(userID: item.userID, user: item.user, member: item.member, serverID: item.member?.id.serverID, source: .visibleMember)
-                                viewModel.imageResourceBecameVisible(
-                                    item.avatar,
-                                    kind: .userAvatar,
-                                    consumerID: memberAvatarConsumerID(item)
-                                )
+                                viewModel.memberAvatarBecameVisible(item.avatar, consumerID: memberAvatarConsumerID(item))
                             }
                             .onDisappear {
-                                viewModel.imageResourceBecameHidden(consumerID: memberAvatarConsumerID(item))
+                                viewModel.memberAvatarBecameHidden(consumerID: memberAvatarConsumerID(item))
                             }
                     }
                 }
@@ -16062,11 +16099,91 @@ struct ProfileBioDisclosurePolicy {
     }
 }
 
-private struct ProfileBioHeightPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
+struct ProfileBioDisclosureState: Equatable {
+    var contentKey: String
+    var preparedContentKey: String?
+    var measuredHeight: CGFloat = 0
+    var isExpanded = false
 
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+    mutating func reset(contentKey: String) {
+        self = ProfileBioDisclosureState(contentKey: contentKey)
+    }
+
+    mutating func acceptPrepared(contentKey: String) {
+        guard self.contentKey == contentKey else { return }
+        preparedContentKey = contentKey
+        measuredHeight = 0
+    }
+
+    mutating func acceptMeasurement(_ height: CGFloat, contentKey: String) {
+        guard self.contentKey == contentKey, preparedContentKey == contentKey else { return }
+        measuredHeight = max(0, height)
+    }
+
+    func showsDisclosure(collapsedHeight: CGFloat) -> Bool {
+        preparedContentKey == contentKey
+            && ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: measuredHeight, collapsedHeight: collapsedHeight)
+    }
+}
+
+private struct ProfileBioContentView: View {
+    let content: String
+    let contentKey: String
+    let width: CGFloat
+    let collapsedHeight: CGFloat
+    @State private var preparedContent: PreparedMarkdownContent?
+    @State private var disclosure: ProfileBioDisclosureState
+
+    init(content: String, contentKey: String, width: CGFloat, collapsedHeight: CGFloat) {
+        self.content = content
+        self.contentKey = contentKey
+        self.width = width
+        self.collapsedHeight = collapsedHeight
+        _preparedContent = State(initialValue: nil)
+        _disclosure = State(initialValue: ProfileBioDisclosureState(contentKey: contentKey))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            Group {
+                if let preparedContent {
+                    MarkdownMessageContent(prepared: preparedContent)
+                } else {
+                    Text(content)
+                        .font(StoatTypography.messageBody)
+                        .textSelection(.enabled)
+                }
+            }
+            .id(preparedContent == nil ? "bio-loading-\(contentKey)" : "bio-prepared-\(contentKey)")
+            .frame(width: width, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { height in
+                disclosure.acceptMeasurement(height, contentKey: contentKey)
+            }
+            .frame(maxHeight: disclosure.isExpanded ? nil : collapsedHeight, alignment: .top)
+            .clipped()
+
+            if disclosure.showsDisclosure(collapsedHeight: collapsedHeight) {
+                Button(disclosure.isExpanded ? "Show Less" : "See More") {
+                    disclosure.isExpanded.toggle()
+                }
+                .buttonStyle(.link)
+                .accessibilityHint(disclosure.isExpanded ? "Collapse the profile biography" : "Show the full profile biography")
+            }
+        }
+        .task(id: contentKey) {
+            preparedContent = nil
+            disclosure.reset(contentKey: contentKey)
+            let content = content
+            let prepared = await Task.detached(priority: .userInitiated) {
+                MarkdownContentPreparer.prepare(content)
+            }.value
+            guard !Task.isCancelled, prepared.source == content, disclosure.contentKey == contentKey else { return }
+            disclosure.acceptPrepared(contentKey: contentKey)
+            preparedContent = prepared
+        }
     }
 }
 
@@ -16074,9 +16191,6 @@ private struct UserProfileCardView: View {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @Bindable var viewModel: MainShellViewModel
     let user: User
-    @State private var isBioExpanded = false
-    @State private var measuredBioHeight: CGFloat = 0
-
     private let cardWidth: CGFloat = 480
     private let cardHeight: CGFloat = 560
     private let collapsedBioHeight: CGFloat = 132
@@ -16121,14 +16235,6 @@ private struct UserProfileCardView: View {
         }
         .onChange(of: viewModel.userProfilesByID[user.id]?.background) { _, background in
             viewModel.loadImageResource(for: background, kind: .profileBackground)
-        }
-        .onChange(of: user.id) { _, _ in
-            isBioExpanded = false
-            measuredBioHeight = 0
-        }
-        .onChange(of: profileBio) { _, _ in
-            isBioExpanded = false
-            measuredBioHeight = 0
         }
         .task(id: viewModel.memberPanelModerationPrewarmToken) {
             await viewModel.profilePopoverBecameVisibleForModerationPrewarm()
@@ -16247,32 +16353,13 @@ private struct UserProfileCardView: View {
     }
 
     @ViewBuilder private func profileBioContent(_ content: String) -> some View {
-        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
-            MarkdownMessageContent(content)
-                .frame(width: contentWidth, alignment: .leading)
-                .fixedSize(horizontal: false, vertical: true)
-                .background {
-                    GeometryReader { proxy in
-                        Color.clear.preference(key: ProfileBioHeightPreferenceKey.self, value: proxy.size.height)
-                    }
-                }
-                .frame(maxHeight: isBioExpanded ? nil : collapsedBioHeight, alignment: .top)
-                .clipped()
-
-            if ProfileBioDisclosurePolicy.isOverflowing(
-                measuredHeight: measuredBioHeight,
-                collapsedHeight: collapsedBioHeight
-            ) {
-                Button(isBioExpanded ? "Show Less" : "See More") {
-                    isBioExpanded.toggle()
-                }
-                .buttonStyle(.link)
-                .accessibilityHint(isBioExpanded ? "Collapse the profile biography" : "Show the full profile biography")
-            }
-        }
-        .onPreferenceChange(ProfileBioHeightPreferenceKey.self) { height in
-            measuredBioHeight = max(measuredBioHeight, height)
-        }
+        ProfileBioContentView(
+            content: content,
+            contentKey: "\(user.id.rawValue)|\(content)",
+            width: contentWidth,
+            collapsedHeight: collapsedBioHeight
+        )
+        .id("\(user.id.rawValue)|\(content)")
     }
 
     private func mutualList(_ values: [String], empty: String) -> some View {

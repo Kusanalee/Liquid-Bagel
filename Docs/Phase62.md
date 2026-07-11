@@ -19,12 +19,22 @@ The first Phase 62 live pass failed two paths. The upper-left current-user avata
 - Text-only inline Markdown now renders as one wrapping text flow instead of an intrinsic-width token row. Profile content receives the card's explicit inner width before height measurement, while custom emoji and mention/reference pills retain their existing token-row path.
 - Bio expansion and measured height reset when either the presented user or profile content changes.
 
+## P1 Follow-up: Member Overlay Continuity And Reliable Disclosure
+
+The second live pass confirmed the upper-left rail avatar, chat-row avatar, and bio wrapping fixes. Two narrower failures remained: a server member avatar could flash for roughly half a second during sends/scrolling, and an overflowing bio did not always present `See More` after asynchronous Markdown preparation.
+
+- Global user avatars and server-member avatar overrides now occupy separate Phase 43 identity fields and cache transitions. A visible member row can no longer alternate invalidation between the user's global avatar and that server's overlay avatar.
+- Member-panel visibility uses stable context/user consumer IDs with a cancellable 750 ms hide grace. Lazy-list recycling and member-group replacement preserve the pin, while panel/context closure cancels pending work and releases all member consumers.
+- Bio disclosure state is keyed by user and content. Markdown prepares off-main, final prepared geometry supplies the exact uncapped height, and stale preparation/measurement from the previous profile is ignored.
+- `See More` appears only after final prepared content is measured above the collapsed height; short bios remain undisclosed, and expansion resets on profile/content changes.
+
 ## Automated Proof
 
 - Phase 62 regression coverage pins the rail avatar through presentation-cache pressure and proves that visibility transfers when the avatar file changes.
 - Bio disclosure policy coverage proves that the control appears only after rendered content exceeds the collapsed height.
 - Existing partial-snapshot identity, optimistic-send avatar grouping, scroll-target, and clipboard diagnostic regression tests remain in the Phase 62 focused slice.
 - Remediation coverage repeats partial message-identity merges against a pinned avatar, verifies authoritative replacement/removal policy, checks presentation churn counters, and selects wrapping text for long plain/Markdown biographies while preserving token rows for emoji/references.
+- Follow-up coverage proves global/member avatar coexistence without eviction/reload churn, server-overlay transition semantics, cancellable member visibility grace and cleanup, plus prepared/stale/short/long bio disclosure state transitions.
 
 ## Live QA Required
 
@@ -33,6 +43,6 @@ The first Phase 62 live pass failed two paths. The upper-left current-user avata
 - Confirm action labels stay on one line, tabs remain aligned, roles do not force horizontal compression, and long bios show `See More`, expand, scroll within the card, and collapse with `Show Less`.
 - Recheck Increase Contrast, Reduce Motion, keyboard focus, and VoiceOver labels on the repaired card.
 
-For the remediation retest, prioritize the first two items. Accessibility QA is explicitly deferred by the tester and does not gate this P1 bug-fix pass.
+For the follow-up retest, prioritize member-panel scrolling/sending and repeat opening long/short bios. Accessibility QA is explicitly deferred by the tester and does not gate this P1 bug-fix pass.
 
-The remediated rail-avatar and profile-bio changes have implementation/test proof only. Their live-sensitive parity rows remain `partial` until repeated sends/scrolling show no rail flash and the supplied long bot bio wraps across the card normally.
+The member-avatar and disclosure follow-up has implementation/test proof only. Live-sensitive parity rows remain `partial` until repeated sends/scrolling show no member-row flash and overflowing bios consistently present `See More`.

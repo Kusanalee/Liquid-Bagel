@@ -48,6 +48,23 @@ enum Phase43AvatarCacheTransition: Equatable {
     }
 }
 
+enum Phase43ServerAvatarCacheTransition: Equatable {
+    case preserve
+    case replace(previous: File?, next: File)
+    case remove(previous: File)
+
+    static func resolve(previous: File?, incoming: File?, source: Phase43IdentitySource) -> Self {
+        if let incoming {
+            guard previous?.id != incoming.id else { return .preserve }
+            return .replace(previous: previous, next: incoming)
+        }
+        guard let previous, source == .realtimeMemberUpdate else {
+            return .preserve
+        }
+        return .remove(previous: previous)
+    }
+}
+
 public struct Phase43ServerIdentityOverlay: Hashable, Sendable {
     public var serverID: ServerID
     public var nickname: String?
@@ -319,9 +336,6 @@ public struct Phase43IdentitySnapshotStore: Hashable, Sendable {
         }
         var snapshot = snapshotsByUserID[member.id.userID] ?? Phase43IdentitySnapshot(userID: member.id.userID)
         let before = snapshot
-        if let avatar = member.avatar {
-            snapshot.avatarFile = avatar
-        }
         snapshot.sourceCategories.insert(source)
         snapshot.confidence = max(snapshot.confidence, Self.confidence(for: source))
         var overlay = snapshot.serverOverlays[member.id.serverID] ?? Phase43ServerIdentityOverlay(serverID: member.id.serverID)
