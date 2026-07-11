@@ -3418,6 +3418,45 @@ final class StoatFeaturesTests: XCTestCase {
     }
 
     @MainActor
+    func testPhase62CurrentUserRailAvatarStaysPinnedAndTransfersVisibility() async throws {
+        let data = Data(repeating: 9, count: 40 * 1024 * 1024)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let original = File(id: "phase62-rail-original", tag: "avatars", filename: "original.png", contentType: "image/png", size: data.count)
+        let pressure = File(id: "phase62-pressure", tag: "avatars", filename: "pressure.png", contentType: "image/png", size: data.count)
+        let replacement = File(id: "phase62-rail-replacement", tag: "avatars", filename: "replacement.png", contentType: "image/png", size: data.count)
+
+        model.currentUserRailAvatarBecameVisible(original)
+        for _ in 0..<80 {
+            if model.imageData(for: original, kind: .userAvatar) != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        model.loadImageResource(for: pressure, kind: .userAvatar)
+        for _ in 0..<80 {
+            let diagnostics = await model.imageResourceDiagnostics()
+            if diagnostics.presentationEvictionCount > 0 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertNotNil(model.imageData(for: original, kind: .userAvatar))
+        XCTAssertNil(model.imageData(for: pressure, kind: .userAvatar))
+
+        model.currentUserRailAvatarBecameVisible(replacement)
+        for _ in 0..<80 {
+            if model.imageData(for: replacement, kind: .userAvatar) != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertNil(model.imageData(for: original, kind: .userAvatar))
+        XCTAssertNotNil(model.imageData(for: replacement, kind: .userAvatar))
+    }
+
+    func testPhase62ProfileBioDisclosureOnlyAppearsForOverflow() {
+        XCTAssertFalse(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 132, collapsedHeight: 132))
+        XCTAssertFalse(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 133, collapsedHeight: 132))
+        XCTAssertTrue(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 134, collapsedHeight: 132))
+    }
+
+    @MainActor
     func testPhase59AvatarCompletionDoesNotInvalidatePreparedTimelineRows() async throws {
         let data = Data("avatar".utf8)
         let loader = MockImageResourceLoader(result: .success(data))

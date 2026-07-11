@@ -7533,6 +7533,18 @@ public final class MainShellViewModel {
         visibleImageResourceRequestsByConsumer.removeValue(forKey: consumerID)
     }
 
+    func currentUserRailAvatarBecameVisible(_ file: File?) {
+        imageResourceBecameVisible(
+            file,
+            kind: .userAvatar,
+            consumerID: "shell-current-user-avatar"
+        )
+    }
+
+    func currentUserRailAvatarBecameHidden() {
+        imageResourceBecameHidden(consumerID: "shell-current-user-avatar")
+    }
+
     private var visibleImageResourceKeys: Set<ImageCacheKey> {
         Set(visibleImageResourceRequestsByConsumer.values.map(\.cacheKey))
     }
@@ -13696,9 +13708,6 @@ public struct ServerRailView: View {
             }
             if let user = viewModel.currentUserForPresentation {
                 currentUserRailItem(user)
-                    .onAppear {
-                        viewModel.loadImageResource(for: user.avatar, kind: .userAvatar)
-                    }
             }
             Divider().padding(.horizontal, StoatSpacing.medium)
             ScrollView {
@@ -13753,6 +13762,15 @@ public struct ServerRailView: View {
             .frame(width: StoatSize.serverIcon, height: StoatSize.serverIcon)
         }
         .buttonStyle(.plain)
+        .onAppear {
+            viewModel.currentUserRailAvatarBecameVisible(display.avatarFile)
+        }
+        .onChange(of: display.avatarFile) { _, avatarFile in
+            viewModel.currentUserRailAvatarBecameVisible(avatarFile)
+        }
+        .onDisappear {
+            viewModel.currentUserRailAvatarBecameHidden()
+        }
         .help("Profile and status")
         .contextMenu {
             statusMenuButton(.online)
@@ -15994,35 +16012,58 @@ private struct FriendItemRow: View {
     }
 }
 
+struct ProfileBioDisclosurePolicy {
+    static func isOverflowing(measuredHeight: CGFloat, collapsedHeight: CGFloat) -> Bool {
+        measuredHeight > collapsedHeight + 1
+    }
+}
+
+private struct ProfileBioHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct UserProfileCardView: View {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @Bindable var viewModel: MainShellViewModel
     let user: User
+    @State private var isBioExpanded = false
+    @State private var measuredBioHeight: CGFloat = 0
+
+    private let cardWidth: CGFloat = 480
+    private let cardHeight: CGFloat = 560
+    private let collapsedBioHeight: CGFloat = 132
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ZStack(alignment: .bottomLeading) {
-                profileBackground
-                AvatarView(title: context.display.displayName, size: 72, isOnline: user.online, presence: user.status?.presence, imageData: viewModel.imageData(for: avatarFile, kind: .userAvatar))
-                    .padding(.leading, StoatSpacing.large)
-                    .offset(y: 28)
-            }
-            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
-                header
-                actionRow
-                Picker("Profile section", selection: $viewModel.profileSelectedTab) {
-                    ForEach(ProfileCardTab.allCases, id: \.self) { tab in
-                        Text(tab.rawValue).tag(tab)
-                    }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                ZStack(alignment: .bottomLeading) {
+                    profileBackground
+                    AvatarView(title: context.display.displayName, size: 72, isOnline: user.online, presence: user.status?.presence, imageData: viewModel.imageData(for: avatarFile, kind: .userAvatar))
+                        .padding(.leading, StoatSpacing.large)
+                        .offset(y: 28)
                 }
-                .pickerStyle(.segmented)
-                tabContent
+                VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                    header
+                    actionGrid
+                    Picker("Profile section", selection: $viewModel.profileSelectedTab) {
+                        ForEach(ProfileCardTab.allCases, id: \.self) { tab in
+                            Text(tab.rawValue).tag(tab)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    tabContent
+                }
+                .padding(.top, 36)
+                .padding([.horizontal, .bottom], StoatSpacing.large)
             }
-            .padding(.top, 36)
-            .padding([.horizontal, .bottom], StoatSpacing.large)
         }
-        .frame(width: 390, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: StoatRadius.panel, style: .continuous))
+        .frame(width: cardWidth, height: cardHeight, alignment: .topLeading)
+        .background(.regularMaterial)
         .onAppear {
             viewModel.loadImageResource(for: avatarFile, kind: .userAvatar)
             if let background = viewModel.userProfilesByID[user.id]?.background {
@@ -16031,6 +16072,10 @@ private struct UserProfileCardView: View {
         }
         .onChange(of: viewModel.userProfilesByID[user.id]?.background) { _, background in
             viewModel.loadImageResource(for: background, kind: .profileBackground)
+        }
+        .onChange(of: user.id) { _, _ in
+            isBioExpanded = false
+            measuredBioHeight = 0
         }
         .task(id: viewModel.memberPanelModerationPrewarmToken) {
             await viewModel.profilePopoverBecameVisibleForModerationPrewarm()
@@ -16069,10 +16114,13 @@ private struct UserProfileCardView: View {
         }
     }
 
-    @ViewBuilder private var actionRow: some View {
-        HStack(spacing: StoatSpacing.small) {
+    @ViewBuilder private var actionGrid: some View {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 118), spacing: StoatSpacing.small)],
+            alignment: .leading,
+            spacing: StoatSpacing.small
+        ) {
             profileActions
-            Spacer()
             if viewModel.isDeveloperControlsEnabled {
                 Button("Copy ID") {
                     Task { await viewModel.messageCopier.copy(user.id.rawValue) }
@@ -16080,6 +16128,7 @@ private struct UserProfileCardView: View {
                 .buttonStyle(GlassButtonStyle())
             }
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder private var tabContent: some View {
@@ -16111,8 +16160,7 @@ private struct UserProfileCardView: View {
                         .foregroundStyle(.secondary)
                 }
             } else if let content = profileBio {
-                MarkdownMessageContent(content)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                profileBioContent(content)
             } else if let error = viewModel.profileErrorsByID[user.id] {
                 Text(error)
                     .font(.caption)
@@ -16126,16 +16174,51 @@ private struct UserProfileCardView: View {
     }
 
     private var roleChips: some View {
-        HStack(spacing: StoatSpacing.xSmall) {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 96), spacing: StoatSpacing.xSmall)],
+            alignment: .leading,
+            spacing: StoatSpacing.xSmall
+        ) {
             ForEach(context.roles) { role in
                 let roleColor = ResolvedRoleColor(rawValue: role.colour, highContrast: colorSchemeContrast == .increased, sourceRoleID: role.id)
                 Text(role.name)
                     .font(.caption.weight(.semibold))
+                    .lineLimit(1)
                     .padding(.horizontal, StoatSpacing.small)
                     .padding(.vertical, StoatSpacing.xxSmall)
                     .foregroundStyle(roleForeground(roleColor))
                     .background(roleForeground(roleColor).opacity(0.12), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                    .help(role.name)
             }
+        }
+    }
+
+    @ViewBuilder private func profileBioContent(_ content: String) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            MarkdownMessageContent(content)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(key: ProfileBioHeightPreferenceKey.self, value: proxy.size.height)
+                    }
+                }
+                .frame(maxHeight: isBioExpanded ? nil : collapsedBioHeight, alignment: .top)
+                .clipped()
+
+            if ProfileBioDisclosurePolicy.isOverflowing(
+                measuredHeight: measuredBioHeight,
+                collapsedHeight: collapsedBioHeight
+            ) {
+                Button(isBioExpanded ? "Show Less" : "See More") {
+                    isBioExpanded.toggle()
+                }
+                .buttonStyle(.link)
+                .accessibilityHint(isBioExpanded ? "Collapse the profile biography" : "Show the full profile biography")
+            }
+        }
+        .onPreferenceChange(ProfileBioHeightPreferenceKey.self) { height in
+            measuredBioHeight = max(measuredBioHeight, height)
         }
     }
 

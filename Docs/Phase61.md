@@ -44,8 +44,9 @@ The seventh live-QA pass failed the two rows above. This remediation fixes only 
 
 - Phase 60 performance: record as acceptable unless a fresh sample or Phase 60 counters show repeating viewport flushes, unbounded row queues, stale row churn, image/decode loops, or avoidable main-thread row preparation.
 - Reactions: Unicode add/remove/reload is green from live QA; custom emoji reactions are still not claimed.
-- Clipboard paste: fixed per the P1 follow-up above; needs a live retest before this row can move off `partial`.
-- Avatar continuity: fixed per the P1 follow-up above; retest repeated sends in a warmed channel and confirm no initials/fallback flash before this row can move off `partial`.
+- Clipboard paste: the Phase 61 live retest passed for screenshot/Finder payloads with empty and non-empty drafts; chips appear immediately, draft text remains intact, and upload waits for Send.
+- Avatar continuity: chat rows passed through pending, confirmation, and realtime echo. A separate flash remains in the upper-left current-user rail avatar and moves to Phase 62.
+- Scrolling: a rapid-scroll peak reached roughly 112%, then settled to 0-10% within two seconds. This is acceptable for Phase 61, with native-feeling scroll smoothness still available for later optimization.
 - Notifications: explicitly deferred in this pass. QA Lane 4 lives in Settings -> Notifications. Signature/build readiness is also summarized in Developer diagnostics as Notification build.
 
 ## Verification
