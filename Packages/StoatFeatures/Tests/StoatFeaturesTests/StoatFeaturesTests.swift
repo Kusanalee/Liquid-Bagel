@@ -3450,10 +3450,65 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertNotNil(model.imageData(for: replacement, kind: .userAvatar))
     }
 
+    @MainActor
+    func testPhase62PartialMessageIdentityDoesNotInvalidatePinnedAvatar() async throws {
+        let data = Data("phase62-avatar".utf8)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let userID = UserID(rawValue: "phase62-partial-user")
+        let avatar = File(id: "phase62-partial-avatar", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: data.count)
+        let completeUser = User(id: userID, username: "phase62", displayName: "Phase 62", avatar: avatar)
+        let partialUser = User(id: userID, username: "phase62")
+
+        model.noteVisibleIdentity(userID: userID, user: completeUser, source: .visibleMessage)
+        model.imageResourceBecameVisible(avatar, kind: .userAvatar, consumerID: "shell-current-user-avatar")
+        for _ in 0..<80 {
+            if model.imageData(for: avatar, kind: .userAvatar) != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let before = await model.imageResourceDiagnostics()
+
+        for _ in 0..<20 {
+            model.noteVisibleIdentity(userID: userID, user: partialUser, source: .visibleMessage)
+        }
+
+        let after = await model.imageResourceDiagnostics()
+        XCTAssertNotNil(model.imageData(for: avatar, kind: .userAvatar))
+        XCTAssertEqual(after.presentationEvictionCount, before.presentationEvictionCount)
+        XCTAssertEqual(after.reloadAfterEvictionCount, before.reloadAfterEvictionCount)
+    }
+
+    func testPhase62AvatarCacheTransitionIsSourceAware() {
+        let original = File(id: "phase62-policy-original", tag: "avatars", filename: "original.png", contentType: "image/png", size: 1)
+        let replacement = File(id: "phase62-policy-replacement", tag: "avatars", filename: "replacement.png", contentType: "image/png", size: 1)
+
+        XCTAssertEqual(
+            Phase43AvatarCacheTransition.resolve(previous: original, incoming: nil, source: .messageUser),
+            .preserve
+        )
+        XCTAssertEqual(
+            Phase43AvatarCacheTransition.resolve(previous: original, incoming: nil, source: .readyUser),
+            .preserve
+        )
+        XCTAssertEqual(
+            Phase43AvatarCacheTransition.resolve(previous: original, incoming: replacement, source: .messageUser),
+            .replace(previous: original, next: replacement)
+        )
+        XCTAssertEqual(
+            Phase43AvatarCacheTransition.resolve(previous: original, incoming: nil, source: .realtimeUserUpdate),
+            .remove(previous: original)
+        )
+        XCTAssertEqual(
+            Phase43AvatarCacheTransition.resolve(previous: original, incoming: nil, source: .currentUserEdit),
+            .remove(previous: original)
+        )
+    }
+
     func testPhase62ProfileBioDisclosureOnlyAppearsForOverflow() {
         XCTAssertFalse(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 132, collapsedHeight: 132))
         XCTAssertFalse(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 133, collapsedHeight: 132))
         XCTAssertTrue(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 134, collapsedHeight: 132))
+        XCTAssertEqual(ProfileBioDisclosurePolicy.contentWidth(cardWidth: 480, horizontalPadding: 24), 432)
     }
 
     @MainActor

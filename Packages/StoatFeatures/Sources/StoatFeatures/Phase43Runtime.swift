@@ -30,6 +30,24 @@ public enum Phase43IdentityConfidence: Int, Codable, Hashable, Sendable, Compara
     }
 }
 
+enum Phase43AvatarCacheTransition: Equatable {
+    case preserve
+    case replace(previous: File?, next: File)
+    case remove(previous: File)
+
+    static func resolve(previous: File?, incoming: File?, source: Phase43IdentitySource) -> Self {
+        if let incoming {
+            guard previous?.id != incoming.id else { return .preserve }
+            return .replace(previous: previous, next: incoming)
+        }
+        guard let previous,
+              source == .realtimeUserUpdate || source == .currentUserEdit else {
+            return .preserve
+        }
+        return .remove(previous: previous)
+    }
+}
+
 public struct Phase43ServerIdentityOverlay: Hashable, Sendable {
     public var serverID: ServerID
     public var nickname: String?

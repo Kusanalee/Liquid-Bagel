@@ -203,6 +203,36 @@ final class StoatUITests: XCTestCase {
         XCTAssertEqual(codeBlocks, ["code::let value = \":bagel:\""])
     }
 
+    func testPhase62PlainMarkdownUsesWrappingTextFlow() {
+        let longBio = "Star Rail codes. /FetchZZZ — Fetch all active Zenless Zone Zero codes. /FetchHI3 — Fetch all active Honkai Impact 3rd codes."
+        XCTAssertEqual(
+            MarkdownMessageContent._testInlineRenderingStrategy(for: longBio),
+            "wrappingText"
+        )
+        XCTAssertEqual(
+            MarkdownMessageContent._testInlineRenderingStrategy(for: "**Bold text** and a [link](https://example.invalid)"),
+            "wrappingText"
+        )
+    }
+
+    func testPhase62InlineMediaAndReferencesKeepTokenRow() {
+        let emoji = MessageInlineCustomEmojiItem(shortcode: ":bagel:", name: "bagel")
+        XCTAssertEqual(
+            MarkdownMessageContent._testInlineRenderingStrategy(for: "hello :bagel:", customEmojiItems: [emoji]),
+            "tokenRow"
+        )
+
+        let userID = "01FD58YK5W7QRV5H3D64KTQYX3"
+        let mention = MessageInlineReferenceItem(kind: .user, rawID: userID, displayName: "Enka")
+        XCTAssertEqual(
+            MarkdownMessageContent._testInlineRenderingStrategy(
+                for: "hello <@\(userID)>",
+                referenceItems: ["<@\(userID)>": mention]
+            ),
+            "tokenRow"
+        )
+    }
+
     func testPhase58MentionTokenizerExtractsUserMentionsOutsideCode() {
         let userID = "01FD58YK5W7QRV5H3D64KTQYX3"
         let mention = MessageInlineReferenceItem(kind: .user, rawID: userID, displayName: "Enka")

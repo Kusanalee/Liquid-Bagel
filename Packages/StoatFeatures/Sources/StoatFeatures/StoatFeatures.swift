@@ -1946,9 +1946,10 @@ public final class MainShellViewModel {
 
     private func mergePhase43User(_ user: User, source: Phase43IdentitySource) {
         let previousAvatar = phase43IdentitySnapshots.snapshot(for: user.id)?.avatarFile
-        if previousAvatar?.id != user.avatar?.id {
-            invalidatePhase43AvatarCache(old: previousAvatar, new: user.avatar)
-        }
+        applyPhase43AvatarCacheTransition(
+            .resolve(previous: previousAvatar, incoming: user.avatar, source: source),
+            userID: user.id
+        )
         if phase43IdentitySnapshots.merge(user: user, source: source, now: phase43Now()) {
             phase43IdentityGeneration = phase43IdentitySnapshots.generation
         }
@@ -1956,8 +1957,11 @@ public final class MainShellViewModel {
 
     private func mergePhase43Member(_ member: ServerMember, user: User?, source: Phase43IdentitySource) {
         let previousAvatar = phase43IdentitySnapshots.snapshot(for: member.id.userID)?.avatarFile
-        if let memberAvatar = member.avatar, previousAvatar?.id != memberAvatar.id {
-            invalidatePhase43AvatarCache(old: previousAvatar, new: memberAvatar)
+        if let memberAvatar = member.avatar {
+            applyPhase43AvatarCacheTransition(
+                .resolve(previous: previousAvatar, incoming: memberAvatar, source: source),
+                userID: member.id.userID
+            )
         }
         if phase43IdentitySnapshots.merge(member: member, user: user, source: source, now: phase43Now()) {
             phase43IdentityGeneration = phase43IdentitySnapshots.generation
@@ -2012,18 +2016,40 @@ public final class MainShellViewModel {
         }
     }
 
-    private func invalidatePhase43AvatarCache(old: File?, new: File?) {
-        let files = [old, new].compactMap { $0 }
-        for file in files {
-            let key = ImageCacheKey(id: file.id.rawValue, kind: .userAvatar)
-            loadedImageResources.removeValue(forKey: key)
-            imageResourceStates.removeValue(forKey: key)
-            imageResourceFailureDates.removeValue(forKey: key)
-            queuedImageResourceRequests.removeValue(forKey: key)
-            imageResourceLoadTasks[key]?.cancel()
-            imageResourceLoadTasks.removeValue(forKey: key)
-            Task { await imageMemoryCache.remove(key) }
+    private func applyPhase43AvatarCacheTransition(
+        _ transition: Phase43AvatarCacheTransition,
+        userID: UserID
+    ) {
+        switch transition {
+        case .preserve:
+            return
+        case let .replace(previous, next):
+            if userID == currentUserID,
+               visibleImageResourceRequestsByConsumer["shell-current-user-avatar"] != nil,
+               let request = imageResourceRequest(for: next, kind: .userAvatar) {
+                visibleImageResourceRequestsByConsumer["shell-current-user-avatar"] = request
+                enqueueImageResourceRequest(request, priority: .visibleMember)
+            }
+            if let previous {
+                invalidatePhase43AvatarCache(previous)
+            }
+        case let .remove(previous):
+            if userID == currentUserID {
+                visibleImageResourceRequestsByConsumer.removeValue(forKey: "shell-current-user-avatar")
+            }
+            invalidatePhase43AvatarCache(previous)
         }
+    }
+
+    private func invalidatePhase43AvatarCache(_ file: File) {
+        let key = ImageCacheKey(id: file.id.rawValue, kind: .userAvatar)
+        removeImagePresentationData(for: key)
+        imageResourceStates.removeValue(forKey: key)
+        imageResourceFailureDates.removeValue(forKey: key)
+        queuedImageResourceRequests.removeValue(forKey: key)
+        imageResourceLoadTasks[key]?.cancel()
+        imageResourceLoadTasks.removeValue(forKey: key)
+        Task { await imageMemoryCache.remove(key) }
     }
 
     public func enqueuePhase43IdentityHydration(userID: UserID, source: Phase43IdentityHydrationSource = .visibleMessage) {
@@ -13696,9 +13722,11 @@ private struct VerificationRow: View {
 
 public struct ServerRailView: View {
     private let viewModel: MainShellViewModel
+    @State private var retainedCurrentUserAvatarData: Data?
 
     public init(viewModel: MainShellViewModel) {
         self.viewModel = viewModel
+        _retainedCurrentUserAvatarData = State(initialValue: nil)
     }
 
     public var body: some View {
@@ -13741,6 +13769,7 @@ public struct ServerRailView: View {
 
     private func currentUserRailItem(_ user: User) -> some View {
         let display = UserDisplayResolver.resolved(userID: user.id, user: user)
+        let currentAvatarData = viewModel.imageData(for: display.avatarFile, kind: .userAvatar)
         return Button {
             viewModel.showUserProfile(user.id, source: .currentUser)
         } label: {
@@ -13750,7 +13779,7 @@ public struct ServerRailView: View {
                     size: StoatSize.serverIcon,
                     isOnline: user.online,
                     presence: user.status?.presence,
-                    imageData: viewModel.imageData(for: display.avatarFile, kind: .userAvatar)
+                    imageData: currentAvatarData ?? retainedCurrentUserAvatarData
                 )
                 if user.status?.presence == .busy {
                     Image(systemName: "bell.slash.fill")
@@ -13763,10 +13792,21 @@ public struct ServerRailView: View {
         }
         .buttonStyle(.plain)
         .onAppear {
+            if let currentAvatarData {
+                retainedCurrentUserAvatarData = currentAvatarData
+            }
             viewModel.currentUserRailAvatarBecameVisible(display.avatarFile)
         }
         .onChange(of: display.avatarFile) { _, avatarFile in
+            if avatarFile == nil {
+                retainedCurrentUserAvatarData = nil
+            }
             viewModel.currentUserRailAvatarBecameVisible(avatarFile)
+        }
+        .onChange(of: currentAvatarData) { _, data in
+            if let data {
+                retainedCurrentUserAvatarData = data
+            }
         }
         .onDisappear {
             viewModel.currentUserRailAvatarBecameHidden()
@@ -16016,6 +16056,10 @@ struct ProfileBioDisclosurePolicy {
     static func isOverflowing(measuredHeight: CGFloat, collapsedHeight: CGFloat) -> Bool {
         measuredHeight > collapsedHeight + 1
     }
+
+    static func contentWidth(cardWidth: CGFloat, horizontalPadding: CGFloat) -> CGFloat {
+        max(1, cardWidth - (horizontalPadding * 2))
+    }
 }
 
 private struct ProfileBioHeightPreferenceKey: PreferenceKey {
@@ -16036,6 +16080,10 @@ private struct UserProfileCardView: View {
     private let cardWidth: CGFloat = 480
     private let cardHeight: CGFloat = 560
     private let collapsedBioHeight: CGFloat = 132
+
+    private var contentWidth: CGFloat {
+        ProfileBioDisclosurePolicy.contentWidth(cardWidth: cardWidth, horizontalPadding: StoatSpacing.large)
+    }
 
     var body: some View {
         ScrollView {
@@ -16058,6 +16106,7 @@ private struct UserProfileCardView: View {
                     .pickerStyle(.segmented)
                     tabContent
                 }
+                .frame(width: contentWidth, alignment: .leading)
                 .padding(.top, 36)
                 .padding([.horizontal, .bottom], StoatSpacing.large)
             }
@@ -16074,6 +16123,10 @@ private struct UserProfileCardView: View {
             viewModel.loadImageResource(for: background, kind: .profileBackground)
         }
         .onChange(of: user.id) { _, _ in
+            isBioExpanded = false
+            measuredBioHeight = 0
+        }
+        .onChange(of: profileBio) { _, _ in
             isBioExpanded = false
             measuredBioHeight = 0
         }
@@ -16196,8 +16249,8 @@ private struct UserProfileCardView: View {
     @ViewBuilder private func profileBioContent(_ content: String) -> some View {
         VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
             MarkdownMessageContent(content)
+                .frame(width: contentWidth, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
                 .background {
                     GeometryReader { proxy in
                         Color.clear.preference(key: ProfileBioHeightPreferenceKey.self, value: proxy.size.height)

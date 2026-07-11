@@ -3826,6 +3826,18 @@ extension MarkdownMessageContent {
     ) -> [String] {
         MarkdownInlineToken.tokenize(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems).map(\.testDescription)
     }
+
+    nonisolated static func _testInlineRenderingStrategy(
+        for source: String,
+        customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        referenceItems: [String: MessageInlineReferenceItem] = [:]
+    ) -> String {
+        let tokens = MarkdownInlineToken.tokenize(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems)
+        return tokens.allSatisfy {
+            if case .text = $0 { return true }
+            return false
+        } ? MarkdownInlineRenderingStrategy.wrappingText.rawValue : MarkdownInlineRenderingStrategy.tokenRow.rawValue
+    }
 }
 
 private struct InlineCustomEmojiMessageContent: View {
@@ -3835,6 +3847,11 @@ private struct InlineCustomEmojiMessageContent: View {
     var body: some View {
         MarkdownMessageContent(source, customEmojiItems: customEmojiItems)
     }
+}
+
+enum MarkdownInlineRenderingStrategy: String, Equatable {
+    case wrappingText
+    case tokenRow
 }
 
 private struct MarkdownInlineContent: View {
@@ -3861,23 +3878,47 @@ private struct MarkdownInlineContent: View {
         self.tokens = MarkdownInlineCache.shared.tokens(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems)
     }
 
-    var body: some View {
-        HStack(alignment: .center, spacing: StoatSpacing.xxSmall) {
-            ForEach(tokens.indices, id: \.self) { index in
-                switch tokens[index] {
-                case let .text(value):
-                    Text(Self.attributed(value))
-                        .font(font)
-                        .textSelection(.enabled)
-                case let .emoji(item):
-                    inlineEmoji(item)
-                case let .reference(item):
-                    inlineReference(item)
+    @ViewBuilder var body: some View {
+        switch renderingStrategy {
+        case .wrappingText:
+            Text(wrappingAttributedText)
+                .font(font)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityLabel(accessibleDescription)
+        case .tokenRow:
+            HStack(alignment: .center, spacing: StoatSpacing.xxSmall) {
+                ForEach(tokens.indices, id: \.self) { index in
+                    switch tokens[index] {
+                    case let .text(value):
+                        Text(Self.attributed(value))
+                            .font(font)
+                            .textSelection(.enabled)
+                    case let .emoji(item):
+                        inlineEmoji(item)
+                    case let .reference(item):
+                        inlineReference(item)
+                    }
                 }
             }
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel(accessibleDescription)
         }
-        .fixedSize(horizontal: false, vertical: true)
-        .accessibilityLabel(accessibleDescription)
+    }
+
+    private var renderingStrategy: MarkdownInlineRenderingStrategy {
+        tokens.allSatisfy {
+            if case .text = $0 { return true }
+            return false
+        } ? .wrappingText : .tokenRow
+    }
+
+    private var wrappingAttributedText: AttributedString {
+        tokens.reduce(into: AttributedString()) { result, token in
+            if case let .text(value) = token {
+                result.append(Self.attributed(value))
+            }
+        }
     }
 
     @ViewBuilder private func inlineEmoji(_ item: MessageInlineCustomEmojiItem) -> some View {
