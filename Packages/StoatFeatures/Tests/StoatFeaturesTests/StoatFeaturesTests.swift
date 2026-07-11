@@ -3576,26 +3576,252 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.pendingMemberAvatarHideCount, 0)
     }
 
+    @MainActor
+    func testPhase63TimelineAvatarHideGraceCancelsAndClears() async throws {
+        let data = Data("phase63-timeline-grace".utf8)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let avatar = File(id: "phase63-timeline-grace", tag: "avatars", filename: "author.png", contentType: "image/png", size: data.count)
+        let consumerID = "timeline-avatar-channel-row"
+
+        model.timelineAvatarBecameVisible(avatar, consumerID: consumerID)
+        model.timelineAvatarBecameHidden(consumerID: consumerID)
+        XCTAssertEqual(model.pendingTimelineAvatarHideCount, 1)
+        model.timelineAvatarBecameVisible(avatar, consumerID: consumerID)
+        XCTAssertEqual(model.pendingTimelineAvatarHideCount, 0)
+
+        model.timelineAvatarBecameHidden(consumerID: consumerID)
+        model.clearTimelineVisibilityGrace()
+        XCTAssertEqual(model.pendingTimelineAvatarHideCount, 0)
+        try await Task.sleep(for: .milliseconds(800))
+        XCTAssertEqual(model.pendingTimelineAvatarHideCount, 0)
+    }
+
+    @MainActor
+    func testPhase63VisibilityGraceUsesOneWorkerForManyTimelineRows() async throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        for index in 0..<40 {
+            model.timelineAvatarBecameHidden(consumerID: "timeline-avatar-phase63-\(index)")
+        }
+        XCTAssertEqual(model.pendingTimelineAvatarHideCount, 40)
+        XCTAssertTrue(model.hasActiveTimelineVisibilityLeaseWorker)
+
+        try await Task.sleep(for: .milliseconds(850))
+        XCTAssertEqual(model.pendingTimelineAvatarHideCount, 0)
+        XCTAssertFalse(model.hasActiveTimelineVisibilityLeaseWorker)
+        XCTAssertEqual(model.phase63ComposerDiagnostics.visibilityLeaseExpirationCount, 40)
+    }
+
+    @MainActor
+    func testPhase63InlinePreviewCancellationWaitsForGracePeriod() throws {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        model.selectServer(model.servers[0].id)
+        let channelID = try XCTUnwrap(model.selection.channelID)
+        let messageID = try XCTUnwrap(model.selectedTimelineMessages.first?.message.id)
+
+        model.updateTimelineVisibility(messageID: messageID, channelID: channelID, isVisible: true)
+        XCTAssertEqual(model.pendingInlinePreviewCancelCount, 0)
+
+        // Scrolling the row offscreen schedules the cancellation instead of running it.
+        model.updateTimelineVisibility(messageID: messageID, channelID: channelID, isVisible: false)
+        XCTAssertEqual(model.pendingInlinePreviewCancelCount, 1)
+
+        // Scrolling straight back keeps the loads: the pending cancellation is dropped.
+        model.updateTimelineVisibility(messageID: messageID, channelID: channelID, isVisible: true)
+        XCTAssertEqual(model.pendingInlinePreviewCancelCount, 0)
+
+        // A channel switch resolves pending grace work immediately.
+        model.updateTimelineVisibility(messageID: messageID, channelID: channelID, isVisible: false)
+        XCTAssertEqual(model.pendingInlinePreviewCancelCount, 1)
+        let otherChannelID = try XCTUnwrap(
+            model.snapshot.channelsByID.values.first { $0.id != channelID && $0.kind == .textChannel }?.id
+        )
+        model.selectChannel(otherChannelID)
+        XCTAssertEqual(model.pendingInlinePreviewCancelCount, 0)
+        XCTAssertEqual(model.pendingTimelineAvatarHideCount, 0)
+    }
+
+    @MainActor
+    func testPhase63TimelineRenderItemViewEquatableSkipsUnchangedRows() {
+        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let channelID: ChannelID = "phase63-equatable-channel"
+        let userID: UserID = "phase63-equatable-user"
+        func makeItem(content: String) -> TimelineRenderItem {
+            TimelineRenderItem(
+                timelineMessage: TimelineMessage(
+                    message: Message(id: "phase63-equatable-message", channelID: channelID, authorID: userID, content: content),
+                    status: .confirmed
+                ),
+                groupID: "group",
+                authorID: userID,
+                showsHeader: true,
+                startsGroup: true
+            )
+        }
+
+        let item = makeItem(content: "hello")
+        XCTAssertEqual(
+            TimelineRenderItemView(item: item, viewModel: model),
+            TimelineRenderItemView(item: item, viewModel: model)
+        )
+        XCTAssertEqual(
+            TimelineRenderItemView(item: item, viewModel: model),
+            TimelineRenderItemView(item: makeItem(content: "hello"), viewModel: model)
+        )
+        XCTAssertNotEqual(
+            TimelineRenderItemView(item: item, viewModel: model),
+            TimelineRenderItemView(item: makeItem(content: "edited"), viewModel: model)
+        )
+        let otherModel = MainShellViewModel(snapshot: MockShellData.snapshot)
+        XCTAssertNotEqual(
+            TimelineRenderItemView(item: item, viewModel: model),
+            TimelineRenderItemView(item: item, viewModel: otherModel)
+        )
+    }
+
     func testPhase62ProfileBioDisclosureOnlyAppearsForOverflow() {
         XCTAssertFalse(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 132, collapsedHeight: 132))
-        XCTAssertFalse(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 133, collapsedHeight: 132))
+        XCTAssertFalse(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 132.5, collapsedHeight: 132))
+        XCTAssertTrue(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 132.6, collapsedHeight: 132))
         XCTAssertTrue(ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: 134, collapsedHeight: 132))
         XCTAssertEqual(ProfileBioDisclosurePolicy.contentWidth(cardWidth: 480, horizontalPadding: 24), 432)
 
         var state = ProfileBioDisclosureState(contentKey: "long")
-        state.acceptMeasurement(220, contentKey: "long")
-        XCTAssertFalse(state.showsDisclosure(collapsedHeight: 132))
+        state.acceptMeasurement(220, contentKey: "long", collapsedHeight: 132)
+        XCTAssertFalse(state.showsDisclosure)
         state.acceptPrepared(contentKey: "long")
-        state.acceptMeasurement(220, contentKey: "stale")
-        XCTAssertFalse(state.showsDisclosure(collapsedHeight: 132))
-        state.acceptMeasurement(220, contentKey: "long")
-        XCTAssertTrue(state.showsDisclosure(collapsedHeight: 132))
+        state.acceptMeasurement(220, contentKey: "stale", collapsedHeight: 132)
+        XCTAssertFalse(state.showsDisclosure)
+        state.acceptMeasurement(220, contentKey: "long", collapsedHeight: 132)
+        XCTAssertTrue(state.showsDisclosure)
         state.isExpanded = true
         state.reset(contentKey: "short")
         state.acceptPrepared(contentKey: "short")
-        state.acceptMeasurement(80, contentKey: "short")
+        state.acceptMeasurement(80, contentKey: "short", collapsedHeight: 132)
         XCTAssertFalse(state.isExpanded)
-        XCTAssertFalse(state.showsDisclosure(collapsedHeight: 132))
+        XCTAssertFalse(state.showsDisclosure)
+    }
+
+    func testPhase63BioDisclosureNeverClipsWithoutButton() {
+        let collapsed: CGFloat = 132
+        for height in [CGFloat(60), 122, 131.6, 132, 132.4, 132.5, 132.6, 133, 140, 396] {
+            var state = ProfileBioDisclosureState(contentKey: "bio")
+            state.acceptPrepared(contentKey: "bio")
+            state.acceptMeasurement(height, contentKey: "bio", collapsedHeight: collapsed)
+            // The clamp may only be applied while measuring or when the button is offered --
+            // "clipped content with no See More" must be unreachable.
+            XCTAssertEqual(
+                state.appliesClamp,
+                state.showsDisclosure,
+                "height \(height): clamp applied without a matching disclosure button"
+            )
+            if height > collapsed + ProfileBioDisclosurePolicy.overflowEpsilon {
+                XCTAssertTrue(state.showsDisclosure, "height \(height) should overflow")
+            } else {
+                XCTAssertFalse(state.showsDisclosure, "height \(height) should fit")
+                XCTAssertEqual(state.classification, .fits)
+            }
+        }
+    }
+
+    func testPhase63BioDisclosureClampsWhileMeasuringWithoutButton() {
+        var state = ProfileBioDisclosureState(contentKey: "bio")
+        XCTAssertEqual(state.classification, .measuring)
+        XCTAssertTrue(state.appliesClamp)
+        XCTAssertFalse(state.showsDisclosure)
+
+        // Placeholder-subtree measurements before prepare are still rejected.
+        state.acceptMeasurement(500, contentKey: "bio", collapsedHeight: 132)
+        XCTAssertEqual(state.classification, .measuring)
+        XCTAssertFalse(state.showsDisclosure)
+    }
+
+    func testPhase63BioDisclosureRetainsClassificationAcrossPrepare() {
+        var state = ProfileBioDisclosureState(contentKey: "bio")
+        state.acceptPrepared(contentKey: "bio")
+        state.acceptMeasurement(300, contentKey: "bio", collapsedHeight: 132)
+        XCTAssertTrue(state.showsDisclosure)
+        state.isExpanded = true
+
+        // A repeated prepare for the same content (e.g. the task re-running) must not zero the
+        // classification -- that produced the Phase 62 one-frame button flicker.
+        state.acceptPrepared(contentKey: "bio")
+        XCTAssertTrue(state.showsDisclosure)
+        XCTAssertTrue(state.isExpanded)
+        XCTAssertFalse(state.appliesClamp)
+
+        // A fresh, smaller measurement reclassifies to fits and drops the button and clamp.
+        state.acceptMeasurement(90, contentKey: "bio", collapsedHeight: 132)
+        XCTAssertFalse(state.showsDisclosure)
+        XCTAssertFalse(state.appliesClamp)
+
+        // A real content change resets everything, including expansion.
+        state.reset(contentKey: "bio-v2")
+        XCTAssertEqual(state.classification, .measuring)
+        XCTAssertFalse(state.isExpanded)
+        XCTAssertNil(state.preparedContentKey)
+    }
+
+    func testPhase63BioDisclosureRejectsStalePreparedGeneration() {
+        var state = ProfileBioDisclosureState(contentKey: "long|width:432")
+        state.acceptPrepared(contentKey: "long|width:432", generation: 2)
+        state.acceptMeasurement(600, contentKey: "long|width:432", generation: 1, collapsedHeight: 132)
+        XCTAssertEqual(state.classification, .measuring)
+        XCTAssertFalse(state.showsDisclosure)
+
+        state.acceptMeasurement(600, contentKey: "long|width:432", generation: 2, collapsedHeight: 132)
+        XCTAssertEqual(state.classification, .overflows)
+        XCTAssertTrue(state.showsDisclosure)
+    }
+
+    @MainActor
+    func testPhase63ComposerEditsDoNotRebuildPrepared250MessageTimeline() async {
+        let channelID: ChannelID = "phase63-composer-channel"
+        let authorID: UserID = "phase63-composer-author"
+        let messages = (0..<250).map { index in
+            Message(
+                id: MessageID(rawValue: String(format: "01P%023d", index)),
+                channelID: channelID,
+                authorID: authorID,
+                content: "Message \(index)"
+            )
+        }
+        let snapshot = RealtimeSnapshot(
+            usersByID: [authorID: User(id: authorID, username: "author")],
+            channelsByID: [channelID: Channel(id: channelID, kind: .directMessage, recipients: [authorID])],
+            messagesByChannelID: [channelID: messages]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
+            snapshot: snapshot
+        )
+        await model.prepareSelectedTimelinePresentation()
+        let groupingBuilds = model.timelinePresentationDiagnostics.groupingBuildCount
+        let rowRequests = model.phase60Diagnostics.rowRequestCount
+        let viewportFlushes = model.phase60Diagnostics.coalescedViewportFlushCount
+
+        model.addPastedImageData(Data([137, 80, 78, 71]), to: channelID)
+        model.updateDraft("still composing ", for: channelID)
+        model.updateDraft("still composing 😭", for: channelID)
+        model.updateDraft("still composing 😭😭", for: channelID)
+        model.updateDraft("still composing 😭😭", for: channelID)
+
+        XCTAssertEqual(model.composerDraftState(for: channelID).text, "still composing 😭😭")
+        XCTAssertEqual(model.composerDraftState(for: channelID).attachments.count, 1)
+        XCTAssertEqual(model.selectedTimelineRenderItems.count, 250)
+        XCTAssertEqual(model.timelinePresentationDiagnostics.groupingBuildCount, groupingBuilds)
+        XCTAssertEqual(model.phase60Diagnostics.rowRequestCount, rowRequests)
+        XCTAssertEqual(model.phase60Diagnostics.coalescedViewportFlushCount, viewportFlushes)
+        XCTAssertEqual(model.phase63ComposerDiagnostics.acceptedDraftMutationCount, 3)
+        XCTAssertEqual(model.phase63ComposerDiagnostics.duplicateDraftMutationCount, 1)
+    }
+
+    func testPhase63BioCollapsedHeightDerivedFromLineMetrics() {
+        XCTAssertEqual(ProfileBioMetrics.collapsedHeight(lineLimit: 8, lineHeight: 16), 128)
+        XCTAssertEqual(ProfileBioMetrics.collapsedHeight(lineLimit: 8, lineHeight: 16.5), 132)
+        XCTAssertEqual(ProfileBioMetrics.collapsedHeight(lineLimit: 6, lineHeight: 20.25), 122)
+        // Degenerate inputs stay usable rather than collapsing to zero.
+        XCTAssertEqual(ProfileBioMetrics.collapsedHeight(lineLimit: 0, lineHeight: 0), 1)
     }
 
     @MainActor
@@ -7686,6 +7912,49 @@ final class StoatFeaturesTests: XCTestCase {
         )
         XCTAssertEqual(foreignItem.renderIdentity, foreignItem.id.rawValue)
         XCTAssertNotEqual(foreignItem.renderIdentity, confirmedItem.renderIdentity)
+    }
+
+    func testPhase63RenderItemEqualityAndHashingSurviveBoxedPayload() {
+        let channelID: ChannelID = "phase63-box-channel"
+        let userID: UserID = "phase63-box-user"
+        func makeItem(content: String, showsHeader: Bool = true) -> TimelineRenderItem {
+            TimelineRenderItem(
+                timelineMessage: TimelineMessage(
+                    message: Message(id: "phase63-box-message", channelID: channelID, authorID: userID, content: content),
+                    status: .confirmed
+                ),
+                groupID: "phase63-box-group",
+                authorID: userID,
+                showsHeader: showsHeader,
+                startsGroup: true,
+                currentUserID: userID
+            )
+        }
+
+        let item = makeItem(content: "hello")
+        let sameValueDistinctInstance = makeItem(content: "hello")
+        let editedContent = makeItem(content: "hello, edited")
+        let differentFlags = makeItem(content: "hello", showsHeader: false)
+
+        // The boxed payload keeps deep value semantics: separately constructed but identical
+        // items compare equal (and hash together), while content or flag changes still register.
+        XCTAssertEqual(item, sameValueDistinctInstance)
+        XCTAssertEqual(item.hashValue, sameValueDistinctInstance.hashValue)
+        XCTAssertNotEqual(item, editedContent)
+        XCTAssertNotEqual(item, differentFlags)
+
+        // A copied struct shares its payload -- the identity fast path -- and stays equal.
+        let copied = item
+        XCTAssertEqual(copied, item)
+        XCTAssertEqual(Set([item, sameValueDistinctInstance, copied]).count, 1)
+
+        // Forwarded accessors expose the same values the memberwise struct did.
+        XCTAssertEqual(item.id, "phase63-box-message")
+        XCTAssertEqual(item.groupID, "phase63-box-group")
+        XCTAssertEqual(item.authorID, userID)
+        XCTAssertTrue(item.showsHeader)
+        XCTAssertTrue(item.startsGroup)
+        XCTAssertEqual(item.renderIdentity, item.id.rawValue)
     }
 
     func testPhase62ScrollTargetResolverUsesRenderedIdentityForOptimisticRows() {

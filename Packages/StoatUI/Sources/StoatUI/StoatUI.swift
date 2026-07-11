@@ -1257,6 +1257,8 @@ public struct GlassComposer: View {
     private let highlightedMentionCandidateID: UserID?
     private let cursorRequest: ComposerCursorRequest?
     private let onInlineTriggerChange: (InlineComposerTrigger?) -> Void
+    private let onNativeEdit: () -> Void
+    private let onInlineTriggerSuppressed: () -> Void
     private let onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void
     private let onSelectHighlightedMentionCandidate: () -> Void
     private let onCancelMentionAutocomplete: () -> Void
@@ -1294,6 +1296,8 @@ public struct GlassComposer: View {
         highlightedMentionCandidateID: UserID? = nil,
         cursorRequest: ComposerCursorRequest? = nil,
         onInlineTriggerChange: @escaping (InlineComposerTrigger?) -> Void = { _ in },
+        onNativeEdit: @escaping () -> Void = {},
+        onInlineTriggerSuppressed: @escaping () -> Void = {},
         onNavigateMentionAutocomplete: @escaping (MentionAutocompleteNavigation) -> Void = { _ in },
         onSelectHighlightedMentionCandidate: @escaping () -> Void = {},
         onCancelMentionAutocomplete: @escaping () -> Void = {},
@@ -1330,6 +1334,8 @@ public struct GlassComposer: View {
         self.highlightedMentionCandidateID = highlightedMentionCandidateID
         self.cursorRequest = cursorRequest
         self.onInlineTriggerChange = onInlineTriggerChange
+        self.onNativeEdit = onNativeEdit
+        self.onInlineTriggerSuppressed = onInlineTriggerSuppressed
         self.onNavigateMentionAutocomplete = onNavigateMentionAutocomplete
         self.onSelectHighlightedMentionCandidate = onSelectHighlightedMentionCandidate
         self.onCancelMentionAutocomplete = onCancelMentionAutocomplete
@@ -1403,6 +1409,8 @@ public struct GlassComposer: View {
                             hasMentionCandidates: !mentionAutocompleteCandidates.isEmpty,
                             cursorRequest: cursorRequest,
                             onInlineTriggerChange: onInlineTriggerChange,
+                            onNativeEdit: onNativeEdit,
+                            onInlineTriggerSuppressed: onInlineTriggerSuppressed,
                             onNavigateMentionAutocomplete: onNavigateMentionAutocomplete,
                             onSelectHighlightedMentionCandidate: onSelectHighlightedMentionCandidate,
                             onCancelMentionAutocomplete: onCancelMentionAutocomplete
@@ -1501,6 +1509,64 @@ extension GlassComposer {
         let pastedImageData: Data?
         let pastedImageDataList: [Data]
         let diagnostics: [ComposerPasteDiagnostic]
+    }
+
+    struct TestNativeInputOutcome {
+        let resultingText: String
+        let pastedImageData: Data?
+        let nativeEditCount: Int
+        let inlineTriggerPublications: [InlineComposerTrigger?]
+        let inlineTriggerSuppressionCount: Int
+    }
+
+    /// Reproduces the live Character Viewer path after an attachment paste. `insertText` is the
+    /// NSTextInputClient entry used for composed Unicode input, including surrogate-pair emoji.
+    @MainActor
+    static func _testAttachmentThenNativeTextAndEmoji(
+        imageData: Data,
+        text: String,
+        emoji: String
+    ) -> TestNativeInputOutcome {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("StoatUITests.ComposerNativeInput.\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.setData(imageData, forType: .png)
+
+        var bindingText = ""
+        var pastedImageData: Data?
+        var nativeEditCount = 0
+        var publications: [InlineComposerTrigger?] = []
+        var suppressionCount = 0
+        let handlers = ComposerTextHandlers(
+            onSubmit: {},
+            onFocus: {},
+            onPasteImageData: { pastedImageData = $0 },
+            onPasteFileURLs: { _ in },
+            onPasteDiagnostic: { _ in },
+            onInlineTriggerChange: { publications.append($0) },
+            onNativeEdit: { nativeEditCount += 1 },
+            onInlineTriggerSuppressed: { suppressionCount += 1 }
+        )
+        let binding = Binding<String>(get: { bindingText }, set: { bindingText = $0 })
+        let coordinator = ComposerTextView.Coordinator(text: binding, handlers: handlers)
+        let textView = ComposerPasteInterceptingTextView()
+        textView.delegate = coordinator
+        textView.pasteboardOverride = pasteboard
+        textView.onPasteImageData = handlers.onPasteImageData
+        textView.paste(nil)
+
+        for value in [text, emoji, emoji] {
+            textView.setSelectedRange(NSRange(location: (textView.string as NSString).length, length: 0))
+            textView.insertText(value, replacementRange: NSRange(location: NSNotFound, length: 0))
+            coordinator.textViewDidChangeSelection(Notification(name: NSTextView.didChangeSelectionNotification, object: textView))
+        }
+
+        return TestNativeInputOutcome(
+            resultingText: bindingText,
+            pastedImageData: pastedImageData,
+            nativeEditCount: nativeEditCount,
+            inlineTriggerPublications: publications,
+            inlineTriggerSuppressionCount: suppressionCount
+        )
     }
 
     /// Drives the composer's native paste entry points against a scratch pasteboard (never
@@ -1861,6 +1927,8 @@ private struct ComposerTextInput: View {
     var hasMentionCandidates: Bool = false
     var cursorRequest: ComposerCursorRequest? = nil
     var onInlineTriggerChange: (InlineComposerTrigger?) -> Void = { _ in }
+    var onNativeEdit: () -> Void = {}
+    var onInlineTriggerSuppressed: () -> Void = {}
     var onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void = { _ in }
     var onSelectHighlightedMentionCandidate: () -> Void = {}
     var onCancelMentionAutocomplete: () -> Void = {}
@@ -1871,17 +1939,21 @@ private struct ComposerTextInput: View {
             text: $text,
             isEnabled: isEnabled,
             focusRequestID: focusRequestID,
-            onSubmit: onSubmit,
-            onFocus: onFocus,
-            onPasteImageData: onPasteImageData,
-            onPasteFileURLs: onPasteFileURLs,
-            onPasteDiagnostic: onPasteDiagnostic,
             hasMentionCandidates: hasMentionCandidates,
             cursorRequest: cursorRequest,
-            onInlineTriggerChange: onInlineTriggerChange,
-            onNavigateMentionAutocomplete: onNavigateMentionAutocomplete,
-            onSelectHighlightedMentionCandidate: onSelectHighlightedMentionCandidate,
-            onCancelMentionAutocomplete: onCancelMentionAutocomplete
+            handlers: ComposerTextHandlers(
+                onSubmit: onSubmit,
+                onFocus: onFocus,
+                onPasteImageData: onPasteImageData,
+                onPasteFileURLs: onPasteFileURLs,
+                onPasteDiagnostic: onPasteDiagnostic,
+                onInlineTriggerChange: onInlineTriggerChange,
+                onNativeEdit: onNativeEdit,
+                onInlineTriggerSuppressed: onInlineTriggerSuppressed,
+                onNavigateMentionAutocomplete: onNavigateMentionAutocomplete,
+                onSelectHighlightedMentionCandidate: onSelectHighlightedMentionCandidate,
+                onCancelMentionAutocomplete: onCancelMentionAutocomplete
+            )
         )
             .font(.body)
         #else
@@ -2029,24 +2101,60 @@ final class ComposerPasteInterceptingTextView: NSTextView {
     }
 }
 
-private struct ComposerTextView: NSViewRepresentable {
-    @Binding var text: String
-    let isEnabled: Bool
-    let focusRequestID: Int
+/// Boxes the composer's callback closures behind one reference so `ComposerTextView` stays a
+/// small struct. SwiftUI copies representable structs repeatedly inside layout passes (this was
+/// a hotspot in the Phase 63 window-resize hang trace); with the box, each copy is one retain
+/// instead of nine closure-context retains plus wide memberwise moves.
+final class ComposerTextHandlers {
     let onSubmit: () -> Void
     let onFocus: () -> Void
     let onPasteImageData: (Data) -> Void
     let onPasteFileURLs: ([URL]) -> Void
     let onPasteDiagnostic: (ComposerPasteDiagnostic) -> Void
+    let onInlineTriggerChange: (InlineComposerTrigger?) -> Void
+    let onNativeEdit: () -> Void
+    let onInlineTriggerSuppressed: () -> Void
+    let onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void
+    let onSelectHighlightedMentionCandidate: () -> Void
+    let onCancelMentionAutocomplete: () -> Void
+
+    init(
+        onSubmit: @escaping () -> Void,
+        onFocus: @escaping () -> Void,
+        onPasteImageData: @escaping (Data) -> Void,
+        onPasteFileURLs: @escaping ([URL]) -> Void,
+        onPasteDiagnostic: @escaping (ComposerPasteDiagnostic) -> Void,
+        onInlineTriggerChange: @escaping (InlineComposerTrigger?) -> Void = { _ in },
+        onNativeEdit: @escaping () -> Void = {},
+        onInlineTriggerSuppressed: @escaping () -> Void = {},
+        onNavigateMentionAutocomplete: @escaping (MentionAutocompleteNavigation) -> Void = { _ in },
+        onSelectHighlightedMentionCandidate: @escaping () -> Void = {},
+        onCancelMentionAutocomplete: @escaping () -> Void = {}
+    ) {
+        self.onSubmit = onSubmit
+        self.onFocus = onFocus
+        self.onPasteImageData = onPasteImageData
+        self.onPasteFileURLs = onPasteFileURLs
+        self.onPasteDiagnostic = onPasteDiagnostic
+        self.onInlineTriggerChange = onInlineTriggerChange
+        self.onNativeEdit = onNativeEdit
+        self.onInlineTriggerSuppressed = onInlineTriggerSuppressed
+        self.onNavigateMentionAutocomplete = onNavigateMentionAutocomplete
+        self.onSelectHighlightedMentionCandidate = onSelectHighlightedMentionCandidate
+        self.onCancelMentionAutocomplete = onCancelMentionAutocomplete
+    }
+}
+
+private struct ComposerTextView: NSViewRepresentable {
+    @Binding var text: String
+    let isEnabled: Bool
+    let focusRequestID: Int
     var hasMentionCandidates: Bool = false
     var cursorRequest: ComposerCursorRequest? = nil
-    var onInlineTriggerChange: (InlineComposerTrigger?) -> Void = { _ in }
-    var onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void = { _ in }
-    var onSelectHighlightedMentionCandidate: () -> Void = {}
-    var onCancelMentionAutocomplete: () -> Void = {}
+    let handlers: ComposerTextHandlers
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, onSubmit: onSubmit, onFocus: onFocus)
+        Coordinator(text: $text, handlers: handlers)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -2057,9 +2165,9 @@ private struct ComposerTextView: NSViewRepresentable {
         textStorage.addLayoutManager(layoutManager)
 
         let textView = ComposerPasteInterceptingTextView(frame: .zero, textContainer: textContainer)
-        textView.onPasteFileURLs = onPasteFileURLs
-        textView.onPasteImageData = onPasteImageData
-        textView.onPasteDiagnostic = onPasteDiagnostic
+        textView.onPasteFileURLs = handlers.onPasteFileURLs
+        textView.onPasteImageData = handlers.onPasteImageData
+        textView.onPasteDiagnostic = handlers.onPasteDiagnostic
         textView.autoresizingMask = [.width]
         textView.delegate = context.coordinator
         textView.drawsBackground = false
@@ -2088,7 +2196,10 @@ private struct ComposerTextView: NSViewRepresentable {
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
         let width = proposal.width ?? nsView.bounds.width
-        let height = proposal.height ?? ComposerTextSizing.height(for: text)
+        // GlassComposer pins the input's height with an explicit frame, so the proposal carries
+        // the answer on the hot path; the text-derived estimate is a fallback, memoized on the
+        // coordinator so it runs once per text change instead of once per layout pass.
+        let height = proposal.height ?? context.coordinator.estimatedHeight(for: text)
         return CGSize(
             width: max(1, width),
             height: min(ComposerTextSizing.maximumHeight, max(ComposerTextSizing.compactHeight, height))
@@ -2115,69 +2226,83 @@ private struct ComposerTextView: NSViewRepresentable {
             textView.scrollRangeToVisible(NSRange(location: clampedOffset, length: 0))
         }
         context.coordinator.text = $text
-        context.coordinator.onSubmit = onSubmit
-        context.coordinator.onFocus = onFocus
-        textView.onPasteImageData = onPasteImageData
-        textView.onPasteFileURLs = onPasteFileURLs
-        textView.onPasteDiagnostic = onPasteDiagnostic
+        context.coordinator.handlers = handlers
+        textView.onPasteImageData = handlers.onPasteImageData
+        textView.onPasteFileURLs = handlers.onPasteFileURLs
+        textView.onPasteDiagnostic = handlers.onPasteDiagnostic
         context.coordinator.hasMentionCandidates = hasMentionCandidates
-        context.coordinator.onInlineTriggerChange = onInlineTriggerChange
-        context.coordinator.onNavigateMentionAutocomplete = onNavigateMentionAutocomplete
-        context.coordinator.onSelectHighlightedMentionCandidate = onSelectHighlightedMentionCandidate
-        context.coordinator.onCancelMentionAutocomplete = onCancelMentionAutocomplete
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var text: Binding<String>
-        var onSubmit: () -> Void
-        var onFocus: () -> Void
+        var handlers: ComposerTextHandlers
         var lastFocusRequestID = 0
         var lastAppliedCursorRequestID = 0
         var hasMentionCandidates = false
-        var onInlineTriggerChange: (InlineComposerTrigger?) -> Void = { _ in }
-        var onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void = { _ in }
-        var onSelectHighlightedMentionCandidate: () -> Void = {}
-        var onCancelMentionAutocomplete: () -> Void = {}
+        private var lastSizingText: String?
+        private var lastSizingHeight: CGFloat = ComposerTextSizing.compactHeight
+        private var hasReportedInlineTrigger = false
+        private var lastReportedInlineTrigger: InlineComposerTrigger?
 
         init(
             text: Binding<String>,
-            onSubmit: @escaping () -> Void,
-            onFocus: @escaping () -> Void
+            handlers: ComposerTextHandlers
         ) {
             self.text = text
-            self.onSubmit = onSubmit
-            self.onFocus = onFocus
+            self.handlers = handlers
+        }
+
+        func estimatedHeight(for text: String) -> CGFloat {
+            if lastSizingText == text {
+                return lastSizingHeight
+            }
+            let height = ComposerTextSizing.height(for: text)
+            lastSizingText = text
+            lastSizingHeight = height
+            return height
         }
 
         func textDidBeginEditing(_ notification: Notification) {
-            onFocus()
+            handlers.onFocus()
         }
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
+            handlers.onNativeEdit()
             text.wrappedValue = textView.string
-            onInlineTriggerChange(Self.detectInlineTrigger(in: textView))
+            reportInlineTriggerIfChanged(in: textView)
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
-            onInlineTriggerChange(Self.detectInlineTrigger(in: textView))
+            reportInlineTriggerIfChanged(in: textView)
+        }
+
+        @MainActor private func reportInlineTriggerIfChanged(in textView: NSTextView) {
+            let trigger = Self.detectInlineTrigger(in: textView)
+            guard !hasReportedInlineTrigger || trigger != lastReportedInlineTrigger else {
+                handlers.onInlineTriggerSuppressed()
+                return
+            }
+            hasReportedInlineTrigger = true
+            lastReportedInlineTrigger = trigger
+            handlers.onInlineTriggerChange(trigger)
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if hasMentionCandidates {
                 switch commandSelector {
                 case #selector(NSResponder.moveUp(_:)):
-                    onNavigateMentionAutocomplete(.up)
+                    handlers.onNavigateMentionAutocomplete(.up)
                     return true
                 case #selector(NSResponder.moveDown(_:)):
-                    onNavigateMentionAutocomplete(.down)
+                    handlers.onNavigateMentionAutocomplete(.down)
                     return true
                 case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertTab(_:)):
-                    onSelectHighlightedMentionCandidate()
+                    handlers.onSelectHighlightedMentionCandidate()
                     return true
                 case #selector(NSResponder.cancelOperation(_:)):
-                    onCancelMentionAutocomplete()
+                    handlers.onCancelMentionAutocomplete()
                     return true
                 default:
                     break
@@ -2190,7 +2315,7 @@ private struct ComposerTextView: NSViewRepresentable {
                 textView.insertNewlineIgnoringFieldEditor(nil)
                 text.wrappedValue = textView.string
             } else {
-                onSubmit()
+                handlers.onSubmit()
             }
             return true
         }
@@ -2607,7 +2732,7 @@ private final class MessageRowStorage {
     let message: Message
     let author: User?
     let authorDisplayNameOverride: String?
-    let authorDisplayColor: Color?
+    let authorDisplayColor: RoleColorValue?
     let showsHeader: Bool
     let statusText: String?
     let isSelected: Bool
@@ -2646,7 +2771,7 @@ private final class MessageRowStorage {
         message: Message,
         author: User?,
         authorDisplayNameOverride: String?,
-        authorDisplayColor: Color?,
+        authorDisplayColor: RoleColorValue?,
         showsHeader: Bool,
         statusText: String?,
         isSelected: Bool,
@@ -2729,7 +2854,7 @@ public struct MessageRow: View {
     private var message: Message { storage.message }
     private var author: User? { storage.author }
     private var authorDisplayNameOverride: String? { storage.authorDisplayNameOverride }
-    private var authorDisplayColor: Color? { storage.authorDisplayColor }
+    private var authorDisplayColor: RoleColorValue? { storage.authorDisplayColor }
     private var showsHeader: Bool { storage.showsHeader }
     private var statusText: String? { storage.statusText }
     private var isSelected: Bool { storage.isSelected }
@@ -2768,7 +2893,7 @@ public struct MessageRow: View {
         message: Message,
         author: User?,
         authorDisplayNameOverride: String? = nil,
-        authorDisplayColor: Color? = nil,
+        authorDisplayColor: RoleColorValue? = nil,
         showsHeader: Bool = true,
         statusText: String? = nil,
         isSelected: Bool = false,
@@ -2872,7 +2997,7 @@ public struct MessageRow: View {
                         Button(action: onOpenAuthorProfile) {
                             Text(authorName)
                                 .font(StoatTypography.messageAuthor)
-                                .foregroundStyle(authorDisplayColor ?? .primary)
+                                .foregroundStyle(authorDisplayColor?.foregroundStyle ?? AnyShapeStyle(.primary))
                         }
                         .buttonStyle(.plain)
                         .help("Open Profile")
@@ -3632,6 +3757,329 @@ public struct PreparedMarkdownContent: Hashable, Sendable {
     fileprivate init(source: String, blocks: [MarkdownBlock]) {
         self.source = source
         self.blocks = blocks
+    }
+}
+
+/// Line-metric geometry for the profile bio's collapsed disclosure, replacing the old magic
+/// point constant so the collapse threshold tracks the actual rendered body-text line height.
+public enum ProfileBioMetrics {
+    /// The rendered line height of `StoatTypography.messageBody` (`Font.body`), taken from the
+    /// same layout machinery AppKit-backed text uses.
+    @MainActor public static var messageBodyLineHeight: CGFloat {
+        #if canImport(AppKit)
+        NSLayoutManager().defaultLineHeight(for: .preferredFont(forTextStyle: .body))
+        #else
+        17
+        #endif
+    }
+
+    /// Pure so tests can drive it with injected metrics.
+    public static func collapsedHeight(lineLimit: Int, lineHeight: CGFloat) -> CGFloat {
+        (CGFloat(max(1, lineLimit)) * max(1, lineHeight)).rounded(.up)
+    }
+}
+
+// MARK: - Role colour values (Phase 63)
+
+/// One colour stop of a parsed role colour. Components are 0...1.
+public struct CSSColorStop: Hashable, Sendable {
+    public var red: Double
+    public var green: Double
+    public var blue: Double
+    public var alpha: Double
+    /// 0...1 position along the gradient line; nil means "distribute like CSS does".
+    public var location: Double?
+
+    public init(red: Double, green: Double, blue: Double, alpha: Double = 1, location: Double? = nil) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+        self.alpha = alpha
+        self.location = location
+    }
+}
+
+/// A role's parsed colour. Revolt's `role.colour` is any CSS background value; we support plain
+/// colours and `linear-gradient(...)`, and treat everything else as colourless (matching the
+/// pre-gradient behavior for unparseable values).
+public enum RoleColorValue: Hashable, Sendable {
+    case solid(CSSColorStop)
+    /// CSS angle convention: 0deg points up, degrees increase clockwise.
+    case linearGradient(angleDegrees: Double, stops: [CSSColorStop])
+
+    /// The stop used wherever a single flat colour is required (mentions, chip backgrounds,
+    /// diagnostics): the first gradient stop, or the solid colour itself.
+    public var primaryStop: CSSColorStop {
+        switch self {
+        case let .solid(stop): return stop
+        case let .linearGradient(_, stops): return stops[0]
+        }
+    }
+
+    public var isGradient: Bool {
+        if case .linearGradient = self { return true }
+        return false
+    }
+}
+
+/// Maps the CSS gradient angle convention onto SwiftUI's unit-square coordinates
+/// (y grows downward): the gradient line passes through the centre pointing at `angleDegrees`.
+public enum LinearGradientGeometry {
+    public static func unitPoints(angleDegrees: Double) -> (start: UnitPoint, end: UnitPoint) {
+        let radians = angleDegrees * .pi / 180
+        let dx = sin(radians)
+        let dy = -cos(radians)
+        return (
+            start: UnitPoint(x: 0.5 - dx / 2, y: 0.5 - dy / 2),
+            end: UnitPoint(x: 0.5 + dx / 2, y: 0.5 + dy / 2)
+        )
+    }
+}
+
+/// Parses the supported subset of CSS colour values used by Revolt role colours:
+/// `#RGB` / `#RRGGBB` / `#RRGGBBAA`, `rgb()` / `rgba()`, and
+/// `linear-gradient(<angle>deg | to <side/corner>, <stop>[, <stop>...])`.
+/// Anything else (named colours, `var()`, conic/radial gradients, `url()`) returns nil.
+public enum CSSRoleColorParser {
+    public static func parse(_ raw: String) -> RoleColorValue? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.lowercased().hasPrefix("linear-gradient(") {
+            return parseLinearGradient(trimmed)
+        }
+        if let stop = parseColor(trimmed) {
+            return .solid(stop)
+        }
+        return nil
+    }
+
+    public static func parseColor(_ raw: String) -> CSSColorStop? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("#") {
+            return parseHexColor(trimmed)
+        }
+        return parseFunctionalColor(trimmed)
+    }
+
+    public static func parseHexColor(_ raw: String) -> CSSColorStop? {
+        var hex = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard hex.hasPrefix("#") else { return nil }
+        hex.removeFirst()
+        guard hex.allSatisfy(\.isHexDigit) else { return nil }
+        switch hex.count {
+        case 3:
+            let expanded = hex.map { "\($0)\($0)" }.joined()
+            return parseSixDigitHex(expanded, alpha: 1)
+        case 6:
+            return parseSixDigitHex(hex, alpha: 1)
+        case 8:
+            guard let alphaByte = Int(hex.suffix(2), radix: 16) else { return nil }
+            return parseSixDigitHex(String(hex.prefix(6)), alpha: Double(alphaByte) / 255)
+        default:
+            return nil
+        }
+    }
+
+    public static func parseFunctionalColor(_ raw: String) -> CSSColorStop? {
+        let lowered = raw.lowercased()
+        let isRGBA = lowered.hasPrefix("rgba(")
+        guard (lowered.hasPrefix("rgb(") || isRGBA), lowered.hasSuffix(")") else { return nil }
+        let inner = raw.dropFirst(isRGBA ? 5 : 4).dropLast()
+        // Accept both comma and space separated component syntax; "/" introduces alpha in the
+        // space-separated form.
+        let normalized = inner.replacingOccurrences(of: "/", with: " ")
+        let components = normalized
+            .split(whereSeparator: { $0 == "," || $0.isWhitespace })
+            .map(String.init)
+        guard components.count == 3 || components.count == 4 else { return nil }
+        func channel(_ value: String) -> Double? {
+            if value.hasSuffix("%") {
+                guard let percent = Double(value.dropLast()) else { return nil }
+                return min(1, max(0, percent / 100))
+            }
+            guard let number = Double(value) else { return nil }
+            return min(1, max(0, number / 255))
+        }
+        guard let red = channel(components[0]),
+              let green = channel(components[1]),
+              let blue = channel(components[2])
+        else { return nil }
+        var alpha: Double = 1
+        if components.count == 4 {
+            let value = components[3]
+            if value.hasSuffix("%") {
+                guard let percent = Double(value.dropLast()) else { return nil }
+                alpha = min(1, max(0, percent / 100))
+            } else {
+                guard let number = Double(value) else { return nil }
+                alpha = min(1, max(0, number))
+            }
+        }
+        return CSSColorStop(red: red, green: green, blue: blue, alpha: alpha)
+    }
+
+    static func parseLinearGradient(_ raw: String) -> RoleColorValue? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().hasPrefix("linear-gradient("), trimmed.hasSuffix(")") else { return nil }
+        let inner = String(trimmed.dropFirst("linear-gradient(".count).dropLast())
+        var arguments = splitTopLevelArguments(inner)
+        guard !arguments.isEmpty else { return nil }
+
+        var angleDegrees: Double = 180 // CSS default: "to bottom"
+        if let direction = parseDirection(arguments[0]) {
+            angleDegrees = direction
+            arguments.removeFirst()
+        }
+
+        let stops = arguments.compactMap(parseStop)
+        guard stops.count == arguments.count, stops.count >= 2 else { return nil }
+        return .linearGradient(angleDegrees: angleDegrees, stops: stops)
+    }
+
+    /// Splits gradient arguments on commas that are not nested inside `rgb()`/`rgba()` parens.
+    private static func splitTopLevelArguments(_ input: String) -> [String] {
+        var arguments: [String] = []
+        var current = ""
+        var depth = 0
+        for character in input {
+            switch character {
+            case "(":
+                depth += 1
+                current.append(character)
+            case ")":
+                depth -= 1
+                current.append(character)
+            case "," where depth == 0:
+                arguments.append(current)
+                current = ""
+            default:
+                current.append(character)
+            }
+        }
+        arguments.append(current)
+        return arguments
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func parseDirection(_ raw: String) -> Double? {
+        let lowered = raw.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if lowered.hasSuffix("deg") {
+            guard let degrees = Double(lowered.dropLast(3).trimmingCharacters(in: .whitespaces)) else { return nil }
+            return degrees.truncatingRemainder(dividingBy: 360)
+        }
+        guard lowered.hasPrefix("to ") else { return nil }
+        let keywords = Set(lowered.dropFirst(3).split(separator: " ").map(String.init))
+        switch keywords {
+        case ["top"]: return 0
+        case ["right"]: return 90
+        case ["bottom"]: return 180
+        case ["left"]: return 270
+        case ["top", "right"], ["right", "top"]: return 45
+        case ["bottom", "right"], ["right", "bottom"]: return 135
+        case ["bottom", "left"], ["left", "bottom"]: return 225
+        case ["top", "left"], ["left", "top"]: return 315
+        default: return nil
+        }
+    }
+
+    /// `<color> [<percent>]` -- the colour token is a hex literal or an rgb()/rgba() call.
+    private static func parseStop(_ raw: String) -> CSSColorStop? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let colorToken: String
+        let remainder: String
+        if trimmed.lowercased().hasPrefix("rgb") {
+            guard let closeIndex = trimmed.firstIndex(of: ")") else { return nil }
+            colorToken = String(trimmed[...closeIndex])
+            remainder = String(trimmed[trimmed.index(after: closeIndex)...])
+        } else {
+            if let spaceIndex = trimmed.firstIndex(where: \.isWhitespace) {
+                colorToken = String(trimmed[..<spaceIndex])
+                remainder = String(trimmed[spaceIndex...])
+            } else {
+                colorToken = trimmed
+                remainder = ""
+            }
+        }
+        guard var stop = parseColor(colorToken) else { return nil }
+        let position = remainder.trimmingCharacters(in: .whitespaces)
+        if !position.isEmpty {
+            guard position.hasSuffix("%"), let percent = Double(position.dropLast()) else { return nil }
+            stop.location = min(1, max(0, percent / 100))
+        }
+        return stop
+    }
+
+    private static func parseSixDigitHex(_ hex: String, alpha: Double) -> CSSColorStop? {
+        guard hex.count == 6, let value = Int(hex, radix: 16) else { return nil }
+        return CSSColorStop(
+            red: Double((value >> 16) & 0xFF) / 255,
+            green: Double((value >> 8) & 0xFF) / 255,
+            blue: Double(value & 0xFF) / 255,
+            alpha: alpha
+        )
+    }
+}
+
+extension CSSColorStop {
+    public var color: Color {
+        Color(red: red, green: green, blue: blue, opacity: alpha)
+    }
+}
+
+extension RoleColorValue {
+    /// The style applied to role-coloured text: a flat colour, or a `LinearGradient` for
+    /// multi-colour roles.
+    public var foregroundStyle: AnyShapeStyle {
+        switch self {
+        case let .solid(stop):
+            return AnyShapeStyle(stop.color)
+        case let .linearGradient(angleDegrees, stops):
+            let points = LinearGradientGeometry.unitPoints(angleDegrees: angleDegrees)
+            return AnyShapeStyle(LinearGradient(
+                gradient: Gradient(stops: resolvedGradientStops(stops)),
+                startPoint: points.start,
+                endPoint: points.end
+            ))
+        }
+    }
+
+    /// A single flat colour for surfaces where a gradient would not read (mention chips,
+    /// low-opacity chip backgrounds, diagnostics tokens).
+    public var solidFallbackColor: Color {
+        primaryStop.color
+    }
+
+    /// Fills in missing stop locations the way CSS distributes them: first stop 0, last stop 1,
+    /// unpositioned interior stops spread evenly between their positioned neighbours, and
+    /// positions clamped to be non-decreasing.
+    private func resolvedGradientStops(_ stops: [CSSColorStop]) -> [Gradient.Stop] {
+        var locations: [Double?] = stops.map(\.location)
+        if locations[0] == nil { locations[0] = 0 }
+        if locations[locations.count - 1] == nil { locations[locations.count - 1] = 1 }
+        var index = 0
+        while index < locations.count {
+            guard locations[index] == nil else {
+                index += 1
+                continue
+            }
+            let previousIndex = index - 1
+            var nextIndex = index
+            while locations[nextIndex] == nil { nextIndex += 1 }
+            let previousValue = locations[previousIndex] ?? 0
+            let nextValue = locations[nextIndex] ?? 1
+            let gapCount = nextIndex - previousIndex
+            for offset in 1..<gapCount {
+                locations[previousIndex + offset] = previousValue
+                    + (nextValue - previousValue) * Double(offset) / Double(gapCount)
+            }
+            index = nextIndex
+        }
+        var running = 0.0
+        return zip(stops, locations).map { stop, location in
+            running = max(running, min(1, max(0, location ?? 0)))
+            return Gradient.Stop(color: stop.color, location: running)
+        }
     }
 }
 
@@ -4478,22 +4926,13 @@ public struct EmbedTimelineCard: View {
     }
 
     private var accentColor: Color {
-        guard let colour = item.embed.colour?.trimmingCharacters(in: .whitespacesAndNewlines), !colour.isEmpty else {
+        guard let colour = item.embed.colour?.trimmingCharacters(in: .whitespacesAndNewlines), !colour.isEmpty,
+              let parsed = CSSRoleColorParser.parse(colour)
+        else {
             return Color.accentColor
         }
-        #if canImport(AppKit)
-        var hex = colour
-        if hex.hasPrefix("#") { hex.removeFirst() }
-        guard hex.count == 6, let value = Int(hex, radix: 16) else { return Color.accentColor }
-        return Color(nsColor: NSColor(
-            calibratedRed: CGFloat((value >> 16) & 0xff) / 255,
-            green: CGFloat((value >> 8) & 0xff) / 255,
-            blue: CGFloat(value & 0xff) / 255,
-            alpha: 1
-        ))
-        #else
-        return Color.accentColor
-        #endif
+        // Embed accents render as a thin edge stripe; a gradient collapses to its primary stop.
+        return parsed.solidFallbackColor
     }
 }
 

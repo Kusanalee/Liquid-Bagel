@@ -46,3 +46,9 @@ The second live pass confirmed the upper-left rail avatar, chat-row avatar, and 
 For the follow-up retest, prioritize member-panel scrolling/sending and repeat opening long/short bios. Accessibility QA is explicitly deferred by the tester and does not gate this P1 bug-fix pass.
 
 The member-avatar and disclosure follow-up has implementation/test proof only. Live-sensitive parity rows remain `partial` until repeated sends/scrolling show no member-row flash and overflowing bios consistently present `See More`.
+
+## Final Phase 62 Live Result
+
+- Member-panel, upper-left rail, and chat-row avatars now pass repeated sends and warmed-channel scrolling without flicker.
+- Short biographies correctly omit the disclosure control and avatar continuity remains stable.
+- Very long biographies still present `See More` inconsistently, especially after asynchronous preparation or mutual-tab switching. That remaining P1 path moves to Phase 63; it does not reopen the accepted avatar fixes.

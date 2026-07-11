@@ -2,6 +2,7 @@ import Foundation
 import StoatAPI
 import StoatModels
 import StoatRealtime
+import StoatUI
 
 #if canImport(Security)
 import Security
@@ -189,42 +190,64 @@ public struct ResolvedRoleColor: Hashable, Sendable {
     public var isReadable: Bool
     public var fallbackReason: String?
     public var rawValue: String
+    /// The full parsed colour (solid or gradient), readability-adjusted per stop.
+    public var value: RoleColorValue
+    /// The adjusted primary-stop components -- kept so pre-gradient consumers (mentions,
+    /// diagnostics, chip backgrounds) continue to read a single flat colour.
     public var red: Double
     public var green: Double
     public var blue: Double
     public var isAdjustedForReadability: Bool
 
     public init?(rawValue: String?, highContrast: Bool = false, sourceRoleID: RoleID? = nil) {
-        guard var hex = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !hex.isEmpty
+        guard let trimmed = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
         else { return nil }
         if highContrast { return nil }
-        if hex.hasPrefix("#") {
-            hex.removeFirst()
+        guard let parsed = CSSRoleColorParser.parse(trimmed) else { return nil }
+
+        var anyStopAdjusted = false
+        func adjusted(_ stop: CSSColorStop) -> CSSColorStop {
+            let luminance = 0.2126 * stop.red + 0.7152 * stop.green + 0.0722 * stop.blue
+            guard luminance > 0.78 else { return stop }
+            anyStopAdjusted = true
+            var adjusted = stop
+            adjusted.red = stop.red * 0.72
+            adjusted.green = stop.green * 0.72
+            adjusted.blue = stop.blue * 0.72
+            return adjusted
         }
-        guard hex.count == 6, let value = Int(hex, radix: 16) else { return nil }
-        let red = Double((value >> 16) & 0xFF) / 255
-        let green = Double((value >> 8) & 0xFF) / 255
-        let blue = Double(value & 0xFF) / 255
-        let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-        if luminance > 0.78 {
-            self.red = red * 0.72
-            self.green = green * 0.72
-            self.blue = blue * 0.72
-            self.isAdjustedForReadability = true
-        } else {
-            self.red = red
-            self.green = green
-            self.blue = blue
-            self.isAdjustedForReadability = false
+
+        let adjustedValue: RoleColorValue
+        switch parsed {
+        case let .solid(stop):
+            adjustedValue = .solid(adjusted(stop))
+        case let .linearGradient(angleDegrees, stops):
+            adjustedValue = .linearGradient(angleDegrees: angleDegrees, stops: stops.map(adjusted))
         }
-        let normalized = "#\(hex.uppercased())"
+
+        let primary = adjustedValue.primaryStop
+        self.value = adjustedValue
+        self.red = primary.red
+        self.green = primary.green
+        self.blue = primary.blue
+        self.isAdjustedForReadability = anyStopAdjusted
+
+        // Tokens keep their pre-gradient hex form for solid colours; gradients carry the primary
+        // stop's hex plus the raw CSS value so diagnostics stay meaningful.
+        let unadjustedPrimary = parsed.primaryStop
+        let primaryHex = String(
+            format: "#%02X%02X%02X",
+            Int((unadjustedPrimary.red * 255).rounded()),
+            Int((unadjustedPrimary.green * 255).rounded()),
+            Int((unadjustedPrimary.blue * 255).rounded())
+        )
         self.sourceRoleID = sourceRoleID
-        self.rawHex = normalized
-        self.displayColorToken = normalized
+        self.rawHex = primaryHex
+        self.displayColorToken = primaryHex
         self.isReadable = true
         self.fallbackReason = nil
-        self.rawValue = normalized
+        self.rawValue = parsed.isGradient ? trimmed : primaryHex
     }
 }
 

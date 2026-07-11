@@ -649,6 +649,7 @@ public final class MainShellViewModel {
     public private(set) var phase51PerformanceDiagnostics = Phase51PerformanceDiagnostics()
     public private(set) var phase59ReactionDiagnostics = Phase59ReactionDiagnostics()
     @ObservationIgnored public private(set) var phase60Diagnostics = Phase60Diagnostics()
+    @ObservationIgnored public private(set) var phase63ComposerDiagnostics = Phase63ComposerDiagnostics()
     public private(set) var phase52FreezeDiagnostics = Phase52FreezeDiagnostics()
     public private(set) var timelinePresentationState: TimelinePresentationState = .idle
     public private(set) var timelinePresentationDiagnostics = TimelinePresentationDiagnostics()
@@ -806,6 +807,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
     @ObservationIgnored private var selectedChannelLoadTaskChannelID: ChannelID?
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
+    @ObservationIgnored private var typingEndDeadline: Date?
     @ObservationIgnored private var typingCleanupTask: Task<Void, Never>?
     @ObservationIgnored private var ackTasksByChannelID: [ChannelID: Task<Void, Never>] = [:]
     @ObservationIgnored private var pendingAckMessageIDsByChannelID: [ChannelID: MessageID] = [:]
@@ -826,6 +828,13 @@ public final class MainShellViewModel {
     @ObservationIgnored private let maxImagePresentationBytes = 64 * 1024 * 1024
     @ObservationIgnored private var visibleImageResourceRequestsByConsumer: [String: ImageResourceRequest] = [:]
     @ObservationIgnored private var memberAvatarHideTasksByConsumer: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var timelineAvatarReleaseDeadlinesByConsumer: [String: Date] = [:]
+    @ObservationIgnored private var inlinePreviewReleaseDeadlinesByMessageID: [MessageID: (channelID: ChannelID, deadline: Date)] = [:]
+    @ObservationIgnored private var timelineVisibilityLeaseTask: Task<Void, Never>?
+    @ObservationIgnored private var selectedTimelineMessagesByIDCache: [MessageID: TimelineMessage] = [:]
+    @ObservationIgnored private var composerEmojiSectionCacheKey: String?
+    @ObservationIgnored private var composerEmojiSectionCache: [EmojiPickerSection] = []
+    @ObservationIgnored private var composerAttachmentPresentationCache: [ChannelID: (attachments: [ComposerAttachmentDraft], chips: [ComposerAttachmentChip], summary: String?)] = [:]
     @ObservationIgnored private var imagePresentationEvictedKeys: Set<ImageCacheKey> = []
     @ObservationIgnored private var imagePresentationEvictedOrder: [ImageCacheKey] = []
     @ObservationIgnored private var imagePresentationEvictionCount = 0
@@ -1050,6 +1059,7 @@ public final class MainShellViewModel {
         freezeDiagnosticsPublishTask?.cancel()
         selectedChannelLoadTask?.cancel()
         typingEndTask?.cancel()
+        timelineVisibilityLeaseTask?.cancel()
         typingCleanupTask?.cancel()
         ackTasksByChannelID.values.forEach { $0.cancel() }
         visibleRangeUpdateTasks.values.forEach { $0.cancel() }
@@ -1440,6 +1450,10 @@ public final class MainShellViewModel {
         selectedTimelineGroupCacheChannelID = channelID
         selectedTimelineGroupCache = groups
         selectedTimelineRenderItemCache = TimelineRenderItemBuilder.flatten(groups, currentUserID: currentUserID)
+        selectedTimelineMessagesByIDCache = Dictionary(
+            selectedTimelineRenderItemCache.map { ($0.id, $0.timelineMessage) },
+            uniquingKeysWith: { _, latest in latest }
+        )
         synchronizeTimelineRowStates(items: selectedTimelineRenderItemCache, channelID: channelID)
         updateTimelineViewportAfterGroupingPass(
             channelID: channelID,
@@ -2763,6 +2777,9 @@ public final class MainShellViewModel {
             roleHasher.combine(role.name)
             roleHasher.combine(role.rank)
             roleHasher.combine(role.hoist)
+            // A colour-only role edit must re-derive the member list, or rows keep rendering the
+            // stale colour until an unrelated change lands (latent pre-Phase 63 bug).
+            roleHasher.combine(role.colour)
         }
         combined ^= roleHasher.finalize()
         return combined
@@ -6361,6 +6378,11 @@ public final class MainShellViewModel {
             validateSelection()
             return
         }
+        // Resolve pending timeline visibility grace work while the departing channel is still
+        // selected, so its message index is still valid for the final preview cancellations.
+        if selectedConversationChannelID != id {
+            clearTimelineVisibilityGrace()
+        }
         let before = selection
         if let serverID = channel.serverID {
             selection.space = .server(serverID)
@@ -6720,9 +6742,25 @@ public final class MainShellViewModel {
     public func updateDraft(_ draft: String, for channelID: ChannelID?) {
         guard let channelID else { return }
         var state = composerDraftState(for: channelID)
+        guard state.text != draft else {
+            phase63ComposerDiagnostics.duplicateDraftMutationCount += 1
+            return
+        }
         state.text = draft
         composerDrafts[channelID] = state
+        phase63ComposerDiagnostics.acceptedDraftMutationCount += 1
+        phase63ComposerDiagnostics.timelineGroupingBuildCountAtLastEdit = timelinePresentationDiagnostics.groupingBuildCount
+        phase63ComposerDiagnostics.timelineRowRequestCountAtLastEdit = phase60Diagnostics.rowRequestCount
+        phase63ComposerDiagnostics.viewportFlushCountAtLastEdit = phase60Diagnostics.coalescedViewportFlushCount
         scheduleTyping(for: channelID, draft: draft)
+    }
+
+    public func noteNativeComposerEdit() {
+        phase63ComposerDiagnostics.nativeEditEventCount += 1
+    }
+
+    public func noteSuppressedComposerInlineTrigger() {
+        phase63ComposerDiagnostics.inlineTriggerSuppressionCount += 1
     }
 
     public var commonEmojiItems: [String] {
@@ -6730,9 +6768,13 @@ public final class MainShellViewModel {
     }
 
     public var composerEmojiSections: [EmojiPickerSection] {
+        let serverID = selectedConversationChannelID.flatMap { snapshot.channelsByID[$0]?.serverID } ?? selection.serverID
+        let cacheKey = "\(snapshotRevision)|\(serverID?.rawValue ?? "no-server")"
+        if composerEmojiSectionCacheKey == cacheKey {
+            return composerEmojiSectionCache
+        }
         let common = Self.dedupedEmojiItems(["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏", "🔥", "✨", "🚀", "💯", "💬", "📌", "⭐", "❌"])
         let smileys = Self.dedupedEmojiItems(["😄", "😅", "😎", "😢", "😮", "🤔", "🫡", "👋", "🙌", "😆", "😋", "😴", "😭", "😬", "😤", "🥳", "🤝", "🫶"])
-        let serverID = selectedConversationChannelID.flatMap { snapshot.channelsByID[$0]?.serverID } ?? selection.serverID
         let custom = Self.dedupedCustomEmojiItems(snapshot.emojisByID.values.map(CustomEmojiDisplayItem.init(emoji:)))
         let currentServer = custom.filter { item in
             guard let serverID else { return false }
@@ -6742,12 +6784,15 @@ public final class MainShellViewModel {
             guard let serverID else { return item.serverID != nil }
             return item.serverID != nil && item.serverID != serverID
         }.prefix(48).map(\.shortcode)
-        return [
+        let sections = [
             EmojiPickerSection(id: "common", title: "Common", items: common),
             EmojiPickerSection(id: "smileys", title: "Unicode", items: smileys),
             EmojiPickerSection(id: "current-server", title: "Current Server", items: Array(currentServer)),
             EmojiPickerSection(id: "other-servers", title: "Other Servers", items: Array(otherServers))
         ].filter { !$0.items.isEmpty }
+        composerEmojiSectionCacheKey = cacheKey
+        composerEmojiSectionCache = sections
+        return sections
     }
 
     private static func dedupedEmojiItems(_ items: [String]) -> [String] {
@@ -6771,9 +6816,7 @@ public final class MainShellViewModel {
 
     public func insertEmoji(_ emoji: String, in channelID: ChannelID?) {
         guard let channelID else { return }
-        var state = composerDraftState(for: channelID)
-        state.text += emoji
-        composerDrafts[channelID] = state
+        updateDraft(composerDraftState(for: channelID).text + emoji, for: channelID)
         emojiPickerDiagnostics = emoji.hasPrefix(":") && emoji.hasSuffix(":") ? "Inserted custom emoji shortcode" : "Inserted Unicode emoji"
         requestFocus(.composer)
     }
@@ -6812,6 +6855,7 @@ public final class MainShellViewModel {
     }
 
     public func composerInlineTriggerChanged(_ trigger: InlineComposerTrigger?, for channelID: ChannelID?) {
+        phase63ComposerDiagnostics.inlineTriggerPublicationCount += 1
         guard let channelID, let trigger else {
             clearComposerMentionAutocomplete()
             return
@@ -6867,6 +6911,10 @@ public final class MainShellViewModel {
     }
 
     public func clearComposerMentionAutocomplete() {
+        guard composerMentionTrigger != nil || !composerMentionCandidates.isEmpty || composerMentionHighlightedID != nil else {
+            phase63ComposerDiagnostics.inlineTriggerSuppressionCount += 1
+            return
+        }
         composerMentionTrigger = nil
         composerMentionCandidates = []
         composerMentionHighlightedID = nil
@@ -7330,7 +7378,16 @@ public final class MainShellViewModel {
     }
 
     public func composerAttachmentChips(for channelID: ChannelID?) -> [ComposerAttachmentChip] {
-        composerDraftState(for: channelID).attachments.map { attachment in
+        composerAttachmentPresentation(for: channelID).chips
+    }
+
+    public func composerAttachmentPresentation(for channelID: ChannelID?) -> (chips: [ComposerAttachmentChip], summary: String?) {
+        guard let channelID else { return ([], nil) }
+        let attachments = composerDraftState(for: channelID).attachments
+        if let cached = composerAttachmentPresentationCache[channelID], cached.attachments == attachments {
+            return (cached.chips, cached.summary)
+        }
+        let chips = attachments.map { attachment in
             ComposerAttachmentChip(
                 id: attachment.id,
                 filename: attachment.filename,
@@ -7340,14 +7397,20 @@ public final class MainShellViewModel {
                 previewData: attachment.previewData
             )
         }
+        let summary: String?
+        if attachments.isEmpty {
+            summary = nil
+        } else {
+            let totalBytes = attachments.reduce(0) { $0 + $1.byteCount }
+            let count = attachments.count == 1 ? "1 attachment" : "\(attachments.count) attachments"
+            summary = "\(count) · \(ByteCountFormatter.string(fromByteCount: Int64(totalBytes), countStyle: .file))"
+        }
+        composerAttachmentPresentationCache[channelID] = (attachments, chips, summary)
+        return (chips, summary)
     }
 
     public func composerAttachmentSummary(for channelID: ChannelID?) -> String? {
-        let attachments = composerDraftState(for: channelID).attachments
-        guard !attachments.isEmpty else { return nil }
-        let totalBytes = attachments.reduce(0) { $0 + $1.byteCount }
-        let count = attachments.count == 1 ? "1 attachment" : "\(attachments.count) attachments"
-        return "\(count) · \(ByteCountFormatter.string(fromByteCount: Int64(totalBytes), countStyle: .file))"
+        composerAttachmentPresentation(for: channelID).summary
     }
 
     private func systemImage(for kind: ComposerAttachmentKind) -> String {
@@ -7596,6 +7659,118 @@ public final class MainShellViewModel {
 
     var pendingMemberAvatarHideCount: Int {
         memberAvatarHideTasksByConsumer.count
+    }
+
+    /// Grace period before offscreen timeline rows release their visibility work. Rows bounce in
+    /// and out of the lazy viewport on every scroll tick; releasing immediately (the pre-Phase 63
+    /// behavior) thrashed avatar requests and inline-preview loads during fast scrolling. The
+    /// member panel got the identical treatment in Phase 62.
+    static let timelineVisibilityHideGraceMilliseconds = 750
+
+    func timelineAvatarBecameVisible(_ file: File?, consumerID: String) {
+        if timelineAvatarReleaseDeadlinesByConsumer.removeValue(forKey: consumerID) != nil {
+            phase63ComposerDiagnostics.visibilityLeaseCancellationCount += 1
+        }
+        imageResourceBecameVisible(file, kind: .userAvatar, consumerID: consumerID)
+    }
+
+    func timelineAvatarBecameHidden(consumerID: String) {
+        timelineAvatarReleaseDeadlinesByConsumer[consumerID] = Date().addingTimeInterval(
+            Double(Self.timelineVisibilityHideGraceMilliseconds) / 1_000
+        )
+        phase63ComposerDiagnostics.visibilityLeaseScheduleCount += 1
+        scheduleTimelineVisibilityLeaseFlushIfNeeded()
+    }
+
+    /// Called on conversation switch: the departing channel's rows are gone for sure, so pending
+    /// grace work is resolved immediately instead of firing 750 ms into the new channel.
+    func clearTimelineVisibilityGrace() {
+        timelineVisibilityLeaseTask?.cancel()
+        timelineVisibilityLeaseTask = nil
+        timelineAvatarReleaseDeadlinesByConsumer.removeAll()
+        visibleImageResourceRequestsByConsumer = visibleImageResourceRequestsByConsumer.filter {
+            !$0.key.hasPrefix("timeline-avatar-")
+        }
+        let pendingCancellations = inlinePreviewReleaseDeadlinesByMessageID
+        inlinePreviewReleaseDeadlinesByMessageID.removeAll()
+        for messageID in pendingCancellations.keys {
+            if let message = timelineMessageForVisibility(messageID)?.message {
+                cancelInlineImagePreviews(for: message)
+            }
+        }
+    }
+
+    var pendingTimelineAvatarHideCount: Int {
+        timelineAvatarReleaseDeadlinesByConsumer.count
+    }
+
+    var pendingInlinePreviewCancelCount: Int {
+        inlinePreviewReleaseDeadlinesByMessageID.count
+    }
+
+    var hasActiveTimelineVisibilityLeaseWorker: Bool {
+        timelineVisibilityLeaseTask != nil
+    }
+
+    private func scheduleInlinePreviewCancellation(for messageID: MessageID, channelID: ChannelID) {
+        inlinePreviewReleaseDeadlinesByMessageID[messageID] = (
+            channelID,
+            Date().addingTimeInterval(Double(Self.timelineVisibilityHideGraceMilliseconds) / 1_000)
+        )
+        phase63ComposerDiagnostics.visibilityLeaseScheduleCount += 1
+        scheduleTimelineVisibilityLeaseFlushIfNeeded()
+    }
+
+    private func scheduleTimelineVisibilityLeaseFlushIfNeeded() {
+        guard timelineVisibilityLeaseTask == nil else { return }
+        let deadlines = Array(timelineAvatarReleaseDeadlinesByConsumer.values)
+            + inlinePreviewReleaseDeadlinesByMessageID.values.map(\.deadline)
+        guard let earliest = deadlines.min() else { return }
+        timelineVisibilityLeaseTask = Task { [weak self] in
+            let delay = max(0, earliest.timeIntervalSinceNow)
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.timelineVisibilityLeaseTask = nil
+            self.flushExpiredTimelineVisibilityLeases()
+            self.scheduleTimelineVisibilityLeaseFlushIfNeeded()
+        }
+    }
+
+    private func flushExpiredTimelineVisibilityLeases(now: Date = Date()) {
+        let expiredAvatarConsumers = timelineAvatarReleaseDeadlinesByConsumer.compactMap { consumerID, deadline in
+            deadline <= now ? consumerID : nil
+        }
+        for consumerID in expiredAvatarConsumers {
+            timelineAvatarReleaseDeadlinesByConsumer[consumerID] = nil
+            visibleImageResourceRequestsByConsumer[consumerID] = nil
+            phase63ComposerDiagnostics.visibilityLeaseExpirationCount += 1
+        }
+
+        let expiredPreviewIDs = inlinePreviewReleaseDeadlinesByMessageID.compactMap { messageID, lease in
+            lease.deadline <= now ? messageID : nil
+        }
+        for messageID in expiredPreviewIDs {
+            guard let lease = inlinePreviewReleaseDeadlinesByMessageID.removeValue(forKey: messageID) else { continue }
+            let visible = pendingVisibleMessageIDsByChannelID[lease.channelID]
+                ?? visibleMessageIDsByChannelID[lease.channelID]
+                ?? []
+            guard !visible.contains(messageID) else { continue }
+            if let message = timelineMessageForVisibility(messageID)?.message {
+                cancelInlineImagePreviews(for: message)
+            }
+            phase63ComposerDiagnostics.visibilityLeaseExpirationCount += 1
+        }
+    }
+
+    /// O(1) message lookup for the scroll-time visibility paths; the index is rebuilt with the
+    /// timeline grouping cache, with a linear fallback for the brief window where the cache
+    /// hasn't caught up to freshly arrived messages.
+    private func timelineMessageForVisibility(_ messageID: MessageID) -> TimelineMessage? {
+        if selectedTimelineGroupCacheChannelID == selectedConversationChannelID,
+           let cached = selectedTimelineMessagesByIDCache[messageID] {
+            return cached
+        }
+        return selectedTimelineMessages.first { $0.message.id == messageID }
     }
 
     func currentUserRailAvatarBecameVisible(_ file: File?) {
@@ -9095,11 +9270,14 @@ public final class MainShellViewModel {
         guard wasVisible != isVisible else { return }
         if isVisible {
             visible.insert(messageID)
+            if inlinePreviewReleaseDeadlinesByMessageID.removeValue(forKey: messageID) != nil {
+                phase63ComposerDiagnostics.visibilityLeaseCancellationCount += 1
+            }
         } else {
             visible.remove(messageID)
-            if let message = selectedTimelineMessages.first(where: { $0.message.id == messageID })?.message {
-                cancelInlineImagePreviews(for: message)
-            }
+            // Cancellation waits out the recycling grace period; a row scrolled straight back
+            // into view keeps its in-flight preview loads instead of restarting them.
+            scheduleInlinePreviewCancellation(for: messageID, channelID: channelID)
         }
         pendingVisibleMessageIDsByChannelID[channelID] = visible
         phase60Diagnostics.visibilityEventCount += 1
@@ -9501,6 +9679,19 @@ public final class MainShellViewModel {
         staleRowDiscards: \(phase60Diagnostics.staleRowDiscardCount)
         activeSkeletons: \(phase60Diagnostics.activeSkeletonCount)
         maximumQueueDepth: \(phase60Diagnostics.maximumQueueDepth)
+        Phase 63 composer isolation
+        nativeEditEvents: \(phase63ComposerDiagnostics.nativeEditEventCount)
+        acceptedDraftMutations: \(phase63ComposerDiagnostics.acceptedDraftMutationCount)
+        duplicateDraftMutations: \(phase63ComposerDiagnostics.duplicateDraftMutationCount)
+        inlineTriggerPublications: \(phase63ComposerDiagnostics.inlineTriggerPublicationCount)
+        inlineTriggerSuppressions: \(phase63ComposerDiagnostics.inlineTriggerSuppressionCount)
+        typingDeadlineResets: \(phase63ComposerDiagnostics.typingDeadlineResetCount)
+        groupingBuildsAtLastEdit: \(phase63ComposerDiagnostics.timelineGroupingBuildCountAtLastEdit)
+        rowRequestsAtLastEdit: \(phase63ComposerDiagnostics.timelineRowRequestCountAtLastEdit)
+        viewportFlushesAtLastEdit: \(phase63ComposerDiagnostics.viewportFlushCountAtLastEdit)
+        visibilityLeasesScheduled: \(phase63ComposerDiagnostics.visibilityLeaseScheduleCount)
+        visibilityLeasesCancelled: \(phase63ComposerDiagnostics.visibilityLeaseCancellationCount)
+        visibilityLeasesExpired: \(phase63ComposerDiagnostics.visibilityLeaseExpirationCount)
         DM route diagnostics
         clickedChannel: \(TimelineCopyFormatter.shortID(dm.clickedChannelID?.rawValue))
         selectedConversation: \(TimelineCopyFormatter.shortID(dm.selectedConversationChannelID?.rawValue))
@@ -11553,6 +11744,11 @@ public final class MainShellViewModel {
 
         let now = Date()
         if activeTypingChannelID != channelID || now.timeIntervalSince(lastTypingBeginAt[channelID] ?? .distantPast) > 8 {
+            if activeTypingChannelID != channelID {
+                typingEndTask?.cancel()
+                typingEndTask = nil
+                typingEndDeadline = nil
+            }
             activeTypingChannelID = channelID
             lastTypingBeginAt[channelID] = now
             Task { [handler = messageActionHandler] in
@@ -11560,18 +11756,42 @@ public final class MainShellViewModel {
             }
         }
 
-        typingEndTask?.cancel()
+        typingEndDeadline = now.addingTimeInterval(3)
+        phase63ComposerDiagnostics.typingDeadlineResetCount += 1
+        startTypingEndWorkerIfNeeded(channelID: channelID)
+    }
+
+    private func startTypingEndWorkerIfNeeded(channelID: ChannelID) {
+        guard typingEndTask == nil else { return }
         typingEndTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(3))
-            await MainActor.run {
-                guard let self, self.activeTypingChannelID == channelID else { return }
-                self.endTypingForActiveChannel()
+            while !Task.isCancelled {
+                guard let self, self.activeTypingChannelID == channelID, let deadline = self.typingEndDeadline else {
+                    break
+                }
+                let delay = max(0, deadline.timeIntervalSinceNow)
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled else { break }
+                guard let currentDeadline = self.typingEndDeadline else { break }
+                if currentDeadline.timeIntervalSinceNow > 0 {
+                    continue
+                }
+                guard self.activeTypingChannelID == channelID else { break }
+                self.typingEndDeadline = nil
+                self.activeTypingChannelID = nil
+                self.typingEndTask = nil
+                Task { [handler = self.messageActionHandler] in
+                    try? await handler.endTyping(channelID: channelID)
+                }
+                return
             }
+            self?.typingEndTask = nil
         }
     }
 
     private func endTypingForActiveChannel() {
         typingEndTask?.cancel()
+        typingEndTask = nil
+        typingEndDeadline = nil
         guard let channelID = activeTypingChannelID else { return }
         activeTypingChannelID = nil
         Task { [handler = messageActionHandler] in
@@ -13541,6 +13761,7 @@ public struct CredentialSetupView: View {
         let phase51 = viewModel.phase51PerformanceDiagnostics
         let phase59Reactions = viewModel.phase59ReactionDiagnostics
         let phase60 = viewModel.phase60Diagnostics
+        let phase63Composer = viewModel.phase63ComposerDiagnostics
         let presentation = viewModel.timelinePresentationDiagnostics
         let roleSort = viewModel.memberRoleSortDiagnostics
         let dmConversation = viewModel.dmDiagnostics
@@ -13574,6 +13795,9 @@ public struct CredentialSetupView: View {
             LabeledContent("Phase 59 reactions", value: "attempts \(phase59Reactions.attemptCount), optimistic \(phase59Reactions.optimisticMutationCount), success \(phase59Reactions.successCount), rollback \(phase59Reactions.rollbackCount), deduped \(phase59Reactions.deduplicatedCount), unavailable \(phase59Reactions.unavailableCount)")
             LabeledContent("Phase 60 viewport", value: "events \(phase60.visibilityEventCount), flushes \(phase60.coalescedViewportFlushCount)")
             LabeledContent("Phase 60 rows", value: "requests \(phase60.rowRequestCount), dedupes \(phase60.rowDedupeCount), completed \(phase60.rowCompletionCount), stale \(phase60.staleRowDiscardCount), skeletons \(phase60.activeSkeletonCount), max queue \(phase60.maximumQueueDepth)")
+            LabeledContent("Phase 63 composer", value: "native \(phase63Composer.nativeEditEventCount), accepted \(phase63Composer.acceptedDraftMutationCount), duplicate \(phase63Composer.duplicateDraftMutationCount), triggers \(phase63Composer.inlineTriggerPublicationCount), suppressed \(phase63Composer.inlineTriggerSuppressionCount), typing resets \(phase63Composer.typingDeadlineResetCount)")
+            LabeledContent("Phase 63 edit baseline", value: "groups \(phase63Composer.timelineGroupingBuildCountAtLastEdit), row requests \(phase63Composer.timelineRowRequestCountAtLastEdit), viewport flushes \(phase63Composer.viewportFlushCountAtLastEdit)")
+            LabeledContent("Phase 63 visibility leases", value: "scheduled \(phase63Composer.visibilityLeaseScheduleCount), cancelled \(phase63Composer.visibilityLeaseCancellationCount), expired \(phase63Composer.visibilityLeaseExpirationCount)")
             LabeledContent("Timeline presentation", value: "groups \(presentation.groupingBuildCount), rows \(presentation.rowBuildCount), visible \(presentation.visibleMessageCount)/\(presentation.visibleGroupCount), cancelled \(presentation.cancellationCount), stale \(presentation.staleResultDiscardCount)")
             LabeledContent("Realtime coalescing", value: "\(viewModel.sessionCoordinator?.coalescedRealtimeUpdateCount ?? 0) pending updates merged")
             LabeledContent("Phase 51 diagnostics", value: "published \(phase51.diagnosticsPublishCount), throttled \(phase51.diagnosticsThrottleCount), budget violations \(phase51.mainThreadBudgetViolationCount)")
@@ -14263,88 +14487,12 @@ public struct ChatPlaceholderView: View {
                 }
             }
             MessageTimelineView(viewModel: viewModel)
-            if let channel = viewModel.selectedConversationChannel {
-                let sendReadiness = viewModel.composerReadiness(for: channel.id)
-                let inputReadiness = viewModel.composerInputReadiness(for: channel.id)
-                let draftState = viewModel.composerDraftState(for: channel.id)
-                GlassComposer(
-                    text: Binding(
-                        get: { viewModel.draft(for: channel.id) },
-                        set: { viewModel.updateDraft($0, for: channel.id) }
-                    ),
-                    shouldMentionReplyAuthor: Binding(
-                        get: { viewModel.composerDraftState(for: channel.id).shouldMentionReplyAuthor },
-                        set: { viewModel.updateReplyMentionPreference($0, for: channel.id) }
-                    ),
-                    placeholder: inputReadiness.isEnabled ? viewModel.composerPlaceholder(for: channel) : inputReadiness.reason,
-                    isEnabled: inputReadiness.isEnabled,
-                    canSend: sendReadiness.canSend,
-                    disabledReason: sendReadiness.canSend ? nil : sendReadiness.reason,
-                    isSending: viewModel.messageController.sendingChannelIDs.contains(channel.id),
-                    canAttach: viewModel.canUploadFiles(in: channel),
-                    attachments: viewModel.composerAttachmentChips(for: channel.id),
-                    attachmentSummary: viewModel.composerAttachmentSummary(for: channel.id),
-                    replyAuthor: draftState.replyContext?.authorDisplayName,
-                    replyPreview: draftState.replyContext?.contentPreview,
-                    focusRequestID: viewModel.composerFocusRequestID,
-                    onCancelReply: {
-                        viewModel.cancelReply(for: channel.id)
-                    },
-                    onAttach: {
-                        viewModel.openAttachmentPicker(for: channel.id)
-                    },
-                    onUploadAttachment: { attachmentID in
-                        Task { await viewModel.retryAttachmentUpload(attachmentID, in: channel.id) }
-                    },
-                    onRemoveAttachment: { attachmentID in
-                        viewModel.removeAttachment(attachmentID, from: channel.id)
-                    },
-                    onPreviewAttachment: { attachmentID in
-                        Task { await viewModel.previewComposerAttachment(attachmentID, in: channel.id) }
-                    },
-                    onDropFileURLs: { urls in
-                        viewModel.reviewDroppedAttachmentURLs(urls, to: channel.id)
-                    },
-                    emojiItems: viewModel.commonEmojiItems,
-                    emojiSections: viewModel.composerEmojiSections,
-                    onInsertEmoji: { emoji in
-                        viewModel.insertEmoji(emoji, in: channel.id)
-                    },
-                    onPasteImageData: { data in
-                        viewModel.addPastedImageDataFromClipboard(data, to: channel.id)
-                    },
-                    onPasteFileURLs: { urls in
-                        viewModel.addAttachmentURLsFromClipboard(urls, to: channel.id)
-                    },
-                    onPasteDiagnostic: { diagnostic in
-                        viewModel.recordComposerPasteDiagnostic(diagnostic)
-                    },
-                    onSend: {
-                        Task { await viewModel.sendDraft(for: channel.id) }
-                    },
-                    onFocus: {
-                        viewModel.focusComposer()
-                    },
-                    mentionAutocompleteCandidates: viewModel.composerMentionCandidates,
-                    highlightedMentionCandidateID: viewModel.composerMentionHighlightedID,
-                    cursorRequest: viewModel.composerCursorRequest,
-                    onInlineTriggerChange: { trigger in
-                        viewModel.composerInlineTriggerChanged(trigger, for: channel.id)
-                    },
-                    onNavigateMentionAutocomplete: { direction in
-                        viewModel.navigateComposerMentionAutocomplete(direction)
-                    },
-                    onSelectHighlightedMentionCandidate: {
-                        viewModel.selectHighlightedComposerMentionCandidate(for: channel.id)
-                    },
-                    onCancelMentionAutocomplete: {
-                        viewModel.clearComposerMentionAutocomplete()
-                    },
-                    onSelectMentionCandidate: { candidate in
-                        viewModel.selectComposerMentionCandidate(candidate, for: channel.id)
-                    }
-                )
-                .padding([.horizontal, .bottom], StoatSpacing.large)
+                // Resolve the toolbar and composer at their fixed heights first so the resize
+                // layout pass hands the timeline ScrollView its remainder in a single proposal
+                // (Phase 63 window-resize hang).
+                .layoutPriority(1)
+            if let channelID = viewModel.selectedConversationChannelID {
+                SelectedChannelComposerView(viewModel: viewModel, channelID: channelID)
             }
         }
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
@@ -14368,6 +14516,82 @@ public struct ChatPlaceholderView: View {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Keeps draft-sized invalidations below the chat container. In particular, changing the native
+/// text view must not re-evaluate the sibling LazyVStack that owns the loaded timeline.
+private struct SelectedChannelComposerView: View {
+    private let viewModel: MainShellViewModel
+    private let channelID: ChannelID
+
+    init(viewModel: MainShellViewModel, channelID: ChannelID) {
+        self.viewModel = viewModel
+        self.channelID = channelID
+    }
+
+    var body: some View {
+        if let channel = viewModel.snapshot.channelsByID[channelID] {
+            let sendReadiness = viewModel.composerReadiness(for: channelID)
+            let inputReadiness = viewModel.composerInputReadiness(for: channelID)
+            let draftState = viewModel.composerDraftState(for: channelID)
+            let attachmentPresentation = viewModel.composerAttachmentPresentation(for: channelID)
+            let emojiSections = viewModel.composerEmojiSections
+            GlassComposer(
+                text: Binding(
+                    get: { viewModel.draft(for: channelID) },
+                    set: { viewModel.updateDraft($0, for: channelID) }
+                ),
+                shouldMentionReplyAuthor: Binding(
+                    get: { viewModel.composerDraftState(for: channelID).shouldMentionReplyAuthor },
+                    set: { viewModel.updateReplyMentionPreference($0, for: channelID) }
+                ),
+                placeholder: inputReadiness.isEnabled ? viewModel.composerPlaceholder(for: channel) : inputReadiness.reason,
+                isEnabled: inputReadiness.isEnabled,
+                canSend: sendReadiness.canSend,
+                disabledReason: sendReadiness.canSend ? nil : sendReadiness.reason,
+                isSending: viewModel.messageController.sendingChannelIDs.contains(channelID),
+                canAttach: viewModel.canUploadFiles(in: channel),
+                attachments: attachmentPresentation.chips,
+                attachmentSummary: attachmentPresentation.summary,
+                replyAuthor: draftState.replyContext?.authorDisplayName,
+                replyPreview: draftState.replyContext?.contentPreview,
+                focusRequestID: viewModel.composerFocusRequestID,
+                onCancelReply: { viewModel.cancelReply(for: channelID) },
+                onAttach: { viewModel.openAttachmentPicker(for: channelID) },
+                onUploadAttachment: { attachmentID in
+                    Task { await viewModel.retryAttachmentUpload(attachmentID, in: channelID) }
+                },
+                onRemoveAttachment: { attachmentID in
+                    viewModel.removeAttachment(attachmentID, from: channelID)
+                },
+                onPreviewAttachment: { attachmentID in
+                    Task { await viewModel.previewComposerAttachment(attachmentID, in: channelID) }
+                },
+                onDropFileURLs: { viewModel.reviewDroppedAttachmentURLs($0, to: channelID) },
+                emojiItems: emojiSections.flatMap(\.items),
+                emojiSections: emojiSections,
+                onInsertEmoji: { viewModel.insertEmoji($0, in: channelID) },
+                onPasteImageData: { viewModel.addPastedImageDataFromClipboard($0, to: channelID) },
+                onPasteFileURLs: { viewModel.addAttachmentURLsFromClipboard($0, to: channelID) },
+                onPasteDiagnostic: { viewModel.recordComposerPasteDiagnostic($0) },
+                onSend: { Task { await viewModel.sendDraft(for: channelID) } },
+                onFocus: { viewModel.focusComposer() },
+                mentionAutocompleteCandidates: viewModel.composerMentionCandidates,
+                highlightedMentionCandidateID: viewModel.composerMentionHighlightedID,
+                cursorRequest: viewModel.composerCursorRequest,
+                onInlineTriggerChange: { viewModel.composerInlineTriggerChanged($0, for: channelID) },
+                onNativeEdit: { viewModel.noteNativeComposerEdit() },
+                onInlineTriggerSuppressed: { viewModel.noteSuppressedComposerInlineTrigger() },
+                onNavigateMentionAutocomplete: { viewModel.navigateComposerMentionAutocomplete($0) },
+                onSelectHighlightedMentionCandidate: {
+                    viewModel.selectHighlightedComposerMentionCandidate(for: channelID)
+                },
+                onCancelMentionAutocomplete: { viewModel.clearComposerMentionAutocomplete() },
+                onSelectMentionCandidate: { viewModel.selectComposerMentionCandidate($0, for: channelID) }
+            )
+            .padding([.horizontal, .bottom], StoatSpacing.large)
         }
     }
 }
@@ -14547,6 +14771,9 @@ public struct MessageTimelineView: View {
         } else {
             ForEach(renderItems, id: \.renderIdentity) { item in
                 TimelineRenderItemView(item: item, viewModel: viewModel)
+                    // Skip re-evaluating unchanged rows when the parent timeline re-renders;
+                    // rows still invalidate individually through the observable state they read.
+                    .equatable()
                     .padding(
                         .top,
                         item.startsGroup
@@ -14754,13 +14981,13 @@ private struct Phase43SystemEventRow: View {
         .accessibilityLabel(presentation.plainText)
     }
 
-    private func roleForeground(_ roleColor: ResolvedRoleColor?) -> Color {
-        guard let roleColor else { return .secondary }
-        return Color(red: roleColor.red, green: roleColor.green, blue: roleColor.blue)
+    private func roleForeground(_ roleColor: ResolvedRoleColor?) -> AnyShapeStyle {
+        guard let roleColor else { return AnyShapeStyle(.secondary) }
+        return roleColor.value.foregroundStyle
     }
 }
 
-public struct TimelineRenderItemView: View {
+public struct TimelineRenderItemView: View, @MainActor Equatable {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     // `renderIdentity` keeps this state through optimistic-send reconciliation. Retaining the
     // last decoded bytes prevents a momentary cache/read-state gap from replacing a visible
@@ -14772,6 +14999,13 @@ public struct TimelineRenderItemView: View {
     public init(item: TimelineRenderItem, viewModel: MainShellViewModel) {
         self.item = item
         self.viewModel = viewModel
+    }
+
+    // Rows that read changed observable state still invalidate individually; this only lets
+    // SwiftUI skip rows whose inputs are unchanged when the whole ForEach re-renders. The item
+    // comparison hits the boxed payload's identity fast path for reused instances.
+    public static func == (lhs: TimelineRenderItemView, rhs: TimelineRenderItemView) -> Bool {
+        lhs.item == rhs.item && lhs.viewModel === rhs.viewModel
     }
 
     public var body: some View {
@@ -14877,9 +15111,8 @@ public struct TimelineRenderItemView: View {
                 viewModel.loadInlineImagePreviews(for: timelineMessage.message)
                 viewModel.loadModeledEmbedMediaPreviews(for: timelineMessage.message)
                 if item.showsHeader {
-                    viewModel.imageResourceBecameVisible(
+                    viewModel.timelineAvatarBecameVisible(
                         display.avatarFile,
-                        kind: .userAvatar,
                         consumerID: timelineAvatarConsumerID(for: item)
                     )
                 }
@@ -14903,7 +15136,7 @@ public struct TimelineRenderItemView: View {
                 isVisible: false
             )
             if item.showsHeader {
-                viewModel.imageResourceBecameHidden(
+                viewModel.timelineAvatarBecameHidden(
                     consumerID: timelineAvatarConsumerID(for: item)
                 )
             }
@@ -14978,11 +15211,11 @@ public struct TimelineRenderItemView: View {
         item.role == .destructive ? .destructive : nil
     }
 
-    private func roleColor(for message: Message) -> Color? {
+    private func roleColor(for message: Message) -> RoleColorValue? {
         guard colorSchemeContrast != .increased,
               let roleColor = viewModel.roleColor(for: message)
         else { return nil }
-        return Color(red: roleColor.red, green: roleColor.green, blue: roleColor.blue)
+        return roleColor.value
     }
 
     @ViewBuilder private func statusView(for timelineMessage: TimelineMessage) -> some View {
@@ -15453,9 +15686,9 @@ public struct MemberPanelView: View {
         return "member-panel-avatar-\(contextID)-\(item.userID.rawValue)"
     }
 
-    private func roleForeground(_ color: ResolvedRoleColor?) -> Color {
-        guard colorSchemeContrast != .increased, let color else { return .primary }
-        return Color(red: color.red, green: color.green, blue: color.blue)
+    private func roleForeground(_ color: ResolvedRoleColor?) -> AnyShapeStyle {
+        guard colorSchemeContrast != .increased, let color else { return AnyShapeStyle(.primary) }
+        return color.value.foregroundStyle
     }
 
     private var members: [User] {
@@ -16090,8 +16323,13 @@ private struct FriendItemRow: View {
 }
 
 struct ProfileBioDisclosurePolicy {
+    /// Tolerance for sub-pixel rounding between the measured content height and the collapsed
+    /// clamp. Anything measuring within the epsilon of the clamp is treated as fitting -- and,
+    /// because the tri-state below only clamps confirmed overflow, it then renders unclipped.
+    static let overflowEpsilon: CGFloat = 0.5
+
     static func isOverflowing(measuredHeight: CGFloat, collapsedHeight: CGFloat) -> Bool {
-        measuredHeight > collapsedHeight + 1
+        measuredHeight > collapsedHeight + overflowEpsilon
     }
 
     static func contentWidth(cardWidth: CGFloat, horizontalPadding: CGFloat) -> CGFloat {
@@ -16099,30 +16337,61 @@ struct ProfileBioDisclosurePolicy {
     }
 }
 
+/// Tri-state bio disclosure. The invariant that fixes the Phase 62 inconsistency: the collapsed
+/// clamp is applied only while measuring or after *confirmed* overflow, so "last line clipped
+/// but no See More button" is structurally unreachable -- content that fits (including content
+/// within the rounding epsilon of the clamp) always renders unclipped.
 struct ProfileBioDisclosureState: Equatable {
+    enum Classification: Equatable {
+        /// No accepted measurement yet: keep the clamp on (avoids a tall flash) but show no button.
+        case measuring
+        /// Confirmed to fit: no clamp, no button.
+        case fits
+        /// Confirmed overflow: clamp while collapsed, show the button.
+        case overflows
+    }
+
     var contentKey: String
     var preparedContentKey: String?
-    var measuredHeight: CGFloat = 0
+    var preparedGeneration: Int? = nil
+    var classification: Classification = .measuring
     var isExpanded = false
 
     mutating func reset(contentKey: String) {
         self = ProfileBioDisclosureState(contentKey: contentKey)
     }
 
-    mutating func acceptPrepared(contentKey: String) {
+    mutating func acceptPrepared(contentKey: String, generation: Int = 0) {
         guard self.contentKey == contentKey else { return }
         preparedContentKey = contentKey
-        measuredHeight = 0
+        preparedGeneration = generation
+        // Deliberately retain the current classification: the prepared subtree re-measures and
+        // reclassifies immediately, and resetting here made the button vanish for a frame on
+        // every loading -> prepared swap (the Phase 62 flicker).
     }
 
-    mutating func acceptMeasurement(_ height: CGFloat, contentKey: String) {
-        guard self.contentKey == contentKey, preparedContentKey == contentKey else { return }
-        measuredHeight = max(0, height)
+    mutating func acceptMeasurement(_ height: CGFloat, contentKey: String, generation: Int = 0, collapsedHeight: CGFloat) {
+        guard self.contentKey == contentKey,
+              preparedContentKey == contentKey,
+              preparedGeneration == generation
+        else { return }
+        classification = ProfileBioDisclosurePolicy.isOverflowing(
+            measuredHeight: max(0, height),
+            collapsedHeight: collapsedHeight
+        ) ? .overflows : .fits
     }
 
-    func showsDisclosure(collapsedHeight: CGFloat) -> Bool {
-        preparedContentKey == contentKey
-            && ProfileBioDisclosurePolicy.isOverflowing(measuredHeight: measuredHeight, collapsedHeight: collapsedHeight)
+    var showsDisclosure: Bool {
+        preparedContentKey == contentKey && classification == .overflows
+    }
+
+    /// Whether the collapsed-height clamp is currently applied to the content.
+    var appliesClamp: Bool {
+        switch classification {
+        case .measuring: return true
+        case .fits: return false
+        case .overflows: return !isExpanded
+        }
     }
 }
 
@@ -16131,16 +16400,21 @@ private struct ProfileBioContentView: View {
     let contentKey: String
     let width: CGFloat
     let collapsedHeight: CGFloat
+    let fadeHeight: CGFloat
     @State private var preparedContent: PreparedMarkdownContent?
+    @State private var preparationGeneration = 0
+    @State private var acceptedPreparedGeneration: Int?
     @State private var disclosure: ProfileBioDisclosureState
 
-    init(content: String, contentKey: String, width: CGFloat, collapsedHeight: CGFloat) {
+    init(content: String, contentKey: String, width: CGFloat, collapsedHeight: CGFloat, fadeHeight: CGFloat) {
         self.content = content
         self.contentKey = contentKey
         self.width = width
         self.collapsedHeight = collapsedHeight
+        self.fadeHeight = fadeHeight
         _preparedContent = State(initialValue: nil)
-        _disclosure = State(initialValue: ProfileBioDisclosureState(contentKey: contentKey))
+        let measurementKey = Self.measurementKey(contentKey: contentKey, width: width)
+        _disclosure = State(initialValue: ProfileBioDisclosureState(contentKey: measurementKey))
     }
 
     var body: some View {
@@ -16157,15 +16431,14 @@ private struct ProfileBioContentView: View {
             .id(preparedContent == nil ? "bio-loading-\(contentKey)" : "bio-prepared-\(contentKey)")
             .frame(width: width, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
-            .onGeometryChange(for: CGFloat.self) { proxy in
-                proxy.size.height
-            } action: { height in
-                disclosure.acceptMeasurement(height, contentKey: contentKey)
-            }
-            .frame(maxHeight: disclosure.isExpanded ? nil : collapsedHeight, alignment: .top)
+            .frame(maxHeight: disclosure.appliesClamp ? collapsedHeight : nil, alignment: .top)
             .clipped()
+            .mask(alignment: .top) { collapseMask }
+            .background(alignment: .topLeading) {
+                preparedMeasurementView
+            }
 
-            if disclosure.showsDisclosure(collapsedHeight: collapsedHeight) {
+            if disclosure.showsDisclosure {
                 Button(disclosure.isExpanded ? "Show Less" : "See More") {
                     disclosure.isExpanded.toggle()
                 }
@@ -16173,16 +16446,68 @@ private struct ProfileBioContentView: View {
                 .accessibilityHint(disclosure.isExpanded ? "Collapse the profile biography" : "Show the full profile biography")
             }
         }
-        .task(id: contentKey) {
+        .task(id: measurementKey) {
             preparedContent = nil
-            disclosure.reset(contentKey: contentKey)
+            acceptedPreparedGeneration = nil
+            preparationGeneration &+= 1
+            let generation = preparationGeneration
+            disclosure.reset(contentKey: measurementKey)
             let content = content
             let prepared = await Task.detached(priority: .userInitiated) {
                 MarkdownContentPreparer.prepare(content)
             }.value
-            guard !Task.isCancelled, prepared.source == content, disclosure.contentKey == contentKey else { return }
-            disclosure.acceptPrepared(contentKey: contentKey)
+            guard !Task.isCancelled, prepared.source == content, disclosure.contentKey == measurementKey else { return }
             preparedContent = prepared
+            acceptedPreparedGeneration = generation
+            disclosure.acceptPrepared(contentKey: measurementKey, generation: generation)
+        }
+    }
+
+    private var measurementKey: String {
+        Self.measurementKey(contentKey: contentKey, width: width)
+    }
+
+    private static func measurementKey(contentKey: String, width: CGFloat) -> String {
+        "\(contentKey)|width:\(width.rounded(.toNearestOrAwayFromZero))"
+    }
+
+    @ViewBuilder private var preparedMeasurementView: some View {
+        if let preparedContent, let generation = acceptedPreparedGeneration {
+            MarkdownMessageContent(prepared: preparedContent)
+                .frame(width: width, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .hidden()
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height
+                } action: { height in
+                    disclosure.acceptMeasurement(
+                        height,
+                        contentKey: measurementKey,
+                        generation: generation,
+                        collapsedHeight: collapsedHeight
+                    )
+                }
+        }
+    }
+
+    /// While collapsed over confirmed overflow, fade the final line height out instead of hard
+    /// clipping -- block markdown (headings, code, spacing) rarely lands the clamp exactly on a
+    /// line boundary, and the fade reads as intentional truncation above the See More button.
+    @ViewBuilder private var collapseMask: some View {
+        if disclosure.appliesClamp && disclosure.classification == .overflows {
+            VStack(spacing: 0) {
+                Rectangle()
+                LinearGradient(
+                    colors: [.black, .black.opacity(0.12)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: fadeHeight)
+            }
+        } else {
+            Rectangle()
         }
     }
 }
@@ -16193,7 +16518,15 @@ private struct UserProfileCardView: View {
     let user: User
     private let cardWidth: CGFloat = 480
     private let cardHeight: CGFloat = 560
-    private let collapsedBioHeight: CGFloat = 132
+    /// Collapse after this many rendered body-text lines; the point value derives from live
+    /// line metrics (Phase 63) instead of the old hard-coded 132pt.
+    private static let collapsedBioLineLimit = 8
+    private var collapsedBioHeight: CGFloat {
+        ProfileBioMetrics.collapsedHeight(
+            lineLimit: Self.collapsedBioLineLimit,
+            lineHeight: ProfileBioMetrics.messageBodyLineHeight
+        )
+    }
 
     private var contentWidth: CGFloat {
         ProfileBioDisclosurePolicy.contentWidth(cardWidth: cardWidth, horizontalPadding: StoatSpacing.large)
@@ -16346,7 +16679,9 @@ private struct UserProfileCardView: View {
                     .padding(.horizontal, StoatSpacing.small)
                     .padding(.vertical, StoatSpacing.xxSmall)
                     .foregroundStyle(roleForeground(roleColor))
-                    .background(roleForeground(roleColor).opacity(0.12), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+                    // Gradient text over a solid primary-stop wash: a 12% gradient background
+                    // reads as mud, so chips keep a flat tint.
+                    .background(roleSolidColor(roleColor).opacity(0.12), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
                     .help(role.name)
             }
         }
@@ -16357,7 +16692,8 @@ private struct UserProfileCardView: View {
             content: content,
             contentKey: "\(user.id.rawValue)|\(content)",
             width: contentWidth,
-            collapsedHeight: collapsedBioHeight
+            collapsedHeight: collapsedBioHeight,
+            fadeHeight: ProfileBioMetrics.messageBodyLineHeight
         )
         .id("\(user.id.rawValue)|\(content)")
     }
@@ -16493,16 +16829,21 @@ private struct UserProfileCardView: View {
         return viewModel.snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: user.id)]
     }
 
-    private func roleForeground(_ color: ResolvedRoleColor?) -> Color {
+    private func roleForeground(_ color: ResolvedRoleColor?) -> AnyShapeStyle {
+        guard colorSchemeContrast != .increased, let color else { return AnyShapeStyle(.secondary) }
+        return color.value.foregroundStyle
+    }
+
+    private func roleSolidColor(_ color: ResolvedRoleColor?) -> Color {
         guard colorSchemeContrast != .increased, let color else { return .secondary }
         return Color(red: color.red, green: color.green, blue: color.blue)
     }
 
-    private var displayNameForeground: Color {
+    private var displayNameForeground: AnyShapeStyle {
         guard colorSchemeContrast != .increased,
               let color = context.display.roleColor
-        else { return .primary }
-        return Color(red: color.red, green: color.green, blue: color.blue)
+        else { return AnyShapeStyle(.primary) }
+        return color.value.foregroundStyle
     }
 
     private func ownerName(_ ownerID: UserID) -> String {
@@ -17497,7 +17838,7 @@ public struct ServerOverviewView: View {
                     ForEach(presentation.orderedRoles) { role in
                         HStack {
                             Circle()
-                                .fill(roleColor(role.colour))
+                                .fill(roleSwatchStyle(role.colour))
                                 .frame(width: 10, height: 10)
                             VStack(alignment: .leading) {
                                 Text(role.name)
@@ -18230,9 +18571,11 @@ public struct ServerOverviewView: View {
         return labels.isEmpty ? "No highlighted permissions" : labels.joined(separator: ", ")
     }
 
-    private func roleColor(_ hex: String?) -> Color {
-        guard let hex, let color = NSColor.phase25Hex(hex) else { return .secondary }
-        return Color(nsColor: color)
+    private func roleSwatchStyle(_ colour: String?) -> AnyShapeStyle {
+        guard let colour, let value = CSSRoleColorParser.parse(colour) else {
+            return AnyShapeStyle(Color.secondary)
+        }
+        return value.foregroundStyle
     }
 
     @ViewBuilder private func stateMessage<Value: Hashable & Sendable>(_ state: ManagementActionState<Value>, loading: String, success: String) -> some View {
@@ -18731,22 +19074,6 @@ public struct ChannelSearchPanel: View {
                     .foregroundStyle(.secondary)
             }
         }
-    }
-}
-
-private extension NSColor {
-    static func phase25Hex(_ value: String) -> NSColor? {
-        var hex = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if hex.hasPrefix("#") {
-            hex.removeFirst()
-        }
-        guard hex.count == 6, let int = UInt64(hex, radix: 16) else { return nil }
-        return NSColor(
-            red: CGFloat((int >> 16) & 0xFF) / 255,
-            green: CGFloat((int >> 8) & 0xFF) / 255,
-            blue: CGFloat(int & 0xFF) / 255,
-            alpha: 1
-        )
     }
 }
 

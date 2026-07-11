@@ -1,6 +1,7 @@
 import AppKit
 import StoatDesignSystem
 import StoatModels
+import SwiftUI
 import XCTest
 @testable import StoatUI
 
@@ -203,6 +204,94 @@ final class StoatUITests: XCTestCase {
         XCTAssertEqual(codeBlocks, ["code::let value = \":bagel:\""])
     }
 
+    func testPhase63CSSRoleColorParserHexForms() throws {
+        let sixDigit = try XCTUnwrap(CSSRoleColorParser.parse("#1a2b3c"))
+        guard case let .solid(stop) = sixDigit else { return XCTFail("expected solid") }
+        XCTAssertEqual(stop.red, Double(0x1A) / 255, accuracy: 0.0001)
+        XCTAssertEqual(stop.green, Double(0x2B) / 255, accuracy: 0.0001)
+        XCTAssertEqual(stop.blue, Double(0x3C) / 255, accuracy: 0.0001)
+        XCTAssertEqual(stop.alpha, 1)
+
+        let shorthand = try XCTUnwrap(CSSRoleColorParser.parseHexColor("#f0a"))
+        XCTAssertEqual(shorthand.red, 1, accuracy: 0.0001)
+        XCTAssertEqual(shorthand.green, 0, accuracy: 0.0001)
+        XCTAssertEqual(shorthand.blue, Double(0xAA) / 255, accuracy: 0.0001)
+
+        let withAlpha = try XCTUnwrap(CSSRoleColorParser.parseHexColor("#11223380"))
+        XCTAssertEqual(withAlpha.alpha, Double(0x80) / 255, accuracy: 0.0001)
+
+        XCTAssertNotNil(CSSRoleColorParser.parse("  #FFFFFF  "))
+        XCTAssertNil(CSSRoleColorParser.parseHexColor("ff0000"))
+        XCTAssertNil(CSSRoleColorParser.parseHexColor("#ff00f"))
+        XCTAssertNil(CSSRoleColorParser.parseHexColor("#gggggg"))
+    }
+
+    func testPhase63CSSRoleColorParserFunctionalForms() throws {
+        let rgb = try XCTUnwrap(CSSRoleColorParser.parseFunctionalColor("rgb(255, 128, 0)"))
+        XCTAssertEqual(rgb.red, 1, accuracy: 0.0001)
+        XCTAssertEqual(rgb.green, 128.0 / 255, accuracy: 0.0001)
+        XCTAssertEqual(rgb.blue, 0, accuracy: 0.0001)
+
+        let rgba = try XCTUnwrap(CSSRoleColorParser.parseFunctionalColor("rgba(0, 0, 255, 0.5)"))
+        XCTAssertEqual(rgba.alpha, 0.5, accuracy: 0.0001)
+
+        let percent = try XCTUnwrap(CSSRoleColorParser.parseFunctionalColor("rgb(100%, 50%, 0%)"))
+        XCTAssertEqual(percent.red, 1, accuracy: 0.0001)
+        XCTAssertEqual(percent.green, 0.5, accuracy: 0.0001)
+
+        let clamped = try XCTUnwrap(CSSRoleColorParser.parseFunctionalColor("rgb(999, -20, 128)"))
+        XCTAssertEqual(clamped.red, 1, accuracy: 0.0001)
+        XCTAssertEqual(clamped.green, 0, accuracy: 0.0001)
+
+        XCTAssertNil(CSSRoleColorParser.parseFunctionalColor("rgb(1, 2)"))
+        XCTAssertNil(CSSRoleColorParser.parseFunctionalColor("hsl(120, 50%, 50%)"))
+        XCTAssertNil(CSSRoleColorParser.parseFunctionalColor("rgb(a, b, c)"))
+    }
+
+    func testPhase63CSSRoleColorParserLinearGradients() throws {
+        let toRight = try XCTUnwrap(CSSRoleColorParser.parse("linear-gradient(to right, #ff0000, #00ff00)"))
+        guard case let .linearGradient(angle, stops) = toRight else { return XCTFail("expected gradient") }
+        XCTAssertEqual(angle, 90)
+        XCTAssertEqual(stops.count, 2)
+        XCTAssertEqual(stops[0].red, 1, accuracy: 0.0001)
+        XCTAssertEqual(stops[1].green, 1, accuracy: 0.0001)
+        XCTAssertTrue(toRight.isGradient)
+        XCTAssertEqual(toRight.primaryStop.red, 1, accuracy: 0.0001)
+
+        let angled = try XCTUnwrap(CSSRoleColorParser.parse("linear-gradient(45deg, #f00 0%, #0f0 50%, #00f 100%)"))
+        guard case let .linearGradient(degrees, positioned) = angled else { return XCTFail("expected gradient") }
+        XCTAssertEqual(degrees, 45)
+        XCTAssertEqual(positioned.map(\.location), [0, 0.5, 1])
+
+        // No direction argument -> CSS default "to bottom" (180deg).
+        let defaulted = try XCTUnwrap(CSSRoleColorParser.parse("linear-gradient(#ff0000, rgb(0, 0, 255))"))
+        guard case let .linearGradient(defaultAngle, mixedStops) = defaulted else { return XCTFail("expected gradient") }
+        XCTAssertEqual(defaultAngle, 180)
+        XCTAssertEqual(mixedStops[1].blue, 1, accuracy: 0.0001)
+
+        XCTAssertNil(CSSRoleColorParser.parse("linear-gradient(to right, #ff0000)"))
+        XCTAssertNil(CSSRoleColorParser.parse("linear-gradient(to right, var(--a), var(--b))"))
+        XCTAssertNil(CSSRoleColorParser.parse("conic-gradient(#f00, #0f0)"))
+        XCTAssertNil(CSSRoleColorParser.parse("radial-gradient(#f00, #0f0)"))
+        XCTAssertNil(CSSRoleColorParser.parse("url(https://example.invalid/x.png)"))
+        XCTAssertNil(CSSRoleColorParser.parse("tomato"))
+        XCTAssertNil(CSSRoleColorParser.parse(""))
+    }
+
+    func testPhase63LinearGradientGeometryCardinalPoints() {
+        func assertPoints(_ degrees: Double, start: UnitPoint, end: UnitPoint, line: UInt = #line) {
+            let points = LinearGradientGeometry.unitPoints(angleDegrees: degrees)
+            XCTAssertEqual(points.start.x, start.x, accuracy: 0.0001, line: line)
+            XCTAssertEqual(points.start.y, start.y, accuracy: 0.0001, line: line)
+            XCTAssertEqual(points.end.x, end.x, accuracy: 0.0001, line: line)
+            XCTAssertEqual(points.end.y, end.y, accuracy: 0.0001, line: line)
+        }
+        assertPoints(0, start: UnitPoint(x: 0.5, y: 1), end: UnitPoint(x: 0.5, y: 0))    // to top
+        assertPoints(90, start: UnitPoint(x: 0, y: 0.5), end: UnitPoint(x: 1, y: 0.5))   // to right
+        assertPoints(180, start: UnitPoint(x: 0.5, y: 0), end: UnitPoint(x: 0.5, y: 1))  // to bottom
+        assertPoints(270, start: UnitPoint(x: 1, y: 0.5), end: UnitPoint(x: 0, y: 0.5))  // to left
+    }
+
     func testPhase62PlainMarkdownUsesWrappingTextFlow() {
         let longBio = "Star Rail codes. /FetchZZZ — Fetch all active Zenless Zone Zero codes. /FetchHI3 — Fetch all active Honkai Impact 3rd codes."
         XCTAssertEqual(
@@ -394,6 +483,23 @@ final class StoatUITests: XCTestCase {
         XCTAssertNil(outcome.pastedFileURLs)
         XCTAssertNil(outcome.pastedImageData)
         XCTAssertEqual(outcome.resultingText, "plain clipboard text")
+    }
+
+    @MainActor
+    func testPhase63AttachmentThenCharacterViewerEmojiKeepsNativeComposerResponsive() {
+        let pngData = Data([0x89, 0x50, 0x4E, 0x47])
+        let outcome = GlassComposer._testAttachmentThenNativeTextAndEmoji(
+            imageData: pngData,
+            text: "still composing ",
+            emoji: "😭"
+        )
+
+        XCTAssertEqual(outcome.pastedImageData, pngData)
+        XCTAssertEqual(outcome.resultingText, "still composing 😭😭")
+        XCTAssertEqual(outcome.nativeEditCount, 3)
+        XCTAssertEqual(outcome.inlineTriggerPublications.count, 1)
+        XCTAssertNil(outcome.inlineTriggerPublications[0])
+        XCTAssertGreaterThanOrEqual(outcome.inlineTriggerSuppressionCount, 2)
     }
 
     #endif

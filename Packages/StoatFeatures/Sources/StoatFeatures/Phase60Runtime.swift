@@ -5,20 +5,50 @@ import StoatRealtime
 import StoatUI
 
 public struct TimelineRenderItem: Identifiable, Hashable, Sendable {
+    /// Immutable boxed storage. Copying a render item during SwiftUI lazy-layout measurement is
+    /// a single retain instead of a memberwise deep copy of the embedded `Message` -- the
+    /// dominant cost in the Phase 63 window-resize hang trace.
+    private final class Payload: Sendable {
+        let timelineMessage: TimelineMessage
+        let groupID: String
+        let authorID: UserID
+        let showsHeader: Bool
+        let startsGroup: Bool
+        let renderIdentity: String
+
+        init(
+            timelineMessage: TimelineMessage,
+            groupID: String,
+            authorID: UserID,
+            showsHeader: Bool,
+            startsGroup: Bool,
+            renderIdentity: String
+        ) {
+            self.timelineMessage = timelineMessage
+            self.groupID = groupID
+            self.authorID = authorID
+            self.showsHeader = showsHeader
+            self.startsGroup = startsGroup
+            self.renderIdentity = renderIdentity
+        }
+    }
+
+    private let payload: Payload
+
     /// The real message id -- unchanged across pending -> confirmed reconciliation, and the one
     /// preparation targeting, actions, acknowledgements, and navigation must keep using.
-    public var id: MessageID { timelineMessage.message.id }
-    public var timelineMessage: TimelineMessage
-    public var groupID: String
-    public var authorID: UserID
-    public var showsHeader: Bool
-    public var startsGroup: Bool
+    public var id: MessageID { payload.timelineMessage.message.id }
+    public var timelineMessage: TimelineMessage { payload.timelineMessage }
+    public var groupID: String { payload.groupID }
+    public var authorID: UserID { payload.authorID }
+    public var showsHeader: Bool { payload.showsHeader }
+    public var startsGroup: Bool { payload.startsGroup }
     /// A view-identity key that stays stable across pending -> confirmed -> realtime-echo
     /// reconciliation for a message the current user just sent (keyed by its nonce, which
     /// survives that transition), so SwiftUI doesn't tear down and rebuild the row -- and its
     /// avatar image view -- just because the real message id changed underneath it. Every other
     /// message (including all incoming messages from other authors) keeps using the real id.
-    public var renderIdentity: String
+    public var renderIdentity: String { payload.renderIdentity }
 
     public init(
         timelineMessage: TimelineMessage,
@@ -28,16 +58,39 @@ public struct TimelineRenderItem: Identifiable, Hashable, Sendable {
         startsGroup: Bool,
         currentUserID: UserID? = nil
     ) {
-        self.timelineMessage = timelineMessage
-        self.groupID = groupID
-        self.authorID = authorID
-        self.showsHeader = showsHeader
-        self.startsGroup = startsGroup
+        let renderIdentity: String
         if let nonce = timelineMessage.message.nonce, timelineMessage.message.authorID == currentUserID {
-            self.renderIdentity = "local-send-\(nonce)"
+            renderIdentity = "local-send-\(nonce)"
         } else {
-            self.renderIdentity = timelineMessage.message.id.rawValue
+            renderIdentity = timelineMessage.message.id.rawValue
         }
+        self.payload = Payload(
+            timelineMessage: timelineMessage,
+            groupID: groupID,
+            authorID: authorID,
+            showsHeader: showsHeader,
+            startsGroup: startsGroup,
+            renderIdentity: renderIdentity
+        )
+    }
+
+    public static func == (lhs: TimelineRenderItem, rhs: TimelineRenderItem) -> Bool {
+        if lhs.payload === rhs.payload { return true }
+        return lhs.payload.timelineMessage == rhs.payload.timelineMessage
+            && lhs.payload.groupID == rhs.payload.groupID
+            && lhs.payload.authorID == rhs.payload.authorID
+            && lhs.payload.showsHeader == rhs.payload.showsHeader
+            && lhs.payload.startsGroup == rhs.payload.startsGroup
+            && lhs.payload.renderIdentity == rhs.payload.renderIdentity
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(payload.timelineMessage)
+        hasher.combine(payload.groupID)
+        hasher.combine(payload.authorID)
+        hasher.combine(payload.showsHeader)
+        hasher.combine(payload.startsGroup)
+        hasher.combine(payload.renderIdentity)
     }
 }
 
@@ -239,6 +292,49 @@ public struct Phase60Diagnostics: Hashable, Sendable {
         self.staleRowDiscardCount = staleRowDiscardCount
         self.activeSkeletonCount = activeSkeletonCount
         self.maximumQueueDepth = maximumQueueDepth
+    }
+}
+
+public struct Phase63ComposerDiagnostics: Hashable, Sendable {
+    public var nativeEditEventCount: Int
+    public var acceptedDraftMutationCount: Int
+    public var duplicateDraftMutationCount: Int
+    public var inlineTriggerPublicationCount: Int
+    public var inlineTriggerSuppressionCount: Int
+    public var typingDeadlineResetCount: Int
+    public var timelineGroupingBuildCountAtLastEdit: Int
+    public var timelineRowRequestCountAtLastEdit: Int
+    public var viewportFlushCountAtLastEdit: Int
+    public var visibilityLeaseScheduleCount: Int
+    public var visibilityLeaseCancellationCount: Int
+    public var visibilityLeaseExpirationCount: Int
+
+    public init(
+        nativeEditEventCount: Int = 0,
+        acceptedDraftMutationCount: Int = 0,
+        duplicateDraftMutationCount: Int = 0,
+        inlineTriggerPublicationCount: Int = 0,
+        inlineTriggerSuppressionCount: Int = 0,
+        typingDeadlineResetCount: Int = 0,
+        timelineGroupingBuildCountAtLastEdit: Int = 0,
+        timelineRowRequestCountAtLastEdit: Int = 0,
+        viewportFlushCountAtLastEdit: Int = 0,
+        visibilityLeaseScheduleCount: Int = 0,
+        visibilityLeaseCancellationCount: Int = 0,
+        visibilityLeaseExpirationCount: Int = 0
+    ) {
+        self.nativeEditEventCount = nativeEditEventCount
+        self.acceptedDraftMutationCount = acceptedDraftMutationCount
+        self.duplicateDraftMutationCount = duplicateDraftMutationCount
+        self.inlineTriggerPublicationCount = inlineTriggerPublicationCount
+        self.inlineTriggerSuppressionCount = inlineTriggerSuppressionCount
+        self.typingDeadlineResetCount = typingDeadlineResetCount
+        self.timelineGroupingBuildCountAtLastEdit = timelineGroupingBuildCountAtLastEdit
+        self.timelineRowRequestCountAtLastEdit = timelineRowRequestCountAtLastEdit
+        self.viewportFlushCountAtLastEdit = viewportFlushCountAtLastEdit
+        self.visibilityLeaseScheduleCount = visibilityLeaseScheduleCount
+        self.visibilityLeaseCancellationCount = visibilityLeaseCancellationCount
+        self.visibilityLeaseExpirationCount = visibilityLeaseExpirationCount
     }
 }
 
