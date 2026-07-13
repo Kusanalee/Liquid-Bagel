@@ -14487,10 +14487,11 @@ public struct ChatPlaceholderView: View {
                 }
             }
             MessageTimelineView(viewModel: viewModel)
-                // Resolve the toolbar and composer at their fixed heights first so the resize
-                // layout pass hands the timeline ScrollView its remainder in a single proposal
-                // (Phase 63 window-resize hang).
-                .layoutPriority(1)
+                // Do NOT give the timeline layoutPriority (Phase 64). A prioritized ScrollView
+                // is asked for its IDEAL height — its full content height — which forces the
+                // LazyVStack to measure every loaded row and freezes channel load at 100% CPU.
+                // Default stack priority hands the ScrollView the flexible remainder while rows
+                // stay lazy.
             if let channelID = viewModel.selectedConversationChannelID {
                 SelectedChannelComposerView(viewModel: viewModel, channelID: channelID)
             }
