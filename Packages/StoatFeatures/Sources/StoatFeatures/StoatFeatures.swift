@@ -518,6 +518,12 @@ public final class MainShellViewModel {
     public private(set) var snapshot: RealtimeSnapshot {
         didSet {
             snapshotRevision &+= 1
+            if oldValue.emojisByID != snapshot.emojisByID {
+                phase68EmojiCatalogRevision &+= 1
+                phase68CustomEmojiIndex = nil
+                composerEmojiSectionCacheKey = nil
+                composerEmojiSectionCache = []
+            }
             // Do NOT unconditionally nil memberListGroupCacheKey here: it fires on every
             // realtime event (including pure message traffic), and eagerly clearing it defeats
             // the fingerprint-based cache in memberListCacheKey(serverID:query:), forcing a full
@@ -650,6 +656,7 @@ public final class MainShellViewModel {
     public private(set) var phase59ReactionDiagnostics = Phase59ReactionDiagnostics()
     @ObservationIgnored public private(set) var phase60Diagnostics = Phase60Diagnostics()
     @ObservationIgnored public private(set) var phase63ComposerDiagnostics = Phase63ComposerDiagnostics()
+    @ObservationIgnored public private(set) var phase68TraceDiagnostics = Phase68TraceDiagnostics()
     public private(set) var phase52FreezeDiagnostics = Phase52FreezeDiagnostics()
     public private(set) var timelinePresentationState: TimelinePresentationState = .idle
     public private(set) var timelinePresentationDiagnostics = TimelinePresentationDiagnostics()
@@ -804,6 +811,13 @@ public final class MainShellViewModel {
     @ObservationIgnored private var phase51ServerSettingsTask: Task<Void, Never>?
     @ObservationIgnored private var phase51TimelinePresentationTask: Task<Void, Never>?
     @ObservationIgnored private var phase51DiagnosticsPublishTask: Task<Void, Never>?
+    @ObservationIgnored private var phase68VisibleIdentityDiagnosticsTask: Task<Void, Never>?
+    @ObservationIgnored private var phase68VisibleIdentityDiagnosticsGeneration = 0
+    @ObservationIgnored private var phase68VisibleIdentityDiagnosticsPreparer: @Sendable (Phase68VisibleIdentityDiagnosticsInput) async -> VisibleIdentityDiagnostics = { input in
+        await Task.detached(priority: .utility) {
+            Phase68VisibleIdentityDiagnosticsPreparer.prepare(input)
+        }.value
+    }
     @ObservationIgnored private var selectedChannelLoadTask: Task<Void, Never>?
     @ObservationIgnored private var selectedChannelLoadTaskChannelID: ChannelID?
     @ObservationIgnored private var typingEndTask: Task<Void, Never>?
@@ -834,6 +848,8 @@ public final class MainShellViewModel {
     @ObservationIgnored private var selectedTimelineMessagesByIDCache: [MessageID: TimelineMessage] = [:]
     @ObservationIgnored private var composerEmojiSectionCacheKey: String?
     @ObservationIgnored private var composerEmojiSectionCache: [EmojiPickerSection] = []
+    @ObservationIgnored private var phase68CustomEmojiIndex: Phase68CustomEmojiIndex?
+    @ObservationIgnored private var phase68EmojiCatalogRevision = 0
     @ObservationIgnored private var composerAttachmentPresentationCache: [ChannelID: (attachments: [ComposerAttachmentDraft], chips: [ComposerAttachmentChip], summary: String?)] = [:]
     @ObservationIgnored private var imagePresentationEvictedKeys: Set<ImageCacheKey> = []
     @ObservationIgnored private var imagePresentationEvictedOrder: [ImageCacheKey] = []
@@ -903,6 +919,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var memberListGroupCacheKey: MemberListCacheKey?
     @ObservationIgnored private var memberListGroupCache: [MemberListGroup] = []
     @ObservationIgnored private var memberListDiagnosticsCache = RoleSortDiagnostics()
+    @ObservationIgnored private var phase68MemberIdentityRevisionByServerID: [ServerID: Int] = [:]
     @ObservationIgnored private var snapshotRevision: Int = 0
     @ObservationIgnored private var phase51SelectionRevision: Int = 0
     @ObservationIgnored private var phase51MediaRevision: Int = 0
@@ -1674,6 +1691,7 @@ public final class MainShellViewModel {
                 snapshot: snapshot,
                 identitySnapshots: phase43IdentitySnapshots,
                 imageDataByKey: loadedImageResources,
+                customEmojiIndex: phase68CustomEmojiIndexValue(),
                 currentUserID: currentUserID,
                 permissions: permissions,
                 isRuntimeSendCapable: isRuntimeSendCapable,
@@ -1717,6 +1735,7 @@ public final class MainShellViewModel {
                     snapshot: next.snapshot,
                     identitySnapshots: next.identitySnapshots,
                     imageDataByKey: next.imageDataByKey,
+                    customEmojiIndex: next.customEmojiIndex,
                     currentUserID: next.currentUserID,
                     permissions: next.permissions,
                     isRuntimeSendCapable: next.isRuntimeSendCapable,
@@ -1960,6 +1979,7 @@ public final class MainShellViewModel {
     }
 
     private func mergePhase43User(_ user: User, source: Phase43IdentitySource) {
+        let before = phase43IdentitySnapshots.snapshot(for: user.id)
         let previousAvatar = phase43IdentitySnapshots.snapshot(for: user.id)?.avatarFile
         applyPhase43AvatarCacheTransition(
             .resolve(previous: previousAvatar, incoming: user.avatar, source: source),
@@ -1967,10 +1987,17 @@ public final class MainShellViewModel {
         )
         if phase43IdentitySnapshots.merge(user: user, source: source, now: phase43Now()) {
             phase43IdentityGeneration = phase43IdentitySnapshots.generation
+            updatePhase68MemberIdentityRevisions(
+                before: before,
+                after: phase43IdentitySnapshots.snapshot(for: user.id)
+            )
+        } else {
+            phase68TraceDiagnostics.identityNoOpMergeCount += 1
         }
     }
 
     private func mergePhase43Member(_ member: ServerMember, user: User?, source: Phase43IdentitySource) {
+        let before = phase43IdentitySnapshots.snapshot(for: member.id.userID)
         let previousAvatar = phase43IdentitySnapshots.snapshot(for: member.id.userID)?
             .serverOverlays[member.id.serverID]?.avatarFile
         applyPhase43ServerAvatarCacheTransition(
@@ -1978,6 +2005,13 @@ public final class MainShellViewModel {
         )
         if phase43IdentitySnapshots.merge(member: member, user: user, source: source, now: phase43Now()) {
             phase43IdentityGeneration = phase43IdentitySnapshots.generation
+            updatePhase68MemberIdentityRevisions(
+                before: before,
+                after: phase43IdentitySnapshots.snapshot(for: member.id.userID),
+                including: [member.id.serverID]
+            )
+        } else {
+            phase68TraceDiagnostics.identityNoOpMergeCount += 1
         }
     }
 
@@ -1993,6 +2027,8 @@ public final class MainShellViewModel {
     private func mergePhase43Profile(_ profile: UserProfile, userID: UserID) {
         if phase43IdentitySnapshots.merge(profile: profile, userID: userID, now: phase43Now()) {
             phase43IdentityGeneration = phase43IdentitySnapshots.generation
+        } else {
+            phase68TraceDiagnostics.identityNoOpMergeCount += 1
         }
     }
 
@@ -2009,9 +2045,37 @@ public final class MainShellViewModel {
                 phase43AvatarMetadataPreservedAfterMemberRemovalCount += 1
             }
         }
+        let beforeRemoval = phase43IdentitySnapshots.snapshot(for: userID)
         if phase43IdentitySnapshots.markMemberRemoved(userID: userID, serverID: serverID, now: phase43Now()) {
             phase43MemberRemovalIdentityPreservationCount += 1
             phase43IdentityGeneration = phase43IdentitySnapshots.generation
+            updatePhase68MemberIdentityRevisions(
+                before: beforeRemoval,
+                after: phase43IdentitySnapshots.snapshot(for: userID),
+                including: [serverID]
+            )
+        } else {
+            phase68TraceDiagnostics.identityNoOpMergeCount += 1
+        }
+    }
+
+    private func updatePhase68MemberIdentityRevisions(
+        before: Phase43IdentitySnapshot?,
+        after: Phase43IdentitySnapshot?,
+        including serverIDs: Set<ServerID> = []
+    ) {
+        var affectedServerIDs = serverIDs
+        if let before {
+            affectedServerIDs.formUnion(before.serverOverlays.keys)
+        }
+        if let after {
+            affectedServerIDs.formUnion(after.serverOverlays.keys)
+        }
+        for serverID in affectedServerIDs where
+            Phase68MemberIdentityPresentationSignature(snapshot: before, serverID: serverID)
+                != Phase68MemberIdentityPresentationSignature(snapshot: after, serverID: serverID) {
+            phase68MemberIdentityRevisionByServerID[serverID, default: 0] &+= 1
+            phase68TraceDiagnostics.memberListRelevantInvalidationCount += 1
         }
     }
 
@@ -2022,9 +2086,17 @@ public final class MainShellViewModel {
             if let member = previous.membersByServerAndUserID[key] {
                 mergePhase43Member(member, user: previous.usersByID[key.userID], source: .realtimeMemberUpdate)
             }
+            let before = phase43IdentitySnapshots.snapshot(for: key.userID)
             if phase43IdentitySnapshots.markMemberRemoved(userID: key.userID, serverID: key.serverID, now: phase43Now()) {
                 phase43MemberRemovalIdentityPreservationCount += 1
                 phase43IdentityGeneration = phase43IdentitySnapshots.generation
+                updatePhase68MemberIdentityRevisions(
+                    before: before,
+                    after: phase43IdentitySnapshots.snapshot(for: key.userID),
+                    including: [key.serverID]
+                )
+            } else {
+                phase68TraceDiagnostics.identityNoOpMergeCount += 1
             }
         }
     }
@@ -2285,7 +2357,7 @@ public final class MainShellViewModel {
     public var memberListPresentationToken: String {
         guard let serverID = selection.serverID else { return "none" }
         let key = memberListCacheKey(serverID: serverID, query: "")
-        return "\(serverID.rawValue)|\(key.membersFingerprint)|\(key.identityGeneration)"
+        return "\(serverID.rawValue)|\(key.membersFingerprint)|\(key.presentationRevision)"
     }
 
     public func cachedMemberListGroups(for serverID: ServerID?) -> [MemberListGroup] {
@@ -2568,6 +2640,8 @@ public final class MainShellViewModel {
         let commitStarted = ContinuousClock.now
         phase43IdentitySnapshots = preparation.identitySnapshots
         phase43IdentityGeneration = preparation.identitySnapshots.generation
+        phase68MemberIdentityRevisionByServerID[serverID, default: 0] &+= 1
+        phase68TraceDiagnostics.memberListRelevantInvalidationCount += 1
         for key in preparation.invalidatedAvatarKeys {
             removeImagePresentationData(for: key)
             imageResourceStates.removeValue(forKey: key)
@@ -2741,7 +2815,7 @@ public final class MainShellViewModel {
         let serverID: ServerID
         let normalizedQuery: String
         let membersFingerprint: Int
-        let identityGeneration: Int
+        let presentationRevision: Int
     }
 
     private func memberListCacheKey(serverID: ServerID, query: String) -> MemberListCacheKey {
@@ -2749,7 +2823,7 @@ public final class MainShellViewModel {
             serverID: serverID,
             normalizedQuery: query,
             membersFingerprint: memberListFingerprint(for: serverID),
-            identityGeneration: phase43IdentityGeneration
+            presentationRevision: phase68MemberIdentityRevisionByServerID[serverID, default: 0]
         )
     }
 
@@ -2764,6 +2838,7 @@ public final class MainShellViewModel {
             var hasher = Hasher()
             hasher.combine(member.id.userID)
             hasher.combine(user?.online ?? false)
+            hasher.combine(user?.status)
             hasher.combine(user?.username)
             hasher.combine(user?.displayName)
             hasher.combine(member.nickname)
@@ -2772,6 +2847,7 @@ public final class MainShellViewModel {
             combined ^= hasher.finalize()
         }
         var roleHasher = Hasher()
+        roleHasher.combine(server.ownerID)
         for role in server.roles.values.sorted(by: { $0.id.rawValue < $1.id.rawValue }) {
             roleHasher.combine(role.id)
             roleHasher.combine(role.name)
@@ -4142,7 +4218,6 @@ public final class MainShellViewModel {
     }
 
     private func invalidateIdentityPresentationCaches() {
-        memberListGroupCacheKey = nil
         timelineRowPresentationCacheKey = nil
         if let context = profilePresentationContext {
             profilePresentationContext = profileContext(userID: context.userID, serverID: context.serverID, source: context.openSource)
@@ -4152,44 +4227,86 @@ public final class MainShellViewModel {
     // MARK: - Diagnostics Updates
 
     private func updateVisibleIdentityDiagnostics() {
-        let visibleDisplays = selectedTimelineMessages.map { resolvedUserDisplay(for: $0.message) }
-            + memberListGroupCache.flatMap(\.items).map { item in
-                resolvedUserDisplay(for: item.user, member: item.member, fallbackID: item.userID, serverID: item.member?.id.serverID)
+        phase68TraceDiagnostics.visibleIdentityDiagnosticsRequestCount += 1
+        phase68VisibleIdentityDiagnosticsGeneration &+= 1
+        guard phase68VisibleIdentityDiagnosticsTask == nil else {
+            phase68TraceDiagnostics.visibleIdentityDiagnosticsCoalescedCount += 1
+            return
+        }
+        startPhase68VisibleIdentityDiagnosticsBuild()
+    }
+
+    private func startPhase68VisibleIdentityDiagnosticsBuild() {
+        phase68VisibleIdentityDiagnosticsTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            let generation = self.phase68VisibleIdentityDiagnosticsGeneration
+            let input = self.phase68VisibleIdentityDiagnosticsInput()
+            let preparer = self.phase68VisibleIdentityDiagnosticsPreparer
+            self.phase68TraceDiagnostics.visibleIdentityDiagnosticsBuildCount += 1
+            let diagnostics = await preparer(input)
+            guard !Task.isCancelled else { return }
+            if generation == self.phase68VisibleIdentityDiagnosticsGeneration {
+                self.visibleIdentityDiagnostics = diagnostics
+                self.phase68VisibleIdentityDiagnosticsTask = nil
+            } else {
+                self.phase68TraceDiagnostics.visibleIdentityDiagnosticsStaleResultCount += 1
+                self.phase68VisibleIdentityDiagnosticsTask = nil
+                self.startPhase68VisibleIdentityDiagnosticsBuild()
             }
+        }
+    }
+
+    private func refreshVisibleIdentityDiagnosticsSynchronously() {
+        phase68VisibleIdentityDiagnosticsTask?.cancel()
+        phase68VisibleIdentityDiagnosticsTask = nil
+        phase68VisibleIdentityDiagnosticsGeneration &+= 1
+        phase68TraceDiagnostics.visibleIdentityDiagnosticsBuildCount += 1
+        visibleIdentityDiagnostics = Phase68VisibleIdentityDiagnosticsPreparer.prepare(
+            phase68VisibleIdentityDiagnosticsInput()
+        )
+    }
+
+    func waitForPhase68VisibleIdentityDiagnosticsForTesting() async {
+        while let task = phase68VisibleIdentityDiagnosticsTask {
+            await task.value
+        }
+    }
+
+    func setPhase68VisibleIdentityDiagnosticsPreparerForTesting(
+        _ preparer: @escaping @Sendable (Phase68VisibleIdentityDiagnosticsInput) async -> VisibleIdentityDiagnostics
+    ) {
+        phase68VisibleIdentityDiagnosticsPreparer = preparer
+    }
+
+    private func phase68VisibleIdentityDiagnosticsInput() -> Phase68VisibleIdentityDiagnosticsInput {
         let failedAvatars = imageResourceStates.filter { key, state in
             key.kind == .userAvatar && {
                 if case .failed = state { return true }
                 return false
             }()
         }.count
-        let systemEventPresentations = selectedTimelineMessages
-            .filter { $0.message.system != nil }
-            .map { systemEventPresentation(for: $0.message) }
-        let phase43 = Phase43IdentityDiagnostics(
-            knownIdentitySnapshotsCount: phase43IdentitySnapshots.knownCount,
-            historicalOnlySnapshotsCount: phase43IdentitySnapshots.historicalOnlyCount,
-            unresolvedVisibleUserIDsCount: missingVisibleUserIDs().count,
-            systemEventClickableParticipantCount: systemEventPresentations.reduce(0) { $0 + $1.clickableParticipantCount },
-            systemEventNonclickableFallbackCount: systemEventPresentations.reduce(0) { $0 + $1.fallbackCount },
-            identityHydrationQueuedCount: phase43QueuedIdentityHydration.count,
-            identityHydrationInFlightCount: phase43IdentityHydrationTasks.count,
-            identityHydrationSuccessCount: phase43IdentityHydrationSuccessCount,
-            identityHydrationFailureCount: phase43IdentityHydrationFailureCount,
-            identityHydrationDedupeHits: phase43IdentityHydrationDedupeHits,
-            identityHydrationCooldownSkips: phase43IdentityHydrationCooldownSkips,
-            avatarMetadataPreservedAfterMemberRemovalCount: phase43AvatarMetadataPreservedAfterMemberRemovalCount,
-            avatarLoadFailureCount: failedAvatars,
-            profileOpensFromSystemEventsCount: phase43ProfileOpensFromSystemEventsCount,
-            currentUserEditSnapshotMergeCount: phase43CurrentUserEditSnapshotMergeCount,
-            memberRemovalIdentityPreservationCount: phase43MemberRemovalIdentityPreservationCount
-        )
-        visibleIdentityDiagnostics = VisibleIdentityDiagnostics(
-            unresolvedVisibleUserCount: missingVisibleUserIDs().count,
-            shortenedVisibleIDCount: visibleDisplays.filter(\.isFallback).count,
-            avatarFailureCacheCount: failedAvatars,
+        return Phase68VisibleIdentityDiagnosticsInput(
+            snapshot: snapshot,
+            identitySnapshots: phase43IdentitySnapshots,
+            timelineMessages: selectedTimelineMessages,
+            memberGroups: memberListGroupCache,
+            selectedChannelID: selectedConversationChannelID,
+            selectedServerID: selection.serverID,
+            currentUser: currentUserForPresentation,
+            failedAvatarCount: failedAvatars,
             profileFetchMergeCount: profileFetchMergeCount,
             memberWrapperUserMergeCount: memberWrapperUserMergeCount,
-            phase43: phase43
+            hydrationQueuedCount: phase43QueuedIdentityHydration.count,
+            hydrationInFlightCount: phase43IdentityHydrationTasks.count,
+            hydrationSuccessCount: phase43IdentityHydrationSuccessCount,
+            hydrationFailureCount: phase43IdentityHydrationFailureCount,
+            hydrationDedupeHits: phase43IdentityHydrationDedupeHits,
+            hydrationCooldownSkips: phase43IdentityHydrationCooldownSkips,
+            avatarMetadataPreservedCount: phase43AvatarMetadataPreservedAfterMemberRemovalCount,
+            profileSystemEventOpenCount: phase43ProfileOpensFromSystemEventsCount,
+            currentUserEditMergeCount: phase43CurrentUserEditSnapshotMergeCount,
+            memberRemovalPreservationCount: phase43MemberRemovalIdentityPreservationCount
         )
     }
 
@@ -6092,6 +6209,7 @@ public final class MainShellViewModel {
 
     private func upsert(member: ServerMember) {
         snapshot.membersByServerAndUserID[ServerMemberKey(member.id)] = member
+        mergePhase43Member(member, user: snapshot.usersByID[member.id.userID], source: .moderationAction)
         selectedMemberDetailID = member.id
         invalidateIdentityPresentationCaches()
         updateVisibleIdentityDiagnostics()
@@ -6768,25 +6886,17 @@ public final class MainShellViewModel {
     }
 
     public var composerEmojiSections: [EmojiPickerSection] {
-        composerEmojiCatalogSections.map { section in
-            EmojiPickerSection(
-                id: section.id,
-                title: section.title,
-                items: section.items.map { item in
-                    guard let mediaKey = item.customMediaKey else { return item }
-                    var hydrated = item
-                    hydrated.imageData = loadedImageResources[
-                        ImageCacheKey(id: mediaKey, kind: .customEmoji)
-                    ]
-                    return hydrated
-                }
-            )
-        }
+        composerEmojiCatalogSections
+    }
+
+    public func composerCustomEmojiImageData(for item: EmojiPickerItem) -> Data? {
+        guard let mediaKey = item.customMediaKey else { return item.imageData }
+        return loadedImageResources[ImageCacheKey(id: mediaKey, kind: .customEmoji)] ?? item.imageData
     }
 
     private var composerEmojiCatalogSections: [EmojiPickerSection] {
         let serverID = selectedConversationChannelID.flatMap { snapshot.channelsByID[$0]?.serverID } ?? selection.serverID
-        let cacheKey = "\(snapshotRevision)|\(serverID?.rawValue ?? "no-server")"
+        let cacheKey = "\(phase68EmojiCatalogRevision)|\(serverID?.rawValue ?? "no-server")"
         if composerEmojiSectionCacheKey == cacheKey {
             return composerEmojiSectionCache
         }
@@ -6794,9 +6904,7 @@ public final class MainShellViewModel {
             .map(EmojiPickerItem.unicode)
         let smileys = Self.dedupedEmojiItems(["😄", "😅", "😎", "😢", "😮", "🤔", "🫡", "👋", "🙌", "😆", "😋", "😴", "😭", "😬", "😤", "🥳", "🤝", "🫶"])
             .map(EmojiPickerItem.unicode)
-        let custom = snapshot.emojisByID.values
-            .map(CustomEmojiDisplayItem.init(emoji:))
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        let custom = phase68CustomEmojiIndexValue().sortedItems
         let currentServer = Self.dedupedCustomEmojiItems(custom.filter { item in
             guard let serverID else { return false }
             return item.serverID == serverID
@@ -6846,12 +6954,10 @@ public final class MainShellViewModel {
 
     private static func dedupedCustomEmojiItems(_ items: [CustomEmojiDisplayItem]) -> [CustomEmojiDisplayItem] {
         var seen: Set<String> = []
-        return items
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-            .filter { item in
-                let key = item.shortcode.lowercased()
-                return seen.insert(key).inserted
-            }
+        return items.filter { item in
+            let key = item.shortcode.lowercased()
+            return seen.insert(key).inserted
+        }
     }
 
     public func insertEmoji(_ emoji: String, in channelID: ChannelID?) {
@@ -6988,20 +7094,12 @@ public final class MainShellViewModel {
     }
 
     public func customEmojiDisplayItem(for raw: String) -> CustomEmojiDisplayItem? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let emoji = snapshot.emojisByID[EmojiID(rawValue: trimmed)] {
-            return CustomEmojiDisplayItem(emoji: emoji)
-        }
-        let normalized = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
-        return snapshot.emojisByID.values
-            .map(CustomEmojiDisplayItem.init(emoji:))
-            .first { $0.name.caseInsensitiveCompare(normalized) == .orderedSame || $0.shortcode.caseInsensitiveCompare(trimmed) == .orderedSame }
+        phase68CustomEmojiIndexValue().item(for: raw, serverID: nil)
     }
 
     public func inlineCustomEmojiItems(for message: Message) -> [MessageInlineCustomEmojiItem] {
-        guard let content = message.content, content.contains(":") else { return [] }
-        return customEmojiDisplayItemsForContext(channelID: message.channelID)
-            .filter { content.localizedCaseInsensitiveContains($0.shortcode) }
+        let serverID = snapshot.channelsByID[message.channelID]?.serverID
+        return phase68CustomEmojiIndexValue().items(in: message.content, serverID: serverID)
             .map { item in
                 MessageInlineCustomEmojiItem(
                     shortcode: item.shortcode,
@@ -7012,27 +7110,36 @@ public final class MainShellViewModel {
     }
 
     public func loadCustomEmojiImages(for message: Message) {
+        let serverID = snapshot.channelsByID[message.channelID]?.serverID
+        let index = phase68CustomEmojiIndexValue()
+        var requestedIDs: Set<EmojiID> = []
         for emojiKey in message.reactions.keys {
-            if let item = customEmojiDisplayItem(for: emojiKey) {
+            if let item = index.item(for: emojiKey, serverID: serverID), requestedIDs.insert(item.id).inserted {
                 loadImageResource(for: item.file, kind: .customEmoji)
             }
         }
-        for item in customEmojiDisplayItemsForContext(channelID: message.channelID) {
-            if message.content?.localizedCaseInsensitiveContains(item.shortcode) == true {
-                loadImageResource(for: item.file, kind: .customEmoji)
-            }
+        for item in index.items(in: message.content, serverID: serverID) where requestedIDs.insert(item.id).inserted {
+            loadImageResource(for: item.file, kind: .customEmoji)
         }
     }
 
     private func customEmojiDisplayItemsForContext(channelID: ChannelID?) -> [CustomEmojiDisplayItem] {
         let serverID = channelID.flatMap { snapshot.channelsByID[$0]?.serverID } ?? selection.serverID ?? selectedConversationChannel?.serverID
-        return snapshot.emojisByID.values
-            .map(CustomEmojiDisplayItem.init(emoji:))
-            .filter { item in
+        return phase68CustomEmojiIndexValue().sortedItems.filter { item in
                 guard let serverID else { return true }
                 return item.serverID == nil || item.serverID == serverID
             }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func phase68CustomEmojiIndexValue() -> Phase68CustomEmojiIndex {
+        if let phase68CustomEmojiIndex {
+            phase68TraceDiagnostics.emojiIndexCacheHitCount += 1
+            return phase68CustomEmojiIndex
+        }
+        let index = Phase68CustomEmojiIndex(emojisByID: snapshot.emojisByID)
+        phase68CustomEmojiIndex = index
+        phase68TraceDiagnostics.emojiIndexBuildCount += 1
+        return index
     }
 
     public func addAttachmentURLs(_ urls: [URL], to channelID: ChannelID?) {
@@ -8942,7 +9049,8 @@ public final class MainShellViewModel {
     public func currentReactionItems(for message: Message) -> [MessageReactionDisplayItem] {
         Phase52TimelineAssetContext(
             snapshot: snapshot,
-            imageDataByKey: loadedImageResources
+            imageDataByKey: loadedImageResources,
+            customEmojiIndex: phase68CustomEmojiIndexValue()
         ).reactionItems(for: message, currentUserID: currentUserID)
     }
 
@@ -9844,7 +9952,7 @@ public final class MainShellViewModel {
     }
 
     public func copyVisibleIdentityDiagnostics() {
-        updateVisibleIdentityDiagnostics()
+        refreshVisibleIdentityDiagnosticsSynchronously()
         publishFreezePerformanceDiagnostics(marker: "copied identity diagnostics")
         let identity = visibleIdentityDiagnostics
         let freeze = freezePerformanceDiagnostics
@@ -9882,6 +9990,10 @@ public final class MainShellViewModel {
         phase51DiagnosticsPublished/throttled: \(phase51.diagnosticsPublishCount)/\(phase51.diagnosticsThrottleCount)
         phase51MainThreadBudgetViolations: \(phase51.mainThreadBudgetViolationCount)
         phase51LastOperation: \(phase51.lastOperationCategory ?? "-") \(phase51.lastOperationMilliseconds.map(String.init) ?? "-")ms
+        phase68IdentityNoOpMerges: \(phase68TraceDiagnostics.identityNoOpMergeCount)
+        phase68MemberInvalidations: \(phase68TraceDiagnostics.memberListRelevantInvalidationCount)
+        phase68EmojiIndexBuilds/cacheHits: \(phase68TraceDiagnostics.emojiIndexBuildCount)/\(phase68TraceDiagnostics.emojiIndexCacheHitCount)
+        phase68DiagnosticsRequests/coalesced/builds/stale: \(phase68TraceDiagnostics.visibleIdentityDiagnosticsRequestCount)/\(phase68TraceDiagnostics.visibleIdentityDiagnosticsCoalescedCount)/\(phase68TraceDiagnostics.visibleIdentityDiagnosticsBuildCount)/\(phase68TraceDiagnostics.visibleIdentityDiagnosticsStaleResultCount)
         """))
         #if canImport(AppKit)
         NSPasteboard.general.clearContents()
@@ -11176,6 +11288,7 @@ public final class MainShellViewModel {
             if let member = previous.membersByServerAndUserID[key] {
                 mergePhase43Member(member, user: previous.usersByID[key.userID], source: .realtimeMemberUpdate)
             }
+            let before = phase43IdentitySnapshots.snapshot(for: key.userID)
             if phase43IdentitySnapshots.markMemberRemoved(
                 userID: key.userID,
                 serverID: key.serverID,
@@ -11183,6 +11296,13 @@ public final class MainShellViewModel {
             ) {
                 phase43MemberRemovalIdentityPreservationCount += 1
                 phase43IdentityGeneration = phase43IdentitySnapshots.generation
+                updatePhase68MemberIdentityRevisions(
+                    before: before,
+                    after: phase43IdentitySnapshots.snapshot(for: key.userID),
+                    including: [key.serverID]
+                )
+            } else {
+                phase68TraceDiagnostics.identityNoOpMergeCount += 1
             }
         }
     }
@@ -13826,6 +13946,7 @@ public struct CredentialSetupView: View {
         let roleSort = viewModel.memberRoleSortDiagnostics
         let dmConversation = viewModel.dmDiagnostics
         let moderation = viewModel.moderationDiagnostics
+        let phase68 = viewModel.phase68TraceDiagnostics
         Section("Developer Diagnostics") {
             LabeledContent("Timeline", value: "loaded \(timeline.loadedMessageCount), visible \(TimelineCopyFormatter.shortID(timeline.firstVisibleMessageID?.rawValue)) to \(TimelineCopyFormatter.shortID(timeline.lastVisibleMessageID?.rawValue))")
             LabeledContent("DM route", value: "clicked \(TimelineCopyFormatter.shortID(dm.clickedChannelID?.rawValue)), selected \(TimelineCopyFormatter.shortID(dm.selectedConversationChannelID?.rawValue)), load \(dm.messageLoadRequested ? "requested" : "idle")")
@@ -13848,6 +13969,9 @@ public struct CredentialSetupView: View {
             LabeledContent("Phase 43 system events", value: "clickable \(identity.phase43.systemEventClickableParticipantCount), fallback \(identity.phase43.systemEventNonclickableFallbackCount), profile opens \(identity.phase43.profileOpensFromSystemEventsCount)")
             LabeledContent("Phase 43 hydration", value: "queued \(identity.phase43.identityHydrationQueuedCount), in-flight \(identity.phase43.identityHydrationInFlightCount), success/fail \(identity.phase43.identityHydrationSuccessCount)/\(identity.phase43.identityHydrationFailureCount), dedupe \(identity.phase43.identityHydrationDedupeHits), cooldown \(identity.phase43.identityHydrationCooldownSkips)")
             LabeledContent("Phase 43 preservation", value: "avatar \(identity.phase43.avatarMetadataPreservedAfterMemberRemovalCount), removals \(identity.phase43.memberRemovalIdentityPreservationCount), current edits \(identity.phase43.currentUserEditSnapshotMergeCount)")
+            LabeledContent("Phase 68 identity", value: "no-op merges \(phase68.identityNoOpMergeCount), member invalidations \(phase68.memberListRelevantInvalidationCount)")
+            LabeledContent("Phase 68 emoji index", value: "builds \(phase68.emojiIndexBuildCount), cache hits \(phase68.emojiIndexCacheHitCount)")
+            LabeledContent("Phase 68 diagnostics", value: "requests \(phase68.visibleIdentityDiagnosticsRequestCount), coalesced \(phase68.visibleIdentityDiagnosticsCoalescedCount), builds \(phase68.visibleIdentityDiagnosticsBuildCount), stale \(phase68.visibleIdentityDiagnosticsStaleResultCount)")
             LabeledContent("Freeze markers", value: freeze.lastMainThreadMarker ?? "-")
             LabeledContent("Freeze counts", value: "timeline \(freeze.timelineRenderPassCount), grouping \(freeze.memberGroupingCount), grouping cache \(freeze.memberGroupingCacheHitCount), visible \(freeze.visibleRangeUpdateCount), capability cache \(freeze.capabilityCacheUpdateCount)")
             LabeledContent("Phase 51 presentations", value: "shell \(phase51.shellBuildCount), timeline \(phase51.timelineBuildCount), cache \(phase51.timelineCacheHitCount), settings \(phase51.serverSettingsBuildCount), cancelled \(phase51.serverSettingsCancellationCount)")
@@ -14638,6 +14762,7 @@ private struct SelectedChannelComposerView: View {
                 emojiItems: emojiSections.flatMap(\.items).map(\.insertionText),
                 emojiSections: emojiSections,
                 onInsertEmoji: { viewModel.insertEmoji($0, in: channelID) },
+                customEmojiImageData: { viewModel.composerCustomEmojiImageData(for: $0) },
                 onRequestCustomEmojiImage: { viewModel.requestComposerCustomEmojiImage($0) },
                 onPasteImageData: { viewModel.addPastedImageDataFromClipboard($0, to: channelID) },
                 onPasteFileURLs: { viewModel.addAttachmentURLsFromClipboard($0, to: channelID) },

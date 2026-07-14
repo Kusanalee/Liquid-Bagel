@@ -369,45 +369,28 @@ public enum Phase52TimelineInteractionPreparer {
 
 public struct Phase52TimelineAssetContext: Sendable {
     private var snapshot: RealtimeSnapshot
-    private var customEmojiByShortcode: [String: [CustomEmojiDisplayItem]]
+    private var customEmojiIndex: Phase68CustomEmojiIndex
     private var imageDataByKey: [ImageCacheKey: Data]
 
     public init(
         snapshot: RealtimeSnapshot,
-        imageDataByKey: [ImageCacheKey: Data]
+        imageDataByKey: [ImageCacheKey: Data],
+        customEmojiIndex: Phase68CustomEmojiIndex? = nil
     ) {
         self.snapshot = snapshot
         self.imageDataByKey = imageDataByKey
-        self.customEmojiByShortcode = Dictionary(
-            grouping: snapshot.emojisByID.values.map(CustomEmojiDisplayItem.init(emoji:)),
-            by: { $0.shortcode.lowercased() }
-        )
+        self.customEmojiIndex = customEmojiIndex ?? Phase68CustomEmojiIndex(emojisByID: snapshot.emojisByID)
     }
 
     public func inlineCustomEmojiItems(for message: Message) -> [MessageInlineCustomEmojiItem] {
-        guard let content = message.content, content.contains(":") else { return [] }
         let serverID = snapshot.channelsByID[message.channelID]?.serverID
-        var seen: Set<String> = []
-        var result: [MessageInlineCustomEmojiItem] = []
-        var remaining = content[...]
-        while let start = remaining.firstIndex(of: ":"),
-              let end = remaining[remaining.index(after: start)...].firstIndex(of: ":") {
-            let raw = String(remaining[start...end])
-            let key = raw.lowercased()
-            if seen.insert(key).inserted,
-               let candidates = customEmojiByShortcode[key],
-               let item = candidates.first(where: { serverID == nil || $0.serverID == nil || $0.serverID == serverID }) {
-                result.append(
-                    MessageInlineCustomEmojiItem(
-                        shortcode: item.shortcode,
-                        name: item.name,
-                        imageData: imageDataByKey[ImageCacheKey(id: item.file.id.rawValue, kind: .customEmoji)]
-                    )
-                )
-            }
-            remaining = remaining[remaining.index(after: end)...]
+        return customEmojiIndex.items(in: message.content, serverID: serverID).map { item in
+            MessageInlineCustomEmojiItem(
+                shortcode: item.shortcode,
+                name: item.name,
+                imageData: imageDataByKey[ImageCacheKey(id: item.file.id.rawValue, kind: .customEmoji)]
+            )
         }
-        return result
     }
 
     /// Phase 58: resolves `<@ULID>`/`<#ULID>`/`<%ULID>` content tokens (Docs/Research.md Phase 58
@@ -506,16 +489,14 @@ public struct Phase52TimelineAssetContext: Sendable {
     }
 
     public func reactionItems(for message: Message, currentUserID: UserID?) -> [MessageReactionDisplayItem] {
-        Phase17MessageActions.reactionSummaries(for: message, currentUserID: currentUserID).map { summary in
-            if let emoji = snapshot.emojisByID.values.first(where: {
-                $0.id.rawValue == summary.emoji || $0.name == summary.emoji
-            }) {
-                let displayItem = CustomEmojiDisplayItem(emoji: emoji)
+        let serverID = snapshot.channelsByID[message.channelID]?.serverID
+        return Phase17MessageActions.reactionSummaries(for: message, currentUserID: currentUserID).map { summary in
+            if let displayItem = customEmojiIndex.item(for: summary.emoji, serverID: serverID) {
                 return MessageReactionDisplayItem(
                     emoji: summary.emoji,
                     count: summary.count,
                     hasCurrentUserReacted: summary.hasCurrentUserReacted,
-                    customEmojiName: emoji.name,
+                    customEmojiName: displayItem.name,
                     customEmojiImageData: imageDataByKey[
                         ImageCacheKey(id: displayItem.file.id.rawValue, kind: .customEmoji)
                     ]

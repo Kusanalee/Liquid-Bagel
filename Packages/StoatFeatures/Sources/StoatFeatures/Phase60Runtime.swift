@@ -226,6 +226,7 @@ struct Phase60QueuedRowPreparation: Sendable {
     var snapshot: RealtimeSnapshot
     var identitySnapshots: Phase43IdentitySnapshotStore
     var imageDataByKey: [ImageCacheKey: Data]
+    var customEmojiIndex: Phase68CustomEmojiIndex
     var currentUserID: UserID?
     var permissions: Permissions?
     var isRuntimeSendCapable: Bool
@@ -344,6 +345,7 @@ public enum Phase60TimelineRowPreparer {
         snapshot: RealtimeSnapshot,
         identitySnapshots: Phase43IdentitySnapshotStore,
         imageDataByKey: [ImageCacheKey: Data],
+        customEmojiIndex: Phase68CustomEmojiIndex? = nil,
         currentUserID: UserID?,
         permissions: Permissions?,
         isRuntimeSendCapable: Bool,
@@ -352,7 +354,8 @@ public enum Phase60TimelineRowPreparer {
         let message = timelineMessage.message
         let assetContext = Phase52TimelineAssetContext(
             snapshot: snapshot,
-            imageDataByKey: imageDataByKey
+            imageDataByKey: imageDataByKey,
+            customEmojiIndex: customEmojiIndex
         )
         let customEmojiItems = assetContext.inlineCustomEmojiItems(for: message)
         let referenceItems = assetContext.inlineReferenceItems(

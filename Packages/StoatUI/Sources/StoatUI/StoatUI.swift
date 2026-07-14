@@ -1323,6 +1323,7 @@ public struct GlassComposer: View {
     private let emojiItems: [String]
     private let emojiSections: [EmojiPickerSection]
     private let onInsertEmoji: (String) -> Void
+    private let customEmojiImageData: (EmojiPickerItem) -> Data?
     private let onRequestCustomEmojiImage: (EmojiPickerItem) -> Void
     private let onPasteImageData: (Data) -> Void
     private let onPasteFileURLs: ([URL]) -> Void
@@ -1363,6 +1364,7 @@ public struct GlassComposer: View {
         emojiItems: [String] = [],
         emojiSections: [EmojiPickerSection] = [],
         onInsertEmoji: @escaping (String) -> Void = { _ in },
+        customEmojiImageData: @escaping (EmojiPickerItem) -> Data? = { $0.imageData },
         onRequestCustomEmojiImage: @escaping (EmojiPickerItem) -> Void = { _ in },
         onPasteImageData: @escaping (Data) -> Void = { _ in },
         onPasteFileURLs: @escaping ([URL]) -> Void = { _ in },
@@ -1402,6 +1404,7 @@ public struct GlassComposer: View {
         self.emojiItems = emojiItems
         self.emojiSections = emojiSections
         self.onInsertEmoji = onInsertEmoji
+        self.customEmojiImageData = customEmojiImageData
         self.onRequestCustomEmojiImage = onRequestCustomEmojiImage
         self.onPasteImageData = onPasteImageData
         self.onPasteFileURLs = onPasteFileURLs
@@ -1525,6 +1528,7 @@ public struct GlassComposer: View {
                                 ? [EmojiPickerSection(id: "emoji", title: "Emoji", items: emojiItems.map(EmojiPickerItem.unicode))]
                                 : emojiSections,
                             disabledReason: isEnabled ? nil : disabledReason,
+                            customEmojiImageData: customEmojiImageData,
                             onRequestCustomEmojiImage: onRequestCustomEmojiImage,
                             onInsertEmoji: { emoji in
                                 onInsertEmoji(emoji)
@@ -1783,6 +1787,7 @@ private struct InlineAutocompletePopover: View {
 private struct EmojiPickerPopover: View {
     let sections: [EmojiPickerSection]
     let disabledReason: String?
+    let customEmojiImageData: (EmojiPickerItem) -> Data?
     let onRequestCustomEmojiImage: (EmojiPickerItem) -> Void
     let onInsertEmoji: (String) -> Void
     @State private var searchText = ""
@@ -1820,7 +1825,7 @@ private struct EmojiPickerPopover: View {
                                         .buttonStyle(.plain)
                                         .accessibilityLabel("Insert emoji \(item.displayName)")
                                         .onAppear {
-                                            guard item.isCustom, item.imageData == nil else { return }
+                                            guard item.isCustom, customEmojiImageData(item) == nil else { return }
                                             onRequestCustomEmojiImage(item)
                                         }
                                     }
@@ -1849,7 +1854,7 @@ private struct EmojiPickerPopover: View {
 
     @ViewBuilder private func emojiLabel(_ item: EmojiPickerItem) -> some View {
         #if canImport(AppKit)
-        if let imageData = item.imageData {
+        if let imageData = customEmojiImageData(item) {
             DecodedDataImage(data: imageData, pixelSize: 56)
                 .scaledToFit()
                 .frame(width: 28, height: 28)

@@ -4751,22 +4751,26 @@ final class StoatFeaturesTests: XCTestCase {
                 .first { $0.id == "current-server" }?
                 .items.first { $0.insertionText == ":bagelwave:" }
         )
+        let metadataBeforeLoad = model.composerEmojiSections
         XCTAssertNil(item.imageData)
+        XCTAssertNil(model.composerCustomEmojiImageData(for: item))
         var loaderCallCount = await loader.callCount()
         XCTAssertEqual(loaderCallCount, 0)
 
         model.requestComposerCustomEmojiImage(item)
         for _ in 0..<50 {
-            item = try XCTUnwrap(
-                model.composerEmojiSections
-                    .first { $0.id == "current-server" }?
-                    .items.first { $0.insertionText == ":bagelwave:" }
-            )
-            if item.imageData == data { break }
+            if model.composerCustomEmojiImageData(for: item) == data { break }
             try await Task.sleep(for: .milliseconds(5))
         }
 
-        XCTAssertEqual(item.imageData, data)
+        XCTAssertEqual(model.composerCustomEmojiImageData(for: item), data)
+        XCTAssertEqual(model.composerEmojiSections, metadataBeforeLoad)
+        item = try XCTUnwrap(
+            model.composerEmojiSections
+                .first { $0.id == "current-server" }?
+                .items.first { $0.insertionText == ":bagelwave:" }
+        )
+        XCTAssertNil(item.imageData)
         loaderCallCount = await loader.callCount()
         XCTAssertEqual(loaderCallCount, 1)
         let diagnostics = await model.imageResourceDiagnostics()
@@ -4775,6 +4779,345 @@ final class StoatFeaturesTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(10))
         loaderCallCount = await loader.callCount()
         XCTAssertEqual(loaderCallCount, 1)
+    }
+
+    func testPhase68IdentitySnapshotMergesAreSemanticallyIdempotent() throws {
+        let userID: UserID = "phase68-identity-user"
+        let serverID: ServerID = "phase68-identity-server"
+        let avatar = File(id: "phase68-avatar", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: 24)
+        let user = User(id: userID, username: "bagel", displayName: "Liquid Bagel", avatar: avatar, bot: BotInformation(ownerID: "phase68-owner"))
+        let member = ServerMember(
+            id: MemberCompositeKey(serverID: serverID, userID: userID),
+            joinedAt: Date(timeIntervalSince1970: 1),
+            nickname: "Bagel Nick",
+            avatar: avatar,
+            roles: ["phase68-role"]
+        )
+        let profile = UserProfile(content: "About this bagel", background: avatar)
+        var store = Phase43IdentitySnapshotStore()
+
+        XCTAssertTrue(store.merge(user: user, source: .readyUser, now: Date(timeIntervalSince1970: 10)))
+        let userSnapshot = try XCTUnwrap(store.snapshot(for: userID))
+        XCTAssertFalse(store.merge(user: user, source: .readyUser, now: Date(timeIntervalSince1970: 20)))
+        XCTAssertEqual(store.generation, userSnapshot.generation)
+        XCTAssertEqual(store.snapshot(for: userID)?.lastUpdatedAt, userSnapshot.lastUpdatedAt)
+
+        XCTAssertTrue(store.merge(member: member, user: user, source: .readyMember, now: Date(timeIntervalSince1970: 30)))
+        let memberSnapshot = try XCTUnwrap(store.snapshot(for: userID))
+        let overlayGeneration = try XCTUnwrap(memberSnapshot.serverOverlays[serverID]).generation
+        XCTAssertFalse(store.merge(member: member, user: user, source: .readyMember, now: Date(timeIntervalSince1970: 40)))
+        XCTAssertEqual(store.generation, memberSnapshot.generation)
+        XCTAssertEqual(store.snapshot(for: userID)?.lastUpdatedAt, memberSnapshot.lastUpdatedAt)
+        XCTAssertEqual(store.snapshot(for: userID)?.serverOverlays[serverID]?.generation, overlayGeneration)
+
+        XCTAssertTrue(store.merge(profile: profile, userID: userID, now: Date(timeIntervalSince1970: 50)))
+        let profileSnapshot = try XCTUnwrap(store.snapshot(for: userID))
+        XCTAssertFalse(store.merge(profile: profile, userID: userID, now: Date(timeIntervalSince1970: 60)))
+        XCTAssertEqual(store.generation, profileSnapshot.generation)
+        XCTAssertEqual(store.snapshot(for: userID)?.lastUpdatedAt, profileSnapshot.lastUpdatedAt)
+
+        XCTAssertTrue(store.markMemberRemoved(userID: userID, serverID: serverID, now: Date(timeIntervalSince1970: 70)))
+        let removedSnapshot = try XCTUnwrap(store.snapshot(for: userID))
+        XCTAssertFalse(store.markMemberRemoved(userID: userID, serverID: serverID, now: Date(timeIntervalSince1970: 80)))
+        XCTAssertEqual(store.generation, removedSnapshot.generation)
+        XCTAssertEqual(store.snapshot(for: userID)?.lastUpdatedAt, removedSnapshot.lastUpdatedAt)
+    }
+
+    func testPhase68NestedMemberMergeReportsUserChangeWithoutRestampingOverlay() throws {
+        let userID: UserID = "phase68-nested-user"
+        let serverID: ServerID = "phase68-nested-server"
+        let member = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date(), nickname: "Stable")
+        var store = Phase43IdentitySnapshotStore()
+        XCTAssertTrue(store.merge(member: member, user: User(id: userID, username: "before"), source: .readyMember))
+        let overlayBefore = try XCTUnwrap(store.snapshot(for: userID)?.serverOverlays[serverID])
+
+        XCTAssertTrue(store.merge(member: member, user: User(id: userID, username: "after"), source: .readyMember))
+
+        let snapshot = try XCTUnwrap(store.snapshot(for: userID))
+        XCTAssertEqual(snapshot.username, "after")
+        XCTAssertEqual(snapshot.serverOverlays[serverID]?.generation, overlayBefore.generation)
+        XCTAssertEqual(snapshot.serverOverlays[serverID]?.lastUpdatedAt, overlayBefore.lastUpdatedAt)
+    }
+
+    @MainActor
+    func testPhase68MemberListTokenIgnoresUnrelatedIdentityAndTracksRelevantChanges() async throws {
+        let serverID: ServerID = "phase68-member-server"
+        let otherServerID: ServerID = "phase68-other-server"
+        let channelID: ChannelID = "phase68-member-channel"
+        let memberUserID: UserID = "phase68-member-user"
+        let unrelatedUserID: UserID = "phase68-unrelated-user"
+        let user = User(id: memberUserID, username: "member", displayName: "Member", online: true)
+        let unrelatedUser = User(id: unrelatedUserID, username: "elsewhere", displayName: "Elsewhere")
+        let member = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: memberUserID), joinedAt: Date(), nickname: "Nick")
+        let unrelatedMember = ServerMember(id: MemberCompositeKey(serverID: otherServerID, userID: unrelatedUserID), joinedAt: Date(), nickname: "Other Nick")
+        let server = Server(id: serverID, ownerID: memberUserID, name: "Phase 68")
+        let otherServer = Server(id: otherServerID, ownerID: unrelatedUserID, name: "Elsewhere")
+        let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        let snapshot = RealtimeSnapshot(
+            usersByID: [memberUserID: user, unrelatedUserID: unrelatedUser],
+            serversByID: [serverID: server, otherServerID: otherServer],
+            channelsByID: [channelID: channel],
+            membersByServerAndUserID: [
+                ServerMemberKey(serverID: serverID, userID: memberUserID): member,
+                ServerMemberKey(serverID: otherServerID, userID: unrelatedUserID): unrelatedMember
+            ]
+        )
+        let api = RecordingAPIClient(profilesByUserID: [memberUserID: UserProfile(content: "Profile-only change")])
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            communityAPIClient: api
+        )
+        let initialToken = model.memberListPresentationToken
+        let initialInvalidations = model.phase68TraceDiagnostics.memberListRelevantInvalidationCount
+
+        for _ in 0..<12 {
+            model.noteVisibleIdentity(userID: memberUserID, user: user, member: member, serverID: serverID, source: .visibleMember)
+        }
+        var changedUnrelatedUser = unrelatedUser
+        changedUnrelatedUser.displayName = "Changed Elsewhere"
+        model.noteVisibleIdentity(userID: unrelatedUserID, user: changedUnrelatedUser, member: unrelatedMember, serverID: otherServerID, source: .visibleMember)
+        XCTAssertEqual(model.memberListPresentationToken, initialToken)
+        XCTAssertEqual(model.phase68TraceDiagnostics.memberListRelevantInvalidationCount, initialInvalidations + 1)
+
+        model.showUserProfile(memberUserID, source: .memberRow, serverID: serverID)
+        for _ in 0..<40 where model.userProfilesByID[memberUserID] == nil {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(model.memberListPresentationToken, initialToken)
+        XCTAssertEqual(model.phase68TraceDiagnostics.memberListRelevantInvalidationCount, initialInvalidations + 1)
+
+        var changedUser = user
+        changedUser.displayName = "Changed Member"
+        model.noteVisibleIdentity(userID: memberUserID, user: changedUser, member: member, serverID: serverID, source: .visibleMember)
+        let changedToken = model.memberListPresentationToken
+        XCTAssertNotEqual(changedToken, initialToken)
+        XCTAssertEqual(model.phase68TraceDiagnostics.memberListRelevantInvalidationCount, initialInvalidations + 2)
+
+        model.noteVisibleIdentity(userID: memberUserID, user: changedUser, member: member, serverID: serverID, source: .visibleMember)
+        XCTAssertEqual(model.memberListPresentationToken, changedToken)
+        XCTAssertEqual(model.phase68TraceDiagnostics.memberListRelevantInvalidationCount, initialInvalidations + 2)
+    }
+
+    @MainActor
+    func testPhase68MemberListTokenTracksPresenceRoleNicknameAvatarBotAndMembership() {
+        let serverID: ServerID = "phase68-token-server"
+        let channelID: ChannelID = "phase68-token-channel"
+        let userID: UserID = "phase68-token-user"
+        let memberKey = ServerMemberKey(serverID: serverID, userID: userID)
+        var user = User(id: userID, username: "token-user", displayName: "Token User", status: UserStatus(presence: .online), online: true)
+        var member = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date(), nickname: "Token Nick")
+        var snapshot = RealtimeSnapshot(
+            usersByID: [userID: user],
+            serversByID: [serverID: Server(id: serverID, ownerID: userID, name: "Token Server")],
+            channelsByID: [channelID: Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")],
+            membersByServerAndUserID: [memberKey: member]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot
+        )
+
+        var previousToken = model.memberListPresentationToken
+        user.status = UserStatus(text: "Away", presence: .idle)
+        snapshot.usersByID[userID] = user
+        model.replaceSnapshotForTesting(snapshot)
+        XCTAssertNotEqual(model.memberListPresentationToken, previousToken)
+
+        previousToken = model.memberListPresentationToken
+        member.roles = ["phase68-token-role"]
+        snapshot.membersByServerAndUserID[memberKey] = member
+        model.replaceSnapshotForTesting(snapshot)
+        XCTAssertNotEqual(model.memberListPresentationToken, previousToken)
+
+        previousToken = model.memberListPresentationToken
+        member.nickname = "Changed Nick"
+        snapshot.membersByServerAndUserID[memberKey] = member
+        model.replaceSnapshotForTesting(snapshot)
+        XCTAssertNotEqual(model.memberListPresentationToken, previousToken)
+
+        previousToken = model.memberListPresentationToken
+        user.avatar = File(id: "phase68-token-avatar", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: 42)
+        user.bot = BotInformation(ownerID: "phase68-token-owner")
+        snapshot.usersByID[userID] = user
+        model.replaceSnapshotForTesting(snapshot)
+        XCTAssertNotEqual(model.memberListPresentationToken, previousToken)
+
+        previousToken = model.memberListPresentationToken
+        snapshot.membersByServerAndUserID.removeValue(forKey: memberKey)
+        model.replaceSnapshotForTesting(snapshot)
+        XCTAssertNotEqual(model.memberListPresentationToken, previousToken)
+
+        let stableToken = model.memberListPresentationToken
+        model.replaceSnapshotForTesting(snapshot)
+        XCTAssertEqual(model.memberListPresentationToken, stableToken)
+    }
+
+    func testPhase68CustomEmojiIndexUsesCurrentServerDeduplicatesAndSkipsFencedCode() throws {
+        let currentServerID: ServerID = "phase68-emoji-current"
+        let otherServerID: ServerID = "phase68-emoji-other"
+        let current = Emoji(id: "phase68-current-wave", parent: .server(currentServerID), creatorID: "creator", name: "wave")
+        let other = Emoji(id: "phase68-other-wave", parent: .server(otherServerID), creatorID: "creator", name: "wave")
+        let second = Emoji(id: "phase68-current-party", parent: .server(currentServerID), creatorID: "creator", name: "party")
+        let index = Phase68CustomEmojiIndex(emojisByID: [current.id: current, other.id: other, second.id: second])
+
+        XCTAssertEqual(index.item(for: ":wave:", serverID: currentServerID)?.id, current.id)
+        XCTAssertNil(index.item(for: other.id.rawValue, serverID: currentServerID))
+        XCTAssertEqual(
+            index.items(in: ":wave: :wave:\n```\n:party:\n```\n:party:", serverID: currentServerID).map(\.id),
+            [current.id, second.id]
+        )
+    }
+
+    @MainActor
+    func testPhase68EmojiIndexReusesCatalogAndInvalidatesOnlyForEmojiChanges() {
+        var snapshot = MockShellData.snapshot
+        let emoji = Emoji(id: "phase68-index-one", parent: .detached, creatorID: MockShellData.currentUserID, name: "indexed")
+        snapshot.emojisByID = [emoji.id: emoji]
+        let model = MainShellViewModel(snapshot: snapshot)
+
+        _ = model.composerEmojiSections
+        _ = model.composerEmojiSections
+        _ = model.customEmojiDisplayItem(for: emoji.id.rawValue)
+        XCTAssertEqual(model.phase68TraceDiagnostics.emojiIndexBuildCount, 1)
+        XCTAssertGreaterThan(model.phase68TraceDiagnostics.emojiIndexCacheHitCount, 0)
+
+        model.mutateSnapshotForTesting { value in
+            value.messagesByChannelID["phase68-unrelated-channel"] = [
+                Message(id: "01J00000000000000000680001", channelID: "phase68-unrelated-channel", authorID: MockShellData.currentUserID, content: "ordinary")
+            ]
+        }
+        _ = model.composerEmojiSections
+        XCTAssertEqual(model.phase68TraceDiagnostics.emojiIndexBuildCount, 1)
+
+        model.mutateSnapshotForTesting { value in
+            let added = Emoji(id: "phase68-index-two", parent: .detached, creatorID: MockShellData.currentUserID, name: "added")
+            value.emojisByID[added.id] = added
+        }
+        _ = model.composerEmojiSections
+        XCTAssertEqual(model.phase68TraceDiagnostics.emojiIndexBuildCount, 2)
+    }
+
+    @MainActor
+    func testPhase68VisibleRowRequestsOnlyReferencedCurrentServerEmojiOnce() async throws {
+        let serverID: ServerID = "phase68-load-server"
+        let otherServerID: ServerID = "phase68-load-other"
+        let channelID: ChannelID = "phase68-load-channel"
+        let one = Emoji(id: "phase68-load-one", parent: .server(serverID), creatorID: "creator", name: "one")
+        let two = Emoji(id: "phase68-load-two", parent: .server(serverID), creatorID: "creator", name: "two")
+        let unused = Emoji(id: "phase68-load-unused", parent: .server(serverID), creatorID: "creator", name: "unused")
+        let other = Emoji(id: "phase68-load-other-emoji", parent: .server(otherServerID), creatorID: "creator", name: "other")
+        let snapshot = RealtimeSnapshot(
+            serversByID: [serverID: Server(id: serverID, ownerID: "owner", name: "Load")],
+            channelsByID: [channelID: Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")],
+            emojisByID: [one.id: one, two.id: two, unused.id: unused, other.id: other]
+        )
+        let loader = MockImageResourceLoader(result: .success(Data("emoji".utf8)))
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            imageResourceLoader: loader
+        )
+        let message = Message(
+            id: "01J00000000000000000680002",
+            channelID: channelID,
+            authorID: "author",
+            content: ":one: :one: :other:\n```\n:unused:\n```",
+            reactions: [two.id.rawValue: ["reactor"], one.id.rawValue: ["reactor"]]
+        )
+
+        model.loadCustomEmojiImages(for: message)
+        for _ in 0..<80 {
+            if await loader.callCount() == 2 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let firstCalls = await loader.calls
+        let firstIDs = Set(firstCalls.map(\.id))
+        let firstCallCount = await loader.callCount()
+        XCTAssertEqual(firstIDs, Set([one.id.rawValue, two.id.rawValue]))
+        XCTAssertEqual(firstCallCount, 2)
+
+        model.loadCustomEmojiImages(for: message)
+        try await Task.sleep(for: .milliseconds(20))
+        let repeatedCallCount = await loader.callCount()
+        XCTAssertEqual(repeatedCallCount, 2)
+    }
+
+    @MainActor
+    func testPhase68VisibleIdentityDiagnosticsBurstCoalescesToLatestBuild() async {
+        let serverID: ServerID = "phase68-diagnostics-server"
+        let channelID: ChannelID = "phase68-diagnostics-channel"
+        let userID: UserID = "phase68-diagnostics-user"
+        let user = User(id: userID, username: "diagnostic", displayName: "Diagnostic User")
+        let member = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date())
+        let event = Message(
+            id: "01J00000000000000000680003",
+            channelID: channelID,
+            authorID: userID,
+            user: user,
+            member: member,
+            system: SystemMessage(kind: .userJoined, by: userID)
+        )
+        let snapshot = RealtimeSnapshot(
+            usersByID: [userID: user],
+            serversByID: [serverID: Server(id: serverID, ownerID: userID, name: "Diagnostics")],
+            channelsByID: [channelID: Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "events")],
+            messagesByChannelID: [channelID: [event]],
+            membersByServerAndUserID: [ServerMemberKey(serverID: serverID, userID: userID): member]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot
+        )
+
+        for _ in 0..<24 {
+            model.noteVisibleSystemEvent(event)
+        }
+        await model.waitForPhase68VisibleIdentityDiagnosticsForTesting()
+
+        XCTAssertEqual(model.phase68TraceDiagnostics.visibleIdentityDiagnosticsRequestCount, 24)
+        XCTAssertGreaterThanOrEqual(model.phase68TraceDiagnostics.visibleIdentityDiagnosticsCoalescedCount, 23)
+        XCTAssertEqual(model.phase68TraceDiagnostics.visibleIdentityDiagnosticsBuildCount, 1)
+        XCTAssertEqual(model.visibleIdentityDiagnostics.phase43.systemEventClickableParticipantCount, 1)
+        XCTAssertEqual(model.visibleIdentityDiagnostics.unresolvedVisibleUserCount, 0)
+    }
+
+    @MainActor
+    func testPhase68VisibleIdentityDiagnosticsDiscardStaleBuildAndPublishLatest() async {
+        let userID: UserID = "phase68-stale-user"
+        let channelID: ChannelID = "phase68-stale-channel"
+        let user = User(id: userID, username: "stale", displayName: "Stale Test")
+        let event = Message(
+            id: "01J00000000000000000680004",
+            channelID: channelID,
+            authorID: userID,
+            user: user,
+            system: SystemMessage(kind: .userJoined, by: userID)
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .home, dmChannelID: channelID),
+            snapshot: RealtimeSnapshot(
+                usersByID: [userID: user],
+                channelsByID: [channelID: Channel(id: channelID, kind: .directMessage, recipients: [userID])],
+                messagesByChannelID: [channelID: [event]]
+            )
+        )
+        let gate = Phase68DiagnosticsBuildGate()
+        model.setPhase68VisibleIdentityDiagnosticsPreparerForTesting { input in
+            await gate.prepare(input)
+        }
+
+        model.noteVisibleSystemEvent(event)
+        while await gate.invocationCount == 0 {
+            await Task.yield()
+        }
+        model.noteVisibleSystemEvent(event)
+        await gate.releaseFirstBuild()
+        await model.waitForPhase68VisibleIdentityDiagnosticsForTesting()
+
+        XCTAssertEqual(model.phase68TraceDiagnostics.visibleIdentityDiagnosticsBuildCount, 2)
+        XCTAssertEqual(model.phase68TraceDiagnostics.visibleIdentityDiagnosticsStaleResultCount, 1)
+        XCTAssertEqual(model.visibleIdentityDiagnostics.unresolvedVisibleUserCount, 2)
     }
 
     @MainActor
@@ -8223,6 +8566,28 @@ private final class Phase55TestClock: @unchecked Sendable {
 
     init(now: Date) {
         self.now = now
+    }
+}
+
+private actor Phase68DiagnosticsBuildGate {
+    private(set) var invocationCount = 0
+    private var firstBuildContinuation: CheckedContinuation<Void, Never>?
+
+    func prepare(_ input: Phase68VisibleIdentityDiagnosticsInput) async -> VisibleIdentityDiagnostics {
+        _ = input
+        invocationCount += 1
+        let invocation = invocationCount
+        if invocation == 1 {
+            await withCheckedContinuation { continuation in
+                firstBuildContinuation = continuation
+            }
+        }
+        return VisibleIdentityDiagnostics(unresolvedVisibleUserCount: invocation)
+    }
+
+    func releaseFirstBuild() {
+        firstBuildContinuation?.resume()
+        firstBuildContinuation = nil
     }
 }
 

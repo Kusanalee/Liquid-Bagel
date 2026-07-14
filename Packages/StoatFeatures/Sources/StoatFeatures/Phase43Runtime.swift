@@ -324,32 +324,43 @@ public struct Phase43IdentitySnapshotStore: Hashable, Sendable {
         snapshot.botOwnerID = user.bot?.ownerID
         snapshot.sourceCategories.insert(source)
         snapshot.confidence = max(snapshot.confidence, Self.confidence(for: source))
+        guard before != snapshot else { return false }
         markUpdated(&snapshot, now: now)
         snapshotsByUserID[user.id] = snapshot
-        return before != snapshot
+        return true
     }
 
     @discardableResult
     public mutating func merge(member: ServerMember, user: User?, source: Phase43IdentitySource, now: Date = Date()) -> Bool {
+        let userChanged: Bool
         if let user {
-            _ = merge(user: user, source: source == .messageMember ? .messageUser : source, now: now)
+            userChanged = merge(user: user, source: source == .messageMember ? .messageUser : source, now: now)
+        } else {
+            userChanged = false
         }
         var snapshot = snapshotsByUserID[member.id.userID] ?? Phase43IdentitySnapshot(userID: member.id.userID)
         let before = snapshot
         snapshot.sourceCategories.insert(source)
         snapshot.confidence = max(snapshot.confidence, Self.confidence(for: source))
         var overlay = snapshot.serverOverlays[member.id.serverID] ?? Phase43ServerIdentityOverlay(serverID: member.id.serverID)
+        let overlayBefore = overlay
         overlay.nickname = Self.trimmed(member.nickname)
         overlay.avatarFile = member.avatar
         overlay.roleIDs = member.roles
         overlay.isCurrentMember = true
         overlay.sourceCategories.insert(source)
-        overlay.generation = generation + 1
-        overlay.lastUpdatedAt = now
         snapshot.serverOverlays[member.id.serverID] = overlay
-        markUpdated(&snapshot, now: now)
+        guard before != snapshot else { return userChanged }
+        generation &+= 1
+        if overlayBefore != overlay {
+            overlay.generation = generation
+            overlay.lastUpdatedAt = now
+            snapshot.serverOverlays[member.id.serverID] = overlay
+        }
+        snapshot.generation = generation
+        snapshot.lastUpdatedAt = now
         snapshotsByUserID[member.id.userID] = snapshot
-        return before != snapshot
+        return true
     }
 
     @discardableResult
@@ -360,9 +371,10 @@ public struct Phase43IdentitySnapshotStore: Hashable, Sendable {
         snapshot.profileBackgroundFile = profile.background
         snapshot.sourceCategories.insert(.profileFetch)
         snapshot.confidence = max(snapshot.confidence, .hydrated)
+        guard before != snapshot else { return false }
         markUpdated(&snapshot, now: now)
         snapshotsByUserID[userID] = snapshot
-        return before != snapshot
+        return true
     }
 
     @discardableResult
@@ -370,16 +382,23 @@ public struct Phase43IdentitySnapshotStore: Hashable, Sendable {
         var snapshot = snapshotsByUserID[userID] ?? Phase43IdentitySnapshot(userID: userID)
         let before = snapshot
         var overlay = snapshot.serverOverlays[serverID] ?? Phase43ServerIdentityOverlay(serverID: serverID)
+        let overlayBefore = overlay
         overlay.isCurrentMember = false
         overlay.sourceCategories.insert(.moderationAction)
-        overlay.generation = generation + 1
-        overlay.lastUpdatedAt = now
         snapshot.serverOverlays[serverID] = overlay
         snapshot.sourceCategories.insert(.moderationAction)
         snapshot.confidence = max(snapshot.confidence, .historical)
-        markUpdated(&snapshot, now: now)
+        guard before != snapshot else { return false }
+        generation &+= 1
+        if overlayBefore != overlay {
+            overlay.generation = generation
+            overlay.lastUpdatedAt = now
+            snapshot.serverOverlays[serverID] = overlay
+        }
+        snapshot.generation = generation
+        snapshot.lastUpdatedAt = now
         snapshotsByUserID[userID] = snapshot
-        return before != snapshot
+        return true
     }
 
     public func resolvedDisplay(
