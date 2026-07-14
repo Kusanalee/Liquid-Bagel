@@ -4698,11 +4698,83 @@ final class StoatFeaturesTests: XCTestCase {
         snapshot.emojisByID["phase35-other"] = Emoji(id: "phase35-other", parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "otherparty")
         let model = MainShellViewModel(selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID), snapshot: snapshot)
         let sections = model.composerEmojiSections
-        let current = sections.first { $0.id == "current-server" }?.items ?? []
-        let other = sections.first { $0.id == "other-servers" }?.items ?? []
+        let current = sections.first { $0.id == "current-server" }?.items.map(\.insertionText) ?? []
+        let other = sections.first { $0.id == "other-servers" }?.items.map(\.insertionText) ?? []
 
         XCTAssertTrue(current.contains(":currentparty:"))
         XCTAssertTrue(other.contains(":otherparty:"))
+    }
+
+    @MainActor
+    func testPhase65EmojiCatalogPrefersCurrentServerForDuplicateShortcode() throws {
+        var snapshot = MockShellData.snapshot
+        let currentServerID: ServerID = "phase65-emoji-current"
+        let otherServerID: ServerID = "phase65-emoji-other"
+        let channelID: ChannelID = "phase65-emoji-channel"
+        snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: MockShellData.currentUserID, name: "Current")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: currentServerID, name: "general")
+        snapshot.emojisByID["phase65-current-wave"] = Emoji(id: "phase65-current-wave", parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "wave")
+        snapshot.emojisByID["phase65-other-wave"] = Emoji(id: "phase65-other-wave", parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "wave")
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID),
+            snapshot: snapshot
+        )
+
+        let current = try XCTUnwrap(model.composerEmojiSections.first { $0.id == "current-server" })
+        let wave = try XCTUnwrap(current.items.first { $0.insertionText == ":wave:" })
+        let other = model.composerEmojiSections.first { $0.id == "other-servers" }
+
+        XCTAssertEqual(wave.customMediaKey, "phase65-current-wave")
+        XCTAssertFalse(other?.items.contains { $0.insertionText == ":wave:" } ?? false)
+    }
+
+    @MainActor
+    func testPhase65ComposerCustomEmojiArtworkLoadsOnlyAfterVisibleRequest() async throws {
+        var snapshot = MockShellData.snapshot
+        let serverID: ServerID = "phase65-art-server"
+        let channelID: ChannelID = "phase65-art-channel"
+        let emojiID: EmojiID = "phase65-art-emoji"
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: MockShellData.currentUserID, name: "Artwork")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        snapshot.emojisByID[emojiID] = Emoji(id: emojiID, parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagelwave")
+        let data = Data("phase65-custom-art".utf8)
+        let loader = MockImageResourceLoader(result: .success(data))
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            imageResourceLoader: loader
+        )
+
+        var item = try XCTUnwrap(
+            model.composerEmojiSections
+                .first { $0.id == "current-server" }?
+                .items.first { $0.insertionText == ":bagelwave:" }
+        )
+        XCTAssertNil(item.imageData)
+        var loaderCallCount = await loader.callCount()
+        XCTAssertEqual(loaderCallCount, 0)
+
+        model.requestComposerCustomEmojiImage(item)
+        for _ in 0..<50 {
+            item = try XCTUnwrap(
+                model.composerEmojiSections
+                    .first { $0.id == "current-server" }?
+                    .items.first { $0.insertionText == ":bagelwave:" }
+            )
+            if item.imageData == data { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertEqual(item.imageData, data)
+        loaderCallCount = await loader.callCount()
+        XCTAssertEqual(loaderCallCount, 1)
+        let diagnostics = await model.imageResourceDiagnostics()
+        XCTAssertEqual(diagnostics.timelineMediaInvalidationCount, 0)
+        model.requestComposerCustomEmojiImage(item)
+        try await Task.sleep(for: .milliseconds(10))
+        loaderCallCount = await loader.callCount()
+        XCTAssertEqual(loaderCallCount, 1)
     }
 
     @MainActor

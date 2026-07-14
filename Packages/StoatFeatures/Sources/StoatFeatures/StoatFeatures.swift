@@ -6764,35 +6764,75 @@ public final class MainShellViewModel {
     }
 
     public var commonEmojiItems: [String] {
-        composerEmojiSections.flatMap(\.items)
+        composerEmojiSections.flatMap(\.items).map(\.insertionText)
     }
 
     public var composerEmojiSections: [EmojiPickerSection] {
+        composerEmojiCatalogSections.map { section in
+            EmojiPickerSection(
+                id: section.id,
+                title: section.title,
+                items: section.items.map { item in
+                    guard let mediaKey = item.customMediaKey else { return item }
+                    var hydrated = item
+                    hydrated.imageData = loadedImageResources[
+                        ImageCacheKey(id: mediaKey, kind: .customEmoji)
+                    ]
+                    return hydrated
+                }
+            )
+        }
+    }
+
+    private var composerEmojiCatalogSections: [EmojiPickerSection] {
         let serverID = selectedConversationChannelID.flatMap { snapshot.channelsByID[$0]?.serverID } ?? selection.serverID
         let cacheKey = "\(snapshotRevision)|\(serverID?.rawValue ?? "no-server")"
         if composerEmojiSectionCacheKey == cacheKey {
             return composerEmojiSectionCache
         }
         let common = Self.dedupedEmojiItems(["👍", "❤️", "😂", "🥯", "✅", "👀", "🎉", "🙏", "🔥", "✨", "🚀", "💯", "💬", "📌", "⭐", "❌"])
+            .map(EmojiPickerItem.unicode)
         let smileys = Self.dedupedEmojiItems(["😄", "😅", "😎", "😢", "😮", "🤔", "🫡", "👋", "🙌", "😆", "😋", "😴", "😭", "😬", "😤", "🥳", "🤝", "🫶"])
-        let custom = Self.dedupedCustomEmojiItems(snapshot.emojisByID.values.map(CustomEmojiDisplayItem.init(emoji:)))
-        let currentServer = custom.filter { item in
+            .map(EmojiPickerItem.unicode)
+        let custom = snapshot.emojisByID.values
+            .map(CustomEmojiDisplayItem.init(emoji:))
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        let currentServer = Self.dedupedCustomEmojiItems(custom.filter { item in
             guard let serverID else { return false }
             return item.serverID == serverID
-        }.prefix(48).map(\.shortcode)
-        let otherServers = custom.filter { item in
+        })
+        let currentServerKeys = Set(currentServer.map { $0.shortcode.lowercased() })
+        let otherServers = Self.dedupedCustomEmojiItems(custom.filter { item in
             guard let serverID else { return item.serverID != nil }
             return item.serverID != nil && item.serverID != serverID
-        }.prefix(48).map(\.shortcode)
+        }).filter { !currentServerKeys.contains($0.shortcode.lowercased()) }
         let sections = [
             EmojiPickerSection(id: "common", title: "Common", items: common),
             EmojiPickerSection(id: "smileys", title: "Unicode", items: smileys),
-            EmojiPickerSection(id: "current-server", title: "Current Server", items: Array(currentServer)),
-            EmojiPickerSection(id: "other-servers", title: "Other Servers", items: Array(otherServers))
+            EmojiPickerSection(
+                id: "current-server",
+                title: "Current Server",
+                items: currentServer.prefix(48).map(Self.composerEmojiPickerItem)
+            ),
+            EmojiPickerSection(
+                id: "other-servers",
+                title: "Other Servers",
+                items: otherServers.prefix(48).map(Self.composerEmojiPickerItem)
+            )
         ].filter { !$0.items.isEmpty }
         composerEmojiSectionCacheKey = cacheKey
         composerEmojiSectionCache = sections
         return sections
+    }
+
+    private static func composerEmojiPickerItem(_ item: CustomEmojiDisplayItem) -> EmojiPickerItem {
+        EmojiPickerItem(
+            id: "custom-\(item.id.rawValue)",
+            insertionText: item.shortcode,
+            displayName: item.name,
+            searchTerms: [item.name, item.shortcode],
+            customMediaKey: item.file.id.rawValue
+        )
     }
 
     private static func dedupedEmojiItems(_ items: [String]) -> [String] {
@@ -6819,6 +6859,13 @@ public final class MainShellViewModel {
         updateDraft(composerDraftState(for: channelID).text + emoji, for: channelID)
         emojiPickerDiagnostics = emoji.hasPrefix(":") && emoji.hasSuffix(":") ? "Inserted custom emoji shortcode" : "Inserted Unicode emoji"
         requestFocus(.composer)
+    }
+
+    public func requestComposerCustomEmojiImage(_ item: EmojiPickerItem) {
+        guard let mediaKey = item.customMediaKey,
+              let emoji = snapshot.emojisByID[EmojiID(rawValue: mediaKey)]
+        else { return }
+        loadImageResource(for: CustomEmojiDisplayItem(emoji: emoji).file, kind: .customEmoji)
     }
 
     /// Server members for a server channel, or DM/group/Saved Notes participants otherwise --
@@ -7802,8 +7849,21 @@ public final class MainShellViewModel {
 
     private func shouldInvalidateTimeline(for key: ImageCacheKey) -> Bool {
         switch key.kind {
-        case .attachmentPreview, .customEmoji:
+        case .attachmentPreview:
             return true
+        case .customEmoji:
+            // Picker cells share the custom-emoji cache but must not rebuild up to 250 timeline
+            // rows as their artwork arrives. Rebuild only when the selected timeline actually
+            // contains this emoji in message content or reactions.
+            guard let emoji = snapshot.emojisByID[EmojiID(rawValue: key.id)] else { return false }
+            let shortcode = ":\(emoji.name):"
+            return selectedTimelineMessages.contains { timelineMessage in
+                timelineMessage.message.content?.localizedCaseInsensitiveContains(shortcode) == true
+                    || timelineMessage.message.reactions.keys.contains { reactionKey in
+                        reactionKey.caseInsensitiveCompare(key.id) == .orderedSame
+                            || reactionKey.caseInsensitiveCompare(shortcode) == .orderedSame
+                    }
+            }
         case .userAvatar:
             // Avatar data is read directly by the row/member view. Rebuilding prepared
             // Markdown, actions, embeds, and reactions for an avatar completion caused
@@ -14459,46 +14519,50 @@ public struct ChatPlaceholderView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            GlassToolbar {
-                HStack(spacing: StoatSpacing.medium) {
-                    Label(viewModel.selectedConversationChannel?.displayName ?? "No channel", systemImage: "number")
-                        .font(.headline)
-                    if let topic = viewModel.selectedConversationChannel?.description {
-                        Text(topic).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Spacer()
-                    GlassIconButton("Pinned in this channel", systemImage: "pin") {
-                        viewModel.openPinnedMessages()
-                    }
-                    GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
-                        viewModel.openChannelSearch(mode: .loadedOnly)
-                    }
-                    if viewModel.rightSidebarContext.isPeopleContext {
-                        let memberToggleLabel = viewModel.selection.isMemberPanelVisible ? "Hide Members" : "Show Members"
-                        GlassIconButton(memberToggleLabel, systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
-                            .accessibilityLabel(memberToggleLabel)
-                    }
-                    let channelSettingsDisabledReason = viewModel.selectedChannel?.kind == .textChannel ? viewModel.channelManagementDisabledReason() : "Select a text channel before opening channel settings."
-                    GlassIconButton(channelSettingsDisabledReason ?? "Channel Settings", systemImage: "gearshape", isDisabled: channelSettingsDisabledReason != nil) {
-                        viewModel.openChannelSettings()
-                    }
-                    .accessibilityLabel("Channel Settings")
+        // The timeline owns the flexible region directly. Toolbar and composer consume safe area
+        // instead of joining every live-resize stack negotiation. Never add layoutPriority here:
+        // an ideal-height proposal measures the entire loaded LazyVStack (the Phase 64 freeze).
+        MessageTimelineView(viewModel: viewModel)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                chatToolbar
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if let channelID = viewModel.selectedConversationChannelID {
+                    SelectedChannelComposerView(viewModel: viewModel, channelID: channelID)
                 }
             }
-            MessageTimelineView(viewModel: viewModel)
-                // Do NOT give the timeline layoutPriority (Phase 64). A prioritized ScrollView
-                // is asked for its IDEAL height — its full content height — which forces the
-                // LazyVStack to measure every loaded row and freezes channel load at 100% CPU.
-                // Default stack priority hands the ScrollView the flexible remainder while rows
-                // stay lazy.
-            if let channelID = viewModel.selectedConversationChannelID {
-                SelectedChannelComposerView(viewModel: viewModel, channelID: channelID)
+            .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
+                loadDroppedFileURLs(from: providers)
+                return true
             }
-        }
-        .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
-            loadDroppedFileURLs(from: providers)
-            return true
+    }
+
+    private var chatToolbar: some View {
+        GlassToolbar {
+            HStack(spacing: StoatSpacing.medium) {
+                Label(viewModel.selectedConversationChannel?.displayName ?? "No channel", systemImage: "number")
+                    .font(.headline)
+                if let topic = viewModel.selectedConversationChannel?.description {
+                    Text(topic).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                GlassIconButton("Pinned in this channel", systemImage: "pin") {
+                    viewModel.openPinnedMessages()
+                }
+                GlassIconButton("Search this channel", systemImage: "magnifyingglass") {
+                    viewModel.openChannelSearch(mode: .loadedOnly)
+                }
+                if viewModel.rightSidebarContext.isPeopleContext {
+                    let memberToggleLabel = viewModel.selection.isMemberPanelVisible ? "Hide Members" : "Show Members"
+                    GlassIconButton(memberToggleLabel, systemImage: "sidebar.right") { viewModel.toggleMemberPanel() }
+                        .accessibilityLabel(memberToggleLabel)
+                }
+                let channelSettingsDisabledReason = viewModel.selectedChannel?.kind == .textChannel ? viewModel.channelManagementDisabledReason() : "Select a text channel before opening channel settings."
+                GlassIconButton(channelSettingsDisabledReason ?? "Channel Settings", systemImage: "gearshape", isDisabled: channelSettingsDisabledReason != nil) {
+                    viewModel.openChannelSettings()
+                }
+                .accessibilityLabel("Channel Settings")
+            }
         }
     }
 
@@ -14571,9 +14635,10 @@ private struct SelectedChannelComposerView: View {
                     Task { await viewModel.previewComposerAttachment(attachmentID, in: channelID) }
                 },
                 onDropFileURLs: { viewModel.reviewDroppedAttachmentURLs($0, to: channelID) },
-                emojiItems: emojiSections.flatMap(\.items),
+                emojiItems: emojiSections.flatMap(\.items).map(\.insertionText),
                 emojiSections: emojiSections,
                 onInsertEmoji: { viewModel.insertEmoji($0, in: channelID) },
+                onRequestCustomEmojiImage: { viewModel.requestComposerCustomEmojiImage($0) },
                 onPasteImageData: { viewModel.addPastedImageDataFromClipboard($0, to: channelID) },
                 onPasteFileURLs: { viewModel.addAttachmentURLsFromClipboard($0, to: channelID) },
                 onPasteDiagnostic: { viewModel.recordComposerPasteDiagnostic($0) },

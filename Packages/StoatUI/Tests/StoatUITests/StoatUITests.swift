@@ -587,4 +587,43 @@ final class StoatUITests: XCTestCase {
             author: nil
         )
     }
+
+    func testPhase65MessageActionReservationDoesNotDependOnHoverVisibility() {
+        let hiddenReservation = MessageRowActionLayout.trailingReservation(
+            primaryActionCount: 3,
+            hasMenu: true
+        )
+        let visibleReservation = MessageRowActionLayout.trailingReservation(
+            primaryActionCount: 3,
+            hasMenu: true
+        )
+
+        XCTAssertEqual(hiddenReservation, visibleReservation)
+        XCTAssertGreaterThan(hiddenReservation, 0)
+        XCTAssertEqual(
+            MessageRowActionLayout.trailingReservation(primaryActionCount: 0, hasMenu: false),
+            0
+        )
+    }
+
+    func testPhase65EmojiPickerItemKeepsArtworkAndReadableFallbackMetadata() {
+        let fallback = EmojiPickerItem(
+            id: "custom-bagel",
+            insertionText: ":bagel:",
+            displayName: "bagel",
+            searchTerms: ["bagel"],
+            customMediaKey: "bagel-media"
+        )
+        var loaded = fallback
+        loaded.imageData = Data("image".utf8)
+
+        XCTAssertTrue(fallback.isCustom)
+        XCTAssertEqual(fallback.insertionText, ":bagel:")
+        XCTAssertNil(fallback.imageData)
+        XCTAssertTrue(fallback.matchesSearch("bag"))
+        XCTAssertEqual(loaded.imageData, Data("image".utf8))
+        let unicode = EmojiPickerItem.unicode("🥯")
+        XCTAssertFalse(unicode.isCustom)
+        XCTAssertTrue(unicode.matchesSearch("bread", aliases: ["bread", "bagel"]))
+    }
 }

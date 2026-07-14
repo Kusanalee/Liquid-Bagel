@@ -635,6 +635,19 @@ public struct MessageRowActionItem: Identifiable, Hashable, Sendable {
     }
 }
 
+enum MessageRowActionLayout {
+    static let buttonWidth: CGFloat = 26
+    static let maximumPrimaryActions = 3
+
+    static func trailingReservation(primaryActionCount: Int, hasMenu: Bool) -> CGFloat {
+        let buttonCount = min(max(0, primaryActionCount), maximumPrimaryActions) + (hasMenu ? 1 : 0)
+        guard buttonCount > 0 else { return 0 }
+        let internalSpacing = CGFloat(max(0, buttonCount - 1)) * StoatSpacing.xxSmall
+        let barPadding = StoatSpacing.xxSmall * 2
+        return CGFloat(buttonCount) * buttonWidth + internalSpacing + barPadding + StoatSpacing.small
+    }
+}
+
 public struct MessageRowReplyPreviewItem: Identifiable, Hashable, Sendable {
     public var id: String
     public var authorName: String?
@@ -1001,12 +1014,50 @@ public enum ExternalEmbedMediaFactory {
     }
 }
 
+public struct EmojiPickerItem: Identifiable, Hashable, Sendable {
+    public var id: String
+    public var insertionText: String
+    public var displayName: String
+    public var searchTerms: [String]
+    public var customMediaKey: String?
+    public var imageData: Data?
+
+    public init(
+        id: String,
+        insertionText: String,
+        displayName: String? = nil,
+        searchTerms: [String] = [],
+        customMediaKey: String? = nil,
+        imageData: Data? = nil
+    ) {
+        self.id = id
+        self.insertionText = insertionText
+        self.displayName = displayName ?? insertionText
+        self.searchTerms = searchTerms
+        self.customMediaKey = customMediaKey
+        self.imageData = imageData
+    }
+
+    public static func unicode(_ value: String) -> EmojiPickerItem {
+        EmojiPickerItem(id: "unicode-\(value)", insertionText: value)
+    }
+
+    public var isCustom: Bool { customMediaKey != nil }
+
+    public func matchesSearch(_ query: String, aliases: [String] = []) -> Bool {
+        insertionText.localizedCaseInsensitiveContains(query)
+            || displayName.localizedCaseInsensitiveContains(query)
+            || searchTerms.contains { $0.localizedCaseInsensitiveContains(query) }
+            || aliases.contains { $0.localizedCaseInsensitiveContains(query) }
+    }
+}
+
 public struct EmojiPickerSection: Identifiable, Hashable, Sendable {
     public var id: String
     public var title: String
-    public var items: [String]
+    public var items: [EmojiPickerItem]
 
-    public init(id: String, title: String, items: [String]) {
+    public init(id: String, title: String, items: [EmojiPickerItem]) {
         self.id = id
         self.title = title
         self.items = items
@@ -1248,6 +1299,7 @@ public struct GlassComposer: View {
     private let emojiItems: [String]
     private let emojiSections: [EmojiPickerSection]
     private let onInsertEmoji: (String) -> Void
+    private let onRequestCustomEmojiImage: (EmojiPickerItem) -> Void
     private let onPasteImageData: (Data) -> Void
     private let onPasteFileURLs: ([URL]) -> Void
     private let onPasteDiagnostic: (ComposerPasteDiagnostic) -> Void
@@ -1287,6 +1339,7 @@ public struct GlassComposer: View {
         emojiItems: [String] = [],
         emojiSections: [EmojiPickerSection] = [],
         onInsertEmoji: @escaping (String) -> Void = { _ in },
+        onRequestCustomEmojiImage: @escaping (EmojiPickerItem) -> Void = { _ in },
         onPasteImageData: @escaping (Data) -> Void = { _ in },
         onPasteFileURLs: @escaping ([URL]) -> Void = { _ in },
         onPasteDiagnostic: @escaping (ComposerPasteDiagnostic) -> Void = { _ in },
@@ -1325,6 +1378,7 @@ public struct GlassComposer: View {
         self.emojiItems = emojiItems
         self.emojiSections = emojiSections
         self.onInsertEmoji = onInsertEmoji
+        self.onRequestCustomEmojiImage = onRequestCustomEmojiImage
         self.onPasteImageData = onPasteImageData
         self.onPasteFileURLs = onPasteFileURLs
         self.onPasteDiagnostic = onPasteDiagnostic
@@ -1443,8 +1497,11 @@ public struct GlassComposer: View {
                     .buttonStyle(.borderless)
                     .popover(isPresented: $isEmojiPopoverPresented, arrowEdge: .top) {
                         EmojiPickerPopover(
-                            sections: emojiSections.isEmpty ? [EmojiPickerSection(id: "emoji", title: "Emoji", items: emojiItems)] : emojiSections,
+                            sections: emojiSections.isEmpty
+                                ? [EmojiPickerSection(id: "emoji", title: "Emoji", items: emojiItems.map(EmojiPickerItem.unicode))]
+                                : emojiSections,
                             disabledReason: isEnabled ? nil : disabledReason,
+                            onRequestCustomEmojiImage: onRequestCustomEmojiImage,
                             onInsertEmoji: { emoji in
                                 onInsertEmoji(emoji)
                                 isEmojiPopoverPresented = false
@@ -1702,6 +1759,7 @@ private struct InlineAutocompletePopover: View {
 private struct EmojiPickerPopover: View {
     let sections: [EmojiPickerSection]
     let disabledReason: String?
+    let onRequestCustomEmojiImage: (EmojiPickerItem) -> Void
     let onInsertEmoji: (String) -> Void
     @State private var searchText = ""
 
@@ -1728,18 +1786,19 @@ private struct EmojiPickerPopover: View {
                                     .font(.caption2.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                 LazyVGrid(columns: Array(repeating: GridItem(.fixed(34), spacing: 4), count: 8), spacing: 4) {
-                                    ForEach(section.items, id: \.self) { emoji in
+                                    ForEach(section.items) { item in
                                         Button {
-                                            onInsertEmoji(emoji)
+                                            onInsertEmoji(item.insertionText)
                                         } label: {
-                                            Text(emoji)
-                                                .font(emoji.hasPrefix(":") ? .caption.weight(.semibold) : .title3)
-                                                .lineLimit(1)
-                                                .minimumScaleFactor(0.6)
+                                            emojiLabel(item)
                                                 .frame(width: 32, height: 32)
                                         }
                                         .buttonStyle(.plain)
-                                        .accessibilityLabel("Insert emoji \(emoji)")
+                                        .accessibilityLabel("Insert emoji \(item.displayName)")
+                                        .onAppear {
+                                            guard item.isCustom, item.imageData == nil else { return }
+                                            onRequestCustomEmojiImage(item)
+                                        }
                                     }
                                 }
                             }
@@ -1758,12 +1817,32 @@ private struct EmojiPickerPopover: View {
         guard !query.isEmpty else { return sections.filter { !$0.items.isEmpty } }
         return sections.compactMap { section in
             let matches = section.items.filter { item in
-                item.localizedCaseInsensitiveContains(query)
-                    || item.trimmingCharacters(in: CharacterSet(charactersIn: ":")).localizedCaseInsensitiveContains(query)
-                    || Self.aliases(for: item).contains { $0.localizedCaseInsensitiveContains(query) }
+                item.matchesSearch(query, aliases: Self.aliases(for: item.insertionText))
             }
             return matches.isEmpty ? nil : EmojiPickerSection(id: section.id, title: section.title, items: matches)
         }
+    }
+
+    @ViewBuilder private func emojiLabel(_ item: EmojiPickerItem) -> some View {
+        #if canImport(AppKit)
+        if let imageData = item.imageData {
+            DecodedDataImage(data: imageData, pixelSize: 56)
+                .scaledToFit()
+                .frame(width: 28, height: 28)
+                .accessibilityHidden(true)
+        } else {
+            fallbackEmojiLabel(item)
+        }
+        #else
+        fallbackEmojiLabel(item)
+        #endif
+    }
+
+    private func fallbackEmojiLabel(_ item: EmojiPickerItem) -> some View {
+        Text(item.insertionText)
+            .font(item.isCustom ? .caption.weight(.semibold) : .title3)
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
     }
 
     private static func aliases(for emoji: String) -> [String] {
@@ -3086,13 +3165,19 @@ public struct MessageRow: View {
                 }
             }
             Spacer(minLength: StoatSpacing.small)
-            if showsActionAffordance {
-                messageActionBar
-            }
         }
+        .padding(.trailing, actionBarTrailingReservation)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
+        .overlay(alignment: .topTrailing) {
+            if !actionItems.isEmpty {
+                messageActionBar
+                    .opacity(showsActionAffordance ? 1 : 0)
+                    .allowsHitTesting(showsActionAffordance)
+                    .accessibilityHidden(!showsActionAffordance)
+            }
+        }
         .padding(.vertical, (showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall) + searchStyle.verticalPaddingAdjustment)
         .background(searchBackground(searchStyle), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
         .overlay {
@@ -3209,6 +3294,13 @@ public struct MessageRow: View {
 
     private var primaryActionItems: [MessageRowActionItem] {
         actionItems.filter { $0.isPrimary && $0.isEnabled }
+    }
+
+    private var actionBarTrailingReservation: CGFloat {
+        MessageRowActionLayout.trailingReservation(
+            primaryActionCount: primaryActionItems.count,
+            hasMenu: !actionItems.isEmpty
+        )
     }
 
     private var showsActionAffordance: Bool {

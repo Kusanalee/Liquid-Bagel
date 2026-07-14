@@ -28,3 +28,13 @@ Phase 64 responds to a live QA blocker introduced by Phase 63: loading a channel
 - Then resume the blocked Phase 63 live acceptance list (attachment plus Character Viewer emoji, long-biography disclosure, rapid-scroll settling).
 
 Bio and large-channel performance rows remain `partial` until the combined Phase 63/64 live passes complete.
+
+## Live QA Result (2026-07-14)
+
+- **Channel load passed:** the capped timeline appeared almost immediately. CPU briefly reached 87% and returned to 0% within one second; the Phase 64 full-history load freeze did not reproduce.
+- **Resize remained partial:** continuous resizing did not freeze, but it was visibly laggy and reached roughly 150% CPU. Phase 65 moves toolbar/composer chrome to timeline safe-area insets without restoring timeline layout priority.
+- **Composer isolation passed:** typing stayed immediate and the Phase 63 isolation behavior held. Live QA exposed a separate row-hover regression where inserting the action bar changed message width and shifted content.
+- **Scroll intents passed:** jump-to-newest, load-older position preservation, and unread scrolling worked. Rapid scrolling still felt laggy, so large-channel performance remains `partial`.
+- **Blocked Phase 63 checks resumed:** attachment plus Character Viewer input passed, and long/short biography disclosure passed. The emoji picker exposed custom emoji as shortcode labels without artwork; Phase 65 adds bounded lazy picker artwork.
+
+This live pass closes the Phase 64 channel-load blocker and the biography-disclosure retest. It does not promote large-channel performance or custom emoji to `done`.
