@@ -44,3 +44,10 @@ Completed validation for this implementation:
 6. If an unresolved row persists, copy Timeline and Identity Diagnostics before refresh or relaunch.
 
 Large-server/member completeness remains `partial` until this repeated live pass succeeds. The previously accepted Phase 68 interaction checks do not need a broad rerun.
+
+## Live QA Result (2026-07-14)
+
+- Three cold launches passed. Temporary member fallbacks resolved in place without closing the panel, manually refreshing, or relaunching.
+- Display names, usernames, nicknames, global/server avatars, roles, presence grouping, bot badges, and profile opening remained correct across the repeated launches.
+- The copied evidence reported 2,362 known/rendered members, zero missing or dropped members, one selected-server publication, two bounded grouping passes, and zero Phase 51 main-thread budget violations.
+- This closes the Phase 69 identity-refresh regression. Large-server parity remains `partial` for the separate native role-rank comparison and because the attached Developer Verification trace exposed an unrelated signature-check loop assigned to Phase 70.

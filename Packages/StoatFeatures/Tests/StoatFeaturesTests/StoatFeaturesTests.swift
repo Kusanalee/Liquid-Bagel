@@ -4272,16 +4272,16 @@ final class StoatFeaturesTests: XCTestCase {
     func testPhase33CustomEmojiResolverAndPickerUseReadyEmoji() {
         var snapshot = MockShellData.snapshot
         let serverID = snapshot.serversByID.values.first!.id
-        let emoji = Emoji(id: "emoji-phase33", parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagel")
+        let emoji = Emoji(id: "01J00000000000000000330001", parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagel")
         snapshot.emojisByID[emoji.id] = emoji
         let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot)
 
-        let itemByID = model.customEmojiDisplayItem(for: "emoji-phase33")
+        let itemByID = model.customEmojiDisplayItem(for: emoji.id.rawValue)
         let itemByName = model.customEmojiDisplayItem(for: ":bagel:")
 
         XCTAssertEqual(itemByID?.name, "bagel")
         XCTAssertEqual(itemByName?.file.tag, "emojis")
-        XCTAssertTrue(model.commonEmojiItems.contains(":bagel:"))
+        XCTAssertTrue(model.commonEmojiItems.contains(":\(emoji.id.rawValue):"))
     }
 
     @MainActor
@@ -4365,18 +4365,24 @@ final class StoatFeaturesTests: XCTestCase {
         let server = snapshot.serversByID.values.first { !$0.channelIDs.isEmpty }!
         let serverID = server.id
         let channelID = server.channelIDs[0]
-        let emoji = Emoji(id: "emoji-phase34", parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagelparty")
+        let emoji = Emoji(id: "01J00000000000000000340004", parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagelparty")
         snapshot.emojisByID[emoji.id] = emoji
         let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot)
 
-        model.insertEmoji(":bagelparty:", in: channelID)
-        XCTAssertEqual(model.draft(for: channelID), ":bagelparty:")
+        let pickerItem = model.composerEmojiSections.first(where: { $0.id == "current-server" })?.items.first
+        XCTAssertEqual(pickerItem?.displayName, "bagelparty")
+        XCTAssertEqual(pickerItem?.insertionText, ":\(emoji.id.rawValue):")
+        model.insertEmoji(pickerItem?.insertionText ?? "", in: channelID)
+        XCTAssertEqual(model.draft(for: channelID), ":\(emoji.id.rawValue):")
         XCTAssertEqual(model.emojiPickerDiagnostics, "Inserted custom emoji shortcode")
 
-        let message = Message(id: "01J00000000000000000340003", channelID: channelID, authorID: MockShellData.currentUserID, content: "hello :bagelparty:")
-        let inline = model.inlineCustomEmojiItems(for: message)
-        XCTAssertEqual(inline.map(\.shortcode), [":bagelparty:"])
-        XCTAssertEqual(inline.first?.name, "bagelparty")
+        let officialMessage = Message(id: "01J00000000000000000340003", channelID: channelID, authorID: MockShellData.currentUserID, content: "hello :\(emoji.id.rawValue):")
+        let officialInline = model.inlineCustomEmojiItems(for: officialMessage)
+        XCTAssertEqual(officialInline.map(\.shortcode), [":\(emoji.id.rawValue):"])
+        XCTAssertEqual(officialInline.first?.name, "bagelparty")
+
+        let legacyMessage = Message(id: "01J00000000000000000340005", channelID: channelID, authorID: MockShellData.currentUserID, content: "hello :bagelparty:")
+        XCTAssertEqual(model.inlineCustomEmojiItems(for: legacyMessage).map(\.shortcode), [":bagelparty:"])
     }
 
     @MainActor
@@ -4698,40 +4704,45 @@ final class StoatFeaturesTests: XCTestCase {
         let currentServerID: ServerID = "phase35-emoji-current"
         let otherServerID: ServerID = "phase35-emoji-other"
         let channelID: ChannelID = "phase35-emoji-channel"
+        let currentEmojiID: EmojiID = "01J00000000000000000350001"
+        let otherEmojiID: EmojiID = "01J00000000000000000350002"
         snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: MockShellData.currentUserID, name: "Current")
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: currentServerID, name: "general")
-        snapshot.emojisByID["phase35-current"] = Emoji(id: "phase35-current", parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "currentparty")
-        snapshot.emojisByID["phase35-other"] = Emoji(id: "phase35-other", parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "otherparty")
+        snapshot.emojisByID[currentEmojiID] = Emoji(id: currentEmojiID, parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "currentparty")
+        snapshot.emojisByID[otherEmojiID] = Emoji(id: otherEmojiID, parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "otherparty")
         let model = MainShellViewModel(selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID), snapshot: snapshot)
         let sections = model.composerEmojiSections
         let current = sections.first { $0.id == "current-server" }?.items.map(\.insertionText) ?? []
         let other = sections.first { $0.id == "other-servers" }?.items.map(\.insertionText) ?? []
 
-        XCTAssertTrue(current.contains(":currentparty:"))
-        XCTAssertTrue(other.contains(":otherparty:"))
+        XCTAssertTrue(current.contains(":\(currentEmojiID.rawValue):"))
+        XCTAssertTrue(other.contains(":\(otherEmojiID.rawValue):"))
     }
 
     @MainActor
-    func testPhase65EmojiCatalogPrefersCurrentServerForDuplicateShortcode() throws {
+    func testPhase65EmojiCatalogPrefersCurrentServerForDuplicateNameWhileUsingIDToken() throws {
         var snapshot = MockShellData.snapshot
         let currentServerID: ServerID = "phase65-emoji-current"
         let otherServerID: ServerID = "phase65-emoji-other"
         let channelID: ChannelID = "phase65-emoji-channel"
+        let currentEmojiID: EmojiID = "01J00000000000000000650001"
+        let otherEmojiID: EmojiID = "01J00000000000000000650002"
         snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: MockShellData.currentUserID, name: "Current")
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: currentServerID, name: "general")
-        snapshot.emojisByID["phase65-current-wave"] = Emoji(id: "phase65-current-wave", parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "wave")
-        snapshot.emojisByID["phase65-other-wave"] = Emoji(id: "phase65-other-wave", parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "wave")
+        snapshot.emojisByID[currentEmojiID] = Emoji(id: currentEmojiID, parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "wave")
+        snapshot.emojisByID[otherEmojiID] = Emoji(id: otherEmojiID, parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "wave")
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID),
             snapshot: snapshot
         )
 
         let current = try XCTUnwrap(model.composerEmojiSections.first { $0.id == "current-server" })
-        let wave = try XCTUnwrap(current.items.first { $0.insertionText == ":wave:" })
+        let wave = try XCTUnwrap(current.items.first { $0.insertionText == ":\(currentEmojiID.rawValue):" })
         let other = model.composerEmojiSections.first { $0.id == "other-servers" }
 
-        XCTAssertEqual(wave.customMediaKey, "phase65-current-wave")
-        XCTAssertFalse(other?.items.contains { $0.insertionText == ":wave:" } ?? false)
+        XCTAssertEqual(wave.displayName, "wave")
+        XCTAssertEqual(wave.customMediaKey, currentEmojiID.rawValue)
+        XCTAssertFalse(other?.items.contains { $0.displayName == "wave" } ?? false)
     }
 
     @MainActor
@@ -4739,7 +4750,7 @@ final class StoatFeaturesTests: XCTestCase {
         var snapshot = MockShellData.snapshot
         let serverID: ServerID = "phase65-art-server"
         let channelID: ChannelID = "phase65-art-channel"
-        let emojiID: EmojiID = "phase65-art-emoji"
+        let emojiID: EmojiID = "01J00000000000000000650003"
         snapshot.serversByID[serverID] = Server(id: serverID, ownerID: MockShellData.currentUserID, name: "Artwork")
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
         snapshot.emojisByID[emojiID] = Emoji(id: emojiID, parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagelwave")
@@ -4755,7 +4766,7 @@ final class StoatFeaturesTests: XCTestCase {
         var item = try XCTUnwrap(
             model.composerEmojiSections
                 .first { $0.id == "current-server" }?
-                .items.first { $0.insertionText == ":bagelwave:" }
+                .items.first { $0.insertionText == ":\(emojiID.rawValue):" }
         )
         let metadataBeforeLoad = model.composerEmojiSections
         XCTAssertNil(item.imageData)
@@ -4774,7 +4785,7 @@ final class StoatFeaturesTests: XCTestCase {
         item = try XCTUnwrap(
             model.composerEmojiSections
                 .first { $0.id == "current-server" }?
-                .items.first { $0.insertionText == ":bagelwave:" }
+                .items.first { $0.insertionText == ":\(emojiID.rawValue):" }
         )
         XCTAssertNil(item.imageData)
         loaderCallCount = await loader.callCount()
@@ -5050,10 +5061,11 @@ final class StoatFeaturesTests: XCTestCase {
     func testPhase68CustomEmojiIndexUsesCurrentServerDeduplicatesAndSkipsFencedCode() throws {
         let currentServerID: ServerID = "phase68-emoji-current"
         let otherServerID: ServerID = "phase68-emoji-other"
-        let current = Emoji(id: "phase68-current-wave", parent: .server(currentServerID), creatorID: "creator", name: "wave")
-        let other = Emoji(id: "phase68-other-wave", parent: .server(otherServerID), creatorID: "creator", name: "wave")
-        let second = Emoji(id: "phase68-current-party", parent: .server(currentServerID), creatorID: "creator", name: "party")
-        let index = Phase68CustomEmojiIndex(emojisByID: [current.id: current, other.id: other, second.id: second])
+        let current = Emoji(id: "01J00000000000000000680011", parent: .server(currentServerID), creatorID: "creator", name: "wave")
+        let other = Emoji(id: "01J00000000000000000680012", parent: .server(otherServerID), creatorID: "creator", name: "wave")
+        let second = Emoji(id: "01J00000000000000000680013", parent: .server(currentServerID), creatorID: "creator", name: "party")
+        let remote = Emoji(id: "01J00000000000000000680014", parent: .server(otherServerID), creatorID: "creator", name: "remote")
+        let index = Phase68CustomEmojiIndex(emojisByID: [current.id: current, other.id: other, second.id: second, remote.id: remote])
 
         XCTAssertEqual(index.item(for: ":wave:", serverID: currentServerID)?.id, current.id)
         XCTAssertNil(index.item(for: other.id.rawValue, serverID: currentServerID))
@@ -5061,6 +5073,16 @@ final class StoatFeaturesTests: XCTestCase {
             index.items(in: ":wave: :wave:\n```\n:party:\n```\n:party:", serverID: currentServerID).map(\.id),
             [current.id, second.id]
         )
+        XCTAssertEqual(
+            index.matches(in: ":\(other.id.rawValue): :wave: :\(other.id.rawValue):", serverID: currentServerID).map(\.token),
+            [":\(other.id.rawValue):", ":wave:"]
+        )
+        XCTAssertEqual(
+            index.matches(in: "```\n:\(other.id.rawValue):\n```", serverID: currentServerID).map(\.token),
+            []
+        )
+        XCTAssertEqual(index.matches(in: ":remote:", serverID: currentServerID), [])
+        XCTAssertEqual(index.matches(in: ":unknown:", serverID: currentServerID), [])
     }
 
     @MainActor
@@ -8596,6 +8618,91 @@ final class StoatFeaturesTests: XCTestCase {
         )
         XCTAssertNotEqual(status, "signed and valid")
         XCTAssertTrue(status.contains("unsigned") || status.contains("invalid"), "expected an error/invalid classification, got \(status)")
+    }
+
+    @MainActor
+    func testPhase70SignatureReadinessIsLazyCoalescedAndCached() async throws {
+        let counter = LockedInvocationCounter()
+        let model = MainShellViewModel(notificationSignatureStatusPreparer: { _ in
+            counter.increment()
+            try? await Task.sleep(for: .milliseconds(40))
+            return "signed and valid"
+        })
+
+        _ = model.notificationBuildReadinessDiagnostics
+        _ = model.notificationBuildReadinessDiagnostics
+        XCTAssertEqual(counter.value, 0)
+        XCTAssertEqual(model.notificationSignatureCheckState, .notStarted)
+
+        model.ensureNotificationSignatureStatus()
+        model.ensureNotificationSignatureStatus()
+        XCTAssertEqual(model.notificationSignatureCheckState, .checking)
+        model.copyVisibleIdentityDiagnostics()
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(model.notificationSignatureCheckState, .finished("signed and valid"))
+        XCTAssertEqual(counter.value, 1)
+        let completed = model.notificationBuildReadinessDiagnostics
+        XCTAssertEqual(completed.signatureChecksStarted, 1)
+        XCTAssertEqual(completed.signatureChecksCompleted, 1)
+        XCTAssertEqual(completed.signatureCheckCacheHits, 1)
+
+        model.testingSignedNotificationBuild = true
+        XCTAssertEqual(model.notificationBuildReadinessDiagnostics.detectedSignatureStatus, "user marked signed build")
+        model.ensureNotificationSignatureStatus()
+        XCTAssertEqual(counter.value, 1)
+        XCTAssertEqual(model.notificationBuildReadinessDiagnostics.signatureCheckCacheHits, 2)
+    }
+
+    func testPhase70DeveloperDiagnosticActionsHaveDistinctReadableLabels() {
+        let titles = DeveloperDiagnosticsCopyAction.allCases.map(\.title)
+        XCTAssertEqual(Set(titles).count, titles.count)
+        XCTAssertTrue(titles.allSatisfy { $0.hasPrefix("Copy ") && $0.count > "Copy ".count })
+    }
+
+    @MainActor
+    func testPhase70OfficialEmojiContentIsIdenticalWhileOptimisticAndConfirmed() async throws {
+        var snapshot = MockShellData.snapshot
+        let server = try XCTUnwrap(snapshot.serversByID.values.first { !$0.channelIDs.isEmpty })
+        let channelID = try XCTUnwrap(server.channelIDs.first)
+        let emoji = Emoji(
+            id: "01J00000000000000000700001",
+            parent: .server(server.id),
+            creatorID: MockShellData.currentUserID,
+            name: "interoperable"
+        )
+        snapshot.emojisByID[emoji.id] = emoji
+        let handler = DelayedMessageActionHandler(delay: .milliseconds(80))
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: channelID),
+            snapshot: snapshot,
+            messageActionHandler: handler
+        )
+        let content = "before :\(emoji.id.rawValue): after"
+        model.updateDraft(content, for: channelID)
+
+        let sendTask = Task { await model.sendDraft(for: channelID) }
+        try await Task.sleep(for: .milliseconds(10))
+        let optimistic = try XCTUnwrap(model.selectedTimelineMessages.first { $0.message.content == content })
+        XCTAssertEqual(optimistic.status, .pending)
+        XCTAssertEqual(model.inlineCustomEmojiItems(for: optimistic.message).map(\.shortcode), [":\(emoji.id.rawValue):"])
+
+        await sendTask.value
+        let confirmed = try XCTUnwrap(model.selectedTimelineMessages.first { $0.message.content == content })
+        XCTAssertEqual(confirmed.status, .confirmed)
+        XCTAssertEqual(confirmed.message.content, optimistic.message.content)
+        XCTAssertEqual(model.inlineCustomEmojiItems(for: confirmed.message).map(\.shortcode), [":\(emoji.id.rawValue):"])
+    }
+}
+
+private final class LockedInvocationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int { lock.withLock { count } }
+
+    func increment() {
+        lock.withLock { count += 1 }
     }
 }
 

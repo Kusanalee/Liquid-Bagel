@@ -785,6 +785,7 @@ public final class MainShellViewModel {
     public var phase25Status: String?
     public var phase26Status: String?
     public var testingSignedNotificationBuild = false
+    public private(set) var notificationSignatureCheckState: NotificationSignatureCheckState = .notStarted
     // Cached per-server capability snapshot — updated lazily whenever snapshot/selection/session state changes.
     // Context-menu disabled checks read from this; never recompute on every SwiftUI layout pass.
     public private(set) var cachedServerCapabilities: ServerManagementCapabilities = ServerManagementCapabilities(canManageServer: false, canManageChannels: false, canInvite: false, isConnectedForLiveActions: false)
@@ -813,6 +814,15 @@ public final class MainShellViewModel {
     @ObservationIgnored private var phase51TimelinePresentationTask: Task<Void, Never>?
     @ObservationIgnored private var phase51DiagnosticsPublishTask: Task<Void, Never>?
     @ObservationIgnored private var phase68VisibleIdentityDiagnosticsTask: Task<Void, Never>?
+    @ObservationIgnored private var notificationSignatureCheckTask: Task<Void, Never>?
+    @ObservationIgnored private var notificationSignatureCheckStartCount = 0
+    @ObservationIgnored private var notificationSignatureCheckCompletionCount = 0
+    @ObservationIgnored private var notificationSignatureCheckCacheHitCount = 0
+    @ObservationIgnored private var notificationSignatureStatusPreparer: @Sendable (URL) async -> String = { bundleURL in
+        await Task.detached(priority: .utility) {
+            NotificationSignatureChecker.detectedSignatureStatus(bundleURL: bundleURL, overrideAsSigned: false)
+        }.value
+    }
     @ObservationIgnored private var phase68VisibleIdentityDiagnosticsGeneration = 0
     @ObservationIgnored private var phase68VisibleIdentityDiagnosticsPreparer: @Sendable (Phase68VisibleIdentityDiagnosticsInput) async -> VisibleIdentityDiagnostics = { input in
         await Task.detached(priority: .utility) {
@@ -996,7 +1006,8 @@ public final class MainShellViewModel {
         dockBadgeManager: (any DockBadgeManaging)? = nil,
         communityAPIClient: (any StoatAPIClient)? = nil,
         notificationRouteCenter: NotificationRouteCenter = .shared,
-        appLifecycleCenter: AppLifecycleCenter = .shared
+        appLifecycleCenter: AppLifecycleCenter = .shared,
+        notificationSignatureStatusPreparer: (@Sendable (URL) async -> String)? = nil
     ) {
         self.selection = selection
         self.snapshot = snapshot
@@ -1024,6 +1035,9 @@ public final class MainShellViewModel {
         self.communityAPIClient = communityAPIClient ?? MockStoatAPIClient()
         self.notificationRouteCenter = notificationRouteCenter
         self.appLifecycleCenter = appLifecycleCenter
+        if let notificationSignatureStatusPreparer {
+            self.notificationSignatureStatusPreparer = notificationSignatureStatusPreparer
+        }
         self.appLifecyclePhase = appLifecycleCenter.phase
         self.previousSnapshot = snapshot
         self.seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
@@ -1074,6 +1088,7 @@ public final class MainShellViewModel {
         phase51TimelinePresentationTask?.cancel()
         phase60RowWorkerTask?.cancel()
         phase51DiagnosticsPublishTask?.cancel()
+        notificationSignatureCheckTask?.cancel()
         freezeDiagnosticsPublishTask?.cancel()
         selectedChannelLoadTask?.cancel()
         typingEndTask?.cancel()
@@ -6943,7 +6958,7 @@ public final class MainShellViewModel {
     private static func composerEmojiPickerItem(_ item: CustomEmojiDisplayItem) -> EmojiPickerItem {
         EmojiPickerItem(
             id: "custom-\(item.id.rawValue)",
-            insertionText: item.shortcode,
+            insertionText: ":\(item.id.rawValue):",
             displayName: item.name,
             searchTerms: [item.name, item.shortcode],
             customMediaKey: item.file.id.rawValue
@@ -7106,10 +7121,11 @@ public final class MainShellViewModel {
 
     public func inlineCustomEmojiItems(for message: Message) -> [MessageInlineCustomEmojiItem] {
         let serverID = snapshot.channelsByID[message.channelID]?.serverID
-        return phase68CustomEmojiIndexValue().items(in: message.content, serverID: serverID)
-            .map { item in
-                MessageInlineCustomEmojiItem(
-                    shortcode: item.shortcode,
+        return phase68CustomEmojiIndexValue().matches(in: message.content, serverID: serverID)
+            .map { match in
+                let item = match.item
+                return MessageInlineCustomEmojiItem(
+                    shortcode: match.token,
                     name: item.name,
                     imageData: imageData(for: item.file, kind: .customEmoji)
                 )
@@ -10132,23 +10148,46 @@ public final class MainShellViewModel {
         let delegateConfigured = false
         #endif
         let request = notificationDiagnostics.lastPermissionRequest
+        let signatureStatus = testingSignedNotificationBuild
+            ? "user marked signed build"
+            : notificationSignatureCheckState.statusText
         return NotificationBuildReadinessDiagnostics(
             bundleIdentifier: bundleID,
             bundleDisplayName: displayName,
             appPath: appPath,
             codeSigningAllowed: "YES (ad-hoc) in checked Xcode build settings",
-            detectedSignatureStatus: NotificationSignatureChecker.detectedSignatureStatus(
-                bundleURL: Bundle.main.bundleURL,
-                overrideAsSigned: testingSignedNotificationBuild
-            ),
+            detectedSignatureStatus: signatureStatus,
             sandboxStatus: sandbox,
             delegateConfigured: delegateConfigured,
             lastUNErrorName: request?.errorCodeName,
             lastBeforeStatus: request?.statusBefore.rawValue,
             lastAfterStatus: request?.statusAfter.rawValue,
             systemSettingsCheck: "If unavailable here, check System Settings > Notifications > Liquid Bagel manually.",
-            testingSignedBuild: testingSignedNotificationBuild
+            testingSignedBuild: testingSignedNotificationBuild,
+            signatureChecksStarted: notificationSignatureCheckStartCount,
+            signatureChecksCompleted: notificationSignatureCheckCompletionCount,
+            signatureCheckCacheHits: notificationSignatureCheckCacheHitCount
         )
+    }
+
+    @MainActor
+    public func ensureNotificationSignatureStatus() {
+        guard notificationSignatureCheckState == .notStarted else {
+            notificationSignatureCheckCacheHitCount += 1
+            return
+        }
+
+        notificationSignatureCheckState = .checking
+        notificationSignatureCheckStartCount += 1
+        let bundleURL = Bundle.main.bundleURL
+        let prepare = notificationSignatureStatusPreparer
+        notificationSignatureCheckTask = Task { [weak self] in
+            let status = await prepare(bundleURL)
+            guard !Task.isCancelled, let self else { return }
+            notificationSignatureCheckCompletionCount += 1
+            notificationSignatureCheckState = .finished(status)
+            notificationSignatureCheckTask = nil
+        }
     }
 
     public var notificationBuildSigningChecklist: String {
@@ -14041,36 +14080,62 @@ public struct CredentialSetupView: View {
             if let dmParity = parity.items.first(where: { $0.section == "Core chat" && $0.name == "DMs" }) {
                 LabeledContent("DM parity", value: "\(dmParity.status.rawValue): \(dmParity.recommendedNextAction)")
             }
-            HStack {
-                Button("Copy Timeline Diagnostics") {
-                    viewModel.copyRedactedTimelineDiagnostics()
+            GroupBox("Copy diagnostics") {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 190), spacing: StoatSpacing.small, alignment: .topLeading)],
+                    alignment: .leading,
+                    spacing: StoatSpacing.small
+                ) {
+                    ForEach(DeveloperDiagnosticsCopyAction.allCases) { action in
+                        Button {
+                            performDeveloperDiagnosticsCopyAction(action)
+                        } label: {
+                            Label(action.title, systemImage: action.systemImage)
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityLabel(action.title)
+                        .help(action.title)
+                    }
                 }
-                Button("Copy DM Trace") {
-                    viewModel.copyRedactedDMTrace()
-                }
-                Button("Copy DM Diagnostics") {
-                    viewModel.copyRedactedDMDiagnostics()
-                }
-                Button("Copy Parity Diagnostics") {
-                    viewModel.copyRedactedParityDiagnostics()
-                }
-                Button("Copy Notification Diagnostics") {
-                    viewModel.copyRedactedNotificationDiagnostics()
-                }
-                Button("Copy Identity Diagnostics") {
-                    viewModel.copyVisibleIdentityDiagnostics()
-                }
-                Button("Copy Moderation Diagnostics") {
-                    viewModel.copyRedactedModerationDiagnostics()
-                }
-                Button("Refresh Members") {
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("Member maintenance") {
+                Button {
                     Task { await viewModel.refreshSelectedServerMembers() }
+                } label: {
+                    Label("Refresh Members", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .buttonStyle(.bordered)
+                .accessibilityLabel("Refresh Members")
+                .help("Refresh members for the selected server")
                 .disabled(!viewModel.canRefreshSelectedServerMembers)
             }
             Text("Diagnostics are redacted and omit tokens, raw response bodies, message content, and local file paths.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    private func performDeveloperDiagnosticsCopyAction(_ action: DeveloperDiagnosticsCopyAction) {
+        switch action {
+        case .timeline:
+            viewModel.copyRedactedTimelineDiagnostics()
+        case .dmTrace:
+            viewModel.copyRedactedDMTrace()
+        case .dm:
+            viewModel.copyRedactedDMDiagnostics()
+        case .parity:
+            viewModel.copyRedactedParityDiagnostics()
+        case .notifications:
+            viewModel.copyRedactedNotificationDiagnostics()
+        case .identity:
+            viewModel.copyVisibleIdentityDiagnostics()
+        case .moderation:
+            viewModel.copyRedactedModerationDiagnostics()
         }
     }
 
@@ -14162,6 +14227,42 @@ public struct CredentialSetupView: View {
     private static func seconds(_ duration: Duration) -> Double {
         let components = duration.components
         return Double(components.seconds) + Double(components.attoseconds) / 1_000_000_000_000_000_000
+    }
+}
+
+enum DeveloperDiagnosticsCopyAction: String, CaseIterable, Identifiable {
+    case timeline
+    case dmTrace
+    case dm
+    case parity
+    case notifications
+    case identity
+    case moderation
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .timeline: "Copy Timeline"
+        case .dmTrace: "Copy DM Trace"
+        case .dm: "Copy DM Diagnostics"
+        case .parity: "Copy Parity"
+        case .notifications: "Copy Notifications"
+        case .identity: "Copy Identity"
+        case .moderation: "Copy Moderation"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .timeline: "text.line.first.and.arrowtriangle.forward"
+        case .dmTrace: "point.topleft.down.to.point.bottomright.curvepath"
+        case .dm: "bubble.left.and.bubble.right"
+        case .parity: "checklist"
+        case .notifications: "bell"
+        case .identity: "person.text.rectangle"
+        case .moderation: "shield"
+        }
     }
 }
 

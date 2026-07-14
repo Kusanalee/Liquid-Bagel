@@ -679,7 +679,7 @@ final class StoatUITests: XCTestCase {
     func testPhase65EmojiPickerItemKeepsArtworkAndReadableFallbackMetadata() {
         let fallback = EmojiPickerItem(
             id: "custom-bagel",
-            insertionText: ":bagel:",
+            insertionText: ":01J00000000000000000650001:",
             displayName: "bagel",
             searchTerms: ["bagel"],
             customMediaKey: "bagel-media"
@@ -688,7 +688,8 @@ final class StoatUITests: XCTestCase {
         loaded.imageData = Data("image".utf8)
 
         XCTAssertTrue(fallback.isCustom)
-        XCTAssertEqual(fallback.insertionText, ":bagel:")
+        XCTAssertEqual(fallback.insertionText, ":01J00000000000000000650001:")
+        XCTAssertEqual(fallback.displayName, "bagel")
         XCTAssertNil(fallback.imageData)
         XCTAssertTrue(fallback.matchesSearch("bag"))
         XCTAssertEqual(loaded.imageData, Data("image".utf8))

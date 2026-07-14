@@ -93,9 +93,16 @@ public struct Phase68CustomEmojiIndex: Hashable, Sendable {
     }
 
     public func items(in content: String?, serverID: ServerID?) -> [CustomEmojiDisplayItem] {
-        guard let content, content.contains(":") else { return [] }
-        var result: [CustomEmojiDisplayItem] = []
         var seen: Set<EmojiID> = []
+        return matches(in: content, serverID: serverID).compactMap { match in
+            seen.insert(match.item.id).inserted ? match.item : nil
+        }
+    }
+
+    public func matches(in content: String?, serverID: ServerID?) -> [Phase68CustomEmojiContentMatch] {
+        guard let content, content.contains(":") else { return [] }
+        var result: [Phase68CustomEmojiContentMatch] = []
+        var seenTokens: Set<String> = []
 
         // Match the Markdown renderer's fenced-code behavior: tokens inside a fenced block
         // remain literal and therefore must not create invisible image work.
@@ -111,27 +118,47 @@ public struct Phase68CustomEmojiIndex: Hashable, Sendable {
                 continue
             }
             guard activeFence == nil else { continue }
-            Self.appendItems(in: line, serverID: serverID, index: self, seen: &seen, result: &result)
+            Self.appendMatches(in: line, serverID: serverID, index: self, seenTokens: &seenTokens, result: &result)
         }
         return result
     }
 
-    private static func appendItems(
+    private static func appendMatches(
         in content: Substring,
         serverID: ServerID?,
         index: Phase68CustomEmojiIndex,
-        seen: inout Set<EmojiID>,
-        result: inout [CustomEmojiDisplayItem]
+        seenTokens: inout Set<String>,
+        result: inout [Phase68CustomEmojiContentMatch]
     ) {
         var remaining = content
         while let start = remaining.firstIndex(of: ":"),
               let end = remaining[remaining.index(after: start)...].firstIndex(of: ":") {
-            let raw = String(remaining[start...end])
-            if let item = index.item(for: raw, serverID: serverID), seen.insert(item.id).inserted {
-                result.append(item)
+            let token = String(remaining[start...end])
+            if let item = index.contentItem(for: token, serverID: serverID), seenTokens.insert(token).inserted {
+                result.append(Phase68CustomEmojiContentMatch(token: token, item: item))
             }
             remaining = remaining[remaining.index(after: end)...]
         }
+    }
+
+    private func contentItem(for token: String, serverID: ServerID?) -> CustomEmojiDisplayItem? {
+        let rawValue = token.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+        if rawValue.count == 26, let item = itemsByID[EmojiID(rawValue: rawValue)] {
+            // Official Stoat content tokens are globally unambiguous emoji IDs. The official
+            // parser recognizes 26-character IDs and the picker exposes emoji from every known
+            // server, so ID-backed content must not be restricted to the selected server.
+            return item
+        }
+
+        // Liquid Bagel historically emitted name-only shortcodes. Keep those messages readable,
+        // but retain server scoping because names are not globally unique.
+        let key = Self.normalizedShortcode(token)
+        guard let candidates = itemsByShortcode[key] else { return nil }
+        if let serverID {
+            return candidates.first(where: { $0.serverID == serverID })
+                ?? candidates.first(where: { $0.serverID == nil })
+        }
+        return candidates.first
     }
 
     private static func fenceMarker(in line: Substring) -> Character? {
@@ -147,6 +174,16 @@ public struct Phase68CustomEmojiIndex: Hashable, Sendable {
 
     private static func normalizedShortcode(_ value: String) -> String {
         value.trimmingCharacters(in: CharacterSet(charactersIn: ":").union(.whitespacesAndNewlines)).lowercased()
+    }
+}
+
+public struct Phase68CustomEmojiContentMatch: Hashable, Sendable {
+    public var token: String
+    public var item: CustomEmojiDisplayItem
+
+    public init(token: String, item: CustomEmojiDisplayItem) {
+        self.token = token
+        self.item = item
     }
 }
 

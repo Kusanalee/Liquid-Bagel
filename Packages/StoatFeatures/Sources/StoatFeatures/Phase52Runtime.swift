@@ -384,9 +384,10 @@ public struct Phase52TimelineAssetContext: Sendable {
 
     public func inlineCustomEmojiItems(for message: Message) -> [MessageInlineCustomEmojiItem] {
         let serverID = snapshot.channelsByID[message.channelID]?.serverID
-        return customEmojiIndex.items(in: message.content, serverID: serverID).map { item in
-            MessageInlineCustomEmojiItem(
-                shortcode: item.shortcode,
+        return customEmojiIndex.matches(in: message.content, serverID: serverID).map { match in
+            let item = match.item
+            return MessageInlineCustomEmojiItem(
+                shortcode: match.token,
                 name: item.name,
                 imageData: imageDataByKey[ImageCacheKey(id: item.file.id.rawValue, kind: .customEmoji)]
             )

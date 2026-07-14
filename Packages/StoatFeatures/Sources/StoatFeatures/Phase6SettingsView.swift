@@ -909,6 +909,9 @@ private struct DeveloperVerificationTab: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .task {
+            viewModel.ensureNotificationSignatureStatus()
+        }
     }
 }
 
@@ -1107,6 +1110,9 @@ private struct NotificationSettingsTab: View {
             }
         }
         .formStyle(.grouped)
+        .task {
+            viewModel.ensureNotificationSignatureStatus()
+        }
     }
 
     private func binding<Value>(_ keyPath: WritableKeyPath<NotificationPreferences, Value>) -> Binding<Value> {

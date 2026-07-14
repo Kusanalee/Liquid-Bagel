@@ -1868,7 +1868,7 @@ private struct EmojiPickerPopover: View {
     }
 
     private func fallbackEmojiLabel(_ item: EmojiPickerItem) -> some View {
-        Text(item.insertionText)
+        Text(item.isCustom ? ":\(item.displayName):" : item.insertionText)
             .font(item.isCustom ? .caption.weight(.semibold) : .title3)
             .lineLimit(1)
             .minimumScaleFactor(0.6)

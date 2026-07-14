@@ -851,6 +851,23 @@ public enum NotificationSignatureChecker {
     }
 }
 
+public enum NotificationSignatureCheckState: Hashable, Sendable {
+    case notStarted
+    case checking
+    case finished(String)
+
+    public var statusText: String {
+        switch self {
+        case .notStarted:
+            "not checked"
+        case .checking:
+            "checking"
+        case let .finished(status):
+            status
+        }
+    }
+}
+
 public struct NotificationBuildReadinessDiagnostics: Hashable, Sendable {
     public var bundleIdentifier: String
     public var bundleDisplayName: String
@@ -864,6 +881,9 @@ public struct NotificationBuildReadinessDiagnostics: Hashable, Sendable {
     public var lastAfterStatus: String?
     public var systemSettingsCheck: String
     public var testingSignedBuild: Bool
+    public var signatureChecksStarted: Int
+    public var signatureChecksCompleted: Int
+    public var signatureCheckCacheHits: Int
 
     public init(
         bundleIdentifier: String = "-",
@@ -877,7 +897,10 @@ public struct NotificationBuildReadinessDiagnostics: Hashable, Sendable {
         lastBeforeStatus: String? = nil,
         lastAfterStatus: String? = nil,
         systemSettingsCheck: String = "Check System Settings > Notifications manually.",
-        testingSignedBuild: Bool = false
+        testingSignedBuild: Bool = false,
+        signatureChecksStarted: Int = 0,
+        signatureChecksCompleted: Int = 0,
+        signatureCheckCacheHits: Int = 0
     ) {
         self.bundleIdentifier = bundleIdentifier
         self.bundleDisplayName = bundleDisplayName
@@ -891,10 +914,13 @@ public struct NotificationBuildReadinessDiagnostics: Hashable, Sendable {
         self.lastAfterStatus = lastAfterStatus
         self.systemSettingsCheck = systemSettingsCheck
         self.testingSignedBuild = testingSignedBuild
+        self.signatureChecksStarted = signatureChecksStarted
+        self.signatureChecksCompleted = signatureChecksCompleted
+        self.signatureCheckCacheHits = signatureCheckCacheHits
     }
 
     public var summary: String {
-        "bundle \(bundleIdentifier), signed \(detectedSignatureStatus), signingAllowed \(codeSigningAllowed), sandbox \(sandboxStatus), delegate \(delegateConfigured ? "yes" : "no")"
+        "bundle \(bundleIdentifier), signed \(detectedSignatureStatus), signingAllowed \(codeSigningAllowed), sandbox \(sandboxStatus), delegate \(delegateConfigured ? "yes" : "no"), signatureChecks \(signatureChecksStarted)/\(signatureChecksCompleted), cacheHits \(signatureCheckCacheHits)"
     }
 }
 
