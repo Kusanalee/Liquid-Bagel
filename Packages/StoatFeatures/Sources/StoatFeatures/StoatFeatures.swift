@@ -648,6 +648,7 @@ public final class MainShellViewModel {
     public var memberListPerformanceDiagnostics = MemberListPerformanceDiagnostics()
     public var memberRoleSortDiagnostics = RoleSortDiagnostics()
     public private(set) var memberListGroupsRevision = 0
+    public private(set) var selectedMemberListPublicationRevision = 0
     public var visibleIdentityDiagnostics = VisibleIdentityDiagnostics()
     @ObservationIgnored public var phase43IdentitySnapshots = Phase43IdentitySnapshotStore()
     public var phase43IdentityGeneration = 0
@@ -2074,9 +2075,16 @@ public final class MainShellViewModel {
         for serverID in affectedServerIDs where
             Phase68MemberIdentityPresentationSignature(snapshot: before, serverID: serverID)
                 != Phase68MemberIdentityPresentationSignature(snapshot: after, serverID: serverID) {
-            phase68MemberIdentityRevisionByServerID[serverID, default: 0] &+= 1
-            phase68TraceDiagnostics.memberListRelevantInvalidationCount += 1
+            advanceMemberIdentityPresentationRevision(for: serverID)
         }
+    }
+
+    private func advanceMemberIdentityPresentationRevision(for serverID: ServerID) {
+        phase68MemberIdentityRevisionByServerID[serverID, default: 0] &+= 1
+        phase68TraceDiagnostics.memberListRelevantInvalidationCount += 1
+        guard selection.serverID == serverID else { return }
+        selectedMemberListPublicationRevision &+= 1
+        phase68TraceDiagnostics.selectedMemberListPublicationCount += 1
     }
 
     private func preserveRemovedRealtimeMemberIdentities(previous: RealtimeSnapshot, current: RealtimeSnapshot) {
@@ -2357,7 +2365,7 @@ public final class MainShellViewModel {
     public var memberListPresentationToken: String {
         guard let serverID = selection.serverID else { return "none" }
         let key = memberListCacheKey(serverID: serverID, query: "")
-        return "\(serverID.rawValue)|\(key.membersFingerprint)|\(key.presentationRevision)"
+        return "\(serverID.rawValue)|\(key.membersFingerprint)|\(key.presentationRevision)|\(selectedMemberListPublicationRevision)"
     }
 
     public func cachedMemberListGroups(for serverID: ServerID?) -> [MemberListGroup] {
@@ -2640,8 +2648,7 @@ public final class MainShellViewModel {
         let commitStarted = ContinuousClock.now
         phase43IdentitySnapshots = preparation.identitySnapshots
         phase43IdentityGeneration = preparation.identitySnapshots.generation
-        phase68MemberIdentityRevisionByServerID[serverID, default: 0] &+= 1
-        phase68TraceDiagnostics.memberListRelevantInvalidationCount += 1
+        advanceMemberIdentityPresentationRevision(for: serverID)
         for key in preparation.invalidatedAvatarKeys {
             removeImagePresentationData(for: key)
             imageResourceStates.removeValue(forKey: key)
@@ -9992,6 +9999,7 @@ public final class MainShellViewModel {
         phase51LastOperation: \(phase51.lastOperationCategory ?? "-") \(phase51.lastOperationMilliseconds.map(String.init) ?? "-")ms
         phase68IdentityNoOpMerges: \(phase68TraceDiagnostics.identityNoOpMergeCount)
         phase68MemberInvalidations: \(phase68TraceDiagnostics.memberListRelevantInvalidationCount)
+        phase69SelectedMemberPublications: \(phase68TraceDiagnostics.selectedMemberListPublicationCount)
         phase68EmojiIndexBuilds/cacheHits: \(phase68TraceDiagnostics.emojiIndexBuildCount)/\(phase68TraceDiagnostics.emojiIndexCacheHitCount)
         phase68DiagnosticsRequests/coalesced/builds/stale: \(phase68TraceDiagnostics.visibleIdentityDiagnosticsRequestCount)/\(phase68TraceDiagnostics.visibleIdentityDiagnosticsCoalescedCount)/\(phase68TraceDiagnostics.visibleIdentityDiagnosticsBuildCount)/\(phase68TraceDiagnostics.visibleIdentityDiagnosticsStaleResultCount)
         """))
@@ -13969,7 +13977,7 @@ public struct CredentialSetupView: View {
             LabeledContent("Phase 43 system events", value: "clickable \(identity.phase43.systemEventClickableParticipantCount), fallback \(identity.phase43.systemEventNonclickableFallbackCount), profile opens \(identity.phase43.profileOpensFromSystemEventsCount)")
             LabeledContent("Phase 43 hydration", value: "queued \(identity.phase43.identityHydrationQueuedCount), in-flight \(identity.phase43.identityHydrationInFlightCount), success/fail \(identity.phase43.identityHydrationSuccessCount)/\(identity.phase43.identityHydrationFailureCount), dedupe \(identity.phase43.identityHydrationDedupeHits), cooldown \(identity.phase43.identityHydrationCooldownSkips)")
             LabeledContent("Phase 43 preservation", value: "avatar \(identity.phase43.avatarMetadataPreservedAfterMemberRemovalCount), removals \(identity.phase43.memberRemovalIdentityPreservationCount), current edits \(identity.phase43.currentUserEditSnapshotMergeCount)")
-            LabeledContent("Phase 68 identity", value: "no-op merges \(phase68.identityNoOpMergeCount), member invalidations \(phase68.memberListRelevantInvalidationCount)")
+            LabeledContent("Phase 68/69 identity", value: "no-op merges \(phase68.identityNoOpMergeCount), member invalidations \(phase68.memberListRelevantInvalidationCount), selected publications \(phase68.selectedMemberListPublicationCount)")
             LabeledContent("Phase 68 emoji index", value: "builds \(phase68.emojiIndexBuildCount), cache hits \(phase68.emojiIndexCacheHitCount)")
             LabeledContent("Phase 68 diagnostics", value: "requests \(phase68.visibleIdentityDiagnosticsRequestCount), coalesced \(phase68.visibleIdentityDiagnosticsCoalescedCount), builds \(phase68.visibleIdentityDiagnosticsBuildCount), stale \(phase68.visibleIdentityDiagnosticsStaleResultCount)")
             LabeledContent("Freeze markers", value: freeze.lastMainThreadMarker ?? "-")

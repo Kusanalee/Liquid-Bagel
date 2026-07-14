@@ -3,6 +3,7 @@ import StoatAPI
 import StoatPersistence
 import StoatRealtime
 import StoatUI
+import Observation
 import XCTest
 @testable import StoatFeatures
 
@@ -4411,6 +4412,7 @@ final class StoatFeaturesTests: XCTestCase {
             runtimeMode: .mock,
             communityAPIClient: api
         )
+        let publicationBeforeHydration = model.phase68TraceDiagnostics.selectedMemberListPublicationCount
 
         await model.hydrateServerMembers(serverID: serverID, force: true, reason: "test")
         await model.prepareMemberListGroups(for: serverID)
@@ -4429,6 +4431,10 @@ final class StoatFeaturesTests: XCTestCase {
         XCTAssertEqual(model.memberHydrationDiagnostics.returnedCount, 3)
         XCTAssertEqual(model.memberHydrationDiagnostics.mergedUserCount, 2)
         XCTAssertEqual(model.memberHydrationDiagnostics.missingUserCount, 1)
+        XCTAssertEqual(model.phase68TraceDiagnostics.selectedMemberListPublicationCount, publicationBeforeHydration + 1)
+        XCTAssertEqual(model.phase52FreezeDiagnostics.snapshotInstallCount, 1)
+        XCTAssertEqual(model.phase52FreezeDiagnostics.memberHydrationCommitCount, 1)
+        XCTAssertEqual(model.phase52FreezeDiagnostics.identityBatchCommitCount, 1)
     }
 
     @MainActor
@@ -4951,6 +4957,94 @@ final class StoatFeaturesTests: XCTestCase {
         let stableToken = model.memberListPresentationToken
         model.replaceSnapshotForTesting(snapshot)
         XCTAssertEqual(model.memberListPresentationToken, stableToken)
+    }
+
+    @MainActor
+    func testPhase69LateSelectedServerIdentityPublishesAndRebuildsUnknownMemberExactlyOnce() async throws {
+        let serverID: ServerID = "phase69-member-server"
+        let otherServerID: ServerID = "phase69-other-server"
+        let channelID: ChannelID = "phase69-member-channel"
+        let userID: UserID = "phase69-late-user"
+        let otherUserID: UserID = "phase69-other-user"
+        let memberKey = ServerMemberKey(serverID: serverID, userID: userID)
+        let otherMemberKey = ServerMemberKey(serverID: otherServerID, userID: otherUserID)
+        let member = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date())
+        let otherMember = ServerMember(id: MemberCompositeKey(serverID: otherServerID, userID: otherUserID), joinedAt: Date())
+        let snapshot = RealtimeSnapshot(
+            serversByID: [
+                serverID: Server(id: serverID, ownerID: userID, name: "Phase 69"),
+                otherServerID: Server(id: otherServerID, ownerID: otherUserID, name: "Other")
+            ],
+            channelsByID: [channelID: Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")],
+            membersByServerAndUserID: [memberKey: member, otherMemberKey: otherMember]
+        )
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
+            snapshot: snapshot
+        )
+
+        await model.prepareMemberListGroups(for: serverID)
+        XCTAssertEqual(model.cachedMemberListGroups(for: serverID).flatMap(\.items).first?.displayName, "Unknown member")
+
+        let userPublication = expectation(description: "late user identity publishes selected member token")
+        withObservationTracking {
+            _ = model.memberListPresentationToken
+        } onChange: {
+            userPublication.fulfill()
+        }
+        let publicationBeforeUser = model.phase68TraceDiagnostics.selectedMemberListPublicationCount
+        let lateAvatar = File(id: "phase69-user-avatar", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: 42)
+        let lateUser = User(id: userID, username: "late-user", displayName: "Late User", avatar: lateAvatar)
+
+        model.noteVisibleIdentity(userID: userID, user: lateUser, member: nil, serverID: serverID, source: .visibleMessage)
+        await fulfillment(of: [userPublication], timeout: 1)
+        XCTAssertEqual(model.phase68TraceDiagnostics.selectedMemberListPublicationCount, publicationBeforeUser + 1)
+
+        await model.prepareMemberListGroups(for: serverID)
+        var rebuiltItem = try XCTUnwrap(model.cachedMemberListGroups(for: serverID).flatMap(\.items).first)
+        XCTAssertEqual(rebuiltItem.displayName, "Late User")
+        XCTAssertEqual(rebuiltItem.avatar?.id, lateAvatar.id)
+
+        let memberPublication = expectation(description: "late member identity publishes selected member token")
+        withObservationTracking {
+            _ = model.memberListPresentationToken
+        } onChange: {
+            memberPublication.fulfill()
+        }
+        let serverAvatar = File(id: "phase69-server-avatar", tag: "avatars", filename: "server-avatar.png", contentType: "image/png", size: 43)
+        var enrichedMember = member
+        enrichedMember.nickname = "Late Nickname"
+        enrichedMember.avatar = serverAvatar
+        let publicationBeforeMember = model.phase68TraceDiagnostics.selectedMemberListPublicationCount
+
+        model.noteVisibleIdentity(userID: userID, user: nil, member: enrichedMember, serverID: serverID, source: .visibleMessage)
+        await fulfillment(of: [memberPublication], timeout: 1)
+        XCTAssertEqual(model.phase68TraceDiagnostics.selectedMemberListPublicationCount, publicationBeforeMember + 1)
+
+        await model.prepareMemberListGroups(for: serverID)
+        rebuiltItem = try XCTUnwrap(model.cachedMemberListGroups(for: serverID).flatMap(\.items).first)
+        XCTAssertEqual(rebuiltItem.displayName, "Late Nickname")
+        XCTAssertEqual(rebuiltItem.avatar?.id, serverAvatar.id)
+
+        let stableToken = model.memberListPresentationToken
+        let stablePublicationCount = model.phase68TraceDiagnostics.selectedMemberListPublicationCount
+        let stableGroupingRevision = model.memberListGroupsRevision
+        model.noteVisibleIdentity(userID: userID, user: nil, member: enrichedMember, serverID: serverID, source: .visibleMessage)
+        XCTAssertEqual(model.memberListPresentationToken, stableToken)
+        XCTAssertEqual(model.phase68TraceDiagnostics.selectedMemberListPublicationCount, stablePublicationCount)
+        XCTAssertEqual(model.memberListGroupsRevision, stableGroupingRevision)
+
+        let selectedTokenBeforeOtherServer = model.memberListPresentationToken
+        model.noteVisibleIdentity(
+            userID: otherUserID,
+            user: User(id: otherUserID, username: "other", displayName: "Other User"),
+            member: otherMember,
+            serverID: otherServerID,
+            source: .visibleMember
+        )
+        XCTAssertEqual(model.memberListPresentationToken, selectedTokenBeforeOtherServer)
+        XCTAssertEqual(model.phase68TraceDiagnostics.selectedMemberListPublicationCount, stablePublicationCount)
+        XCTAssertEqual(model.memberListGroupsRevision, stableGroupingRevision)
     }
 
     func testPhase68CustomEmojiIndexUsesCurrentServerDeduplicatesAndSkipsFencedCode() throws {

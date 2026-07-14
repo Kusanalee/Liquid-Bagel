@@ -6,6 +6,7 @@ import StoatUI
 public struct Phase68TraceDiagnostics: Hashable, Sendable {
     public var identityNoOpMergeCount: Int
     public var memberListRelevantInvalidationCount: Int
+    public var selectedMemberListPublicationCount: Int
     public var emojiIndexBuildCount: Int
     public var emojiIndexCacheHitCount: Int
     public var visibleIdentityDiagnosticsRequestCount: Int
@@ -16,6 +17,7 @@ public struct Phase68TraceDiagnostics: Hashable, Sendable {
     public init(
         identityNoOpMergeCount: Int = 0,
         memberListRelevantInvalidationCount: Int = 0,
+        selectedMemberListPublicationCount: Int = 0,
         emojiIndexBuildCount: Int = 0,
         emojiIndexCacheHitCount: Int = 0,
         visibleIdentityDiagnosticsRequestCount: Int = 0,
@@ -25,6 +27,7 @@ public struct Phase68TraceDiagnostics: Hashable, Sendable {
     ) {
         self.identityNoOpMergeCount = identityNoOpMergeCount
         self.memberListRelevantInvalidationCount = memberListRelevantInvalidationCount
+        self.selectedMemberListPublicationCount = selectedMemberListPublicationCount
         self.emojiIndexBuildCount = emojiIndexBuildCount
         self.emojiIndexCacheHitCount = emojiIndexCacheHitCount
         self.visibleIdentityDiagnosticsRequestCount = visibleIdentityDiagnosticsRequestCount

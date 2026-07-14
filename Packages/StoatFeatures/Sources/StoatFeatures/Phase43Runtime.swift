@@ -422,12 +422,12 @@ public struct Phase43IdentitySnapshotStore: Hashable, Sendable {
         if let displayName = Self.trimmed(user?.displayName) {
             return ResolvedUserDisplay(userID: userID, displayName: displayName, subtitle: subtitle, avatarFile: avatar, fallbackInitials: UserDisplayResolver.initials(for: displayName), isFallback: false, source: .userDisplayName, isBot: user?.bot != nil || snapshot?.isBot == true, roleColor: roleColor, roleColorDiagnostics: roleDiagnostics, serverContextID: server?.id)
         }
+        if let displayName = snapshot?.displayName {
+            return ResolvedUserDisplay(userID: userID, displayName: displayName, subtitle: subtitle, avatarFile: avatar, fallbackInitials: UserDisplayResolver.initials(for: displayName), isFallback: false, source: .userDisplayName, isBot: snapshot?.isBot == true, roleColor: roleColor, roleColorDiagnostics: roleDiagnostics, serverContextID: server?.id)
+        }
         if let username {
             let source: ResolvedUserDisplaySource = (user?.bot != nil || snapshot?.isBot == true) ? .botName : .username
             return ResolvedUserDisplay(userID: userID, displayName: username, subtitle: "@\(username)", avatarFile: avatar, fallbackInitials: UserDisplayResolver.initials(for: username), isFallback: false, source: source, isBot: user?.bot != nil || snapshot?.isBot == true, roleColor: roleColor, roleColorDiagnostics: roleDiagnostics, serverContextID: server?.id)
-        }
-        if let displayName = snapshot?.displayName {
-            return ResolvedUserDisplay(userID: userID, displayName: displayName, subtitle: subtitle, avatarFile: avatar, fallbackInitials: UserDisplayResolver.initials(for: displayName), isFallback: false, source: .userDisplayName, isBot: snapshot?.isBot == true, roleColor: roleColor, roleColorDiagnostics: roleDiagnostics, serverContextID: server?.id)
         }
         if let historical = historicalOverlay?.nickname {
             return ResolvedUserDisplay(userID: userID, displayName: historical, subtitle: subtitle, avatarFile: avatar, fallbackInitials: UserDisplayResolver.initials(for: historical), isFallback: false, source: .memberNickname, isBot: snapshot?.isBot == true, roleColor: roleColor, roleColorDiagnostics: roleDiagnostics, serverContextID: server?.id)
