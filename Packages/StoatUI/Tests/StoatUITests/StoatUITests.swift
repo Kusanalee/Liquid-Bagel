@@ -606,6 +606,39 @@ final class StoatUITests: XCTestCase {
         )
     }
 
+    func testPhase66MessageActionBarMountsOnlyForActiveRowsWithActions() {
+        XCTAssertFalse(MessageRowActionLayout.shouldMountActionBar(
+            hasActions: true,
+            isHovering: false,
+            isFocused: false,
+            isSelected: false
+        ))
+        XCTAssertTrue(MessageRowActionLayout.shouldMountActionBar(
+            hasActions: true,
+            isHovering: true,
+            isFocused: false,
+            isSelected: false
+        ))
+        XCTAssertTrue(MessageRowActionLayout.shouldMountActionBar(
+            hasActions: true,
+            isHovering: false,
+            isFocused: true,
+            isSelected: false
+        ))
+        XCTAssertTrue(MessageRowActionLayout.shouldMountActionBar(
+            hasActions: true,
+            isHovering: false,
+            isFocused: false,
+            isSelected: true
+        ))
+        XCTAssertFalse(MessageRowActionLayout.shouldMountActionBar(
+            hasActions: false,
+            isHovering: true,
+            isFocused: true,
+            isSelected: true
+        ))
+    }
+
     func testPhase65EmojiPickerItemKeepsArtworkAndReadableFallbackMetadata() {
         let fallback = EmojiPickerItem(
             id: "custom-bagel",

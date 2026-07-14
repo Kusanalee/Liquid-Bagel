@@ -646,6 +646,15 @@ enum MessageRowActionLayout {
         let barPadding = StoatSpacing.xxSmall * 2
         return CGFloat(buttonCount) * buttonWidth + internalSpacing + barPadding + StoatSpacing.small
     }
+
+    static func shouldMountActionBar(
+        hasActions: Bool,
+        isHovering: Bool,
+        isFocused: Bool,
+        isSelected: Bool
+    ) -> Bool {
+        hasActions && (isHovering || isFocused || isSelected)
+    }
 }
 
 public struct MessageRowReplyPreviewItem: Identifiable, Hashable, Sendable {
@@ -3171,11 +3180,8 @@ public struct MessageRow: View {
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
         .overlay(alignment: .topTrailing) {
-            if !actionItems.isEmpty {
+            if showsActionAffordance {
                 messageActionBar
-                    .opacity(showsActionAffordance ? 1 : 0)
-                    .allowsHitTesting(showsActionAffordance)
-                    .accessibilityHidden(!showsActionAffordance)
             }
         }
         .padding(.vertical, (showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall) + searchStyle.verticalPaddingAdjustment)
@@ -3304,7 +3310,12 @@ public struct MessageRow: View {
     }
 
     private var showsActionAffordance: Bool {
-        !actionItems.isEmpty && (isHovering || isFocused || isSelected)
+        MessageRowActionLayout.shouldMountActionBar(
+            hasActions: !actionItems.isEmpty,
+            isHovering: isHovering,
+            isFocused: isFocused,
+            isSelected: isSelected
+        )
     }
 
     private var fallbackReactionItems: [MessageReactionDisplayItem] {

@@ -37,3 +37,10 @@ Phase 65 responds to the Phase 64 live pass. Immediate channel loading, composer
 6. Reconfirm jump-to-newest, load-older position preservation, unread scrolling, and long/short biography disclosure after the chat-layout restructure.
 
 Large-channel performance, emoji picker, and custom emoji remain `partial` until this live retest passes. Animated custom emoji playback and unverified cross-server usage remain outside Phase 65.
+
+## Live QA Result (2026-07-14)
+
+- **Scrolling failed:** the app froze again while scrolling the capped timeline, so the remaining Phase 65 QA is paused.
+- The supplied 1.616-second sample did not reproduce the Phase 64 full-history measurement loop. Instead, 632 of 718 platform-view update samples were inside SwiftUI's macOS `AppKitPopUpAdaptor`, rebuilding message action `Menu` content and accessibility labels.
+- Phase 65 preserved row geometry by keeping the action-bar overlay mounted at zero opacity for inactive rows. That also materialized an AppKit-backed menu for every realized row, turning rapid lazy-row creation into main-thread menu work.
+- Phase 66 keeps the fixed trailing reservation but mounts the action bar and menu only for the active hovered, focused, or selected row. Large-channel performance remains `partial` pending the Phase 66 live gate.
