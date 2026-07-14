@@ -638,6 +638,7 @@ public struct MessageRowActionItem: Identifiable, Hashable, Sendable {
 enum MessageRowActionLayout {
     static let buttonWidth: CGFloat = 26
     static let maximumPrimaryActions = 3
+    static let hoverFadeDuration: TimeInterval = 0.08
 
     static func trailingReservation(primaryActionCount: Int, hasMenu: Bool) -> CGFloat {
         let buttonCount = min(max(0, primaryActionCount), maximumPrimaryActions) + (hasMenu ? 1 : 0)
@@ -654,6 +655,20 @@ enum MessageRowActionLayout {
         isSelected: Bool
     ) -> Bool {
         hasActions && (isHovering || isFocused || isSelected)
+    }
+
+    static func allowsActionBarInteraction(
+        hasActions: Bool,
+        isHovering: Bool,
+        isFocused: Bool,
+        isSelected: Bool
+    ) -> Bool {
+        shouldMountActionBar(
+            hasActions: hasActions,
+            isHovering: isHovering,
+            isFocused: isFocused,
+            isSelected: isSelected
+        )
     }
 }
 
@@ -3178,11 +3193,21 @@ public struct MessageRow: View {
         .padding(.trailing, actionBarTrailingReservation)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .onHover { isHovering = $0 }
-        .overlay(alignment: .topTrailing) {
-            if showsActionAffordance {
-                messageActionBar
+        .onHover { hovering in
+            guard hovering != isHovering else { return }
+            withAnimation(.easeOut(duration: MessageRowActionLayout.hoverFadeDuration)) {
+                isHovering = hovering
             }
+        }
+        .overlay(alignment: .topTrailing) {
+            Group {
+                if showsActionAffordance {
+                    messageActionBar
+                        .transition(.opacity)
+                }
+            }
+            .allowsHitTesting(allowsActionAffordanceInteraction)
+            .accessibilityHidden(!allowsActionAffordanceInteraction)
         }
         .padding(.vertical, (showsHeader ? StoatSpacing.small : StoatSpacing.xxSmall) + searchStyle.verticalPaddingAdjustment)
         .background(searchBackground(searchStyle), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
@@ -3311,6 +3336,15 @@ public struct MessageRow: View {
 
     private var showsActionAffordance: Bool {
         MessageRowActionLayout.shouldMountActionBar(
+            hasActions: !actionItems.isEmpty,
+            isHovering: isHovering,
+            isFocused: isFocused,
+            isSelected: isSelected
+        )
+    }
+
+    private var allowsActionAffordanceInteraction: Bool {
+        MessageRowActionLayout.allowsActionBarInteraction(
             hasActions: !actionItems.isEmpty,
             isHovering: isHovering,
             isFocused: isFocused,

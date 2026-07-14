@@ -588,18 +588,21 @@ final class StoatUITests: XCTestCase {
         )
     }
 
-    func testPhase65MessageActionReservationDoesNotDependOnHoverVisibility() {
-        let hiddenReservation = MessageRowActionLayout.trailingReservation(
+    func testPhase67MessageActionReservationDoesNotDependOnPresentationState() {
+        let expectedReservation = MessageRowActionLayout.trailingReservation(
             primaryActionCount: 3,
             hasMenu: true
         )
-        let visibleReservation = MessageRowActionLayout.trailingReservation(
-            primaryActionCount: 3,
-            hasMenu: true
-        )
+        let presentationStates = ["hidden", "hovered", "focused", "selected", "fading"]
 
-        XCTAssertEqual(hiddenReservation, visibleReservation)
-        XCTAssertGreaterThan(hiddenReservation, 0)
+        for state in presentationStates {
+            XCTAssertEqual(
+                MessageRowActionLayout.trailingReservation(primaryActionCount: 3, hasMenu: true),
+                expectedReservation,
+                "Reservation changed while \(state)"
+            )
+        }
+        XCTAssertGreaterThan(expectedReservation, 0)
         XCTAssertEqual(
             MessageRowActionLayout.trailingReservation(primaryActionCount: 0, hasMenu: false),
             0
@@ -637,6 +640,40 @@ final class StoatUITests: XCTestCase {
             isFocused: true,
             isSelected: true
         ))
+    }
+
+    func testPhase67MessageActionInteractionFollowsActiveMountState() {
+        XCTAssertFalse(MessageRowActionLayout.allowsActionBarInteraction(
+            hasActions: true,
+            isHovering: false,
+            isFocused: false,
+            isSelected: false
+        ))
+        XCTAssertTrue(MessageRowActionLayout.allowsActionBarInteraction(
+            hasActions: true,
+            isHovering: true,
+            isFocused: false,
+            isSelected: false
+        ))
+        XCTAssertTrue(MessageRowActionLayout.allowsActionBarInteraction(
+            hasActions: true,
+            isHovering: false,
+            isFocused: true,
+            isSelected: false
+        ))
+        XCTAssertTrue(MessageRowActionLayout.allowsActionBarInteraction(
+            hasActions: true,
+            isHovering: false,
+            isFocused: false,
+            isSelected: true
+        ))
+        XCTAssertFalse(MessageRowActionLayout.allowsActionBarInteraction(
+            hasActions: false,
+            isHovering: true,
+            isFocused: true,
+            isSelected: true
+        ))
+        XCTAssertEqual(MessageRowActionLayout.hoverFadeDuration, 0.08, accuracy: 0.001)
     }
 
     func testPhase65EmojiPickerItemKeepsArtworkAndReadableFallbackMetadata() {

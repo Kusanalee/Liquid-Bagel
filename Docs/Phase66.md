@@ -30,3 +30,11 @@ Phase 66 responds to the Phase 65 live blocker: the app froze while scrolling th
 5. Reconfirm jump-to-newest, load-older position preservation, and unread scrolling.
 
 Large-channel performance remains `partial` until this live gate passes. Emoji-picker and broader Phase 65 QA remain paused behind the scrolling blocker.
+
+## Live QA Result (2026-07-14)
+
+- **Scrolling freeze passed:** rapid scrolling with the pointer over and outside the timeline no longer froze or beachballed, and no row jump, movement, or rewrapping was observed.
+- **Settling passed:** CPU returned below 10% within two seconds. Short active-scroll spikes remain informational because scrolling must perform bounded layout, rendering, hit-testing, and pointer tracking.
+- **Sample passed the Phase 66 signatures:** the 1.956-second Debug/Xcode sample found the main thread waiting in 1,713 of 1,955 samples. `LazyStack.measureEstimates` was absent and `AppKitPopUpAdaptor` appeared only incidentally instead of dominating the capture.
+- **Actions passed with a polish gap:** primary actions, the ellipsis menu, and full-row context actions worked, but the action bar rarely flickered across hover/tracking transitions. Phase 67 adds an opacity-only hover transition without changing row geometry or restoring inactive-row menus.
+- A Release Time Profiler capture plus jump-to-newest, load-older position preservation, and unread-separator scrolling remain required before the combined Phase 66/67 gate is complete. Large-channel performance therefore remains `partial`.
