@@ -34,6 +34,10 @@ Categorical outcomes only. No payload bodies, private URLs, full IDs, or message
 | 17 | Send a mention inside a fenced code block | Token stays literal text, not a pill, in both clients | | |
 | 18 | Mention a user ID that cannot be resolved locally (if safely testable) | Safe `Unknown User` fallback pill renders; no raw ID leak, no crash | | |
 | 19 | Copy Developer Verification diagnostics after this lane | No redaction leaks | | |
+| 20 | Put the caret in the middle of a draft and insert Unicode and custom emoji from the picker | Each emoji lands at the caret, the caret lands immediately after it, and the composer regains focus | | |
+| 21 | Type `#`, `%`, and `:sh` in a server-channel draft; navigate and select results with Up/Down/Return/Tab/Escape | Visible text channels, rank-ordered roles, and custom emoji share one responsive popover and insert exact `<#ULID> `, `<%ULID> `, and `:ULID:` tokens | | |
+| 22 | Compare picker and `:` typeahead insertion for the same custom emoji | Draft/wire token is byte-identical and has no trailing space | | |
+| 23 | Try `# Heading`, `#1`, `#ffffff`, `https://`, `12:30`, `50%`, `a@b.com`, and sigils inside inline code | No autocomplete appears; valid mid-sentence `@`, `#`, `%`, and two-character `:` queries still appear | | |
 
 ## Matrix Rows Unlocked
 
@@ -42,10 +46,10 @@ Categorical outcomes only. No payload bodies, private URLs, full IDs, or message
 | Core chat / replies | Steps 5-8 pass including at least one deleted/unloaded variant |
 | Core chat / pins | Steps 9-10 pass |
 | Core chat / reactions | Steps 11-12 pass |
-| Core chat / emoji picker | Step 13 passes official-client comparison |
-| Core chat / custom emoji | Steps 2, 12 pass with live syntax/media proof |
+| Core chat / emoji picker | Steps 13, 20, and 22 pass official-client and caret comparison |
+| Core chat / custom emoji | Steps 2, 12, 21, and 22 pass with live syntax/media proof |
 | Core chat / markdown | Steps 1-2 pass real-message comparison |
 | Core chat / embeds | Steps 3-4 pass with live payload variety |
-| Core chat / mentions | Steps 14-18 pass, including the fenced-code and unresolved-mention cases |
+| Core chat / mentions | Steps 14-18, 21, and 23 pass, including all composer kinds, fenced-code, negative cases, and unresolved mentions |
 
 Rows stay `partial` if a live-sensitive step is blocked; note the blocker as the row's concrete noncritical gap.

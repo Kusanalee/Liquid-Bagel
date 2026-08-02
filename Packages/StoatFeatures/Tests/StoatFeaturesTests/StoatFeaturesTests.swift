@@ -4,6 +4,7 @@ import StoatPersistence
 import StoatRealtime
 import StoatUI
 import Observation
+import SwiftUI
 import XCTest
 @testable import StoatFeatures
 
@@ -6005,7 +6006,7 @@ final class StoatFeaturesTests: XCTestCase {
         let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser)
 
         model.composerInlineTriggerChanged(InlineComposerTrigger(utf16Location: 0, utf16Length: 1, query: ""), for: groupID)
-        XCTAssertEqual(Set(model.composerMentionCandidates.map(\.name)), ["Alice", "Bob"])
+        XCTAssertEqual(Set(model.composerAutocompleteCandidates.map(\.name)), ["Alice", "Bob"])
 
         var updatedSnapshot = model.snapshot
         let carol = User(id: "phase58-idx-carol", username: "carol", displayName: "Carol")
@@ -6017,7 +6018,7 @@ final class StoatFeaturesTests: XCTestCase {
         model.replaceSnapshotForTesting(updatedSnapshot)
 
         model.composerInlineTriggerChanged(InlineComposerTrigger(utf16Location: 0, utf16Length: 1, query: ""), for: groupID)
-        XCTAssertEqual(Set(model.composerMentionCandidates.map(\.name)), ["Alice", "Bob", "Carol"])
+        XCTAssertEqual(Set(model.composerAutocompleteCandidates.map(\.name)), ["Alice", "Bob", "Carol"])
     }
 
     @MainActor
@@ -6036,8 +6037,8 @@ final class StoatFeaturesTests: XCTestCase {
         let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser)
 
         model.composerInlineTriggerChanged(InlineComposerTrigger(utf16Location: 0, utf16Length: 1, query: "match"), for: groupID)
-        XCTAssertEqual(model.composerMentionCandidates.count, 10)
-        XCTAssertTrue(model.composerMentionCandidates.allSatisfy { $0.name.lowercased().hasPrefix("match") })
+        XCTAssertEqual(model.composerAutocompleteCandidates.count, 10)
+        XCTAssertTrue(model.composerAutocompleteCandidates.allSatisfy { $0.name.lowercased().hasPrefix("match") })
     }
 
     @MainActor
@@ -6053,17 +6054,186 @@ final class StoatFeaturesTests: XCTestCase {
 
         model.updateDraft("hi @al", for: groupID)
         model.composerInlineTriggerChanged(InlineComposerTrigger(utf16Location: 3, utf16Length: 3, query: "al"), for: groupID)
-        guard let candidate = model.composerMentionCandidates.first(where: { $0.userID == alice.id }) else {
+        guard let candidate = model.composerAutocompleteCandidates.first(where: { $0.userID == alice.id }) else {
             XCTFail("expected Alice among candidates")
             return
         }
-        model.selectComposerMentionCandidate(candidate, for: groupID)
+        model.selectComposerAutocompleteCandidate(candidate, for: groupID)
 
         let expectedToken = "hi <@\(alice.id.rawValue)> "
         XCTAssertEqual(model.draft(for: groupID), expectedToken)
-        XCTAssertNil(model.composerMentionTrigger)
-        XCTAssertTrue(model.composerMentionCandidates.isEmpty)
+        XCTAssertNil(model.composerAutocompleteTrigger)
+        XCTAssertTrue(model.composerAutocompleteCandidates.isEmpty)
         XCTAssertEqual(model.composerCursorRequest?.utf16Offset, (expectedToken as NSString).length)
+    }
+
+    @MainActor
+    func testPhase71EmojiInsertionUsesUTF16CaretAndSafeFallbacks() {
+        let channelID: ChannelID = "phase71-caret-channel"
+        var snapshot = RealtimeSnapshot()
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .group, name: "Caret")
+        let model = MainShellViewModel(snapshot: snapshot)
+
+        model.updateDraft("A😀B", for: channelID)
+        model.insertEmoji("🥯", at: 3, in: channelID)
+        XCTAssertEqual(model.draft(for: channelID), "A😀🥯B")
+        XCTAssertEqual(model.composerCursorRequest?.utf16Offset, 5)
+
+        model.updateDraft("A😀B", for: channelID)
+        model.insertEmoji("🥯", in: channelID)
+        XCTAssertEqual(model.draft(for: channelID), "A😀B🥯")
+
+        model.updateDraft("A😀B", for: channelID)
+        model.insertEmoji("🥯", at: 999, in: channelID)
+        XCTAssertEqual(model.draft(for: channelID), "A😀B🥯")
+        XCTAssertEqual(model.composerCursorRequest?.utf16Offset, 6)
+    }
+
+    @MainActor
+    func testPhase71ChannelRoleAndEmojiAutocompleteScopeOrderingAndTokens() throws {
+        let currentUser = User(id: "phase71-me", username: "me", relationship: .user)
+        let serverID: ServerID = "phase71-server"
+        let generalID: ChannelID = "phase71-general"
+        let randomID: ChannelID = "phase71-random"
+        let voiceID: ChannelID = "phase71-voice"
+        let dmID: ChannelID = "phase71-dm"
+        let adminID: RoleID = "phase71-admin"
+        let memberID: RoleID = "phase71-member"
+        let emojiID: EmojiID = "01J00000000000000000710001"
+        let roles = [
+            memberID: Role(id: memberID, name: "Member", permissions: PermissionOverride(), rank: 20),
+            adminID: Role(id: adminID, name: "Admin", permissions: PermissionOverride(), colour: "#3366CC", rank: 1)
+        ]
+        let server = Server(
+            id: serverID,
+            ownerID: currentUser.id,
+            name: "Phase 71",
+            channelIDs: [generalID, voiceID, randomID],
+            roles: roles
+        )
+        var snapshot = RealtimeSnapshot()
+        snapshot.usersByID[currentUser.id] = currentUser
+        snapshot.serversByID[serverID] = server
+        snapshot.channelsByID[generalID] = Channel(id: generalID, kind: .textChannel, serverID: serverID, name: "general")
+        snapshot.channelsByID[randomID] = Channel(id: randomID, kind: .textChannel, serverID: serverID, name: "random")
+        snapshot.channelsByID[voiceID] = Channel(id: voiceID, kind: .voiceChannel, serverID: serverID, name: "voice")
+        snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, name: "DM", recipients: [currentUser.id])
+        snapshot.emojisByID[emojiID] = Emoji(id: emojiID, parent: .server(serverID), creatorID: currentUser.id, name: "bagel_party")
+        let model = MainShellViewModel(
+            selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: generalID),
+            snapshot: snapshot,
+            currentUser: currentUser
+        )
+
+        model.composerInlineTriggerChanged(
+            InlineComposerTrigger(utf16Location: 0, utf16Length: 1, query: "", kind: .channel),
+            for: generalID
+        )
+        XCTAssertEqual(model.composerAutocompleteCandidates.map(\.rawID), [generalID.rawValue, randomID.rawValue])
+
+        model.composerInlineTriggerChanged(
+            InlineComposerTrigger(utf16Location: 0, utf16Length: 1, query: "", kind: .channel),
+            for: dmID
+        )
+        XCTAssertTrue(model.composerAutocompleteCandidates.isEmpty)
+
+        model.composerInlineTriggerChanged(
+            InlineComposerTrigger(utf16Location: 0, utf16Length: 1, query: "", kind: .role),
+            for: generalID
+        )
+        XCTAssertEqual(model.composerAutocompleteCandidates.map(\.rawID), [adminID.rawValue, memberID.rawValue])
+        XCTAssertNotNil(model.composerAutocompleteCandidates.first?.roleColor)
+
+        model.updateDraft("#ge", for: generalID)
+        model.composerInlineTriggerChanged(
+            InlineComposerTrigger(utf16Location: 0, utf16Length: 3, query: "ge", kind: .channel),
+            for: generalID
+        )
+        model.selectComposerAutocompleteCandidate(try XCTUnwrap(model.composerAutocompleteCandidates.first), for: generalID)
+        XCTAssertEqual(model.draft(for: generalID), "<#\(generalID.rawValue)> ")
+
+        model.updateDraft("%ad", for: generalID)
+        model.composerInlineTriggerChanged(
+            InlineComposerTrigger(utf16Location: 0, utf16Length: 3, query: "ad", kind: .role),
+            for: generalID
+        )
+        model.selectComposerAutocompleteCandidate(try XCTUnwrap(model.composerAutocompleteCandidates.first), for: generalID)
+        XCTAssertEqual(model.draft(for: generalID), "<%\(adminID.rawValue)> ")
+
+        let pickerToken = try XCTUnwrap(
+            model.composerEmojiSections.flatMap(\.items).first { $0.displayName == "bagel_party" }?.insertionText
+        )
+        model.composerInlineTriggerChanged(
+            InlineComposerTrigger(utf16Location: 0, utf16Length: 3, query: "ba", kind: .emoji),
+            for: generalID
+        )
+        let emojiCandidate = try XCTUnwrap(model.composerAutocompleteCandidates.first)
+        XCTAssertEqual(Phase71ComposerToken.insertionText(for: emojiCandidate), pickerToken)
+        XCTAssertEqual(pickerToken, ":\(emojiID.rawValue):")
+    }
+
+    @MainActor
+    func testPhase71EmojiAutocompleteReusesPhase68IndexAndAliasIndexKeepsCap() {
+        let serverID: ServerID = "phase71-cache-server"
+        let channelID: ChannelID = "phase71-cache-channel"
+        var snapshot = RealtimeSnapshot()
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Cache")
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
+        for index in 0..<15 {
+            let id = EmojiID(rawValue: String(format: "01J0000000000000000071%04d", index))
+            snapshot.emojisByID[id] = Emoji(id: id, parent: .server(serverID), creatorID: "owner", name: "party_\(index)")
+        }
+        let model = MainShellViewModel(snapshot: snapshot)
+
+        for query in ["pa", "par", "party"] {
+            model.composerInlineTriggerChanged(
+                InlineComposerTrigger(utf16Location: 0, utf16Length: query.count + 1, query: query, kind: .emoji),
+                for: channelID
+            )
+        }
+        XCTAssertEqual(model.phase68TraceDiagnostics.emojiIndexBuildCount, 1)
+        XCTAssertGreaterThanOrEqual(model.phase68TraceDiagnostics.emojiIndexCacheHitCount, 3)
+        XCTAssertEqual(model.composerAutocompleteCandidates.count, 10)
+
+        let aliasCandidates = (0..<12).map { index in
+            ComposerAutocompleteCandidate(
+                kind: .emoji,
+                rawID: "alias-\(index)",
+                name: "Artwork \(index)",
+                searchAliases: ["party\(index)"]
+            )
+        }
+        let aliasMatches = Phase58MentionCandidateIndex(candidates: aliasCandidates).matches(prefix: "party", limit: 10)
+        XCTAssertEqual(aliasMatches.count, 10)
+        XCTAssertEqual(Set(aliasMatches.map(\.id)).count, 10)
+    }
+
+    func testPhase71VerifiedMacShortcutTableHasOfficialUniqueMappings() throws {
+        let shortcuts = Phase71Keybinds.verifiedMacShortcuts
+        XCTAssertEqual(shortcuts[.selectPreviousServer]?.key, .upArrow)
+        XCTAssertEqual(shortcuts[.selectPreviousServer]?.modifiers, [.command, .control])
+        XCTAssertEqual(shortcuts[.selectNextServer]?.key, .downArrow)
+        XCTAssertEqual(shortcuts[.selectNextServer]?.modifiers, [.command, .control])
+        XCTAssertEqual(shortcuts[.selectPreviousChannel]?.key, .upArrow)
+        XCTAssertEqual(shortcuts[.selectPreviousChannel]?.modifiers, [.command])
+        XCTAssertEqual(shortcuts[.selectNextChannel]?.key, .downArrow)
+        XCTAssertEqual(shortcuts[.selectNextChannel]?.modifiers, [.command])
+
+        let identities = shortcuts.values.map { "\($0.key.character)|\($0.modifiers)" }
+        XCTAssertEqual(Set(identities).count, identities.count)
+    }
+
+    @MainActor
+    func testPhase71NilTriggerPublicationsPreservePhase63SuppressionContract() {
+        let model = MainShellViewModel(snapshot: RealtimeSnapshot())
+        let publications = model.phase63ComposerDiagnostics.inlineTriggerPublicationCount
+        let suppressions = model.phase63ComposerDiagnostics.inlineTriggerSuppressionCount
+
+        model.composerInlineTriggerChanged(nil, for: nil)
+        model.composerInlineTriggerChanged(nil, for: nil)
+
+        XCTAssertEqual(model.phase63ComposerDiagnostics.inlineTriggerPublicationCount, publications + 2)
+        XCTAssertEqual(model.phase63ComposerDiagnostics.inlineTriggerSuppressionCount, suppressions + 2)
     }
 
     @MainActor

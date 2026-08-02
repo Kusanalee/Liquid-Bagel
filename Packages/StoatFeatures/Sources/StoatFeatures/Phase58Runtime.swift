@@ -30,27 +30,38 @@ public struct PendingGroupMemberRemoval: Hashable, Sendable, Identifiable {
 public struct Phase58MentionCandidateIndex: Sendable {
     private struct Entry: Sendable {
         let searchKey: String
-        let candidate: ComposerMentionCandidate
+        let candidate: ComposerAutocompleteCandidate
     }
 
     private let entries: [Entry]
 
-    public init(candidates: [ComposerMentionCandidate]) {
-        var seen: Set<UserID> = []
+    public init(candidates: [ComposerAutocompleteCandidate]) {
+        var seen: Set<String> = []
         var built: [Entry] = []
         built.reserveCapacity(candidates.count)
-        for candidate in candidates where seen.insert(candidate.userID).inserted {
-            built.append(Entry(searchKey: candidate.name.lowercased(), candidate: candidate))
+        for candidate in candidates where seen.insert(candidate.id).inserted {
+            for searchKey in [candidate.name] + candidate.searchAliases {
+                built.append(Entry(searchKey: searchKey.lowercased(), candidate: candidate))
+            }
         }
-        entries = built.sorted { $0.searchKey < $1.searchKey }
+        entries = built.sorted {
+            $0.searchKey == $1.searchKey ? $0.candidate.id < $1.candidate.id : $0.searchKey < $1.searchKey
+        }
     }
 
     public var isEmpty: Bool { entries.isEmpty }
 
-    public func matches(prefix: String, limit: Int) -> [ComposerMentionCandidate] {
+    public func matches(prefix: String, limit: Int) -> [ComposerAutocompleteCandidate] {
         let query = prefix.lowercased()
         guard !query.isEmpty else {
-            return entries.prefix(limit).map(\.candidate)
+            var seen: Set<String> = []
+            var result: [ComposerAutocompleteCandidate] = []
+            for entry in entries where result.count < limit {
+                if seen.insert(entry.candidate.id).inserted {
+                    result.append(entry.candidate)
+                }
+            }
+            return result
         }
         var low = 0
         var high = entries.count
@@ -62,10 +73,14 @@ public struct Phase58MentionCandidateIndex: Sendable {
                 high = mid
             }
         }
-        var result: [ComposerMentionCandidate] = []
+        var result: [ComposerAutocompleteCandidate] = []
+        var seen: Set<String> = []
         var index = low
         while index < entries.count, result.count < limit, entries[index].searchKey.hasPrefix(query) {
-            result.append(entries[index].candidate)
+            let candidate = entries[index].candidate
+            if seen.insert(candidate.id).inserted {
+                result.append(candidate)
+            }
             index += 1
         }
         return result

@@ -25,12 +25,13 @@ Categorical outcomes only.
 | 8 | Audit the menu bar (App, File, Edit, View, Window, Help) against native conventions | Commands route correctly; no dead items; Window management behaves natively | | |
 | 9 | Exercise multiple windows/spaces if supported, full screen, and window restoration | Native behavior without layout breakage | | |
 | 10 | Check role-color readability in both light/dark and Increase Contrast modes, including mention pills | Sanitized colors keep contrast; Increase Contrast falls back to the system accent for mention pills same as author names; fallbacks diagnosed, not broken | | |
+| 11 | With the composer focused, use Cmd-Up/Down for channels and Control-Cmd-Up/Down for servers; then press Escape | Navigation matches the official macOS table; Cmd-Up/Down are global and do not move the native text caret to document boundaries; Escape still marks read, jumps newest, and focuses the composer | | |
 
 ## Matrix Rows Unlocked
 
 | ParityMatrix row | Promotion condition |
 | --- | --- |
-| UI/platform / keyboard shortcuts | Step 7 passes plus the Phase 50 menu-route check in step 2 |
+| UI/platform / keyboard shortcuts | Steps 7 and 11 pass plus the Phase 50 menu-route check in step 2 |
 | UI/platform / accessibility | Step 6 VoiceOver pass completes with fixes filed for any unlabeled controls |
 | UI/platform / high contrast | Steps 5, 10 pass |
 | UI/platform / reduce transparency | Steps 3-4 pass |

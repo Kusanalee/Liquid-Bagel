@@ -697,12 +697,12 @@ public final class MainShellViewModel {
     public var addGroupMembersSelectedUserIDs: Set<UserID> = []
     public var groupMembershipActionState: GroupMembershipActionState = .idle
     public var pendingGroupMemberRemoval: PendingGroupMemberRemoval?
-    public var composerMentionTrigger: InlineComposerTrigger?
-    public var composerMentionCandidates: [ComposerMentionCandidate] = []
-    public var composerMentionHighlightedID: UserID?
+    public var composerAutocompleteTrigger: InlineComposerTrigger?
+    public var composerAutocompleteCandidates: [ComposerAutocompleteCandidate] = []
+    public var composerAutocompleteHighlightedID: String?
     public var composerCursorRequest: ComposerCursorRequest?
     private var composerCursorRequestCounter = 0
-    private var mentionCandidateIndexCache: (channelID: ChannelID, revision: Int, index: Phase58MentionCandidateIndex)?
+    private var autocompleteIndexCache: [ComposerAutocompleteKind: (scopeID: String, revision: Int, index: Phase58MentionCandidateIndex)] = [:]
     public var settingsSyncState: SettingsSyncState = .idle
     private var localSettingsSyncTimestamp: Int64?
     public var newDirectMessageSearch = ""
@@ -859,6 +859,7 @@ public final class MainShellViewModel {
     @ObservationIgnored private var selectedTimelineMessagesByIDCache: [MessageID: TimelineMessage] = [:]
     @ObservationIgnored private var composerEmojiSectionCacheKey: String?
     @ObservationIgnored private var composerEmojiSectionCache: [EmojiPickerSection] = []
+    @ObservationIgnored private var emojiAutocompleteCache: (revision: Int, serverID: ServerID?, candidates: [ComposerAutocompleteCandidate])?
     @ObservationIgnored private var phase68CustomEmojiIndex: Phase68CustomEmojiIndex?
     @ObservationIgnored private var phase68EmojiCatalogRevision = 0
     @ObservationIgnored private var composerAttachmentPresentationCache: [ChannelID: (attachments: [ComposerAttachmentDraft], chips: [ComposerAttachmentChip], summary: String?)] = [:]
@@ -6956,9 +6957,14 @@ public final class MainShellViewModel {
     }
 
     private static func composerEmojiPickerItem(_ item: CustomEmojiDisplayItem) -> EmojiPickerItem {
-        EmojiPickerItem(
+        let candidate = ComposerAutocompleteCandidate(
+            kind: .emoji,
+            rawID: item.id.rawValue,
+            name: item.name
+        )
+        return EmojiPickerItem(
             id: "custom-\(item.id.rawValue)",
-            insertionText: ":\(item.id.rawValue):",
+            insertionText: Phase71ComposerToken.insertionText(for: candidate),
             displayName: item.name,
             searchTerms: [item.name, item.shortcode],
             customMediaKey: item.file.id.rawValue
@@ -6982,11 +6988,14 @@ public final class MainShellViewModel {
         }
     }
 
-    public func insertEmoji(_ emoji: String, in channelID: ChannelID?) {
+    public func insertEmoji(_ emoji: String, at utf16Offset: Int? = nil, in channelID: ChannelID?) {
         guard let channelID else { return }
-        updateDraft(composerDraftState(for: channelID).text + emoji, for: channelID)
+        let currentLength = (draft(for: channelID) as NSString).length
+        let location = utf16Offset ?? currentLength
+        _ = spliceComposerDraft(emoji, replacingUTF16Range: NSRange(location: location, length: 0), in: channelID)
         emojiPickerDiagnostics = emoji.hasPrefix(":") && emoji.hasSuffix(":") ? "Inserted custom emoji shortcode" : "Inserted Unicode emoji"
         requestFocus(.composer)
+        composerFocusRequestID += 1
     }
 
     public func requestComposerCustomEmojiImage(_ item: EmojiPickerItem) {
@@ -6998,7 +7007,7 @@ public final class MainShellViewModel {
 
     /// Server members for a server channel, or DM/group/Saved Notes participants otherwise --
     /// the raw candidate pool a `Phase58MentionCandidateIndex` sorts and searches.
-    private func mentionCandidateSource(for channelID: ChannelID) -> [ComposerMentionCandidate] {
+    private func mentionCandidateSource(for channelID: ChannelID) -> [ComposerAutocompleteCandidate] {
         guard let channel = snapshot.channelsByID[channelID] else { return [] }
         let items: [MemberListItem]
         if let serverID = channel.serverID {
@@ -7009,90 +7018,199 @@ public final class MainShellViewModel {
         return items
             .filter { $0.userID != currentUserID }
             .map { item in
-                ComposerMentionCandidate(
+                ComposerAutocompleteCandidate.user(
                     userID: item.userID,
                     name: item.displayName,
                     subtitle: item.subtitle,
-                    avatarData: imageData(for: item.avatar, kind: .userAvatar)
+                    avatarData: imageData(for: item.avatar, kind: .userAvatar),
+                    searchAliases: [item.user?.username].compactMap { $0 }
                 )
             }
     }
 
     /// Phase 58: rebuilds the candidate index only when the channel or snapshot revision changes,
     /// so a run of keystrokes within the same `@query` never re-derives it from scratch.
-    private func mentionCandidateIndex(for channelID: ChannelID) -> Phase58MentionCandidateIndex {
-        if let cached = mentionCandidateIndexCache, cached.channelID == channelID, cached.revision == snapshotRevision {
+    private func autocompleteCandidateIndex(
+        kind: ComposerAutocompleteKind,
+        channelID: ChannelID
+    ) -> Phase58MentionCandidateIndex {
+        let channel = snapshot.channelsByID[channelID]
+        let serverID = channel?.serverID
+        let revision = kind == .emoji ? phase68EmojiCatalogRevision : snapshotRevision
+        let scopeID = kind == .user ? channelID.rawValue : (serverID?.rawValue ?? "no-server")
+        if kind == .emoji {
+            _ = phase68CustomEmojiIndexValue()
+        }
+        if let cached = autocompleteIndexCache[kind], cached.scopeID == scopeID, cached.revision == revision {
             return cached.index
         }
-        let index = Phase58MentionCandidateIndex(candidates: mentionCandidateSource(for: channelID))
-        mentionCandidateIndexCache = (channelID: channelID, revision: snapshotRevision, index: index)
+        let candidates: [ComposerAutocompleteCandidate]
+        switch kind {
+        case .user:
+            candidates = mentionCandidateSource(for: channelID)
+        case .channel:
+            candidates = channelAutocompleteCandidates(for: channelID)
+        case .role:
+            candidates = roleAutocompleteCandidates(for: channelID)
+        case .emoji:
+            candidates = emojiAutocompleteCandidates(for: serverID)
+        }
+        let index = Phase58MentionCandidateIndex(candidates: candidates)
+        autocompleteIndexCache[kind] = (scopeID: scopeID, revision: revision, index: index)
         return index
+    }
+
+    private func channelAutocompleteCandidates(for channelID: ChannelID) -> [ComposerAutocompleteCandidate] {
+        guard let serverID = snapshot.channelsByID[channelID]?.serverID else { return [] }
+        return navigationHelper.visibleSelectableChannels(in: serverID, snapshot: snapshot)
+            .filter { $0.kind == .textChannel }
+            .map { channel in
+                ComposerAutocompleteCandidate(
+                    kind: .channel,
+                    rawID: channel.id.rawValue,
+                    name: channel.displayName,
+                    subtitle: snapshot.serversByID[serverID]?.name
+                )
+            }
+    }
+
+    private func roleAutocompleteCandidates(for channelID: ChannelID) -> [ComposerAutocompleteCandidate] {
+        guard let serverID = snapshot.channelsByID[channelID]?.serverID,
+              let server = snapshot.serversByID[serverID]
+        else { return [] }
+        return server.roles.values.sorted {
+            $0.rank == $1.rank
+                ? $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                : $0.rank < $1.rank
+        }.map { role in
+            let color = ResolvedRoleColor(rawValue: role.colour, sourceRoleID: role.id)
+            return ComposerAutocompleteCandidate(
+                kind: .role,
+                rawID: role.id.rawValue,
+                name: role.name,
+                subtitle: server.name,
+                roleColor: color.map {
+                    MessageInlineMentionColorComponents(red: $0.red, green: $0.green, blue: $0.blue)
+                }
+            )
+        }
+    }
+
+    private func emojiAutocompleteCandidates(for serverID: ServerID?) -> [ComposerAutocompleteCandidate] {
+        if let cache = emojiAutocompleteCache,
+           cache.revision == phase68EmojiCatalogRevision,
+           cache.serverID == serverID {
+            return cache.candidates
+        }
+        let all = phase68CustomEmojiIndexValue().sortedItems
+        let current = Self.dedupedCustomEmojiItems(all.filter { $0.serverID == serverID && serverID != nil })
+        let currentShortcodes = Set(current.map { $0.shortcode.lowercased() })
+        let other = Self.dedupedCustomEmojiItems(all.filter { item in
+            item.serverID != nil && item.serverID != serverID
+        }).filter { !currentShortcodes.contains($0.shortcode.lowercased()) }
+        let candidates = (current + other).map { item in
+            ComposerAutocompleteCandidate(
+                kind: .emoji,
+                rawID: item.id.rawValue,
+                name: item.name,
+                subtitle: item.serverID.flatMap { snapshot.serversByID[$0]?.name },
+                avatarData: loadedImageResources[ImageCacheKey(id: item.file.id.rawValue, kind: .customEmoji)],
+                literalText: ":\(item.shortcode):",
+                searchAliases: [item.shortcode]
+            )
+        }
+        emojiAutocompleteCache = (phase68EmojiCatalogRevision, serverID, candidates)
+        return candidates
+    }
+
+    public func requestComposerAutocompleteEmojiImage(_ candidate: ComposerAutocompleteCandidate) {
+        guard candidate.kind == .emoji,
+              let emoji = snapshot.emojisByID[EmojiID(rawValue: candidate.rawID)]
+        else { return }
+        loadImageResource(for: CustomEmojiDisplayItem(emoji: emoji).file, kind: .customEmoji)
     }
 
     public func composerInlineTriggerChanged(_ trigger: InlineComposerTrigger?, for channelID: ChannelID?) {
         phase63ComposerDiagnostics.inlineTriggerPublicationCount += 1
         guard let channelID, let trigger else {
-            clearComposerMentionAutocomplete()
+            clearComposerAutocomplete()
             return
         }
-        composerMentionTrigger = trigger
-        let matches = mentionCandidateIndex(for: channelID).matches(prefix: trigger.query, limit: 10)
-        composerMentionCandidates = matches
-        if let highlighted = composerMentionHighlightedID, matches.contains(where: { $0.userID == highlighted }) {
+        composerAutocompleteTrigger = trigger
+        let matches = autocompleteCandidateIndex(kind: trigger.kind, channelID: channelID)
+            .matches(prefix: trigger.query, limit: 10)
+        composerAutocompleteCandidates = matches
+        if let highlighted = composerAutocompleteHighlightedID, matches.contains(where: { $0.id == highlighted }) {
             return
         }
-        composerMentionHighlightedID = matches.first?.userID
+        composerAutocompleteHighlightedID = matches.first?.id
     }
 
     public func navigateComposerMentionAutocomplete(_ direction: MentionAutocompleteNavigation) {
-        guard !composerMentionCandidates.isEmpty else { return }
-        let ids = composerMentionCandidates.map(\.userID)
-        guard let highlighted = composerMentionHighlightedID, let currentIndex = ids.firstIndex(of: highlighted) else {
-            composerMentionHighlightedID = ids.first
+        guard !composerAutocompleteCandidates.isEmpty else { return }
+        let ids = composerAutocompleteCandidates.map(\.id)
+        guard let highlighted = composerAutocompleteHighlightedID, let currentIndex = ids.firstIndex(of: highlighted) else {
+            composerAutocompleteHighlightedID = ids.first
             return
         }
         switch direction {
         case .up:
-            composerMentionHighlightedID = ids[max(0, currentIndex - 1)]
+            composerAutocompleteHighlightedID = ids[max(0, currentIndex - 1)]
         case .down:
-            composerMentionHighlightedID = ids[min(ids.count - 1, currentIndex + 1)]
+            composerAutocompleteHighlightedID = ids[min(ids.count - 1, currentIndex + 1)]
         }
     }
 
     public func selectHighlightedComposerMentionCandidate(for channelID: ChannelID?) {
-        guard let candidate = composerMentionCandidates.first(where: { $0.userID == composerMentionHighlightedID }) else {
-            clearComposerMentionAutocomplete()
+        guard let candidate = composerAutocompleteCandidates.first(where: { $0.id == composerAutocompleteHighlightedID }) else {
+            clearComposerAutocomplete()
             return
         }
-        selectComposerMentionCandidate(candidate, for: channelID)
+        selectComposerAutocompleteCandidate(candidate, for: channelID)
     }
 
     /// Splices the verified `<@ULID>` token (Docs/Research.md Phase 58 Notes) into the composer
     /// draft at the trigger's exact range, then requests the caret land right after it.
-    public func selectComposerMentionCandidate(_ candidate: ComposerMentionCandidate, for channelID: ChannelID?) {
-        defer { clearComposerMentionAutocomplete() }
-        guard let channelID, let trigger = composerMentionTrigger else { return }
-        let currentText = draft(for: channelID)
-        let nsText = currentText as NSString
-        guard trigger.utf16Location >= 0, trigger.utf16Location + trigger.utf16Length <= nsText.length else { return }
-        let token = "<@\(candidate.userID.rawValue)> "
-        let updated = nsText.replacingCharacters(in: NSRange(location: trigger.utf16Location, length: trigger.utf16Length), with: token)
-        updateDraft(updated, for: channelID)
-        composerCursorRequestCounter += 1
-        composerCursorRequest = ComposerCursorRequest(
-            id: composerCursorRequestCounter,
-            utf16Offset: trigger.utf16Location + (token as NSString).length
+    public func selectComposerAutocompleteCandidate(_ candidate: ComposerAutocompleteCandidate, for channelID: ChannelID?) {
+        defer { clearComposerAutocomplete() }
+        guard let channelID, let trigger = composerAutocompleteTrigger else { return }
+        _ = spliceComposerDraft(
+            Phase71ComposerToken.insertionText(for: candidate),
+            replacingUTF16Range: NSRange(location: trigger.utf16Location, length: trigger.utf16Length),
+            in: channelID
         )
     }
 
-    public func clearComposerMentionAutocomplete() {
-        guard composerMentionTrigger != nil || !composerMentionCandidates.isEmpty || composerMentionHighlightedID != nil else {
+    @discardableResult
+    private func spliceComposerDraft(
+        _ replacement: String,
+        replacingUTF16Range range: NSRange,
+        in channelID: ChannelID
+    ) -> Bool {
+        guard range.location >= 0, range.length >= 0 else { return false }
+        let currentText = draft(for: channelID)
+        let nsText = currentText as NSString
+        let location = min(range.location, nsText.length)
+        let length = min(range.length, nsText.length - location)
+        let effectiveRange = NSRange(location: location, length: length)
+        guard Range(effectiveRange, in: currentText) != nil else { return false }
+        updateDraft(nsText.replacingCharacters(in: effectiveRange, with: replacement), for: channelID)
+        composerCursorRequestCounter += 1
+        composerCursorRequest = ComposerCursorRequest(
+            id: composerCursorRequestCounter,
+            utf16Offset: location + (replacement as NSString).length
+        )
+        return true
+    }
+
+    public func clearComposerAutocomplete() {
+        guard composerAutocompleteTrigger != nil || !composerAutocompleteCandidates.isEmpty || composerAutocompleteHighlightedID != nil else {
             phase63ComposerDiagnostics.inlineTriggerSuppressionCount += 1
             return
         }
-        composerMentionTrigger = nil
-        composerMentionCandidates = []
-        composerMentionHighlightedID = nil
+        composerAutocompleteTrigger = nil
+        composerAutocompleteCandidates = []
+        composerAutocompleteHighlightedID = nil
     }
 
     public func customEmojiDisplayItemsForCurrentContext() -> [CustomEmojiDisplayItem] {
@@ -8009,6 +8127,15 @@ public final class MainShellViewModel {
             imagePresentationByteCount -= existing.count
         }
         loadedImageResources[key] = data
+        if key.kind == .customEmoji {
+            emojiAutocompleteCache = nil
+            autocompleteIndexCache[.emoji] = nil
+            for index in composerAutocompleteCandidates.indices
+                where composerAutocompleteCandidates[index].kind == .emoji
+                    && composerAutocompleteCandidates[index].rawID == key.id {
+                composerAutocompleteCandidates[index].avatarData = data
+            }
+        }
         imagePresentationByteCount += data.count
         imagePresentationOrder.removeAll { $0 == key }
         imagePresentationOrder.append(key)
@@ -14870,7 +14997,9 @@ private struct SelectedChannelComposerView: View {
                 onDropFileURLs: { viewModel.reviewDroppedAttachmentURLs($0, to: channelID) },
                 emojiItems: emojiSections.flatMap(\.items).map(\.insertionText),
                 emojiSections: emojiSections,
-                onInsertEmoji: { viewModel.insertEmoji($0, in: channelID) },
+                onInsertEmoji: { emoji, utf16Offset in
+                    viewModel.insertEmoji(emoji, at: utf16Offset, in: channelID)
+                },
                 customEmojiImageData: { viewModel.composerCustomEmojiImageData(for: $0) },
                 onRequestCustomEmojiImage: { viewModel.requestComposerCustomEmojiImage($0) },
                 onPasteImageData: { viewModel.addPastedImageDataFromClipboard($0, to: channelID) },
@@ -14878,8 +15007,8 @@ private struct SelectedChannelComposerView: View {
                 onPasteDiagnostic: { viewModel.recordComposerPasteDiagnostic($0) },
                 onSend: { Task { await viewModel.sendDraft(for: channelID) } },
                 onFocus: { viewModel.focusComposer() },
-                mentionAutocompleteCandidates: viewModel.composerMentionCandidates,
-                highlightedMentionCandidateID: viewModel.composerMentionHighlightedID,
+                mentionAutocompleteCandidates: viewModel.composerAutocompleteCandidates,
+                highlightedMentionCandidateID: viewModel.composerAutocompleteHighlightedID,
                 cursorRequest: viewModel.composerCursorRequest,
                 onInlineTriggerChange: { viewModel.composerInlineTriggerChanged($0, for: channelID) },
                 onNativeEdit: { viewModel.noteNativeComposerEdit() },
@@ -14888,8 +15017,9 @@ private struct SelectedChannelComposerView: View {
                 onSelectHighlightedMentionCandidate: {
                     viewModel.selectHighlightedComposerMentionCandidate(for: channelID)
                 },
-                onCancelMentionAutocomplete: { viewModel.clearComposerMentionAutocomplete() },
-                onSelectMentionCandidate: { viewModel.selectComposerMentionCandidate($0, for: channelID) }
+                onCancelMentionAutocomplete: { viewModel.clearComposerAutocomplete() },
+                onSelectMentionCandidate: { viewModel.selectComposerAutocompleteCandidate($0, for: channelID) },
+                onRequestAutocompleteEmojiImage: { viewModel.requestComposerAutocompleteEmojiImage($0) }
             )
             .padding([.horizontal, .bottom], StoatSpacing.large)
         }

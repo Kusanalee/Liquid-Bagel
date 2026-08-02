@@ -56,31 +56,34 @@ struct AppCommands: Commands {
             Button("Previous Server") {
                 commandHandler?.perform(.selectPreviousServer)
             }
-            .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+            .keyboardShortcut(Phase71Keybinds.verifiedMacShortcuts[.selectPreviousServer]!.key,
+                              modifiers: Phase71Keybinds.verifiedMacShortcuts[.selectPreviousServer]!.modifiers)
             .disabled(commandHandler?.canPerform(.selectPreviousServer) == false)
 
             Button("Next Server") {
                 commandHandler?.perform(.selectNextServer)
             }
-            .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+            .keyboardShortcut(Phase71Keybinds.verifiedMacShortcuts[.selectNextServer]!.key,
+                              modifiers: Phase71Keybinds.verifiedMacShortcuts[.selectNextServer]!.modifiers)
             .disabled(commandHandler?.canPerform(.selectNextServer) == false)
 
             Button("Previous Channel") {
                 commandHandler?.perform(.selectPreviousChannel)
             }
-            .keyboardShortcut(.upArrow, modifiers: [.command, .control])
+            .keyboardShortcut(Phase71Keybinds.verifiedMacShortcuts[.selectPreviousChannel]!.key,
+                              modifiers: Phase71Keybinds.verifiedMacShortcuts[.selectPreviousChannel]!.modifiers)
             .disabled(commandHandler?.canPerform(.selectPreviousChannel) == false)
 
             Button("Next Channel") {
                 commandHandler?.perform(.selectNextChannel)
             }
-            .keyboardShortcut(.downArrow, modifiers: [.command, .control])
+            .keyboardShortcut(Phase71Keybinds.verifiedMacShortcuts[.selectNextChannel]!.key,
+                              modifiers: Phase71Keybinds.verifiedMacShortcuts[.selectNextChannel]!.modifiers)
             .disabled(commandHandler?.canPerform(.selectNextChannel) == false)
 
             Button("Jump to Newest Message") {
                 commandHandler?.perform(.jumpToNewestMessage)
             }
-            .keyboardShortcut(.downArrow, modifiers: [.command])
             .disabled(commandHandler?.canPerform(.jumpToNewestMessage) == false)
 
             Button("Jump to First Unread") {

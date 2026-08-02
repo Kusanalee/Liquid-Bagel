@@ -1208,15 +1208,29 @@ public struct GlassSearchField: View {
 /// Phase 58: the `@token` immediately before the composer caret, with no intervening whitespace.
 /// Offsets are UTF-16 (matching `NSString`/`NSTextView` indexing) so the caller can splice the
 /// verified mention token into the same `text` binding without needing AppKit types.
+public enum ComposerAutocompleteKind: String, Hashable, Sendable {
+    case user
+    case channel
+    case role
+    case emoji
+}
+
 public struct InlineComposerTrigger: Hashable, Sendable {
     public var utf16Location: Int
     public var utf16Length: Int
     public var query: String
+    public var kind: ComposerAutocompleteKind
 
-    public init(utf16Location: Int, utf16Length: Int, query: String) {
+    public init(
+        utf16Location: Int,
+        utf16Length: Int,
+        query: String,
+        kind: ComposerAutocompleteKind = .user
+    ) {
         self.utf16Location = utf16Location
         self.utf16Length = utf16Length
         self.query = query
+        self.kind = kind
     }
 }
 
@@ -1238,19 +1252,55 @@ public enum MentionAutocompleteNavigation: Hashable, Sendable {
     case down
 }
 
-public struct ComposerMentionCandidate: Identifiable, Hashable, Sendable {
-    public var id: UserID { userID }
-    public var userID: UserID
+public struct ComposerAutocompleteCandidate: Identifiable, Hashable, Sendable {
+    public var id: String { "\(kind.rawValue):\(rawID)" }
+    public var kind: ComposerAutocompleteKind
+    public var rawID: String
     public var name: String
     public var subtitle: String?
     public var avatarData: Data?
+    public var roleColor: MessageInlineMentionColorComponents?
+    public var literalText: String?
+    public var searchAliases: [String]
 
-    public init(userID: UserID, name: String, subtitle: String? = nil, avatarData: Data? = nil) {
-        self.userID = userID
+    public init(
+        kind: ComposerAutocompleteKind,
+        rawID: String,
+        name: String,
+        subtitle: String? = nil,
+        avatarData: Data? = nil,
+        roleColor: MessageInlineMentionColorComponents? = nil,
+        literalText: String? = nil,
+        searchAliases: [String] = []
+    ) {
+        self.kind = kind
+        self.rawID = rawID
         self.name = name
         self.subtitle = subtitle
         self.avatarData = avatarData
+        self.roleColor = roleColor
+        self.literalText = literalText
+        self.searchAliases = searchAliases
     }
+
+    public static func user(
+        userID: UserID,
+        name: String,
+        subtitle: String? = nil,
+        avatarData: Data? = nil,
+        searchAliases: [String] = []
+    ) -> Self {
+        Self(
+            kind: .user,
+            rawID: userID.rawValue,
+            name: name,
+            subtitle: subtitle,
+            avatarData: avatarData,
+            searchAliases: searchAliases
+        )
+    }
+
+    public var userID: UserID? { kind == .user ? UserID(rawValue: rawID) : nil }
 }
 
 /// A redacted, developer-only outcome for a media paste attempt. It deliberately carries only
@@ -1301,6 +1351,7 @@ public struct ComposerPasteDiagnostic: Hashable, Sendable {
 
 public struct GlassComposer: View {
     @State private var isEmojiPopoverPresented = false
+    @State private var caretTracker = ComposerCaretTracker()
     @Binding private var text: String
     private let placeholder: String
     private let isEnabled: Bool
@@ -1322,7 +1373,7 @@ public struct GlassComposer: View {
     private let onDropFileURLs: ([URL]) -> Void
     private let emojiItems: [String]
     private let emojiSections: [EmojiPickerSection]
-    private let onInsertEmoji: (String) -> Void
+    private let onInsertEmoji: (String, Int?) -> Void
     private let customEmojiImageData: (EmojiPickerItem) -> Data?
     private let onRequestCustomEmojiImage: (EmojiPickerItem) -> Void
     private let onPasteImageData: (Data) -> Void
@@ -1330,8 +1381,8 @@ public struct GlassComposer: View {
     private let onPasteDiagnostic: (ComposerPasteDiagnostic) -> Void
     private let onSend: () -> Void
     private let onFocus: () -> Void
-    private let mentionAutocompleteCandidates: [ComposerMentionCandidate]
-    private let highlightedMentionCandidateID: UserID?
+    private let mentionAutocompleteCandidates: [ComposerAutocompleteCandidate]
+    private let highlightedMentionCandidateID: String?
     private let cursorRequest: ComposerCursorRequest?
     private let onInlineTriggerChange: (InlineComposerTrigger?) -> Void
     private let onNativeEdit: () -> Void
@@ -1339,7 +1390,8 @@ public struct GlassComposer: View {
     private let onNavigateMentionAutocomplete: (MentionAutocompleteNavigation) -> Void
     private let onSelectHighlightedMentionCandidate: () -> Void
     private let onCancelMentionAutocomplete: () -> Void
-    private let onSelectMentionCandidate: (ComposerMentionCandidate) -> Void
+    private let onSelectMentionCandidate: (ComposerAutocompleteCandidate) -> Void
+    private let onRequestAutocompleteEmojiImage: (ComposerAutocompleteCandidate) -> Void
 
     public init(
         text: Binding<String>,
@@ -1363,7 +1415,7 @@ public struct GlassComposer: View {
         onDropFileURLs: @escaping ([URL]) -> Void = { _ in },
         emojiItems: [String] = [],
         emojiSections: [EmojiPickerSection] = [],
-        onInsertEmoji: @escaping (String) -> Void = { _ in },
+        onInsertEmoji: @escaping (String, Int?) -> Void = { _, _ in },
         customEmojiImageData: @escaping (EmojiPickerItem) -> Data? = { $0.imageData },
         onRequestCustomEmojiImage: @escaping (EmojiPickerItem) -> Void = { _ in },
         onPasteImageData: @escaping (Data) -> Void = { _ in },
@@ -1371,8 +1423,8 @@ public struct GlassComposer: View {
         onPasteDiagnostic: @escaping (ComposerPasteDiagnostic) -> Void = { _ in },
         onSend: @escaping () -> Void = {},
         onFocus: @escaping () -> Void = {},
-        mentionAutocompleteCandidates: [ComposerMentionCandidate] = [],
-        highlightedMentionCandidateID: UserID? = nil,
+        mentionAutocompleteCandidates: [ComposerAutocompleteCandidate] = [],
+        highlightedMentionCandidateID: String? = nil,
         cursorRequest: ComposerCursorRequest? = nil,
         onInlineTriggerChange: @escaping (InlineComposerTrigger?) -> Void = { _ in },
         onNativeEdit: @escaping () -> Void = {},
@@ -1380,7 +1432,8 @@ public struct GlassComposer: View {
         onNavigateMentionAutocomplete: @escaping (MentionAutocompleteNavigation) -> Void = { _ in },
         onSelectHighlightedMentionCandidate: @escaping () -> Void = {},
         onCancelMentionAutocomplete: @escaping () -> Void = {},
-        onSelectMentionCandidate: @escaping (ComposerMentionCandidate) -> Void = { _ in }
+        onSelectMentionCandidate: @escaping (ComposerAutocompleteCandidate) -> Void = { _ in },
+        onRequestAutocompleteEmojiImage: @escaping (ComposerAutocompleteCandidate) -> Void = { _ in }
     ) {
         self._text = text
         self._shouldMentionReplyAuthor = shouldMentionReplyAuthor
@@ -1421,6 +1474,7 @@ public struct GlassComposer: View {
         self.onSelectHighlightedMentionCandidate = onSelectHighlightedMentionCandidate
         self.onCancelMentionAutocomplete = onCancelMentionAutocomplete
         self.onSelectMentionCandidate = onSelectMentionCandidate
+        self.onRequestAutocompleteEmojiImage = onRequestAutocompleteEmojiImage
     }
 
     public var body: some View {
@@ -1482,6 +1536,7 @@ public struct GlassComposer: View {
                             text: $text,
                             isEnabled: isEnabled,
                             focusRequestID: focusRequestID,
+                            caretTracker: caretTracker,
                             onSubmit: onSend,
                             onFocus: onFocus,
                             onPasteImageData: onPasteImageData,
@@ -1502,7 +1557,8 @@ public struct GlassComposer: View {
                                     InlineAutocompletePopover(
                                         candidates: mentionAutocompleteCandidates,
                                         highlightedID: highlightedMentionCandidateID,
-                                        onSelect: onSelectMentionCandidate
+                                        onSelect: onSelectMentionCandidate,
+                                        onRequestEmojiImage: onRequestAutocompleteEmojiImage
                                     )
                                     .alignmentGuide(.top) { dimensions in dimensions.height + 4 }
                                 }
@@ -1517,6 +1573,9 @@ public struct GlassComposer: View {
                     }
                     Button {
                         isEmojiPopoverPresented.toggle()
+                        if isEmojiPopoverPresented {
+                            onCancelMentionAutocomplete()
+                        }
                     } label: {
                         Image(systemName: "face.smiling")
                             .frame(width: 30, height: 30)
@@ -1531,7 +1590,11 @@ public struct GlassComposer: View {
                             customEmojiImageData: customEmojiImageData,
                             onRequestCustomEmojiImage: onRequestCustomEmojiImage,
                             onInsertEmoji: { emoji in
-                                onInsertEmoji(emoji)
+                                let currentLength = (text as NSString).length
+                                let offset = caretTracker.documentUTF16Length == currentLength
+                                    ? caretTracker.utf16Offset
+                                    : nil
+                                onInsertEmoji(emoji, offset)
                                 isEmojiPopoverPresented = false
                             }
                         )
@@ -1736,9 +1799,10 @@ extension GlassComposer {
 #endif
 
 private struct InlineAutocompletePopover: View {
-    let candidates: [ComposerMentionCandidate]
-    let highlightedID: UserID?
-    let onSelect: (ComposerMentionCandidate) -> Void
+    let candidates: [ComposerAutocompleteCandidate]
+    let highlightedID: String?
+    let onSelect: (ComposerAutocompleteCandidate) -> Void
+    let onRequestEmojiImage: (ComposerAutocompleteCandidate) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1747,8 +1811,7 @@ private struct InlineAutocompletePopover: View {
                     onSelect(candidate)
                 } label: {
                     HStack(spacing: StoatSpacing.small) {
-                        AvatarView(title: candidate.name, size: 22, imageData: candidate.avatarData)
-                            .accessibilityHidden(true)
+                        accessory(candidate)
                         VStack(alignment: .leading, spacing: 0) {
                             Text(candidate.name)
                                 .font(.callout.weight(.medium))
@@ -1765,14 +1828,19 @@ private struct InlineAutocompletePopover: View {
                     .padding(.horizontal, StoatSpacing.small)
                     .padding(.vertical, StoatSpacing.xSmall)
                     .background(
-                        candidate.userID == highlightedID ? Color.accentColor.opacity(0.18) : Color.clear,
+                        candidate.id == highlightedID ? Color.accentColor.opacity(0.18) : Color.clear,
                         in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
                     )
                 }
                 .buttonStyle(.plain)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(candidate.subtitle.map { "\(candidate.name), \($0)" } ?? candidate.name)
-                .accessibilityAddTraits(candidate.userID == highlightedID ? [.isSelected] : [])
+                .accessibilityAddTraits(candidate.id == highlightedID ? [.isSelected] : [])
+                .onAppear {
+                    if candidate.kind == .emoji, candidate.avatarData == nil {
+                        onRequestEmojiImage(candidate)
+                    }
+                }
             }
         }
         .padding(StoatSpacing.xxSmall)
@@ -1780,7 +1848,44 @@ private struct InlineAutocompletePopover: View {
         .frame(width: 260)
         .shadow(radius: 8)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("mention suggestions, \(candidates.count) results")
+        .accessibilityLabel("autocomplete suggestions, \(candidates.count) results")
+    }
+
+    @ViewBuilder private func accessory(_ candidate: ComposerAutocompleteCandidate) -> some View {
+        switch candidate.kind {
+        case .user:
+            AvatarView(title: candidate.name, size: 22, imageData: candidate.avatarData)
+                .accessibilityHidden(true)
+        case .channel:
+            Image(systemName: "number")
+                .frame(width: 22, height: 22)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+        case .role:
+            Image(systemName: "person.crop.circle.badge.checkmark")
+                .frame(width: 22, height: 22)
+                .foregroundStyle(roleColor(candidate.roleColor))
+                .accessibilityHidden(true)
+        case .emoji:
+            if let data = candidate.avatarData {
+                DecodedDataImage(data: data, pixelSize: 44)
+                    .scaledToFit()
+                    .frame(width: 22, height: 22)
+                    .accessibilityHidden(true)
+            } else {
+                Text(candidate.literalText ?? ":\(candidate.name):")
+                    .font(.caption2.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
+                    .frame(width: 22, height: 22)
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private func roleColor(_ components: MessageInlineMentionColorComponents?) -> Color {
+        guard let components else { return .secondary }
+        return Color(red: components.red, green: components.green, blue: components.blue)
     }
 }
 
@@ -2027,6 +2132,7 @@ private struct ComposerTextInput: View {
     @Binding var text: String
     let isEnabled: Bool
     let focusRequestID: Int
+    let caretTracker: ComposerCaretTracker
     let onSubmit: () -> Void
     let onFocus: () -> Void
     let onPasteImageData: (Data) -> Void
@@ -2047,6 +2153,7 @@ private struct ComposerTextInput: View {
             text: $text,
             isEnabled: isEnabled,
             focusRequestID: focusRequestID,
+            caretTracker: caretTracker,
             hasMentionCandidates: hasMentionCandidates,
             cursorRequest: cursorRequest,
             handlers: ComposerTextHandlers(
@@ -2253,16 +2360,35 @@ final class ComposerTextHandlers {
     }
 }
 
+/// Pull-based AppKit selection state. This deliberately has no observation conformance: arrow
+/// keys and clicks update two integers without invalidating the SwiftUI composer hierarchy.
+@MainActor final class ComposerCaretTracker {
+    var utf16Offset: Int?
+    var documentUTF16Length = 0
+
+    func update(from textView: NSTextView) {
+        let selection = textView.selectedRange()
+        utf16Offset = selection.length == 0 ? selection.location : nil
+        documentUTF16Length = (textView.string as NSString).length
+    }
+
+    func invalidate() {
+        utf16Offset = nil
+        documentUTF16Length = 0
+    }
+}
+
 private struct ComposerTextView: NSViewRepresentable {
     @Binding var text: String
     let isEnabled: Bool
     let focusRequestID: Int
+    let caretTracker: ComposerCaretTracker
     var hasMentionCandidates: Bool = false
     var cursorRequest: ComposerCursorRequest? = nil
     let handlers: ComposerTextHandlers
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, handlers: handlers)
+        Coordinator(text: $text, handlers: handlers, caretTracker: caretTracker)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -2318,6 +2444,7 @@ private struct ComposerTextView: NSViewRepresentable {
         guard let textView = nsView.documentView as? ComposerPasteInterceptingTextView else { return }
         if textView.string != text {
             textView.string = text
+            caretTracker.invalidate()
         }
         textView.isEditable = isEnabled
         textView.textColor = isEnabled ? .labelColor : .secondaryLabelColor
@@ -2332,6 +2459,7 @@ private struct ComposerTextView: NSViewRepresentable {
             let clampedOffset = max(0, min(cursorRequest.utf16Offset, (textView.string as NSString).length))
             textView.setSelectedRange(NSRange(location: clampedOffset, length: 0))
             textView.scrollRangeToVisible(NSRange(location: clampedOffset, length: 0))
+            caretTracker.update(from: textView)
         }
         context.coordinator.text = $text
         context.coordinator.handlers = handlers
@@ -2344,6 +2472,7 @@ private struct ComposerTextView: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var text: Binding<String>
         var handlers: ComposerTextHandlers
+        let caretTracker: ComposerCaretTracker
         var lastFocusRequestID = 0
         var lastAppliedCursorRequestID = 0
         var hasMentionCandidates = false
@@ -2354,10 +2483,12 @@ private struct ComposerTextView: NSViewRepresentable {
 
         init(
             text: Binding<String>,
-            handlers: ComposerTextHandlers
+            handlers: ComposerTextHandlers,
+            caretTracker: ComposerCaretTracker = ComposerCaretTracker()
         ) {
             self.text = text
             self.handlers = handlers
+            self.caretTracker = caretTracker
         }
 
         func estimatedHeight(for text: String) -> CGFloat {
@@ -2378,11 +2509,13 @@ private struct ComposerTextView: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else { return }
             handlers.onNativeEdit()
             text.wrappedValue = textView.string
+            caretTracker.update(from: textView)
             reportInlineTriggerIfChanged(in: textView)
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
+            caretTracker.update(from: textView)
             reportInlineTriggerIfChanged(in: textView)
         }
 
@@ -2428,8 +2561,8 @@ private struct ComposerTextView: NSViewRepresentable {
             return true
         }
 
-        /// Phase 58: the `@token` immediately before the caret, scanning backward until
-        /// whitespace (cancels) or `@` (found). Bounded to avoid pathological scans on long lines.
+        /// Phase 71: the inline sigil token immediately before the caret. Scans stay bounded to
+        /// protect long drafts and all offsets use AppKit's UTF-16 indexing.
         @MainActor
         static func detectInlineTrigger(in textView: NSTextView) -> InlineComposerTrigger? {
             let selectedRange = textView.selectedRange()
@@ -2442,18 +2575,24 @@ private struct ComposerTextView: NSViewRepresentable {
             var scanned = 0
             while start > 0, scanned < scanLimit {
                 let previousChar = nsString.substring(with: NSRange(location: start - 1, length: 1))
-                if previousChar == "@" {
-                    let atIndex = start - 1
-                    if atIndex > 0 {
-                        let charBeforeAt = nsString.substring(with: NSRange(location: atIndex - 1, length: 1))
-                        // A word character immediately before "@" (e.g. "a@b.com") is not a mention
-                        // trigger -- only fire at the start of the message or after whitespace/punctuation.
-                        if charBeforeAt.rangeOfCharacter(from: .alphanumerics) != nil {
+                if let kind = kind(for: previousChar) {
+                    let sigilIndex = start - 1
+                    if sigilIndex > 0 {
+                        let charBeforeSigil = nsString.substring(with: NSRange(location: sigilIndex - 1, length: 1))
+                        if charBeforeSigil.rangeOfCharacter(from: .alphanumerics) != nil {
                             return nil
                         }
                     }
                     let query = nsString.substring(with: NSRange(location: start, length: caret - start))
-                    return InlineComposerTrigger(utf16Location: atIndex, utf16Length: caret - atIndex, query: query)
+                    guard isAcceptableQuery(query, kind: kind), !isInsideInlineCode(nsString, sigilIndex: sigilIndex) else {
+                        return nil
+                    }
+                    return InlineComposerTrigger(
+                        utf16Location: sigilIndex,
+                        utf16Length: caret - sigilIndex,
+                        query: query,
+                        kind: kind
+                    )
                 }
                 if previousChar.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
                     return nil
@@ -2462,6 +2601,51 @@ private struct ComposerTextView: NSViewRepresentable {
                 scanned += 1
             }
             return nil
+        }
+
+        private static func kind(for sigil: String) -> ComposerAutocompleteKind? {
+            switch sigil {
+            case "@": .user
+            case "#": .channel
+            case "%": .role
+            case ":": .emoji
+            default: nil
+            }
+        }
+
+        static func isAcceptableQuery(_ query: String, kind: ComposerAutocompleteKind) -> Bool {
+            guard query.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return false }
+            switch kind {
+            case .user:
+                return true
+            case .emoji:
+                guard query.count >= 2 else { return false }
+                return query.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) || "_+-".unicodeScalars.contains($0) }
+            case .channel:
+                guard query.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || "_-".unicodeScalars.contains($0) }) else {
+                    return false
+                }
+                guard !query.isEmpty, !query.allSatisfy(\.isNumber) else { return query.isEmpty }
+                let isHexShape = [3, 4, 6, 8].contains(query.count)
+                    && query.unicodeScalars.allSatisfy { CharacterSet(charactersIn: "0123456789abcdefABCDEF").contains($0) }
+                return !isHexShape
+            case .role:
+                guard query.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || "_-".unicodeScalars.contains($0) }) else {
+                    return false
+                }
+                return query.isEmpty || !query.allSatisfy(\.isNumber)
+            }
+        }
+
+        private static func isInsideInlineCode(_ text: NSString, sigilIndex: Int) -> Bool {
+            var lineStart = sigilIndex
+            while lineStart > 0 {
+                let character = text.substring(with: NSRange(location: lineStart - 1, length: 1))
+                if character == "\n" { break }
+                lineStart -= 1
+            }
+            let prefix = text.substring(with: NSRange(location: lineStart, length: sigilIndex - lineStart))
+            return prefix.filter { $0 == "`" }.count.isMultiple(of: 2) == false
         }
     }
 }

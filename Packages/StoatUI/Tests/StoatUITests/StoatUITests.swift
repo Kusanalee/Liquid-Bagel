@@ -392,6 +392,7 @@ final class StoatUITests: XCTestCase {
         XCTAssertEqual(atEnd?.query, "enk")
         XCTAssertEqual(atEnd?.utf16Location, 6)
         XCTAssertEqual(atEnd?.utf16Length, 4)
+        XCTAssertEqual(atEnd?.kind, .user)
 
         let bareAt = GlassComposer._testDetectInlineTrigger(text: "hello @", caretUTF16Offset: 7)
         XCTAssertEqual(bareAt?.query, "")
@@ -411,6 +412,39 @@ final class StoatUITests: XCTestCase {
         // A word character immediately before "@" (e.g. an email address) must not trigger.
         let emailLikeNoTrigger = GlassComposer._testDetectInlineTrigger(text: "a@b.com", caretUTF16Offset: 7)
         XCTAssertNil(emailLikeNoTrigger)
+    }
+
+    @MainActor
+    func testPhase71KindAwareInlineTriggerDetectionAndSuppression() {
+        func detect(_ text: String) -> InlineComposerTrigger? {
+            GlassComposer._testDetectInlineTrigger(text: text, caretUTF16Offset: (text as NSString).length)
+        }
+
+        XCTAssertEqual(detect("@al")?.kind, .user)
+        XCTAssertEqual(detect("#dev")?.kind, .channel)
+        XCTAssertEqual(detect("%admin")?.kind, .role)
+        XCTAssertEqual(detect(":bagel")?.kind, .emoji)
+        XCTAssertEqual(detect(":bagel")?.query, "bagel")
+
+        XCTAssertNil(detect(":"))
+        XCTAssertNil(detect(":b"))
+        XCTAssertNil(detect(":bagel:"))
+        XCTAssertNil(detect("https://"))
+        XCTAssertNil(detect("12:30"))
+        XCTAssertNil(detect("#1"))
+        XCTAssertNil(detect("#42"))
+        XCTAssertNil(detect("#fff"))
+        XCTAssertNil(detect("#1a2b3c"))
+        XCTAssertNotNil(detect("#2024-planning"))
+        XCTAssertNil(detect("#foo.bar"))
+        XCTAssertNil(detect("50%"))
+        XCTAssertNil(detect("%42"))
+        XCTAssertNil(detect("`@literal"))
+        XCTAssertNotNil(detect("`code` @real"))
+
+        let channel = ComposerAutocompleteCandidate(kind: .channel, rawID: "same", name: "General")
+        let role = ComposerAutocompleteCandidate(kind: .role, rawID: "same", name: "General")
+        XCTAssertNotEqual(channel.id, role.id)
     }
 
     @MainActor
