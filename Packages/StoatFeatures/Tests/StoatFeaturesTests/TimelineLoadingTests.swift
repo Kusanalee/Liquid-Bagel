@@ -22,7 +22,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testViewModelObservesSnapshotAndKeepsValidSelection() async throws {
         let source = MutableSnapshotSource(snapshot: TestShellData.snapshot)
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], snapshotSource: source, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], snapshotSource: source, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let selected = try XCTUnwrap(model.selection.channelID)
@@ -36,7 +36,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testDeletedSelectedChannelFallsBackSafely() async throws {
         let source = MutableSnapshotSource(snapshot: TestShellData.snapshot)
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], snapshotSource: source, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], snapshotSource: source, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let deleted = try XCTUnwrap(model.selection.channelID)
@@ -54,7 +54,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testDeletedSelectedServerFallsBackHome() async throws {
         let source = MutableSnapshotSource(snapshot: TestShellData.snapshot)
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], snapshotSource: source, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], snapshotSource: source, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         var snapshot = TestShellData.snapshot

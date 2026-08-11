@@ -14,7 +14,7 @@ import XCTest
 extension StoatFeaturesTests {
     @MainActor
     func testComposerDraftsSendSuccessAndEchoDedupe() async {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let channelID = model.selection.channelID!
@@ -35,7 +35,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase56OptimisticAndConfirmedSendGroupsPaintWithoutPreparationPass() async throws {
         let handler = DelayedMessageActionHandler(delay: .milliseconds(80))
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         let server = try XCTUnwrap(model.servers.first { $0.name == "Bagel Lab" })
         model.selectServer(server.id)
         let channelID = try XCTUnwrap(model.selection.channelID)
@@ -69,7 +69,7 @@ extension StoatFeaturesTests {
         snapshot.membersByServerAndUserID[ServerMemberKey(serverID: server.id, userID: TestShellData.currentUserID)]?.avatar = memberAvatar
 
         let handler = DelayedMessageActionHandler(delay: .milliseconds(80))
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         model.selectServer(server.id)
         model.updateDraft("avatar continuity", for: channelID)
 
@@ -94,7 +94,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testFailedSendMarksTimelineMessageFailed() async {
         let handler = StubMessageActionHandler(sendError: MessageActionError.unavailable("send failed"))
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let channelID = model.selection.channelID!
@@ -107,7 +107,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testDraftsArePerChannelAndEmptyDraftCannotSend() async {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channels = model.channels(for: model.servers.first { $0.name == "Bagel Lab" }!.id).filter { $0.kind == .textChannel }
 
         model.updateDraft("one", for: channels[0].id)
@@ -123,7 +123,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase32EmojiInsertionAppendsToComposerDraft() {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
 
         model.updateDraft("hello", for: channelID)
@@ -137,7 +137,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase15AttachmentQueueDoesNotUploadUntilExplicitAction() async throws {
         let uploader = StubAttachmentUploadHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
         let url = try makeTemporaryAttachment(name: "note.txt", contents: Data("hello".utf8))
 
@@ -158,7 +158,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase32DroppedFilesOpenReviewBeforeQueueingOrUploading() async throws {
         let uploader = StubAttachmentUploadHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
         let url = try makeTemporaryAttachment(name: "phase32 dropped.txt", contents: Data("drop".utf8))
 
@@ -184,7 +184,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase32DroppedFilesWithoutSendableTargetShowBlockedReview() async throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let url = try makeTemporaryAttachment(name: "phase32 blocked.txt", contents: Data("blocked".utf8))
 
         model.reviewDroppedAttachmentURLs([url], to: nil)
@@ -200,7 +200,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase15AttachmentValidationAndPermissionGate() async throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
         let oversized = try makeTemporaryAttachment(name: "large.txt", contents: Data(repeating: 1, count: 21 * 1024 * 1024))
 
@@ -211,14 +211,14 @@ extension StoatFeaturesTests {
 
         var snapshot = TestShellData.snapshot
         snapshot.channelsByID[channelID]?.permissions = [.viewChannel, .readMessageHistory, .sendMessage]
-        let permissionModel = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let permissionModel = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         XCTAssertFalse(permissionModel.canUploadFiles(in: permissionModel.snapshot.channelsByID[channelID]))
     }
 
     @MainActor
     func testPhase33UploadLimitBoundaryAndPasteReviewDoNotUpload() async throws {
         let uploader = StubAttachmentUploadHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
         let exact = try makeTemporaryAttachment(name: "exact-20mb.txt", contents: Data(repeating: 1, count: AttachmentUploadLimits.maxFileBytes))
         let over = try makeTemporaryAttachment(name: "over-20mb.txt", contents: Data(repeating: 1, count: AttachmentUploadLimits.maxFileBytes + 1))
@@ -240,7 +240,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase61PastedImageQueuesComposerAttachmentWithoutUploading() async throws {
         let uploader = StubAttachmentUploadHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
 
         model.addPastedImageData(Data(repeating: 2, count: 32), to: channelID)
@@ -258,7 +258,7 @@ extension StoatFeaturesTests {
     func testPhase61PastedImageCanSendAttachmentOnly() async throws {
         let uploader = StubAttachmentUploadHandler()
         let handler = RecordingAttachmentMessageActionHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let channelID = model.selection.channelID!
@@ -277,7 +277,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase61PastedFileURLsQueueComposerAttachmentsWithoutReviewOrUpload() async throws {
         let uploader = StubAttachmentUploadHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
         let url = try makeTemporaryAttachment(name: "pasted-file.txt", contents: Data("paste".utf8))
 
@@ -291,7 +291,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase61InvalidPastedImageAndMissingChannelStayOutOfComposer() {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
 
         model.addPastedImageData(Data(repeating: 1, count: AttachmentUploadLimits.maxFileBytes + 1), to: channelID)
@@ -309,7 +309,7 @@ extension StoatFeaturesTests {
     func testPhase15SendUploadsAttachmentsAndSendsFileIDs() async throws {
         let uploader = StubAttachmentUploadHandler()
         let handler = RecordingAttachmentMessageActionHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let channelID = model.selection.channelID!
@@ -332,7 +332,7 @@ extension StoatFeaturesTests {
     func testPhase15AttachmentOnlySendAndUploadFailureKeepsDraft() async throws {
         let failingUploader = StubAttachmentUploadHandler(uploadError: MessageActionError.unavailable("upload failed"))
         let handler = RecordingAttachmentMessageActionHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, attachmentUploadHandler: failingUploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, attachmentUploadHandler: failingUploader, communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let channelID = model.selection.channelID!
@@ -348,7 +348,7 @@ extension StoatFeaturesTests {
 
         let workingUploader = StubAttachmentUploadHandler()
         let workingHandler = RecordingAttachmentMessageActionHandler()
-        let workingModel = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: workingHandler, attachmentUploadHandler: workingUploader, communityAPIClient: StubStoatAPIClient())
+        let workingModel = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: workingHandler, attachmentUploadHandler: workingUploader, communityAPIClient: StubStoatAPIClient())
         workingModel.selectServer(server.id)
         let workingChannelID = workingModel.selection.channelID!
         workingModel.addAttachmentURLs([url], to: workingChannelID)
@@ -362,7 +362,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase16RemotePreviewOnlyLoadsAfterExplicitAction() async throws {
         let loader = StubRemoteAttachmentLoader(result: .success(RemoteAttachmentData(fileID: "file-remote", filename: "note.txt", contentType: "text/plain", byteCount: 5, data: Data("hello".utf8))))
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
         let file = File(id: "file-remote", tag: "attachments", filename: "note.txt", metadata: .text, contentType: "text/plain", size: 5)
         let item = AttachmentDisplayItem(file: file)
 
@@ -381,7 +381,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase16RemotePreviewFailureIsSafeAndRetryable() async throws {
         let loader = StubRemoteAttachmentLoader(result: .failure(AttachmentActionError.unavailable("token=secret /Users/enka/private/file.png")))
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
         let file = File(id: "file-failed", tag: "attachments", filename: "safe.txt", metadata: .text, contentType: "text/plain", size: 5)
         let item = AttachmentDisplayItem(file: file)
 
@@ -406,7 +406,7 @@ extension StoatFeaturesTests {
         let loader = StubRemoteAttachmentLoader(result: .success(RemoteAttachmentData(fileID: "file-save", filename: "payload.txt", contentType: "text/plain", byteCount: data.count, data: data)))
         let saver = StubAttachmentSaver()
         let opener = StubAttachmentOpener()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, attachmentSaver: saver, attachmentOpener: opener, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, attachmentSaver: saver, attachmentOpener: opener, communityAPIClient: StubStoatAPIClient())
         let file = File(id: "file-save", tag: "attachments", filename: "/private/payload.txt", metadata: .text, contentType: "text/plain", size: data.count)
         let item = AttachmentDisplayItem(file: file)
 
@@ -426,7 +426,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase16ComposerSummaryFailedReadinessAndDiagnostics() async throws {
         let failingUploader = StubAttachmentUploadHandler(uploadError: MessageActionError.unavailable("upload failed"))
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: failingUploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: failingUploader, communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let channelID = model.selection.channelID!
@@ -490,7 +490,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase20SendDiagnosticsAndTimelineCopyStayRedacted() async throws {
         let handler = StubMessageActionHandler(sendError: MessageActionError.unavailable(#"send failed token="secret" /Users/enka/private/file.png {"raw":"payload"}"#))
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         let channelID = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "general" }?.id)
         model.selectChannel(channelID)
         model.updateDraft("diagnostic message", for: channelID)
@@ -516,7 +516,7 @@ extension StoatFeaturesTests {
     func testPhase20ImageSendPreservesLocalPreviewData() async throws {
         let uploader = StubAttachmentUploadHandler()
         let handler = ImageAttachmentMessageActionHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
         let channelID = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "general" }?.id)
         let png = Data([137, 80, 78, 71, 13, 10, 26, 10])
         model.selectChannel(channelID)
@@ -534,7 +534,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testEditDeleteAndReactionActionsCallHandler() async {
         let handler = StubMessageActionHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let ownMessage = model.selectedTimelineMessages.first { $0.message.authorID == TestShellData.currentUserID }!
@@ -557,7 +557,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testTypingBeginDoesNotSpamAndChannelSwitchEndsTyping() async throws {
         let handler = StubMessageActionHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let channelID = model.selection.channelID!

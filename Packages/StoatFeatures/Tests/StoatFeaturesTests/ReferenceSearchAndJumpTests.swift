@@ -27,7 +27,7 @@ extension StoatFeaturesTests {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server("server"), serverID: "server", channelID: channelID),
             snapshot: snapshot,
-            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), messageReferenceResolver: resolver, communityAPIClient: StubStoatAPIClient())
+            runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), messageReferenceResolver: resolver, communityAPIClient: StubStoatAPIClient())
 
         XCTAssertEqual(model.resolvedReplyPreview(for: reply), "Loading original message...")
         model.prepareReplyPreview(for: reply)
@@ -40,7 +40,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase11TimelineDiagnosticsStayTokenFree() throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
         let first = try XCTUnwrap(model.selectedTimelineMessages.first?.message.id)
@@ -110,7 +110,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase12FindInLoadedMessagesIsLocalAndCreatesJumpIntent() async throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
         let message = message(id: "01J00000000000000000000001", author: "a", channel: channelID)
@@ -141,7 +141,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase13CalibrationRecordsObservationsAndRedactsCopy() throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         model.startTimelineCalibration()
         model.addTimelineCalibrationCheckpoint(note: "token=super-secret-value")
@@ -164,7 +164,7 @@ extension StoatFeaturesTests {
         XCTAssertEqual(responsive, responsive.validated())
         XCTAssertEqual(TimelineTuningPreset.debugStrict.configuration.ackDebounceMilliseconds, 0)
 
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.applyTimelineTuningPreset(.responsive)
         XCTAssertEqual(model.timelineTuning, TimelineTuningPreset.responsive.configuration)
         model.resetTimelineTuningToDefaults()
@@ -173,7 +173,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase13LoadedFindUsesChannelSearchStateAndJumps() async throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         model.channelSearchQuery = ChannelSearchQuery(text: "Phase", mode: .loadedOnly)
 
@@ -203,7 +203,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase13SearchResultNavigationRouteGatingAndAccessibility() throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
         let result = ChannelSearchResult(
@@ -228,7 +228,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase14SearchHighlightClassifiesLoadedAndUnloadedResults() async throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         model.channelSearchQuery = ChannelSearchQuery(text: "Phase", mode: .loadedOnly)
 
@@ -244,7 +244,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase14SearchNavigationCyclesAndScrollsLoadedResults() async throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
         let messages = Array(model.selectedTimelineMessages.prefix(2))
@@ -273,7 +273,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase14UnloadedResultPreservesSelectionAndCanClearHighlights() throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
         let result = ChannelSearchResult(
@@ -300,7 +300,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase14ChannelSwitchClearsScopedHighlights() async throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         model.channelSearchQuery = ChannelSearchQuery(text: "Phase", mode: .loadedOnly)
         await model.runChannelSearch()
@@ -331,7 +331,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase14CalibrationDecisionKeepsConservativeWithoutRealNotesAndRedactsImport() {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         guard case .remainConservative = model.defaultTuningDecision else {
             return XCTFail("Expected conservative default without notes")
         }
@@ -387,7 +387,7 @@ extension StoatFeaturesTests {
     func testPhase17DeleteConfirmationAndStableIDGating() {
         let currentUser = TestShellData.currentUserID
         let channelID: ChannelID = "channel-phase17"
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: User(id: currentUser, username: "me"), messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: User(id: currentUser, username: "me"), messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let confirmed = TimelineMessage(message: Message(id: "01J00000000000000000017003", channelID: channelID, authorID: currentUser, content: "delete me"))
         let pending = TimelineMessage(message: Message(id: "pending-local", channelID: channelID, authorID: currentUser, content: "pending"), status: .pending)
 
@@ -401,7 +401,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase17CopyUsesMockCopierAndRedactsUnsafeContent() async {
         let copier = StubMessageCopier()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), messageCopier: copier, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), messageCopier: copier, communityAPIClient: StubStoatAPIClient())
         let message = Message(
             id: "01J00000000000000000017004",
             channelID: "channel-phase17",
@@ -423,7 +423,7 @@ extension StoatFeaturesTests {
         let currentUser = TestShellData.currentUserID
         let channelID = TestShellData.snapshot.channelsByID.values.first { $0.kind == .textChannel }!.id
         let handler = StubMessageActionHandler(currentUserID: currentUser)
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: User(id: currentUser, username: "me"), messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: User(id: currentUser, username: "me"), messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         let reacted = TimelineMessage(message: Message(id: "01J00000000000000000017005", channelID: channelID, authorID: "other", content: "hello", reactions: ["👍": [currentUser, "other"], "✅": ["other"]]))
 
         let summaries = model.reactionSummaries(for: reacted.message)
@@ -444,7 +444,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase17AttachmentDisplayDoesNotInvokeRemoteLoader() async {
         let loader = StubRemoteAttachmentLoader()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
         let file = File(id: "file-phase17", tag: "attachments", filename: "photo.png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
         let message = Message(id: "01J00000000000000000017007", channelID: "channel-phase17", authorID: "other", content: "with file", attachments: [file])
 

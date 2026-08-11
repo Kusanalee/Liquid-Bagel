@@ -119,7 +119,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase18NotificationRouteOpensLoadedMessage() async {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(), notificationPermissionManager: StubNotificationPermissionManager(), dockBadgeManager: StubDockBadgeManager(), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(), notificationPermissionManager: StubNotificationPermissionManager(), dockBadgeManager: StubDockBadgeManager(), communityAPIClient: StubStoatAPIClient())
         let channel = model.snapshot.channelsByID.values.first { ($0.serverID != nil) && $0.kind == .textChannel }!
         let message = model.snapshot.messagesByChannelID[channel.id]!.first!
 
@@ -131,7 +131,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase18NotificationRouteDoesNotFetchUnloadedMessageInMockMode() async {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(), notificationPermissionManager: StubNotificationPermissionManager(), dockBadgeManager: StubDockBadgeManager(), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(), notificationPermissionManager: StubNotificationPermissionManager(), dockBadgeManager: StubDockBadgeManager(), communityAPIClient: StubStoatAPIClient())
         let channel = model.snapshot.channelsByID.values.first { ($0.serverID != nil) && $0.kind == .textChannel }!
 
         await model.openNotificationRoute(NotificationRoute(serverID: channel.serverID, channelID: channel.id, messageID: "missing-message"))
@@ -144,7 +144,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase18MockDeliveryIsExplicitOnly() async throws {
         let service = StubNotificationService()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: service, notificationPermissionManager: StubNotificationPermissionManager(), dockBadgeManager: StubDockBadgeManager(), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: service, notificationPermissionManager: StubNotificationPermissionManager(), dockBadgeManager: StubDockBadgeManager(), communityAPIClient: StubStoatAPIClient())
 
         let before = await service.events()
         XCTAssertTrue(before.isEmpty)
@@ -232,7 +232,7 @@ extension StoatFeaturesTests {
         let dock = StubDockBadgeManager()
         let model = MainShellViewModel(
             snapshot: TestShellData.snapshot,
-            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(),
+            runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(),
             notificationPermissionManager: StubNotificationPermissionManager(),
             dockBadgeManager: dock,
             communityAPIClient: StubStoatAPIClient(), notificationRouteCenter: NotificationRouteCenter()
@@ -258,7 +258,7 @@ extension StoatFeaturesTests {
         let dock = StubDockBadgeManager()
         let model = MainShellViewModel(
             snapshot: TestShellData.snapshot,
-            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(),
+            runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(),
             notificationPermissionManager: StubNotificationPermissionManager(),
             dockBadgeManager: dock,
             communityAPIClient: StubStoatAPIClient(), notificationRouteCenter: NotificationRouteCenter()
@@ -352,7 +352,7 @@ extension StoatFeaturesTests {
     func testPhase21InlineImagePolicyAutoLoadsSmallVisibleImages() async {
         let data = Data("png".utf8)
         let loader = StubRemoteAttachmentLoader(result: .success(RemoteAttachmentData(filename: "photo.png", contentType: "image/png", byteCount: data.count, data: data)))
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
         let file = File(id: "phase21-image", tag: "attachments", filename: "photo.png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
         let message = Message(id: "01J00000000000000000021001", channelID: "01HX0000000000000000000101", authorID: TestShellData.currentUserID, attachments: [file])
 
@@ -378,7 +378,7 @@ extension StoatFeaturesTests {
         snapshot.messagesByChannelID[channelID] = [message]
         let data = Data("png-bytes".utf8)
         let loader = StubImageResourceLoader(result: .success(data))
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
 
         await model.prepareSelectedTimelinePresentation()
         let cachedBefore = model.timelineRowPresentation(for: message.id)
@@ -412,7 +412,7 @@ extension StoatFeaturesTests {
         let message = Message(id: "01J00000000000000000560002", channelID: channelID, authorID: "phase56-author", content: "look", attachments: files)
         snapshot.messagesByChannelID[channelID] = [message]
         let loader = StubImageResourceLoader(result: .success(Data("png-bytes".utf8)))
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
 
         await model.prepareSelectedTimelinePresentation()
         let rowBuildCountBeforeLoads = model.timelinePresentationDiagnostics.rowBuildCount
@@ -443,7 +443,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase21ExplicitInlinePolicyDoesNotAutoLoadImages() async {
         let loader = StubRemoteAttachmentLoader()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
         model.inlineImagePreviewPolicy = .explicitClickOnly
         let file = File(id: "phase21-image-explicit", tag: "attachments", filename: "photo.png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
         let message = Message(id: "01J00000000000000000021002", channelID: "01HX0000000000000000000101", authorID: TestShellData.currentUserID, attachments: [file])

@@ -894,7 +894,7 @@ public final class ChannelMessageController {
     @ObservationIgnored private var messageCache: any ChannelMessageCaching = NoopChannelMessageCache()
 
     public init(
-        runtimeMode: AppRuntimeMode = .mock,
+        runtimeMode: AppRuntimeMode = .liveManual,
         apiClient: (any StoatAPIClient)? = nil,
         currentUserID: UserID? = nil,
         pageSize: Int = 50,

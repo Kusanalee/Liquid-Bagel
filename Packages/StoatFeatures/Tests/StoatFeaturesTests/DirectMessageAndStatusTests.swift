@@ -76,7 +76,7 @@ extension StoatFeaturesTests {
         snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Group", recipients: [currentUserID, otherUserID])
         snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: [currentUserID, otherUserID])
         snapshot.channelsByID[savedID] = Channel(id: savedID, kind: .savedMessages, userID: currentUserID, recipients: [])
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.selectChannel(groupID)
         XCTAssertEqual(model.activeConversation, .groupDM(channelID: groupID))
@@ -157,7 +157,7 @@ extension StoatFeaturesTests {
         let currentUser = User(id: "phase41-me", username: "me", displayName: "Old Name", relationship: .user)
         snapshot.usersByID[currentUser.id] = currentUser
         let api = RecordingAPIClient(currentUser: currentUser, uploadError: StoatAPIError.unknown(statusCode: 400, body: #"{"error":"reject"}"#))
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.prepareProfileEditor(force: true)
         try model.stageProfileMediaData(kind: .avatar, data: Self.phase41PNGData, filename: "/Users/enka/secret/avatar.png", mimeType: "image/png")
@@ -178,7 +178,7 @@ extension StoatFeaturesTests {
         let currentUser = User(id: "phase41-me", username: "me", displayName: "Old Name", relationship: .user)
         snapshot.usersByID[currentUser.id] = currentUser
         let api = RecordingAPIClient(currentUser: currentUser, editUserError: StoatAPIError.serverError(statusCode: 500, message: "nope"))
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
         model.userProfilesByID[currentUser.id] = UserProfile(content: "old bio")
 
         model.prepareProfileEditor(force: true)
@@ -211,7 +211,7 @@ extension StoatFeaturesTests {
             currentUser: currentUser,
             uploadedFileIDsByTag: [.avatars: "phase41-new-avatar", .backgrounds: "phase41-new-background"]
         )
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
         model.userProfilesByID[currentUserID] = UserProfile(content: "old bio", background: oldBackground)
         model.loadedImageResources[ImageCacheKey(id: oldAvatar.id.rawValue, kind: .userAvatar)] = Data("old-avatar".utf8)
         model.loadedImageResources[ImageCacheKey(id: oldBackground.id.rawValue, kind: .profileBackground)] = Data("old-background".utf8)
@@ -248,7 +248,7 @@ extension StoatFeaturesTests {
         let avatar = File(id: "phase41-avatar", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: 1)
         let currentUser = User(id: "phase41-me", username: "me", displayName: "Old Name", avatar: avatar, relationship: .user)
         snapshot.usersByID[currentUser.id] = currentUser
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.prepareProfileEditor(force: true)
         XCTAssertFalse(model.profileEditDraft.isDirty)
@@ -337,7 +337,7 @@ extension StoatFeaturesTests {
         let currentUser = User(id: "phase55-me", username: "me", status: UserStatus(text: nil, presence: .idle), relationship: .user)
         snapshot.usersByID[currentUser.id] = currentUser
         let api = RecordingAPIClient(currentUser: currentUser)
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.customStatusDraft = "  Reviewing bagels  "
         await model.submitCustomStatusDraft()
@@ -358,7 +358,7 @@ extension StoatFeaturesTests {
         let currentUser = User(id: "phase55-me", username: "me", status: UserStatus(text: "old status", presence: .online), relationship: .user)
         snapshot.usersByID[currentUser.id] = currentUser
         let api = RecordingAPIClient(currentUser: currentUser)
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         await model.clearCustomStatus()
 
@@ -376,7 +376,7 @@ extension StoatFeaturesTests {
         let currentUser = User(id: "phase55-me", username: "me", status: UserStatus(text: "keep me", presence: .online), relationship: .user)
         snapshot.usersByID[currentUser.id] = currentUser
         let api = RecordingAPIClient(currentUser: currentUser, editUserError: StoatAPIError.serverError(statusCode: 500, message: "nope"))
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         await model.setCurrentUserStatusText("new text")
 
@@ -393,7 +393,7 @@ extension StoatFeaturesTests {
         let currentUser = User(id: "phase55-me", username: "me", status: UserStatus(text: "same", presence: .online), relationship: .user)
         snapshot.usersByID[currentUser.id] = currentUser
         let api = RecordingAPIClient(currentUser: currentUser)
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.openCustomStatusEditor()
         XCTAssertEqual(model.customStatusDraft, "same")
@@ -417,7 +417,7 @@ extension StoatFeaturesTests {
         let currentUser = User(id: "phase55-me", username: "me", relationship: .user)
         snapshot.usersByID[currentUser.id] = currentUser
         let api = RecordingAPIClient(currentUser: currentUser)
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.openNewGroup()
         XCTAssertTrue(model.isPresentingNewGroup)
@@ -451,7 +451,7 @@ extension StoatFeaturesTests {
             currentUser: currentUser,
             createGroupError: StoatAPIError.serverError(statusCode: 500, message: "nope")
         )
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.openNewGroup()
         model.groupCreateName = "Bagel Crew"
@@ -484,7 +484,7 @@ extension StoatFeaturesTests {
         snapshot.usersByID[currentUser.id] = currentUser
         snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id])
         let api = RecordingAPIClient(currentUser: currentUser)
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.openAddGroupMembers(for: groupID)
         XCTAssertTrue(model.isPresentingAddGroupMembers)
@@ -514,7 +514,7 @@ extension StoatFeaturesTests {
         snapshot.usersByID[currentUser.id] = currentUser
         snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id])
         let api = RecordingAPIClient(currentUser: currentUser, addGroupRecipientError: StoatAPIError.forbidden)
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.openAddGroupMembers(for: groupID)
         model.toggleAddGroupMemberCandidate("phase58-not-a-friend")
@@ -536,7 +536,7 @@ extension StoatFeaturesTests {
         snapshot.usersByID[currentUser.id] = currentUser
         snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id, "phase58-member-a"])
         let api = RecordingAPIClient(currentUser: currentUser)
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         // Self-removal must never be requestable through this path.
         model.requestRemoveGroupMember(currentUser.id, from: groupID, displayName: "Me")
@@ -564,7 +564,7 @@ extension StoatFeaturesTests {
         snapshot.usersByID[currentUser.id] = currentUser
         snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: ownerID, active: true, recipients: [ownerID, currentUser.id, "phase58-member-a"])
         let api = RecordingAPIClient(currentUser: currentUser)
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.requestRemoveGroupMember("phase58-member-a", from: groupID, displayName: "Member A")
         XCTAssertNil(model.pendingGroupMemberRemoval, "Only the group owner may request removal of another member")
@@ -589,7 +589,7 @@ extension StoatFeaturesTests {
         snapshot.usersByID[existingFriend.id] = existingFriend
         snapshot.usersByID[newFriend.id] = newFriend
         snapshot.channelsByID[groupID] = Channel(id: groupID, kind: .group, name: "Bagel Crew", ownerID: currentUser.id, active: true, recipients: [currentUser.id, existingFriend.id])
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: friendedCurrentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: friendedCurrentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         let candidates = model.addGroupMemberCandidates(for: groupID)
         XCTAssertEqual(candidates.map(\.user.id), [newFriend.id])

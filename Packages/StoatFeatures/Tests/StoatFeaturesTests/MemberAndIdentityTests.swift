@@ -14,7 +14,7 @@ import XCTest
 extension StoatFeaturesTests {
     @MainActor
     func testPhase22MockRelationshipActionsAndDMSelection() async {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let design = UserID(rawValue: "01HX0000000000000000000003")
 
         await model.performRelationshipAction(.block, userID: design)
@@ -31,7 +31,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase22QuickSwitcherRoutesFriendsAndAddFriend() {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.perform(.jumpToFriends)
         XCTAssertEqual(model.selection.space, .directMessages)
@@ -80,7 +80,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase27DMSelectionTargetsComposerAndQueuesDropWithoutUpload() async throws {
         let uploader = StubAttachmentUploadHandler()
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), attachmentUploadHandler: uploader, communityAPIClient: StubStoatAPIClient())
         let dmID = try XCTUnwrap(model.directMessageItems.first?.id)
         let url = try makeTemporaryAttachment(name: "phase27.txt", contents: Data("queued".utf8))
 
@@ -160,7 +160,7 @@ extension StoatFeaturesTests {
             Message(id: "01J00000000000000000280001", channelID: groupID, authorID: otherUserID, content: "hello")
         ]
 
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectDirectMessages()
 
         XCTAssertEqual(model.selection.space, .directMessages)
@@ -217,7 +217,7 @@ extension StoatFeaturesTests {
             )
         }
 
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let groups = model.memberListGroups(for: serverID)
 
         XCTAssertEqual(groups.reduce(0) { $0 + $1.items.count }, 250)
@@ -316,7 +316,7 @@ extension StoatFeaturesTests {
             snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date())
         }
         let loader = StubImageResourceLoader(result: .success(Data("avatar".utf8)))
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         await model.prepareMemberListGroups(for: serverID)
 
         model.reloadVisibleImages()
@@ -351,7 +351,7 @@ extension StoatFeaturesTests {
                 joinedAt: Date()
             )
         }
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.prepareMemberListGroups(for: serverID)
         let revisionAfterFirstPrepare = model.memberListGroupsRevision
@@ -378,7 +378,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase55MediaSafeModeResetsAfterImageQueueDrains() async throws {
         let loader = SlowImageResourceLoader(delayNanoseconds: 10_000_000)
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         for index in 0..<32 {
             let file = File(id: FileID(rawValue: "phase55-safemode-\(index)"), tag: "attachments", filename: "\(index).png", contentType: "image/png", size: 1)
             model.loadImageResource(for: file, kind: .attachmentPreview)
@@ -397,7 +397,7 @@ extension StoatFeaturesTests {
     func testPhase55InlinePreviewQueueDrainsBeyondConcurrencyLimit() async throws {
         let data = Data("png".utf8)
         let loader = StubRemoteAttachmentLoader(result: .success(RemoteAttachmentData(filename: "photo.png", contentType: "image/png", byteCount: data.count, data: data)))
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), remoteAttachmentLoader: loader, communityAPIClient: StubStoatAPIClient())
         let files = (0..<10).map { index in
             File(id: FileID(rawValue: "phase55-inline-\(index)"), tag: "attachments", filename: "photo\(index).png", metadata: .image(width: 10, height: 10, thumbhash: nil, animated: false), contentType: "image/png", size: 100)
         }
@@ -418,7 +418,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase55FailedImageResourceRetriesWithBackoffForAllKinds() async throws {
         let loader = StubImageResourceLoader(result: .failure(AttachmentActionError.unavailable("nope")))
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let clock = Phase55TestClock(now: Date())
         model.setPhase43NowProvider { clock.now }
         let file = File(id: "phase55-banner", tag: "banners", filename: "banner.png", contentType: "image/png", size: 10)
@@ -444,7 +444,7 @@ extension StoatFeaturesTests {
     func testPhase57ImageDataMissIsCacheOnlyAndExplicitVisibilityDeduplicatesReload() async throws {
         let data = Data("avatar".utf8)
         let loader = StubImageResourceLoader(result: .success(data))
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let file = File(id: "phase56-avatar-reload", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: data.count)
 
         XCTAssertNil(model.imageData(for: file, kind: .userAvatar))
@@ -469,7 +469,7 @@ extension StoatFeaturesTests {
     func testPhase57VisibleImageSurvivesPressureAndEvictedImageDoesNotReloadLoop() async throws {
         let data = Data(repeating: 7, count: 40 * 1024 * 1024)
         let loader = StubImageResourceLoader(result: .success(data))
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let pinned = File(id: "phase57-pinned", tag: "avatars", filename: "pinned.png", contentType: "image/png", size: data.count)
         let unpinned = File(id: "phase57-unpinned", tag: "avatars", filename: "unpinned.png", contentType: "image/png", size: data.count)
 
@@ -514,7 +514,7 @@ extension StoatFeaturesTests {
     func testPhase62CurrentUserRailAvatarStaysPinnedAndTransfersVisibility() async throws {
         let data = Data(repeating: 9, count: 40 * 1024 * 1024)
         let loader = StubImageResourceLoader(result: .success(data))
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let original = File(id: "phase62-rail-original", tag: "avatars", filename: "original.png", contentType: "image/png", size: data.count)
         let pressure = File(id: "phase62-pressure", tag: "avatars", filename: "pressure.png", contentType: "image/png", size: data.count)
         let replacement = File(id: "phase62-rail-replacement", tag: "avatars", filename: "replacement.png", contentType: "image/png", size: data.count)
@@ -547,7 +547,7 @@ extension StoatFeaturesTests {
     func testPhase62PartialMessageIdentityDoesNotInvalidatePinnedAvatar() async throws {
         let data = Data("phase62-avatar".utf8)
         let loader = StubImageResourceLoader(result: .success(data))
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let userID = UserID(rawValue: "phase62-partial-user")
         let avatar = File(id: "phase62-partial-avatar", tag: "avatars", filename: "avatar.png", contentType: "image/png", size: data.count)
         let completeUser = User(id: userID, username: "phase62", displayName: "Phase 62", avatar: avatar)
@@ -613,7 +613,7 @@ extension StoatFeaturesTests {
     func testPhase62MemberOverlayDoesNotOscillateGlobalAvatarCache() async throws {
         let data = Data("phase62-member-avatar".utf8)
         let loader = StubImageResourceLoader(result: .success(data))
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let userID = UserID(rawValue: "phase62-member-user")
         let serverID = ServerID(rawValue: "phase62-member-server")
         let globalAvatar = File(id: "phase62-global-avatar", tag: "avatars", filename: "global.png", contentType: "image/png", size: data.count)
@@ -652,7 +652,7 @@ extension StoatFeaturesTests {
     func testPhase62MemberAvatarVisibilityGraceCancelsAndClears() async throws {
         let data = Data("phase62-member-grace".utf8)
         let loader = StubImageResourceLoader(result: .success(data))
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let avatar = File(id: "phase62-member-grace", tag: "avatars", filename: "member.png", contentType: "image/png", size: data.count)
         let consumerID = "member-panel-avatar-server-user"
 
@@ -673,7 +673,7 @@ extension StoatFeaturesTests {
     func testPhase63TimelineAvatarHideGraceCancelsAndClears() async throws {
         let data = Data("phase63-timeline-grace".utf8)
         let loader = StubImageResourceLoader(result: .success(data))
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let avatar = File(id: "phase63-timeline-grace", tag: "avatars", filename: "author.png", contentType: "image/png", size: data.count)
         let consumerID = "timeline-avatar-channel-row"
 
@@ -692,7 +692,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase63VisibilityGraceUsesOneWorkerForManyTimelineRows() async throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         for index in 0..<40 {
             model.timelineAvatarBecameHidden(consumerID: "timeline-avatar-phase63-\(index)")
         }
@@ -707,7 +707,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase63InlinePreviewCancellationWaitsForGracePeriod() throws {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
         let messageID = try XCTUnwrap(model.selectedTimelineMessages.first?.message.id)
@@ -736,7 +736,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase63TimelineRenderItemViewEquatableSkipsUnchangedRows() {
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channelID: ChannelID = "phase63-equatable-channel"
         let userID: UserID = "phase63-equatable-user"
         func makeItem(content: String) -> TimelineRenderItem {
@@ -765,7 +765,7 @@ extension StoatFeaturesTests {
             TimelineRenderItemView(item: item, viewModel: model),
             TimelineRenderItemView(item: makeItem(content: "edited"), viewModel: model)
         )
-        let otherModel = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let otherModel = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         XCTAssertNotEqual(
             TimelineRenderItemView(item: item, viewModel: model),
             TimelineRenderItemView(item: item, viewModel: otherModel)
@@ -886,7 +886,7 @@ extension StoatFeaturesTests {
         )
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
-            snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+            snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         await model.prepareSelectedTimelinePresentation()
         let groupingBuilds = model.timelinePresentationDiagnostics.groupingBuildCount
         let rowRequests = model.phase60Diagnostics.rowRequestCount
@@ -920,7 +920,7 @@ extension StoatFeaturesTests {
     func testPhase59AvatarCompletionDoesNotInvalidatePreparedTimelineRows() async throws {
         let data = Data("avatar".utf8)
         let loader = StubImageResourceLoader(result: .success(data))
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let memberAvatar = File(id: "phase57-member-avatar", tag: "avatars", filename: "member.png", contentType: "image/png", size: data.count)
         let timelineAvatar = File(id: "phase57-timeline-avatar", tag: "avatars", filename: "timeline.png", contentType: "image/png", size: data.count)
 
@@ -967,7 +967,7 @@ extension StoatFeaturesTests {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(serverID), serverID: serverID),
             snapshot: snapshot,
-            currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+            runtimeMode: .mock, sessionState: .mock, currentUser: currentUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         XCTAssertEqual(model.shellPresentationSnapshot.allFriendItems.map(\.user.id), [friendID])
         XCTAssertEqual(model.phase51PerformanceDiagnostics.shellRelationshipCandidateCount, 1)
         let requestsBefore = model.phase51PerformanceDiagnostics.shellRequestCount
@@ -989,7 +989,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase59VisibleAvatarPromotesAheadOfQueuedBackgroundAndIdentityWork() async throws {
         let loader = SlowImageResourceLoader(delayNanoseconds: 120_000_000)
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         for index in 0..<8 {
             model.loadImageResource(
                 for: File(id: FileID(rawValue: "phase59-background-\(index)"), tag: "banners", filename: "b.png", contentType: "image/png", size: 5),
@@ -1015,7 +1015,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase59ReactionIsOptimisticAndDeduplicatesWhileInFlight() async throws {
         let handler = Phase59ReactionHandler(delay: .milliseconds(80))
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let message = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
 
@@ -1042,7 +1042,7 @@ extension StoatFeaturesTests {
             delay: .milliseconds(30),
             error: MessageActionError.unavailable("server rejected reaction")
         )
-        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let message = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
 
@@ -1063,7 +1063,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase57TransientNoticePolicyKeepsSuccessSilentAndExpiresFailures() async throws {
-        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let model = MainShellViewModel(runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.placeholderStatus = "Custom status set."
         XCTAssertNil(model.transientNotice)
@@ -1222,7 +1222,7 @@ extension StoatFeaturesTests {
         let manager = StubNotificationPermissionManager(status: .notDetermined)
         let model = MainShellViewModel(
             snapshot: TestShellData.snapshot,
-            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(),
+            runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), notificationDeliverer: StubNotificationService(),
             notificationPermissionManager: manager,
             dockBadgeManager: StubDockBadgeManager(), communityAPIClient: StubStoatAPIClient())
 

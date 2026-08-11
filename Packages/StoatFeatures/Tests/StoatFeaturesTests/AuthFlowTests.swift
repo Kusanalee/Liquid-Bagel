@@ -669,7 +669,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         )
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
-            snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+            snapshot: snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.prepareSelectedTimelinePresentation()
         let firstBuildCount = model.phase51PerformanceDiagnostics.timelineBuildCount
@@ -706,7 +706,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
             snapshot: snapshot,
-            currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+            runtimeMode: .mock, sessionState: .mock, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         await model.prepareSelectedTimelinePresentation()
         XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [message.id])
 
@@ -771,7 +771,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
             let model = MainShellViewModel(
                 selection: route.1,
                 snapshot: snapshot,
-                currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+                runtimeMode: .mock, sessionState: .mock, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
             await model.prepareSelectedTimelinePresentation()
             XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [message.id])
@@ -798,7 +798,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: firstID),
             snapshot: snapshot,
-            currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+            runtimeMode: .mock, sessionState: .mock, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         await model.prepareSelectedTimelinePresentation()
 
         model.selectChannel(secondID)
@@ -862,7 +862,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
             snapshot: snapshot,
-            currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+            runtimeMode: .mock, sessionState: .mock, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         await model.prepareSelectedTimelinePresentation()
 
         var deletedSnapshot = snapshot
