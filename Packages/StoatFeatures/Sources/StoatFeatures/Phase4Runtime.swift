@@ -1523,6 +1523,16 @@ public final class AppSessionCoordinator {
 
     @ObservationIgnored private let tokenStore: any TokenStore
     @ObservationIgnored private let preferencesStore: any AppPreferencesStore
+
+    // MARK: Connectivity supervision (Phase 74)
+
+    @ObservationIgnored private let networkPathMonitor: (any NetworkPathMonitoring)?
+    @ObservationIgnored private var networkPathTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingConnectivityTask: Task<Void, Never>?
+    @ObservationIgnored private var lastConnectivityAttemptAt: Date?
+    @ObservationIgnored private var isSuspendedForSleep = false
+    public private(set) var networkPathStatus: NetworkPathStatus = .unknown
+    public private(set) var connectivityDiagnostics = ConnectivitySupervisorDiagnostics()
     @ObservationIgnored private let readyFields: Set<ReadyField>
     @ObservationIgnored private let sessionValidator: any SessionValidating
     @ObservationIgnored private let apiClientFactory: @Sendable (StoatAPIEnvironment, any CredentialProvider) -> any StoatAPIClient
@@ -1553,8 +1563,10 @@ public final class AppSessionCoordinator {
         },
         realtimeStoreFactory: @escaping @Sendable () -> RealtimeStateStore = {
             RealtimeStateStore()
-        }
+        },
+        networkPathMonitor: (any NetworkPathMonitoring)? = nil
     ) {
+        self.networkPathMonitor = networkPathMonitor
         self.tokenStore = tokenStore
         self.preferencesStore = preferencesStore
         self.environment = environment
@@ -1593,6 +1605,115 @@ public final class AppSessionCoordinator {
         eventTask?.cancel()
         connectionTask?.cancel()
         diagnosticsTask?.cancel()
+        networkPathTask?.cancel()
+        pendingConnectivityTask?.cancel()
+    }
+
+    // MARK: - Connectivity supervision (Phase 74)
+
+    /// Begin watching for the network coming back and for the Mac waking up.
+    ///
+    /// Both are signals `LiveStoatRealtimeClient` cannot see for itself: it only ever reacts to
+    /// its own socket failing, so it will sit out a backoff delay that stopped being relevant the
+    /// moment Wi-Fi reassociated.
+    public func startConnectivitySupervision() async {
+        guard let monitor = networkPathMonitor, networkPathTask == nil else { return }
+        await monitor.start()
+        networkPathStatus = await monitor.currentStatus()
+        let updates = monitor.pathUpdates
+        networkPathTask = Task { [weak self] in
+            for await status in updates {
+                guard !Task.isCancelled else { return }
+                await self?.handleNetworkPath(status)
+            }
+        }
+    }
+
+    public func stopConnectivitySupervision() async {
+        networkPathTask?.cancel()
+        networkPathTask = nil
+        pendingConnectivityTask?.cancel()
+        pendingConnectivityTask = nil
+        await networkPathMonitor?.cancel()
+    }
+
+    private func handleNetworkPath(_ status: NetworkPathStatus) async {
+        networkPathStatus = status
+        // Losing the path deliberately does nothing to the connection. The socket will fail on
+        // its own, and tearing it down here would race the client's own error handling. What this
+        // buys is accurate wording: "No internet connection" rather than "Couldn't reach Stoat".
+        guard status.isSatisfied else { return }
+        scheduleConnectivityAttempt(trigger: .networkPath, after: ConnectivityPolicy.pathSettleDelay)
+    }
+
+    public func handleSystemPowerEvent(_ event: SystemPowerEvent) async {
+        switch event {
+        case .willSleep:
+            guard !isSuspendedForSleep else { return }
+            isSuspendedForSleep = true
+            connectivityDiagnostics.sleepSuspensionCount += 1
+            await sessionCacheWillSuspend?()
+            // Disconnecting explicitly also cancels the client's backoff, so nothing is left
+            // counting down through the sleep and racing the wake-up attempt.
+            await disconnectActiveRealtime()
+            connectionState = .disconnected(reason: .requested)
+        case .didWake:
+            guard isSuspendedForSleep else { return }
+            isSuspendedForSleep = false
+            scheduleConnectivityAttempt(trigger: .wake, after: ConnectivityPolicy.wakeSettleDelay)
+        }
+    }
+
+    public func handleAppBecameActive() async {
+        scheduleConnectivityAttempt(trigger: .foreground, after: .zero)
+    }
+
+    /// Hook for flushing the offline cache before the machine sleeps. Set by the shell in Stage 7.
+    @ObservationIgnored public var sessionCacheWillSuspend: (@Sendable () async -> Void)?
+
+    private func scheduleConnectivityAttempt(trigger: ConnectivityTrigger, after delay: Duration) {
+        pendingConnectivityTask?.cancel()
+        pendingConnectivityTask = Task { [weak self] in
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            guard !Task.isCancelled else { return }
+            await self?.attemptSupervisedConnect(trigger: trigger)
+        }
+    }
+
+    private func attemptSupervisedConnect(trigger: ConnectivityTrigger) async {
+        pendingConnectivityTask = nil
+        guard hasSavedCredential else { return }
+
+        let decision = ConnectivityPolicy.decide(
+            trigger: trigger,
+            connectionState: connectionState,
+            pathStatus: networkPathStatus,
+            lastAttemptAt: lastConnectivityAttemptAt,
+            now: Date()
+        )
+        switch decision {
+        case .suppressedBackoffActive:
+            connectivityDiagnostics.suppressedBecauseBackoffActiveCount += 1
+            return
+        case .suppressedCooldown:
+            connectivityDiagnostics.suppressedBecauseCooldownCount += 1
+            return
+        case .suppressedOffline:
+            connectivityDiagnostics.suppressedBecauseOfflineCount += 1
+            return
+        case .connect:
+            break
+        }
+
+        lastConnectivityAttemptAt = Date()
+        switch trigger {
+        case .wake: connectivityDiagnostics.wakeTriggeredConnectCount += 1
+        case .networkPath: connectivityDiagnostics.pathTriggeredConnectCount += 1
+        case .foreground: connectivityDiagnostics.foregroundTriggeredConnectCount += 1
+        }
+        await connectLive(source: .retry)
     }
 
     public func startLiveFirstSession() async {

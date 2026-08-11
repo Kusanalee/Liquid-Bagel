@@ -6799,6 +6799,7 @@ public final class MainShellViewModel {
 
     public func attachSessionCoordinator(_ coordinator: AppSessionCoordinator) {
         sessionCoordinator = coordinator
+        installSystemPowerHandler()
         syncFromSessionCoordinator()
     }
 
@@ -10346,6 +10347,10 @@ public final class MainShellViewModel {
         appLifecyclePhase = phase
         if phase == .active {
             refreshNotificationPermissionStatus()
+            // Coming back to the app is a weak, frequent signal, so the supervisor's own cooldown
+            // decides whether it turns into an attempt. Worth having: a connection that failed
+            // while the app sat in the background should not need a menu command to recover.
+            Task { [weak self] in await self?.sessionCoordinator?.handleAppBecameActive() }
         }
         reconcileNotificationLifecycle()
     }
@@ -11845,6 +11850,17 @@ public final class MainShellViewModel {
         }
     }
 
+    /// Route sleep/wake to the coordinator's connectivity supervisor. Installed from
+    /// `attachSessionCoordinator` rather than `init` so a shell built without a coordinator --
+    /// which every test does -- never claims the process-wide handler.
+    private func installSystemPowerHandler() {
+        SystemPowerCenter.shared.setHandler { [weak self] event in
+            Task { @MainActor [weak self] in
+                await self?.sessionCoordinator?.handleSystemPowerEvent(event)
+            }
+        }
+    }
+
     private func reconcileNotificationLifecycle() {
         expiredNotificationRouteCount += removeExpiredQueuedNotificationRoutes()
         pruneNotificationBanners()
@@ -12750,7 +12766,11 @@ public final class LiquidBagelAppModel {
     public let shell: MainShellViewModel
     public let loginViewModel: FirstRunLoginViewModel
 
-    public init(coordinator: AppSessionCoordinator = AppSessionCoordinator()) {
+    /// The shipping app gets a real `NWPathMonitor`. Tests construct the coordinator themselves
+    /// and pass a deterministic monitor, or none at all.
+    public init(
+        coordinator: AppSessionCoordinator = AppSessionCoordinator(networkPathMonitor: NWPathNetworkMonitor())
+    ) {
         self.coordinator = coordinator
         self.shell = MainShellViewModel(
             snapshot: RealtimeSnapshot(),
@@ -13253,6 +13273,7 @@ public struct LiquidBagelRootView: View {
         }
         .task {
             appModel.shell.attachSessionCoordinator(appModel.coordinator)
+            await appModel.coordinator.startConnectivitySupervision()
             await appModel.coordinator.startLiveFirstSession()
             appModel.shell.syncFromSessionCoordinator()
         }
