@@ -162,16 +162,38 @@ extension MarkdownMessageContent {
         MarkdownInlineToken.tokenize(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems).map(\.testDescription)
     }
 
-    nonisolated static func _testInlineRenderingStrategy(
+    /// Describes the segments that compose into the paragraph's single `Text`.
+    ///
+    /// Replaces the old `_testInlineRenderingStrategy` seam. There is no longer a strategy to
+    /// report: every source composes one `Text`, and mentions and emoji are runs inside it rather
+    /// than sibling views in a non-wrapping `HStack`.
+    nonisolated static func _testInlineSegmentDescriptions(
+        for source: String,
+        customEmojiItems: [MessageInlineCustomEmojiItem] = [],
+        referenceItems: [String: MessageInlineReferenceItem] = [:]
+    ) -> [String] {
+        MarkdownInlineToken.tokenize(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems)
+            .map(\.testDescription)
+    }
+
+    /// The literal text of a mention run, including its non-breaking padding and name joining.
+    nonisolated static func _testMentionRunText(for item: MessageInlineReferenceItem) -> String {
+        MarkdownInlineContent.mentionRunText(for: item)
+    }
+
+    /// Whether a mention of this kind carries a tappable `.link` run attribute.
+    nonisolated static func _testMentionHasLink(for item: MessageInlineReferenceItem) -> Bool {
+        MentionLinkRoute.url(for: item) != nil
+    }
+
+    nonisolated static func _testAccessibleDescription(
         for source: String,
         customEmojiItems: [MessageInlineCustomEmojiItem] = [],
         referenceItems: [String: MessageInlineReferenceItem] = [:]
     ) -> String {
-        let tokens = MarkdownInlineToken.tokenize(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems)
-        return tokens.allSatisfy {
-            if case .text = $0 { return true }
-            return false
-        } ? MarkdownInlineRenderingStrategy.wrappingText.rawValue : MarkdownInlineRenderingStrategy.tokenRow.rawValue
+        MarkdownInlineContent.accessibleDescription(
+            for: MarkdownInlineToken.tokenize(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems)
+        )
     }
 }
 struct InlineCustomEmojiMessageContent: View {

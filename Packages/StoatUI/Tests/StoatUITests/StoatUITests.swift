@@ -292,34 +292,113 @@ final class StoatUITests: XCTestCase {
         assertPoints(270, start: UnitPoint(x: 1, y: 0.5), end: UnitPoint(x: 0, y: 0.5))  // to left
     }
 
-    func testPhase62PlainMarkdownUsesWrappingTextFlow() {
+    func testPhase62PlainMarkdownComposesTextSegments() {
         let longBio = "Star Rail codes. /FetchZZZ — Fetch all active Zenless Zone Zero codes. /FetchHI3 — Fetch all active Honkai Impact 3rd codes."
-        XCTAssertEqual(
-            MarkdownMessageContent._testInlineRenderingStrategy(for: longBio),
-            "wrappingText"
-        )
-        XCTAssertEqual(
-            MarkdownMessageContent._testInlineRenderingStrategy(for: "**Bold text** and a [link](https://example.invalid)"),
-            "wrappingText"
-        )
+        XCTAssertEqual(MarkdownMessageContent._testInlineSegmentDescriptions(for: longBio), ["text::\(longBio)"])
+
+        let styled = "**Bold text** and a [link](https://example.invalid)"
+        XCTAssertEqual(MarkdownMessageContent._testInlineSegmentDescriptions(for: styled), ["text::\(styled)"])
     }
 
-    func testPhase62InlineMediaAndReferencesKeepTokenRow() {
+    /// Phase 72 replaces `testPhase62InlineMediaAndReferencesKeepTokenRow`, which asserted that
+    /// emoji and mentions forced a non-wrapping `HStack`. That assertion encoded the bug: an
+    /// `HStack` cannot line-break, so any paragraph containing a mention or custom emoji refused
+    /// to wrap and truncated. All three token kinds now compose into one wrapping `Text`.
+    func testPhase72InlineMediaAndReferencesComposeIntoOneText() {
         let emoji = MessageInlineCustomEmojiItem(shortcode: ":bagel:", name: "bagel")
         XCTAssertEqual(
-            MarkdownMessageContent._testInlineRenderingStrategy(for: "hello :bagel:", customEmojiItems: [emoji]),
-            "tokenRow"
+            MarkdownMessageContent._testInlineSegmentDescriptions(for: "hello :bagel:", customEmojiItems: [emoji]),
+            ["text::hello ", "emoji:::bagel:"]
         )
 
         let userID = "01FD58YK5W7QRV5H3D64KTQYX3"
         let mention = MessageInlineReferenceItem(kind: .user, rawID: userID, displayName: "Enka")
         XCTAssertEqual(
-            MarkdownMessageContent._testInlineRenderingStrategy(
-                for: "hello <@\(userID)>",
+            MarkdownMessageContent._testInlineSegmentDescriptions(
+                for: "hello <@\(userID)> bye",
                 referenceItems: ["<@\(userID)>": mention]
             ),
-            "tokenRow"
+            ["text::hello ", "reference:user::\(userID)", "text:: bye"]
         )
+    }
+
+    func testPhase72MentionRunIsUnbreakableAndPadded() {
+        let item = MessageInlineReferenceItem(kind: .user, rawID: "01FD58YK5W7QRV5H3D64KTQYX3", displayName: "Design Pilot")
+        let run = MarkdownMessageContent._testMentionRunText(for: item)
+
+        // No ordinary space anywhere, so the mention wraps to the next line whole rather than
+        // splitting into two tinted fragments.
+        XCTAssertFalse(run.contains(" "), "mention run must not contain U+0020: \(run.debugDescription)")
+        XCTAssertTrue(run.contains("Design\u{00A0}Pilot"))
+        XCTAssertTrue(run.hasPrefix("\u{00A0}@"))
+        XCTAssertTrue(run.hasSuffix("\u{00A0}"))
+    }
+
+    func testPhase72OnlyUserMentionsAreTappable() {
+        let id = "01FD58YK5W7QRV5H3D64KTQYX3"
+        XCTAssertTrue(MarkdownMessageContent._testMentionHasLink(
+            for: MessageInlineReferenceItem(kind: .user, rawID: id, displayName: "Enka")
+        ))
+        // Channel and role mentions were inert before and stay inert.
+        XCTAssertFalse(MarkdownMessageContent._testMentionHasLink(
+            for: MessageInlineReferenceItem(kind: .channel, rawID: id, displayName: "general")
+        ))
+        XCTAssertFalse(MarkdownMessageContent._testMentionHasLink(
+            for: MessageInlineReferenceItem(kind: .role, rawID: id, displayName: "Core Crew")
+        ))
+    }
+
+    func testPhase72MentionLinkRouteRoundTripsAndRejectsBadInput() throws {
+        let id = "01FD58YK5W7QRV5H3D64KTQYX3"
+        let item = MessageInlineReferenceItem(kind: .user, rawID: id, displayName: "Enka")
+        let url = try XCTUnwrap(MentionLinkRoute.url(for: item))
+        XCTAssertEqual(url.absoluteString, "liquidbagel-mention://user/\(id)")
+        XCTAssertEqual(MentionLinkRoute.parse(url)?.rawValue, id)
+
+        // Ordinary links must fall through to the system so real URLs in messages still open.
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "https://example.invalid/\(id)")!))
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "liquidbagel-mention://role/\(id)")!))
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "liquidbagel-mention://user/0000")!))
+        // I, L, O and U are outside the Crockford ULID alphabet.
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "liquidbagel-mention://user/01FD58YK5W7QRV5H3D64KTQYXI")!))
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "liquidbagel-mention://user/01fd58yk5w7qrv5h3d64ktqyx3")!))
+    }
+
+    func testPhase72AccessibleDescriptionExpandsMentionKinds() {
+        let id = "01FD58YK5W7QRV5H3D64KTQYX3"
+        func description(_ item: MessageInlineReferenceItem) -> String {
+            MarkdownMessageContent._testAccessibleDescription(
+                for: "hi <@\(id)>",
+                referenceItems: ["<@\(id)>": item]
+            )
+        }
+
+        XCTAssertEqual(
+            description(MessageInlineReferenceItem(kind: .user, rawID: id, displayName: "Enka")),
+            "hi mention, Enka"
+        )
+        XCTAssertEqual(
+            description(MessageInlineReferenceItem(kind: .user, rawID: id, displayName: "Enka", isCurrentUser: true)),
+            "hi mentions you"
+        )
+        XCTAssertEqual(
+            description(MessageInlineReferenceItem(kind: .channel, rawID: id, displayName: "general")),
+            "hi channel mention, general"
+        )
+        XCTAssertEqual(
+            description(MessageInlineReferenceItem(kind: .role, rawID: id, displayName: "Core Crew")),
+            "hi role mention, Core Crew"
+        )
+    }
+
+    func testPhase72InlineEmojiGlyphScaleIsClamped() {
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 44), 2, accuracy: 0.001)
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 22), 1, accuracy: 0.001)
+        // Never scale below 1 -- a tiny bitmap should not be blown up past its natural size.
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 11), 1, accuracy: 0.001)
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 0), 1, accuracy: 0.001)
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: -5), 1, accuracy: 0.001)
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 10_000), 8, accuracy: 0.001)
     }
 
     func testPhase58MentionTokenizerExtractsUserMentionsOutsideCode() {

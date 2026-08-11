@@ -240,10 +240,46 @@ final class MarkdownInlineCache: @unchecked Sendable {
         }
     }
 }
-enum MarkdownInlineRenderingStrategy: String, Equatable {
-    case wrappingText
-    case tokenRow
+/// Scales a decoded custom-emoji bitmap so an interpolated `Text` glyph lands at body height.
+///
+/// `Text` renders interpolated images at their natural point size, which for a 44px bitmap is
+/// 44pt — twice the intended 22pt. `Image(decorative:scale:)` divides by the scale, so the
+/// scale we want is `pixelHeight / targetPointHeight`.
+enum InlineEmojiGlyphMetrics {
+    static let targetPointHeight: CGFloat = 22
+
+    static func scale(pixelHeight: Int, targetPointHeight: CGFloat = targetPointHeight) -> CGFloat {
+        guard pixelHeight > 0, targetPointHeight > 0 else { return 1 }
+        return min(8, max(1, CGFloat(pixelHeight) / targetPointHeight))
+    }
 }
+
+/// Encodes a mention as a URL so it can ride on an `AttributedString` `.link` run.
+///
+/// Inline mentions have to participate in real line breaking, which means they must be runs
+/// inside the message's single `Text` rather than sibling views. `.link` is the only run
+/// attribute SwiftUI hit-tests, and it coexists with `.textSelection(.enabled)`.
+public enum MentionLinkRoute {
+    public static let scheme = "liquidbagel-mention"
+    private static let userHost = "user"
+
+    public static func url(for item: MessageInlineReferenceItem) -> URL? {
+        guard item.kind == .user, isValidID(item.rawID) else { return nil }
+        return URL(string: "\(scheme)://\(userHost)/\(item.rawID)")
+    }
+
+    public static func parse(_ url: URL) -> UserID? {
+        guard url.scheme == scheme, url.host == userHost else { return nil }
+        let id = url.path.hasPrefix("/") ? String(url.path.dropFirst()) : url.path
+        guard isValidID(id) else { return nil }
+        return UserID(rawValue: id)
+    }
+
+    private static func isValidID(_ id: String) -> Bool {
+        id.count == MentionTokenSyntax.length && id.allSatisfy { MentionTokenSyntax.alphabet.contains($0) }
+    }
+}
+
 struct MarkdownInlineContent: View {
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     let source: String
@@ -252,6 +288,18 @@ struct MarkdownInlineContent: View {
     let font: Font
     let onOpenMention: (UserID) -> Void
     private let tokens: [MarkdownInlineToken]
+
+    #if canImport(AppKit)
+    /// Seeded synchronously from the bounded front cache so an already-decoded emoji paints on
+    /// first render; misses are filled off the main thread by the task below. Deliberately kept
+    /// out of `PreparedMarkdownContent`, which is `Hashable` and backs the timeline row's
+    /// `.equatable()` fast path -- putting image data there would destabilize row equality.
+    @State private var emojiImages: [DecodedImageKey: CGImage] = [:]
+    #endif
+
+    /// Ceiling on per-row inline work. Pathological content falls back to plain text instead of
+    /// composing thousands of runs on the main thread.
+    private static let maximumTokens = 200
 
     init(
         source: String,
@@ -266,101 +314,91 @@ struct MarkdownInlineContent: View {
         self.font = font
         self.onOpenMention = onOpenMention
         self.tokens = MarkdownInlineCache.shared.tokens(source: source, emojiItems: customEmojiItems, referenceItems: referenceItems)
-    }
 
-    @ViewBuilder var body: some View {
-        switch renderingStrategy {
-        case .wrappingText:
-            Text(wrappingAttributedText)
-                .font(font)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityLabel(accessibleDescription)
-        case .tokenRow:
-            HStack(alignment: .center, spacing: StoatSpacing.xxSmall) {
-                ForEach(tokens.indices, id: \.self) { index in
-                    switch tokens[index] {
-                    case let .text(value):
-                        Text(Self.attributed(value))
-                            .font(font)
-                            .textSelection(.enabled)
-                    case let .emoji(item):
-                        inlineEmoji(item)
-                    case let .reference(item):
-                        inlineReference(item)
-                    }
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .accessibilityLabel(accessibleDescription)
-        }
-    }
-
-    private var renderingStrategy: MarkdownInlineRenderingStrategy {
-        tokens.allSatisfy {
-            if case .text = $0 { return true }
-            return false
-        } ? .wrappingText : .tokenRow
-    }
-
-    private var wrappingAttributedText: AttributedString {
-        tokens.reduce(into: AttributedString()) { result, token in
-            if case let .text(value) = token {
-                result.append(Self.attributed(value))
-            }
-        }
-    }
-
-    @ViewBuilder private func inlineEmoji(_ item: MessageInlineCustomEmojiItem) -> some View {
         #if canImport(AppKit)
-        if let data = item.imageData {
-            DecodedDataImage(data: data, pixelSize: 44)
-                .scaledToFit()
-                .frame(width: 22, height: 22)
-                .accessibilityLabel(item.name)
-        } else {
-            Text(item.shortcode)
-                .font(StoatTypography.messageBody)
+        var seeded: [DecodedImageKey: CGImage] = [:]
+        for key in Self.emojiKeys(in: self.tokens) {
+            if let image = DecodedImageFrontCache.shared.image(for: key) {
+                seeded[key] = image
+            }
         }
-        #else
-        Text(item.shortcode)
-            .font(StoatTypography.messageBody)
+        _emojiImages = State(initialValue: seeded)
         #endif
     }
 
-    @ViewBuilder private func inlineReference(_ item: MessageInlineReferenceItem) -> some View {
-        switch item.kind {
-        case .user:
-            Button {
-                onOpenMention(UserID(rawValue: item.rawID))
-            } label: {
-                referencePillLabel(item)
+    var body: some View {
+        composedText
+            .font(font)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel(accessibleDescription)
+            .environment(\.openURL, OpenURLAction { url in
+                guard let userID = MentionLinkRoute.parse(url) else { return .systemAction }
+                onOpenMention(userID)
+                return .handled
+            })
+            .task(id: source) {
+                #if canImport(AppKit)
+                await loadMissingEmojiImages()
+                #endif
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(item.isCurrentUser ? "mentions you" : "mention, \(item.displayName)")
-        case .channel:
-            referencePillLabel(item)
-                .accessibilityLabel("channel mention, \(item.displayName)")
-        case .role:
-            referencePillLabel(item)
-                .accessibilityLabel("role mention, \(item.displayName)")
+    }
+
+    /// One `Text` for the whole paragraph. Mentions and emoji are runs and glyphs inside it, so
+    /// SwiftUI line-breaks them exactly like words -- this is what fixes the old `HStack` path,
+    /// which could not wrap at all and truncated any paragraph containing a mention or emoji.
+    private var composedText: Text {
+        guard tokens.count <= Self.maximumTokens else { return Text(source) }
+        return tokens.reduce(Text("")) { partial, token in
+            switch token {
+            case let .text(value):
+                return partial + Text(Self.attributed(value))
+            case let .emoji(item):
+                return partial + emojiText(item)
+            case let .reference(item):
+                return partial + Text(mentionAttributedString(item))
+            }
         }
     }
 
-    private func referencePillLabel(_ item: MessageInlineReferenceItem) -> some View {
-        HStack(spacing: 2) {
-            Text(sigil(for: item.kind))
-            Text(item.displayName)
+    private func emojiText(_ item: MessageInlineCustomEmojiItem) -> Text {
+        #if canImport(AppKit)
+        if let data = item.imageData {
+            let key = DecodedImageKey(data: data, pixelSize: Self.emojiPixelSize)
+            if let image = emojiImages[key] {
+                let scale = InlineEmojiGlyphMetrics.scale(pixelHeight: image.height)
+                return Text(Image(decorative: image, scale: scale))
+            }
         }
-        .font(font.weight(.medium))
-        .padding(.horizontal, 5)
-        .padding(.vertical, 1)
-        .background(referenceBackground(item), in: Capsule())
-        .foregroundStyle(referenceForeground(item))
+        #endif
+        return Text(item.shortcode)
+    }
+
+    private func mentionAttributedString(_ item: MessageInlineReferenceItem) -> AttributedString {
+        var string = AttributedString(Self.mentionRunText(for: item))
+        string.font = font.weight(.medium)
+        string.foregroundColor = referenceForeground(item)
+        string.backgroundColor = referenceBackground(item)
+        if let url = MentionLinkRoute.url(for: item) {
+            string.link = url
+        }
+        return string
+    }
+
+    /// Non-breaking spaces give the tinted run breathing room without introducing break
+    /// opportunities, and the display name's own spaces are joined the same way so a mention
+    /// moves to the next line whole rather than splitting across two tinted fragments.
+    nonisolated static func mentionRunText(for item: MessageInlineReferenceItem) -> String {
+        let name = item.displayName.replacingOccurrences(of: " ", with: "\u{00A0}")
+        return "\u{00A0}\(sigil(for: item.kind))\(name)\u{00A0}"
+    }
+
+    nonisolated static func sigil(for kind: MessageInlineReferenceKind) -> String {
+        kind == .channel ? "#" : "@"
     }
 
     private func sigil(for kind: MessageInlineReferenceKind) -> String {
-        kind == .channel ? "#" : "@"
+        Self.sigil(for: kind)
     }
 
     private func referenceForeground(_ item: MessageInlineReferenceItem) -> Color {
@@ -377,6 +415,13 @@ struct MarkdownInlineContent: View {
     }
 
     private var accessibleDescription: String {
+        Self.accessibleDescription(for: tokens)
+    }
+
+    /// A single `Text` is one accessibility element, so the per-pill VoiceOver labels the old
+    /// view-per-token path provided are not expressible. Mentions expand to their spoken form
+    /// inline instead, so every mention is still announced with its kind.
+    nonisolated static func accessibleDescription(for tokens: [MarkdownInlineToken]) -> String {
         tokens.map { token -> String in
             switch token {
             case let .text(value):
@@ -384,7 +429,14 @@ struct MarkdownInlineContent: View {
             case let .emoji(item):
                 return item.name
             case let .reference(item):
-                return "\(sigil(for: item.kind))\(item.displayName)"
+                switch item.kind {
+                case .user:
+                    return item.isCurrentUser ? "mentions you" : "mention, \(item.displayName)"
+                case .channel:
+                    return "channel mention, \(item.displayName)"
+                case .role:
+                    return "role mention, \(item.displayName)"
+                }
             }
         }.joined()
     }
@@ -392,4 +444,28 @@ struct MarkdownInlineContent: View {
     private static func attributed(_ value: String) -> AttributedString {
         MarkdownInlineCache.shared.attributed(value)
     }
+}
+
+extension MarkdownInlineContent {
+    static let emojiPixelSize = 44
+
+    static func emojiKeys(in tokens: [MarkdownInlineToken]) -> [DecodedImageKey] {
+        tokens.compactMap { token in
+            guard case let .emoji(item) = token, let data = item.imageData else { return nil }
+            return DecodedImageKey(data: data, pixelSize: emojiPixelSize)
+        }
+    }
+
+    #if canImport(AppKit)
+    private func loadMissingEmojiImages() async {
+        for token in tokens {
+            guard case let .emoji(item) = token, let data = item.imageData else { continue }
+            let key = DecodedImageKey(data: data, pixelSize: Self.emojiPixelSize)
+            guard emojiImages[key] == nil else { continue }
+            if let image = await DecodedImageStore.shared.image(for: key, data: data) {
+                emojiImages[key] = image
+            }
+        }
+    }
+    #endif
 }

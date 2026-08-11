@@ -73,7 +73,7 @@ public struct DecodedImageDiagnostics: Hashable, Sendable {
 
 #if canImport(AppKit)
 @MainActor
-private final class DecodedImageFrontCache {
+final class DecodedImageFrontCache {
     static let shared = DecodedImageFrontCache()
 
     private var images: [DecodedImageKey: CGImage] = [:]
@@ -117,7 +117,7 @@ private final class DecodedImageFrontCache {
     }
 }
 
-private actor DecodedImageStore {
+actor DecodedImageStore {
     static let shared = DecodedImageStore()
 
     private var images: [DecodedImageKey: CGImage] = [:]
