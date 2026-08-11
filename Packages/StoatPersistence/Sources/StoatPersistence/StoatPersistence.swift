@@ -351,6 +351,12 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public var lastSelectedEnvironmentID: String?
     public var environmentProfiles: [EnvironmentProfile]
     public var showDeveloperRuntimeControls: Bool
+    /// Paint the shell from the offline cache before the network is touched.
+    ///
+    /// A kill switch rather than a feature toggle. This is the change most likely to produce a
+    /// subtle staleness bug in the field, and being able to turn it off without shipping a build
+    /// is worth one stored boolean.
+    public var offlineCacheRestoreOnLaunch: Bool
     public var lastSelectedServerID: ServerID?
     public var lastSelectedChannelID: ChannelID?
     public var memberPanelVisible: Bool
@@ -376,12 +382,14 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         case timelineTuning
         case notificationPreferences
         case lastSettingsSyncTimestamp
+        case offlineCacheRestoreOnLaunch
     }
 
     public init(
         lastSelectedEnvironmentID: String? = nil,
         environmentProfiles: [EnvironmentProfile] = [EnvironmentProfile.production()],
         showDeveloperRuntimeControls: Bool = false,
+        offlineCacheRestoreOnLaunch: Bool = true,
         lastSelectedServerID: ServerID? = nil,
         lastSelectedChannelID: ChannelID? = nil,
         memberPanelVisible: Bool = true,
@@ -396,6 +404,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.lastSelectedEnvironmentID = lastSelectedEnvironmentID
         self.environmentProfiles = Self.normalizedProfiles(environmentProfiles)
         self.showDeveloperRuntimeControls = showDeveloperRuntimeControls
+        self.offlineCacheRestoreOnLaunch = offlineCacheRestoreOnLaunch
         self.lastSelectedServerID = lastSelectedServerID
         self.lastSelectedChannelID = lastSelectedChannelID
         self.memberPanelVisible = memberPanelVisible
@@ -415,6 +424,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
             lastSelectedEnvironmentID: try container.decodeIfPresent(String.self, forKey: .lastSelectedEnvironmentID),
             environmentProfiles: try container.decodeIfPresent([EnvironmentProfile].self, forKey: .environmentProfiles) ?? [EnvironmentProfile.production()],
             showDeveloperRuntimeControls: try container.decodeIfPresent(Bool.self, forKey: .showDeveloperRuntimeControls) ?? false,
+            offlineCacheRestoreOnLaunch: try container.decodeIfPresent(Bool.self, forKey: .offlineCacheRestoreOnLaunch) ?? true,
             lastSelectedServerID: try container.decodeIfPresent(ServerID.self, forKey: .lastSelectedServerID),
             lastSelectedChannelID: try container.decodeIfPresent(ChannelID.self, forKey: .lastSelectedChannelID),
             memberPanelVisible: try container.decodeIfPresent(Bool.self, forKey: .memberPanelVisible) ?? true,
@@ -433,6 +443,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         try container.encodeIfPresent(lastSelectedEnvironmentID, forKey: .lastSelectedEnvironmentID)
         try container.encode(environmentProfiles, forKey: .environmentProfiles)
         try container.encode(showDeveloperRuntimeControls, forKey: .showDeveloperRuntimeControls)
+        try container.encode(offlineCacheRestoreOnLaunch, forKey: .offlineCacheRestoreOnLaunch)
         try container.encodeIfPresent(lastSelectedServerID, forKey: .lastSelectedServerID)
         try container.encodeIfPresent(lastSelectedChannelID, forKey: .lastSelectedChannelID)
         try container.encode(memberPanelVisible, forKey: .memberPanelVisible)

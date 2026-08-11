@@ -643,7 +643,12 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         let switcher = QuickSwitcherViewModel(snapshot: snapshot)
 
         switcher.query = "indexed channel"
-        try await Task.sleep(for: .milliseconds(120))
+        // Poll rather than sleeping a fixed 120ms. Indexing 5,000 channels and filtering them
+        // both happen on debounced tasks, so a fixed wait is a race that only shows up when the
+        // machine is busy running the rest of the suite.
+        for _ in 0..<100 where switcher.results.count < 50 {
+            try await Task.sleep(for: .milliseconds(20))
+        }
 
         XCTAssertEqual(switcher.results.count, 50)
         XCTAssertEqual(Set(switcher.results.map(\.id)).count, 50)

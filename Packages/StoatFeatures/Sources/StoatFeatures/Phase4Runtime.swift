@@ -1059,6 +1059,25 @@ public final class ChannelMessageController {
             }
         }
 
+        // Offline. Hydrate from the disk cache with `hasMoreBefore: false`, which is what stops
+        // automatic pagination from firing against an API client that does not exist -- the
+        // prefetch gate already refuses when there is nothing more to fetch, so no extra offline
+        // check is needed there. The timeline header distinguishes this from the genuine start
+        // of a channel via `isOffline`.
+        if shouldUseLiveAPI, apiClient == nil, snapshotMessages.isEmpty {
+            let cached = await messageCache.history(for: channelID)
+            guard initialLoadTokens[channelID] == token else { return .cancelled }
+            if let cached, !cached.messages.isEmpty {
+                apply(
+                    .initialLoadSucceeded(messages: cached.messages, hasMoreBefore: false, loadedAt: cached.savedAt),
+                    channelID: channelID
+                )
+                completedInitialLoadChannelIDs.insert(channelID)
+                lastErrorByChannelID[channelID] = nil
+                return .loaded(messageCount: state(for: channelID).timelineMessages.count)
+            }
+        }
+
         apply(.initialLoadSucceeded(messages: snapshotMessages, hasMoreBefore: false, loadedAt: Date()), channelID: channelID)
         completedInitialLoadChannelIDs.insert(channelID)
         lastErrorByChannelID[channelID] = nil
@@ -1396,8 +1415,16 @@ public final class ChannelMessageController {
         guard shouldUseLiveAPI else { return }
         let messages = confirmedPersistableMessages(for: channelID)
         guard !messages.isEmpty else { return }
+        // Carry `hasMoreBefore` to disk so the next offline open can tell the start of a channel
+        // apart from the end of what was saved. The cache raises it again if it has to truncate.
+        let cached = CachedChannelHistory(
+            channelID: channelID,
+            messages: messages,
+            hasMoreBefore: history(for: channelID).hasMoreBefore,
+            savedAt: Date()
+        )
         Task { [messageCache] in
-            await messageCache.store(messages, for: channelID)
+            await messageCache.store(cached)
         }
     }
 
@@ -1533,6 +1560,20 @@ public final class AppSessionCoordinator {
     @ObservationIgnored private var isSuspendedForSleep = false
     public private(set) var networkPathStatus: NetworkPathStatus = .unknown
     public private(set) var connectivityDiagnostics = ConnectivitySupervisorDiagnostics()
+
+    // MARK: Offline session cache (Phase 74)
+
+    @ObservationIgnored private let sessionCache: any SessionSnapshotStoring
+    /// What is on disk for the current environment, or `nil` if nothing usable is.
+    public private(set) var sessionCacheAvailability: SessionCacheAvailability?
+    /// The shell is currently rendering cached content rather than a live session.
+    public private(set) var isUsingCachedSession = false
+    /// Mirror of what `connectLive`'s catch block already computes, promoted out of the
+    /// diagnostics bag so `startupState` can read it without reaching into diagnostics.
+    public private(set) var lastConnectFailureCategory: LoginErrorDisplay?
+    /// Read markers restored from disk, awaiting reconciliation against server truth.
+    public private(set) var restoredReadStates: [CachedLocalReadState] = []
+    @ObservationIgnored public private(set) var sessionCacheWriter: SessionCacheWriter?
     @ObservationIgnored private let readyFields: Set<ReadyField>
     @ObservationIgnored private let sessionValidator: any SessionValidating
     @ObservationIgnored private let apiClientFactory: @Sendable (StoatAPIEnvironment, any CredentialProvider) -> any StoatAPIClient
@@ -1564,8 +1605,13 @@ public final class AppSessionCoordinator {
         realtimeStoreFactory: @escaping @Sendable () -> RealtimeStateStore = {
             RealtimeStateStore()
         },
-        networkPathMonitor: (any NetworkPathMonitoring)? = nil
+        networkPathMonitor: (any NetworkPathMonitoring)? = nil,
+        sessionCache: (any SessionSnapshotStoring)? = nil
     ) {
+        // Defaults to a store with nothing in it rather than a real one. Tests construct
+        // coordinators constantly and none of them should be reading the developer's own cache
+        // off disk, so opting in is the app's job.
+        self.sessionCache = sessionCache ?? InMemorySessionSnapshotStore()
         self.networkPathMonitor = networkPathMonitor
         self.tokenStore = tokenStore
         self.preferencesStore = preferencesStore
@@ -1607,6 +1653,101 @@ public final class AppSessionCoordinator {
         diagnosticsTask?.cancel()
         networkPathTask?.cancel()
         pendingConnectivityTask?.cancel()
+    }
+
+    // MARK: - Offline session restore (Phase 74)
+
+    /// Paint the shell from disk before touching the network.
+    ///
+    /// Runs on every launch, not only offline ones: a cached shell appears immediately and is
+    /// then replaced by live data, which is a better first second than a spinner even on a fast
+    /// connection.
+    ///
+    /// Two things this must NOT do, both of which would cause subtle damage later:
+    ///
+    /// - It must not set `sessionState = .connected`. Nothing has been validated.
+    /// - It must leave `hydrationStatus.readyReceived` false, which keeps the notification
+    ///   pipeline's guards closed. Restoring a cache is not new activity and must never notify.
+    public func restoreCachedSession() async {
+        guard preferences.offlineCacheRestoreOnLaunch else { return }
+        await loadPreferences()
+        await refreshCredentialAvailability()
+        guard hasSavedCredential else { return }
+
+        let environmentID = environment.stableID
+        guard let availability = await sessionCache.availability(environmentID: environmentID) else { return }
+        let loaded = await sessionCache.load(environmentID: environmentID, userID: availability.userID)
+        guard loaded.isUsable else { return }
+
+        let restored = SessionCacheMapper.snapshot(from: loaded)
+        // Setting the current user from cache is what makes the later promotion to live a
+        // *load-scope* change rather than an identity-scope one. `ChannelMessageController`
+        // wipes every loaded history when the current user changes, so getting this wrong would
+        // blank the timeline the moment the connection succeeded.
+        currentUser = loaded.core?.currentUser
+        snapshot = restored
+        snapshotSource = StaticShellSnapshotSource(snapshot: restored)
+        restoredReadStates = loaded.readStates
+        sessionCacheAvailability = availability
+        isUsingCachedSession = true
+        startupAuthDiagnostics.lastAuthAction = "restored_offline_cache"
+    }
+
+    /// Start caching for the signed-in account. Called once a session has a validated user.
+    public func activateSessionCache() async {
+        guard let currentUser else { return }
+        if sessionCacheWriter == nil {
+            sessionCacheWriter = SessionCacheWriter(
+                store: sessionCache,
+                environmentID: environment.stableID,
+                userID: currentUser.id
+            )
+        }
+        // Identity and core are written eagerly rather than waiting for the debounce, because
+        // they are what makes the whole cache findable and loadable. A crash before the first
+        // flush would otherwise leave shards that no launch can locate.
+        await sessionCacheWriter?.writeIdentity()
+        await sessionCacheWriter?.writeCore(currentUser: currentUser)
+        sessionCacheAvailability = SessionCacheAvailability(userID: currentUser.id, savedAt: Date())
+    }
+
+    /// Write whatever is pending right now. Called on disconnect, sleep, backgrounding, and
+    /// termination. The disconnect flush matters most: it captures exactly the state the next
+    /// offline launch needs.
+    public func flushSessionCache() async {
+        await sessionCacheWriter?.flush()
+    }
+
+    public func noteReadStatesChanged(_ states: [ChannelID: LocalReadState]) {
+        sessionCacheWriter?.noteReadStatesChanged(states)
+    }
+
+    public func noteServerSelectedForCache(_ serverID: ServerID) {
+        sessionCacheWriter?.noteServerSelected(serverID)
+    }
+
+    public func sessionCacheDiagnostics() async -> SessionCacheDiagnostics {
+        await sessionCache.diagnostics()
+    }
+
+    /// Remove every cached byte for the signed-in account, plus the key that decrypts it.
+    public func purgeSessionCache() async {
+        let environmentID = environment.stableID
+        let userID = currentUser?.id ?? sessionCacheAvailability?.userID
+        if let userID {
+            await sessionCache.purgeScope(environmentID: environmentID, userID: userID)
+        } else {
+            await sessionCache.purgeEnvironment(environmentID: environmentID)
+        }
+        if let scoped = tokenStore as? any ScopedTokenStore {
+            // Destroying the key is the backstop: even a file deletion that silently failed
+            // leaves behind ciphertext nothing can read.
+            try? await scoped.clearCacheKey(scope: CredentialScope(environmentID: environmentID, accountUserID: userID))
+            try? await scoped.clearCacheKey(scope: CredentialScope(environmentID: environmentID))
+        }
+        sessionCacheAvailability = nil
+        isUsingCachedSession = false
+        restoredReadStates = []
     }
 
     // MARK: - Connectivity supervision (Phase 74)
@@ -1652,7 +1793,7 @@ public final class AppSessionCoordinator {
             guard !isSuspendedForSleep else { return }
             isSuspendedForSleep = true
             connectivityDiagnostics.sleepSuspensionCount += 1
-            await sessionCacheWillSuspend?()
+            await flushSessionCache()
             // Disconnecting explicitly also cancels the client's backoff, so nothing is left
             // counting down through the sleep and racing the wake-up attempt.
             await disconnectActiveRealtime()
@@ -1667,9 +1808,6 @@ public final class AppSessionCoordinator {
     public func handleAppBecameActive() async {
         scheduleConnectivityAttempt(trigger: .foreground, after: .zero)
     }
-
-    /// Hook for flushing the offline cache before the machine sleeps. Set by the shell in Stage 7.
-    @ObservationIgnored public var sessionCacheWillSuspend: (@Sendable () async -> Void)?
 
     private func scheduleConnectivityAttempt(trigger: ConnectivityTrigger, after delay: Duration) {
         pendingConnectivityTask?.cancel()
@@ -2228,6 +2366,7 @@ public final class AppSessionCoordinator {
             let message = StartupAuthDiagnosticsRedactor.redact("\(source.failurePrefix): \(error.userFacingMessage)")
             sessionState = .connectionFailed(message)
             let category = loginErrorCategory(for: error)
+            lastConnectFailureCategory = category
             startupAuthDiagnostics.lastErrorCategory = category
             startupAuthDiagnostics.lastAuthResult = "failed_\(loginErrorCategoryName(category))"
             if source == .startupAuto {
@@ -2238,6 +2377,7 @@ public final class AppSessionCoordinator {
     }
 
     public func disconnectLive() async {
+        await flushSessionCache()
         await disconnectActiveRealtime()
         mode = .liveManual
         connectionState = .disconnected(reason: .requested)
@@ -2255,6 +2395,9 @@ public final class AppSessionCoordinator {
 
     public func forgetLocalSession() async {
         await disconnectActiveRealtime()
+        // Before the credential goes, while `currentUser` still identifies whose cache this is.
+        // Afterwards there would be no way to find the right scope directory.
+        await purgeSessionCache()
         do {
             try await clearCredentialForCurrentEnvironment()
             mode = .liveManual
@@ -2331,6 +2474,10 @@ public final class AppSessionCoordinator {
                 await MainActor.run {
                     self?.snapshot = snapshot
                     self?.applyVerificationState(event: event, snapshot: snapshot)
+                    // The writer decides for itself whether this update dirtied anything. The
+                    // dominant event stream -- messages, typing, presence -- dirties no session
+                    // shard, so this is a set lookup on the hot path, not a write.
+                    self?.sessionCacheWriter?.note(update)
                 }
             }
         }
@@ -2379,10 +2526,15 @@ public final class AppSessionCoordinator {
         case .ready:
             sessionState = .connected
             lastErrorMessage = nil
+            lastConnectFailureCategory = nil
             verificationState.readyReceived = true
             verificationState.webSocketConnected = true
             verificationState.authenticated = true
             updateHydrationStatus(snapshot: snapshot, readyReceived: true)
+            // A validated, connected session is the only thing that justifies writing message
+            // content to disk, so this is where caching starts.
+            isUsingCachedSession = false
+            Task { [weak self] in await self?.activateSessionCache() }
         case .connecting, .connected, .authenticating, .authenticated, .reconnecting:
             sessionState = .connecting
             verificationState.webSocketConnected = true

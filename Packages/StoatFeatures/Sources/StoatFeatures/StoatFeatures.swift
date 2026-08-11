@@ -43,8 +43,34 @@ public enum AppStartupState: Hashable, Sendable {
     case validatingCredential
     case connectingLive
     case ready
+    /// The main shell, rendering cached content, with no live gateway.
+    case readyOffline(OfflineShellReason)
     case savedCredentialFailed(String)
     case startupFailed(AppStartupFailure)
+
+    /// Both shell states answer yes.
+    ///
+    /// `LiquidBagelRootView` branches on this rather than pattern-matching `.ready` and
+    /// `.readyOffline` as two arms of one switch. Two arms would make SwiftUI build a
+    /// `_ConditionalContent` and tear down `MainShellView` on every online-offline transition,
+    /// resetting scroll position, sheets, focus, and every piece of `@State` inside it.
+    public var showsMainShell: Bool {
+        switch self {
+        case .ready, .readyOffline: true
+        default: false
+        }
+    }
+}
+
+public enum OfflineShellReason: Hashable, Sendable {
+    /// Launch: the cache painted and the first connection attempt is still running.
+    case notYetConnected
+    /// Was connected, dropped, backoff is running.
+    case reconnecting
+    /// The network path is observably down.
+    case networkUnavailable
+    /// Reachable network, unreachable or failing server.
+    case serverUnreachable
 }
 
 public enum AppStartupFailure: Hashable, Sendable {
@@ -585,6 +611,9 @@ public final class MainShellViewModel {
             guard oldValue != localReadStates else { return }
             phase51ShellDataRevision &+= 1
             schedulePhase51ShellPresentationRefresh(reason: "local read state")
+            // Debounced inside the writer. Unread markers surviving a relaunch is most of what
+            // makes an offline launch feel like the app rather than a snapshot of it.
+            sessionCoordinator?.noteReadStatesChanged(localReadStates)
         }
     }
     /// Outcome of the last message action. Had no render site at all before Phase 74, so
@@ -6553,6 +6582,10 @@ public final class MainShellViewModel {
         selection.serverID = id
         selection.channelID = firstVisibleTextChannel(in: id)?.id
         selection.dmChannelID = nil
+        // Member rosters are only cached for recently visited servers -- persisting every
+        // server's full roster is the difference between a 60 MB and a 600 MB cache on a heavy
+        // account, for a panel that is rarely why anyone opens the app offline.
+        sessionCoordinator?.noteServerSelectedForCache(id)
         clearTimelineSelection()
         updateViewportForSelectedChannel()
         reconcileSearchHighlightsForSelectedChannel()
@@ -6803,6 +6836,31 @@ public final class MainShellViewModel {
         syncFromSessionCoordinator()
     }
 
+    /// Fold read markers restored from disk into the shell, and start caching.
+    ///
+    /// Called once after `restoreCachedSession` and again after the first live connect, because
+    /// reconciliation is only meaningful once there is a snapshot to reconcile against.
+    public func adoptRestoredSessionCache() async {
+        guard let sessionCoordinator else { return }
+        let restored = sessionCoordinator.restoredReadStates
+        if !restored.isEmpty {
+            let reconciled = SessionCacheMapper.reconcileReadStates(
+                cached: restored,
+                snapshot: snapshot,
+                now: Date()
+            )
+            // Merge rather than replace: anything already marked read in this session is fresher
+            // than anything that came off disk.
+            for (channelID, state) in reconciled where localReadStates[channelID] == nil {
+                localReadStates[channelID] = state
+            }
+        }
+        await sessionCoordinator.activateSessionCache()
+        if let serverID = selection.serverID {
+            sessionCoordinator.noteServerSelectedForCache(serverID)
+        }
+    }
+
     public func connectLiveManually() async {
         guard let sessionCoordinator else { return }
         await sessionCoordinator.connectLiveManually()
@@ -6851,6 +6909,9 @@ public final class MainShellViewModel {
         schedulePhase51ShellPresentationRefresh(reason: "session snapshot")
         if sessionCoordinator.mode == .liveManual,
            previousNotificationGeneration != sessionCoordinator.liveConnectionGeneration {
+            // Reseeding from the *new* snapshot is what absorbs a whole Ready payload silently.
+            // The offline restore never bumps the generation, so promoting a cached session to a
+            // live one lands here exactly once and does not notify for the backlog.
             seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
             notificationLiveConnectionGeneration = sessionCoordinator.liveConnectionGeneration
             deliveredNotificationIDs.removeAll()
@@ -10345,6 +10406,11 @@ public final class MainShellViewModel {
             return
         }
         appLifecyclePhase = phase
+        if phase != .active {
+            // Leaving the app is a good moment to checkpoint: it is quiet, and it is often the
+            // last thing that happens before the process goes away.
+            Task { [weak self] in await self?.sessionCoordinator?.flushSessionCache() }
+        }
         if phase == .active {
             refreshNotificationPermissionStatus()
             // Coming back to the app is a weak, frequent signal, so the supervisor's own cooldown
@@ -12766,10 +12832,14 @@ public final class LiquidBagelAppModel {
     public let shell: MainShellViewModel
     public let loginViewModel: FirstRunLoginViewModel
 
-    /// The shipping app gets a real `NWPathMonitor`. Tests construct the coordinator themselves
-    /// and pass a deterministic monitor, or none at all.
+    /// The shipping app gets a real path monitor and a real on-disk cache. Tests construct the
+    /// coordinator themselves and get an in-memory cache and no monitor, so no test ever reads
+    /// or writes the developer's own cache.
     public init(
-        coordinator: AppSessionCoordinator = AppSessionCoordinator(networkPathMonitor: NWPathNetworkMonitor())
+        coordinator: AppSessionCoordinator = AppSessionCoordinator(
+            networkPathMonitor: NWPathNetworkMonitor(),
+            sessionCache: FileSessionSnapshotStore()
+        )
     ) {
         self.coordinator = coordinator
         self.shell = MainShellViewModel(
@@ -12788,22 +12858,57 @@ public final class LiquidBagelAppModel {
         case .signedOut:
             return .noCredential
         case .loadingCredential, .validatingCredential:
-            return coordinator.hasSavedCredential ? .validatingCredential : .noCredential
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            return offlineOr(.validatingCredential, reason: .notYetConnected)
         case .savedCredentialUnvalidated:
-            return coordinator.hasSavedCredential ? .savedCredentialFailed("A saved session is available for this environment. Retry connection when you are ready.") : .noCredential
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            return offlineOr(
+                .savedCredentialFailed("A saved session is available for this environment. Retry connection when you are ready."),
+                reason: .reconnecting
+            )
         case .validatedReady, .readyToConnect:
-            return coordinator.hasSavedCredential ? .savedCredentialFailed("The saved session is ready, but realtime is not connected.") : .noCredential
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            return offlineOr(
+                .savedCredentialFailed("The saved session is ready, but realtime is not connected."),
+                reason: .reconnecting
+            )
         case .connecting:
-            return .connectingLive
+            return offlineOr(.connectingLive, reason: .notYetConnected)
         case .connected:
             return .ready
-        case let .validationFailed(msg), let .invalidSession(msg), let .connectionFailed(msg):
+        case let .connectionFailed(msg):
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            return offlineOr(.savedCredentialFailed(msg), reason: offlineReasonForConnectFailure)
+        case let .validationFailed(msg):
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            // A network-class validation failure means we could not reach the server to ask, not
+            // that the answer was no. Anything else is a real credential problem.
+            return coordinator.lastConnectFailureCategory == .networkError
+                ? offlineOr(.savedCredentialFailed(msg), reason: offlineReasonForConnectFailure)
+                : .savedCredentialFailed(msg)
+        case let .invalidSession(msg):
+            // Never show cached content behind a session the server has rejected.
             return coordinator.hasSavedCredential ? .savedCredentialFailed(msg) : .noCredential
         case let .keychainFailed(msg):
             return .startupFailed(.keychainUnavailable(msg))
         case let .failed(msg):
             return .startupFailed(.unknown(msg))
         }
+    }
+
+    /// Substitute the offline shell for `fallback` when there is something to show and the reason
+    /// we are not connected is not an authentication problem.
+    private func offlineOr(_ fallback: AppStartupState, reason: OfflineShellReason) -> AppStartupState {
+        guard coordinator.isUsingCachedSession,
+              coordinator.sessionCacheAvailability != nil,
+              coordinator.hasSavedCredential
+        else { return fallback }
+        return .readyOffline(reason)
+    }
+
+    private var offlineReasonForConnectFailure: OfflineShellReason {
+        if coordinator.networkPathStatus.isKnownOffline { return .networkUnavailable }
+        return .serverUnreachable
     }
 }
 
@@ -13258,24 +13363,39 @@ public struct LiquidBagelRootView: View {
 
     public var body: some View {
         Group {
-            switch appModel.startupState {
-            case .loadingPreferences, .validatingCredential, .connectingLive:
-                StartupProgressView()
-            case .noCredential:
-                FirstRunLoginView(viewModel: appModel.loginViewModel, coordinator: appModel.coordinator)
-            case let .savedCredentialFailed(message):
-                SavedCredentialFailureView(message: message, coordinator: appModel.coordinator)
-            case let .startupFailed(failure):
-                StartupFailureView(failure: failure)
-            case .ready:
+            // One shell branch, deliberately. Making `.ready` and `.readyOffline` two arms of the
+            // same switch would build a `_ConditionalContent`, and SwiftUI would tear down and
+            // rebuild `MainShellView` every time the connection came or went -- losing scroll
+            // position, open sheets, focus, and every piece of `@State` in the shell.
+            if appModel.startupState.showsMainShell {
                 MainShellView(viewModel: appModel.shell)
+            } else {
+                switch appModel.startupState {
+                case .loadingPreferences, .validatingCredential, .connectingLive:
+                    StartupProgressView()
+                case .noCredential:
+                    FirstRunLoginView(viewModel: appModel.loginViewModel, coordinator: appModel.coordinator)
+                case let .savedCredentialFailed(message):
+                    SavedCredentialFailureView(message: message, coordinator: appModel.coordinator)
+                case let .startupFailed(failure):
+                    StartupFailureView(failure: failure)
+                case .ready, .readyOffline:
+                    EmptyView()
+                }
             }
         }
         .task {
             appModel.shell.attachSessionCoordinator(appModel.coordinator)
+            // Paint from disk first. This is local and fast, so the shell is on screen before
+            // the network is touched at all -- offline it is the only thing that will appear,
+            // and online it beats a spinner.
+            await appModel.coordinator.restoreCachedSession()
+            appModel.shell.syncFromSessionCoordinator()
+            await appModel.shell.adoptRestoredSessionCache()
             await appModel.coordinator.startConnectivitySupervision()
             await appModel.coordinator.startLiveFirstSession()
             appModel.shell.syncFromSessionCoordinator()
+            await appModel.shell.adoptRestoredSessionCache()
         }
         .onChange(of: scenePhase) { _, phase in
             appModel.shell.updateAppLifecyclePhase(AppLifecyclePhase(phase))
