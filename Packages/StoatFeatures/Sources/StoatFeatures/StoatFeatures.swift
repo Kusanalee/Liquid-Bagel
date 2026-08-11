@@ -658,6 +658,7 @@ public final class MainShellViewModel {
     @ObservationIgnored public private(set) var phase60Diagnostics = Phase60Diagnostics()
     @ObservationIgnored public private(set) var phase63ComposerDiagnostics = Phase63ComposerDiagnostics()
     @ObservationIgnored public private(set) var phase68TraceDiagnostics = Phase68TraceDiagnostics()
+    @ObservationIgnored public private(set) var phase74PaginationDiagnostics = Phase74PaginationDiagnostics()
     public private(set) var phase52FreezeDiagnostics = Phase52FreezeDiagnostics()
     public private(set) var timelinePresentationState: TimelinePresentationState = .idle
     public private(set) var timelinePresentationDiagnostics = TimelinePresentationDiagnostics()
@@ -912,6 +913,10 @@ public final class MainShellViewModel {
     @ObservationIgnored private let attachmentValidationPolicy = AttachmentValidationPolicy()
     @ObservationIgnored private let profileMediaValidationPolicy = ProfileEditMediaValidationPolicy()
     @ObservationIgnored private var visibleRangeUpdateTasks: [ChannelID: Task<Void, Never>] = [:]
+    /// Automatic-pagination pacing, per channel. `@ObservationIgnored` deliberately: mutating it
+    /// must not invalidate any SwiftUI body, or a prefetch decision would re-render the timeline
+    /// it is trying to extend.
+    @ObservationIgnored private var olderLoadPacingByChannelID: [ChannelID: OlderLoadPacingState] = [:]
     @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
     @ObservationIgnored private var selectedTimelineGroupCacheKey: String?
     @ObservationIgnored private var selectedTimelineGroupCacheChannelID: ChannelID?
@@ -1830,6 +1835,27 @@ public final class MainShellViewModel {
 
     public var selectedChannelMessageState: ChannelMessageState {
         messageController.state(for: selectedConversationChannelID)
+    }
+
+    /// Live session that is not currently connected. Offline content may still be on screen.
+    public var isOffline: Bool {
+        effectiveRuntimeMode == .liveManual && effectiveSessionState != .connected
+    }
+
+    /// The single fixed-height slot above loaded history. A pure switch over already-prepared
+    /// values, per the Phase 51 render-safety contract.
+    public var olderHistoryHeaderState: OlderHistoryHeaderState {
+        guard let channelID = selectedConversationChannelID,
+              let history = messageController.historiesByChannelID[channelID],
+              !history.messages.isEmpty
+        else { return .idle }
+
+        if history.isLoadingOlder { return .loading }
+        if let error = history.loadedRange.lastPaginationError { return .failed(message: error) }
+        guard !history.hasMoreBefore else { return .idle }
+        // Out of cached history is not the same fact as the start of the channel.
+        if isOffline { return .unavailableOffline }
+        return .beginning(channelName: selectedConversationChannel?.displayName)
     }
 
     public var phase27Diagnostics: Phase27Diagnostics {
@@ -6717,6 +6743,7 @@ public final class MainShellViewModel {
     }
 
     public func validateSelection() {
+        defer { resetOlderLoadPacingForDeselectedChannels() }
         switch selection.space {
         case .home, .discover, .directMessages:
             if selection.space == .directMessages,
@@ -8985,19 +9012,114 @@ public final class MainShellViewModel {
         reconcileTimelineSelection()
     }
 
+    /// Explicit request for an older page -- the developer harness button and the unread-recovery
+    /// affordance. Bypasses the automatic pacing budget and the failure cooldown.
     public func loadOlderSelectedMessages() async {
         guard let channelID = selectedConversationChannelID else { return }
-        let anchor = timelineViewport.visibleRange?.firstVisibleMessageID ?? selectedTimelineMessages.first?.message.id
+        await requestOlderMessagesIfNeeded(channelID: channelID, trigger: .explicitCommand)
+    }
+
+    /// Called when the timeline crosses the prefetch threshold in either direction.
+    ///
+    /// Crossing *away* from the top is what re-arms automatic pagination and refunds the
+    /// consecutive-page budget: the user demonstrably moved, so they are reading rather than
+    /// sitting in a channel too short to scroll.
+    public func timelineOlderPrefetchThresholdChanged(_ isNearOldest: Bool) {
+        guard let channelID = selectedConversationChannelID else { return }
+        guard isNearOldest else {
+            var pacing = olderLoadPacingByChannelID[channelID] ?? OlderLoadPacingState()
+            guard pacing.consecutiveAutomaticPages != 0 else { return }
+            pacing.consecutiveAutomaticPages = 0
+            olderLoadPacingByChannelID[channelID] = pacing
+            return
+        }
+        Task { await requestOlderMessagesIfNeeded(channelID: channelID, trigger: .scrollPrefetch) }
+    }
+
+    @discardableResult
+    public func requestOlderMessagesIfNeeded(channelID: ChannelID, trigger: OlderLoadTrigger) async -> Bool {
+        if let reason = olderLoadSuppressionReason(channelID: channelID, trigger: trigger) {
+            phase74PaginationDiagnostics.prefetchSuppressedCount += 1
+            phase74PaginationDiagnostics.lastSuppressionReason = reason
+            return false
+        }
+
+        phase74PaginationDiagnostics.prefetchTriggerCount += 1
+        phase74PaginationDiagnostics.lastTrigger = trigger
+
+        var pacing = olderLoadPacingByChannelID[channelID] ?? OlderLoadPacingState()
+        pacing.isInFlight = true
+        if trigger.isAutomatic {
+            pacing.consecutiveAutomaticPages += 1
+        }
+        olderLoadPacingByChannelID[channelID] = pacing
+
+        // Anchor on what the user is actually looking at, not on the oldest loaded message --
+        // after the prepend we scroll this row back to the top so the content under the cursor
+        // does not move.
+        let anchor = timelineViewport.visibleRange?.firstVisibleMessageID
+            ?? selectedTimelineMessages.first?.message.id
         let loaded = await messageController.loadOlderMessages(channelID: channelID)
+
+        // The channel may have changed while the request was in flight; drop the pacing entry
+        // rather than writing stale state back over a fresh channel's bookkeeping.
+        if var updated = olderLoadPacingByChannelID[channelID] {
+            updated.isInFlight = false
+            if !loaded {
+                updated.lastFailureAt = Date()
+            }
+            olderLoadPacingByChannelID[channelID] = updated
+        }
+
+        guard channelID == selectedConversationChannelID else { return loaded }
+
         if loaded {
+            phase74PaginationDiagnostics.pageLoadedCount += 1
             let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
-            let target = anchor.flatMap { loadedIDs.contains($0) ? $0 : nil } ?? selectedTimelineMessages.first?.message.id
+            let target = anchor.flatMap { loadedIDs.contains($0) ? $0 : nil }
+                ?? selectedTimelineMessages.first?.message.id
             timelineViewport = viewportReducer.preserveAfterPrepend(timelineViewport, previousOldestID: target)
             lastTimelineActionResult = "Loaded older messages"
             recordTimelineCalibrationObservation(kind: .afterLoadOlder)
         } else {
+            phase74PaginationDiagnostics.pageFailedCount += 1
             lastTimelineActionResult = "Load older unavailable or failed"
         }
+        return loaded
+    }
+
+    private func olderLoadSuppressionReason(
+        channelID: ChannelID,
+        trigger: OlderLoadTrigger
+    ) -> OlderLoadSuppressionReason? {
+        guard channelID == selectedConversationChannelID else { return .notSelectedChannel }
+        let pacing = olderLoadPacingByChannelID[channelID] ?? OlderLoadPacingState()
+        guard !pacing.isInFlight else { return .alreadyInFlight }
+        guard let history = messageController.historiesByChannelID[channelID] else { return .noLoadedHistory }
+        guard !history.messages.isEmpty else { return .noLoadedHistory }
+        guard !history.isLoadingInitial else { return .initialLoadInFlight }
+        guard !history.isLoadingOlder else { return .pageAlreadyLoading }
+        guard history.hasMoreBefore else { return .noMoreBefore }
+        // Unread recovery walks backwards page by page toward a specific target. A prefetch
+        // racing it would consume the page it is waiting for and confuse its attempt counting.
+        if case .loadingToTarget = history.unreadRecoveryState { return .unreadRecoveryInProgress }
+
+        guard trigger.isAutomatic else { return nil }
+        if let lastFailureAt = pacing.lastFailureAt,
+           Date().timeIntervalSince(lastFailureAt) < OlderLoadPacingState.failureCooldown {
+            return .failureCooldown
+        }
+        if pacing.consecutiveAutomaticPages >= OlderLoadPacingState.maximumConsecutiveAutomaticPages {
+            return .automaticPageBudgetExhausted
+        }
+        return nil
+    }
+
+    /// Drop pacing state for every channel that is no longer selected. Without this, returning to
+    /// a channel would inherit its exhausted page budget or an expired failure cooldown.
+    private func resetOlderLoadPacingForDeselectedChannels() {
+        let selected = selectedConversationChannelID
+        olderLoadPacingByChannelID = olderLoadPacingByChannelID.filter { $0.key == selected }
     }
 
     public func beginEditing(_ timelineMessage: TimelineMessage) {
@@ -9641,6 +9763,17 @@ public final class MainShellViewModel {
         if timelineViewport.isAtNewest {
             acknowledgeSelectedChannel()
             scheduleLiveAckIfNeeded(channelID: channelID)
+        }
+
+        // Backstop for the scroll-geometry trigger, which only fires on a threshold crossing and
+        // therefore cannot re-arm if a prepend restoration leaves the offset inside the
+        // threshold. `loadedIDs` is already computed above, so this costs one index lookup.
+        if let firstVisible = timelineViewport.visibleRange?.firstVisibleMessageID,
+           TimelinePrefetchPolicy.isNearOldestRow(
+               firstVisibleIndex: loadedIDs.firstIndex(of: firstVisible),
+               rowThreshold: timelineTuning.olderPrefetchRowThreshold
+           ) {
+            Task { await requestOlderMessagesIfNeeded(channelID: channelID, trigger: .visibleRangeNearOldest) }
         }
     }
 
@@ -11888,9 +12021,9 @@ public final class MainShellViewModel {
         case .loading:
             return "loading"
         case let .loaded(messages, hasMoreBefore):
+            let loadingOlder = messageController.historiesByChannelID[channelID]?.isLoadingOlder ?? false
             return "loaded \(messages.count), hasMoreBefore \(hasMoreBefore ? "yes" : "no")"
-        case let .loadingOlder(messages):
-            return "loading older \(messages.count)"
+                + (loadingOlder ? ", loading older" : "")
         case .empty:
             return "empty"
         case let .failed(error, cachedMessages):
@@ -14983,6 +15116,20 @@ public struct MessageTimelineView: View {
                 performScroll(intent, proxy: proxy)
                 viewModel.consumeScrollIntent()
             }
+            // Pure observation -- it reads the scroll geometry, it does not participate in
+            // layout, so it cannot provoke the Phase 64 ideal-height probe. The transform must
+            // stay this cheap and must return a `Bool`: SwiftUI only calls `action` when the
+            // transformed value changes, so quantising here turns a per-frame callback into one
+            // call per threshold crossing.
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                TimelinePrefetchPolicy.isNearOldest(
+                    contentOffsetY: geometry.contentOffset.y,
+                    containerHeight: geometry.containerSize.height,
+                    distancePercent: viewModel.timelineTuning.olderPrefetchDistancePercent
+                )
+            } action: { _, isNearOldest in
+                viewModel.timelineOlderPrefetchThresholdChanged(isNearOldest)
+            }
         }
         .task(id: viewModel.selectedTimelinePresentationToken) {
             await viewModel.prepareSelectedTimelineRows()
@@ -15020,10 +15167,10 @@ public struct MessageTimelineView: View {
             renderItems: viewModel.selectedTimelineRenderItems
         )
         let scroll = { proxy.scrollTo(resolvedTarget, anchor: anchor) }
-        if reduceMotion {
-            scroll()
-        } else {
+        if TimelineScrollAnimationPolicy.shouldAnimate(intent: intent, reduceMotion: reduceMotion) {
             withAnimation(.easeInOut(duration: 0.18), scroll)
+        } else {
+            scroll()
         }
     }
 
@@ -15043,7 +15190,7 @@ public struct MessageTimelineView: View {
                 LoadingStateView()
                     .frame(maxWidth: .infinity)
             } else {
-                timelineMessages(showLoadOlder: false, isLoadingOlder: false)
+                timelineMessages()
             }
         case .empty:
             EmptyStateView(title: "Nothing here yet", message: "No messages are loaded for this channel.")
@@ -15055,17 +15202,15 @@ public struct MessageTimelineView: View {
                 retryButton
             } else {
                 inlineError(message)
-                timelineMessages(showLoadOlder: false, isLoadingOlder: false)
+                timelineMessages()
             }
-        case let .loaded(messages, hasMoreBefore):
+        case let .loaded(messages, _):
             if messages.isEmpty {
                 EmptyStateView(title: "Nothing here yet", message: "No messages are loaded for this channel.")
                     .frame(maxWidth: .infinity)
             } else {
-                timelineMessages(showLoadOlder: hasMoreBefore, isLoadingOlder: false)
+                timelineMessages()
             }
-        case .loadingOlder:
-            timelineMessages(showLoadOlder: false, isLoadingOlder: true)
         }
     }
 
@@ -15095,27 +15240,56 @@ public struct MessageTimelineView: View {
         return "Pick a server channel or DM to open the timeline."
     }
 
-    @ViewBuilder private func timelineMessages(showLoadOlder: Bool, isLoadingOlder: Bool) -> some View {
+    /// The slot above loaded history.
+    ///
+    /// Always rendered and always exactly `olderHistoryHeaderHeight` tall. The previous
+    /// implementation swapped a button, a spinner and a caption -- three different heights -- at
+    /// index 0 of the `LazyVStack`, so every pagination state change shifted all content below
+    /// it. That is a jump no scroll-anchor mechanism can undo, and it is why this reserves space
+    /// even when idle.
+    ///
+    /// The fixed frame is on a leaf view. It is a concrete size, not an ideal-size request on the
+    /// enclosing `ScrollView`, so it does not interact with the Phase 64 freeze.
+    @ViewBuilder private var olderHistoryHeader: some View {
+        Group {
+            switch viewModel.olderHistoryHeaderState {
+            case .idle:
+                Color.clear
+            case .loading:
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Loading older messages")
+            case let .beginning(channelName):
+                Text(channelName.map { "This is the beginning of \($0)." } ?? "This is the beginning of the conversation.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .unavailableOffline:
+                Label("Older messages are unavailable offline.", systemImage: "wifi.slash")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case let .failed(message):
+                HStack(spacing: StoatSpacing.small) {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Button("Retry") {
+                        Task { await viewModel.loadOlderSelectedMessages() }
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: olderHistoryHeaderHeight, maxHeight: olderHistoryHeaderHeight)
+    }
+
+    private var olderHistoryHeaderHeight: CGFloat { 32 }
+
+    @ViewBuilder private func timelineMessages() -> some View {
         unreadRecoveryBanner
         searchHighlightAffordance
-        if isLoadingOlder {
-            ProgressView("Loading older messages")
-                .controlSize(.small)
-                .frame(maxWidth: .infinity)
-        } else if showLoadOlder {
-            Button {
-                Task { await viewModel.loadOlderSelectedMessages() }
-            } label: {
-                Label("Load Older Messages", systemImage: "arrow.up.to.line")
-            }
-            .buttonStyle(GlassButtonStyle())
-            .frame(maxWidth: .infinity)
-        } else if viewModel.selectedChannelMessageState.timelineMessages.isEmpty == false {
-            Text("Beginning of loaded history")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity)
-        }
+        olderHistoryHeader
         unreadSeparator
         let renderItems = viewModel.selectedTimelineRenderItems
         if renderItems.isEmpty, !viewModel.selectedTimelineMessages.isEmpty {
@@ -15203,9 +15377,9 @@ public struct MessageTimelineView: View {
             case let .targetUnloaded(messageID):
                 HStack(spacing: StoatSpacing.small) {
                     Image(systemName: "text.line.first.and.arrowtriangle.forward")
-                    Text("Unread message is outside the loaded range.")
+                    Text("Your first unread message is further back.")
                     Spacer()
-                    Button("Load Older") {
+                    Button("Jump to Unread") {
                         Task { await viewModel.loadToFirstUnreadMessage() }
                     }
                     .buttonStyle(GlassButtonStyle())
@@ -15213,7 +15387,7 @@ public struct MessageTimelineView: View {
                 .font(.caption)
                 .padding(StoatSpacing.medium)
                 .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
-                .accessibilityLabel("Unread message is outside the loaded range. Load older messages to reach it. Target \(messageID.rawValue).")
+                .accessibilityLabel("Your first unread message is further back than the loaded history. Jump to it. Target \(messageID.rawValue).")
             case let .loadingToTarget(_, attempts):
                 HStack(spacing: StoatSpacing.small) {
                     ProgressView()

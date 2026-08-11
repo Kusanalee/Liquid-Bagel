@@ -1158,6 +1158,7 @@ private struct TimelineValidationHarnessView: View {
             warningList(diagnostics.validationWarnings)
             actionGrid
             tuningControls
+            paginationDiagnostics
             defaultTuningDecisionControls
             calibrationControls
             findControls
@@ -1263,6 +1264,22 @@ private struct TimelineValidationHarnessView: View {
             Stepper("Load-to-unread attempts: \(viewModel.timelineTuning.loadToUnreadMaxAttempts)", value: binding(\.loadToUnreadMaxAttempts), in: 1...20)
             Stepper("Reference cooldown: \(viewModel.timelineTuning.referenceFetchCooldownSeconds) sec", value: binding(\.referenceFetchCooldownSeconds), in: 0...3600, step: 10)
             Stepper("Ack debounce: \(viewModel.timelineTuning.ackDebounceMilliseconds) ms", value: binding(\.ackDebounceMilliseconds), in: 0...10000, step: 100)
+            Stepper("Older prefetch distance: \(viewModel.timelineTuning.olderPrefetchDistancePercent)% of viewport", value: binding(\.olderPrefetchDistancePercent), in: 0...500, step: 25)
+            Stepper("Older prefetch row backstop: \(viewModel.timelineTuning.olderPrefetchRowThreshold) rows", value: binding(\.olderPrefetchRowThreshold), in: 0...100)
+        }
+        .font(.caption)
+    }
+
+    private var paginationDiagnostics: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            Text("Older-Message Prefetch").font(.subheadline.weight(.semibold))
+            let diagnostics = viewModel.phase74PaginationDiagnostics
+            LabeledContent("Triggered", value: "\(diagnostics.prefetchTriggerCount)")
+            LabeledContent("Suppressed", value: "\(diagnostics.prefetchSuppressedCount)")
+            LabeledContent("Pages loaded", value: "\(diagnostics.pageLoadedCount)")
+            LabeledContent("Pages failed", value: "\(diagnostics.pageFailedCount)")
+            LabeledContent("Last trigger", value: diagnostics.lastTrigger.map { String(describing: $0) } ?? "-")
+            LabeledContent("Last suppression", value: diagnostics.lastSuppressionReason?.rawValue ?? "-")
         }
         .font(.caption)
     }

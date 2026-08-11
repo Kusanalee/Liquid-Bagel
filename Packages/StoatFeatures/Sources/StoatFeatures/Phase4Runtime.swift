@@ -253,7 +253,6 @@ public enum ChannelMessageState: Equatable, Sendable {
     case idle
     case loading
     case loaded(messages: [TimelineMessage], hasMoreBefore: Bool)
-    case loadingOlder(messages: [TimelineMessage])
     case empty
     case failed(String, cachedMessages: [TimelineMessage])
 
@@ -261,7 +260,7 @@ public enum ChannelMessageState: Equatable, Sendable {
         switch self {
         case .idle, .loading, .empty:
             return []
-        case let .loaded(messages, _), let .loadingOlder(messages), let .failed(_, messages):
+        case let .loaded(messages, _), let .failed(_, messages):
             return messages
         }
     }
@@ -321,10 +320,11 @@ public struct ChannelMessageHistory: Hashable, Sendable {
         self.pendingReferenceFetchMessageIDs = pendingReferenceFetchMessageIDs
     }
 
+    /// Pagination is deliberately absent from this projection. Loading an older page is a
+    /// detail of the history header, not a mode the whole timeline enters: swapping the
+    /// timeline into a separate state mid-scroll is what made the old "Load Older Messages"
+    /// button feel like a mode switch. Read `isLoadingOlder` directly for the header.
     public var state: ChannelMessageState {
-        if isLoadingOlder {
-            return .loadingOlder(messages: messages)
-        }
         if isLoadingInitial && messages.isEmpty {
             return .loading
         }
@@ -463,7 +463,11 @@ public struct ChannelMessageHistoryReducer: Sendable {
             history.lastLoadedAt = loadedAt
         case let .olderLoadFailed(message):
             history.isLoadingOlder = false
-            history.errorMessage = message
+            // Deliberately does NOT set `errorMessage`. That field is the *initial-load* error
+            // channel and drives the full-timeline `.failed` state plus its retry button. Now
+            // that older pages are fetched automatically while scrolling, letting a transient
+            // pagination blip repaint the whole timeline as failed would be worse than the
+            // button ever was. Pagination reports through the history header instead.
             history.loadedRange.lastPaginationError = message
         case .olderLoadCancelled:
             history.isLoadingOlder = false

@@ -133,6 +133,12 @@ public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
     public var referenceFetchMaxAttempts: Int
     public var referenceFetchCooldownSeconds: Int
     public var ackDebounceMilliseconds: Int
+    /// How far above the viewport an older page starts loading, as a percentage of viewport
+    /// height. 150 means "begin fetching when the oldest loaded message is within 1.5 screens".
+    public var olderPrefetchDistancePercent: Int
+    /// Backstop trigger: fetch when the first visible message is within this many rows of the
+    /// oldest loaded one. Covers the case where the scroll-geometry threshold cannot re-arm.
+    public var olderPrefetchRowThreshold: Int
 
     public init(
         nearNewestMessageThreshold: Int = 2,
@@ -140,7 +146,9 @@ public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
         loadToUnreadMaxAttempts: Int = 4,
         referenceFetchMaxAttempts: Int = 1,
         referenceFetchCooldownSeconds: Int = 60,
-        ackDebounceMilliseconds: Int = 1500
+        ackDebounceMilliseconds: Int = 1500,
+        olderPrefetchDistancePercent: Int = 150,
+        olderPrefetchRowThreshold: Int = 12
     ) {
         self.nearNewestMessageThreshold = nearNewestMessageThreshold
         self.visibleRangeUpdateDebounceMilliseconds = visibleRangeUpdateDebounceMilliseconds
@@ -148,6 +156,38 @@ public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
         self.referenceFetchMaxAttempts = referenceFetchMaxAttempts
         self.referenceFetchCooldownSeconds = referenceFetchCooldownSeconds
         self.ackDebounceMilliseconds = ackDebounceMilliseconds
+        self.olderPrefetchDistancePercent = olderPrefetchDistancePercent
+        self.olderPrefetchRowThreshold = olderPrefetchRowThreshold
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case nearNewestMessageThreshold
+        case visibleRangeUpdateDebounceMilliseconds
+        case loadToUnreadMaxAttempts
+        case referenceFetchMaxAttempts
+        case referenceFetchCooldownSeconds
+        case ackDebounceMilliseconds
+        case olderPrefetchDistancePercent
+        case olderPrefetchRowThreshold
+    }
+
+    /// Decoded key-by-key with per-field fallbacks rather than through the synthesized
+    /// initializer. Synthesized `Decodable` throws on a missing key, so adding a field would
+    /// make every previously stored payload fail to decode and silently reset the user's whole
+    /// preference blob. Same reason `NotificationPreferences` does this.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = TimelineTuningConfiguration()
+        self.init(
+            nearNewestMessageThreshold: try container.decodeIfPresent(Int.self, forKey: .nearNewestMessageThreshold) ?? defaults.nearNewestMessageThreshold,
+            visibleRangeUpdateDebounceMilliseconds: try container.decodeIfPresent(Int.self, forKey: .visibleRangeUpdateDebounceMilliseconds) ?? defaults.visibleRangeUpdateDebounceMilliseconds,
+            loadToUnreadMaxAttempts: try container.decodeIfPresent(Int.self, forKey: .loadToUnreadMaxAttempts) ?? defaults.loadToUnreadMaxAttempts,
+            referenceFetchMaxAttempts: try container.decodeIfPresent(Int.self, forKey: .referenceFetchMaxAttempts) ?? defaults.referenceFetchMaxAttempts,
+            referenceFetchCooldownSeconds: try container.decodeIfPresent(Int.self, forKey: .referenceFetchCooldownSeconds) ?? defaults.referenceFetchCooldownSeconds,
+            ackDebounceMilliseconds: try container.decodeIfPresent(Int.self, forKey: .ackDebounceMilliseconds) ?? defaults.ackDebounceMilliseconds,
+            olderPrefetchDistancePercent: try container.decodeIfPresent(Int.self, forKey: .olderPrefetchDistancePercent) ?? defaults.olderPrefetchDistancePercent,
+            olderPrefetchRowThreshold: try container.decodeIfPresent(Int.self, forKey: .olderPrefetchRowThreshold) ?? defaults.olderPrefetchRowThreshold
+        )
     }
 
     public static var defaults: TimelineTuningConfiguration {
@@ -161,7 +201,9 @@ public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
             loadToUnreadMaxAttempts: Self.clamp(loadToUnreadMaxAttempts, 1...20),
             referenceFetchMaxAttempts: Self.clamp(referenceFetchMaxAttempts, 0...5),
             referenceFetchCooldownSeconds: Self.clamp(referenceFetchCooldownSeconds, 0...3_600),
-            ackDebounceMilliseconds: Self.clamp(ackDebounceMilliseconds, 0...10_000)
+            ackDebounceMilliseconds: Self.clamp(ackDebounceMilliseconds, 0...10_000),
+            olderPrefetchDistancePercent: Self.clamp(olderPrefetchDistancePercent, 0...500),
+            olderPrefetchRowThreshold: Self.clamp(olderPrefetchRowThreshold, 0...100)
         )
     }
 
@@ -198,7 +240,9 @@ public enum TimelineTuningPreset: String, Codable, Hashable, Sendable, CaseItera
                 loadToUnreadMaxAttempts: 5,
                 referenceFetchMaxAttempts: 1,
                 referenceFetchCooldownSeconds: 60,
-                ackDebounceMilliseconds: 1400
+                ackDebounceMilliseconds: 1400,
+                olderPrefetchDistancePercent: 200,
+                olderPrefetchRowThreshold: 15
             )
         case .responsive:
             TimelineTuningConfiguration(
@@ -207,7 +251,9 @@ public enum TimelineTuningPreset: String, Codable, Hashable, Sendable, CaseItera
                 loadToUnreadMaxAttempts: 6,
                 referenceFetchMaxAttempts: 2,
                 referenceFetchCooldownSeconds: 45,
-                ackDebounceMilliseconds: 1000
+                ackDebounceMilliseconds: 1000,
+                olderPrefetchDistancePercent: 300,
+                olderPrefetchRowThreshold: 20
             )
         case .debugStrict:
             TimelineTuningConfiguration(
@@ -216,7 +262,9 @@ public enum TimelineTuningPreset: String, Codable, Hashable, Sendable, CaseItera
                 loadToUnreadMaxAttempts: 2,
                 referenceFetchMaxAttempts: 0,
                 referenceFetchCooldownSeconds: 0,
-                ackDebounceMilliseconds: 0
+                ackDebounceMilliseconds: 0,
+                olderPrefetchDistancePercent: 0,
+                olderPrefetchRowThreshold: 0
             )
         }
     }
