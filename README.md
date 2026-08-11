@@ -1,5 +1,9 @@
 # Liquid Bagel
 
+<p align="center">
+  <img src="Docs/Images/liquid-bagel-banner.png" alt="Liquid Bagel — a native macOS client for Stoat" width="100%">
+</p>
+
 Liquid Bagel is an unofficial, native macOS client for [Stoat](https://stoat.chat). It is built with SwiftUI and connects directly to Stoat's REST and realtime APIs—no Electron and no webview.
 
 > [!WARNING]
@@ -27,7 +31,7 @@ Version 1.0 is not signed with an Apple Developer ID or notarized, so Gatekeeper
 3. Scroll to **Security**, find the message about Liquid Bagel, and click **Open Anyway**.
 4. Confirm by clicking **Open**. You should only need to do this once.
 
-The complete source code is public in this repository, so you can inspect the code and build the app yourself before signing in. See [Build from Source](#build-from-source).
+Liquid Bagel is open source under the [MIT License](LICENSE), so you can inspect the code and build the app yourself before signing in. See [Build from Source](#build-from-source).
 
 ## Getting Started
 
@@ -106,4 +110,4 @@ This project is under active development (see `Docs/Phase*.md` for history). Bef
 
 ## License
 
-The source is publicly available for inspection, but no license file is currently published. Until one is added, treat the code as all-rights-reserved by its contributors.
+Liquid Bagel is available under the [MIT License](LICENSE).
