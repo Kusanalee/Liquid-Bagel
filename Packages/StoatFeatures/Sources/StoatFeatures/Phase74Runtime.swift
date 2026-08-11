@@ -104,6 +104,63 @@ public enum OlderHistoryHeaderState: Hashable, Sendable {
     case failed(message: String)
 }
 
+// MARK: - Connection chrome
+
+public enum ConnectionChromeLevel: Hashable, Sendable {
+    case info
+    case warning
+    case error
+}
+
+/// What the window says about the connection.
+///
+/// Produced as `nil` when everything is fine. A healthy app should not spend a permanent line of
+/// the sidebar telling you it is connected -- that is the expected state, and stating it is noise
+/// that trains people to ignore the place real problems appear.
+public struct ConnectionChrome: Hashable, Sendable {
+    public var level: ConnectionChromeLevel
+    public var title: String
+    public var detail: String?
+    public var systemImage: String
+    public var actionTitle: String?
+
+    public init(
+        level: ConnectionChromeLevel,
+        title: String,
+        detail: String? = nil,
+        systemImage: String,
+        actionTitle: String? = nil
+    ) {
+        self.level = level
+        self.title = title
+        self.detail = detail
+        self.systemImage = systemImage
+        self.actionTitle = actionTitle
+    }
+}
+
+/// Anything that changes state on the server.
+public enum WriteAction: Hashable, Sendable {
+    case sendMessage
+    case attachFile
+    case react
+    case edit
+    case delete
+    case pin
+
+    /// Completes "Reconnect to ___."
+    var verb: String {
+        switch self {
+        case .sendMessage: "send messages"
+        case .attachFile: "attach files"
+        case .react: "react"
+        case .edit: "edit messages"
+        case .delete: "delete messages"
+        case .pin: "pin messages"
+        }
+    }
+}
+
 public struct Phase74PaginationDiagnostics: Hashable, Sendable {
     public var prefetchTriggerCount: Int
     public var prefetchSuppressedCount: Int

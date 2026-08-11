@@ -350,3 +350,89 @@ private func seedCache(_ store: InMemorySessionSnapshotStore, userID: UserID) as
         userID: userID
     )
 }
+
+// Phase 74 -- connection chrome and write blocking.
+extension StoatFeaturesTests {
+    @MainActor
+    func testPhase74ChromeIsSilentWhenConnected() {
+        // The contract: a healthy app says nothing about its connection. The sidebar used to
+        // carry a permanent "Connected" line, which is noise and trains people to ignore the one
+        // place a real problem would appear.
+        let model = MainShellViewModel(
+            snapshot: RealtimeSnapshot(),
+            runtimeMode: .liveManual,
+            sessionState: .connected,
+            currentUser: User(id: "u1", username: "u1"),
+            messageActionHandler: StubMessageActionHandler(currentUserID: "u1"),
+            communityAPIClient: StubStoatAPIClient()
+        )
+
+        XCTAssertNil(model.connectionChrome)
+        XCTAssertFalse(model.isOffline)
+        XCTAssertNil(model.writeBlockReason(.sendMessage))
+    }
+
+    @MainActor
+    func testPhase74ChromeAppearsOnlyWhenSomethingIsWrong() {
+        let model = MainShellViewModel(
+            snapshot: RealtimeSnapshot(),
+            runtimeMode: .liveManual,
+            sessionState: .connected,
+            currentUser: User(id: "u1", username: "u1"),
+            messageActionHandler: StubMessageActionHandler(currentUserID: "u1"),
+            communityAPIClient: StubStoatAPIClient()
+        )
+
+        model.sessionState = .connectionFailed("boom")
+        let offline = model.connectionChrome
+        XCTAssertNotNil(offline)
+        XCTAssertEqual(offline?.level, .warning)
+
+        model.sessionState = .invalidSession("expired")
+        XCTAssertEqual(model.connectionChrome?.level, .error)
+
+        model.sessionState = .connecting
+        XCTAssertEqual(model.connectionChrome?.level, .info)
+    }
+
+    @MainActor
+    func testPhase74EveryWriteActionIsBlockedWithTheSameShapeOfReason() {
+        let model = MainShellViewModel(
+            snapshot: RealtimeSnapshot(),
+            runtimeMode: .liveManual,
+            sessionState: .connectionFailed("boom"),
+            currentUser: User(id: "u1", username: "u1"),
+            messageActionHandler: StubMessageActionHandler(currentUserID: "u1"),
+            communityAPIClient: StubStoatAPIClient()
+        )
+
+        let actions: [WriteAction] = [.sendMessage, .attachFile, .react, .edit, .delete, .pin]
+        for action in actions {
+            let reason = model.writeBlockReason(action)
+            XCTAssertNotNil(reason, "\(action) should be blocked offline")
+            XCTAssertEqual(reason?.hasPrefix("You're offline."), true, "\(action): \(reason ?? "nil")")
+        }
+        // Distinct per action, so the composer and a context menu never say the same generic thing.
+        XCTAssertEqual(Set(actions.compactMap { model.writeBlockReason($0) }).count, actions.count)
+    }
+
+    @MainActor
+    func testPhase74OfflineComposerExplainsItselfRatherThanJustGoingDead() {
+        var snapshot = RealtimeSnapshot()
+        let channelID: ChannelID = "c1"
+        snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: "s1", name: "general")
+        let model = MainShellViewModel(
+            snapshot: snapshot,
+            runtimeMode: .liveManual,
+            sessionState: .connectionFailed("boom"),
+            currentUser: User(id: "u1", username: "u1"),
+            messageActionHandler: StubMessageActionHandler(currentUserID: "u1"),
+            communityAPIClient: StubStoatAPIClient()
+        )
+        model.updateDraft("hello", for: channelID)
+
+        let readiness = model.composerReadiness(for: channelID)
+        XCTAssertFalse(readiness.canSend)
+        XCTAssertEqual(readiness.reason, model.writeBlockReason(.sendMessage))
+    }
+}

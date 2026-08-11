@@ -1880,6 +1880,86 @@ public final class MainShellViewModel {
         effectiveRuntimeMode == .liveManual && effectiveSessionState != .connected
     }
 
+    /// What the window should say about the connection, or `nil` when there is nothing worth
+    /// saying.
+    ///
+    /// This replaced a permanent "Connected" chip under the sidebar title. A healthy app stating
+    /// that it is healthy is noise, and worse, it trains people to ignore the one place real
+    /// problems would appear. Chrome only when something is wrong.
+    public var connectionChrome: ConnectionChrome? {
+        guard effectiveRuntimeMode == .liveManual else {
+            return ConnectionChrome(level: .info, title: "Preview Data", systemImage: "eye")
+        }
+        switch effectiveSessionState {
+        case .connected:
+            return nil
+        case .connecting, .loadingCredential, .validatingCredential:
+            return ConnectionChrome(level: .info, title: "Connecting…", systemImage: "arrow.clockwise")
+        case .signedOut:
+            return ConnectionChrome(level: .warning, title: "Signed out", systemImage: "person.slash")
+        case .invalidSession:
+            return ConnectionChrome(
+                level: .error,
+                title: "Session expired",
+                detail: "Sign in again to reconnect.",
+                systemImage: "exclamationmark.triangle"
+            )
+        case .readyToConnect, .validatedReady, .savedCredentialUnvalidated,
+             .validationFailed, .connectionFailed, .keychainFailed, .failed:
+            return offlineChrome
+        case .mock:
+            return ConnectionChrome(level: .info, title: "Preview Data", systemImage: "eye")
+        }
+    }
+
+    private var offlineChrome: ConnectionChrome {
+        let detail = sessionCoordinator?.sessionCacheAvailability.map {
+            "Showing content saved \($0.savedAt.formatted(date: .omitted, time: .shortened))."
+        }
+        if sessionCoordinator?.networkPathStatus.isKnownOffline == true {
+            return ConnectionChrome(
+                level: .warning,
+                title: "No internet connection",
+                detail: detail,
+                systemImage: "wifi.slash",
+                actionTitle: nil
+            )
+        }
+        return ConnectionChrome(
+            level: .warning,
+            title: "Offline",
+            detail: detail,
+            systemImage: "wifi.slash",
+            actionTitle: "Reconnect"
+        )
+    }
+
+    /// Formatted size of what offline mode has stored, for Settings.
+    public private(set) var offlineCacheSizeDescription: String = "—"
+
+    public func refreshOfflineCacheSize() async {
+        guard let diagnostics = await sessionCoordinator?.sessionCacheDiagnostics() else { return }
+        offlineCacheSizeDescription = diagnostics.totalBytesOnDisk == 0
+            ? "Nothing saved"
+            : ByteCountFormatter.string(fromByteCount: Int64(diagnostics.totalBytesOnDisk), countStyle: .file)
+    }
+
+    public func clearOfflineCache() async {
+        await sessionCoordinator?.purgeSessionCache()
+        await refreshOfflineCacheSize()
+        presentNotice("Saved content removed.", severity: .success)
+    }
+
+    /// `nil` means the action is allowed. One reason, produced in one place, so the composer and
+    /// the message context menu cannot drift into saying different things about the same state.
+    ///
+    /// Only concerned with connectivity. Permission checks stay where they are, because "you
+    /// don't have permission" and "you're offline" are different problems with different fixes.
+    public func writeBlockReason(_ action: WriteAction) -> String? {
+        guard effectiveRuntimeMode == .liveManual, isOffline else { return nil }
+        return "You're offline. Reconnect to \(action.verb)."
+    }
+
     /// One sentence anyone can act on, for the Settings connection row. The counter grid it
     /// replaces is still available behind Developer Options.
     public var connectionSummaryText: String {
@@ -7747,8 +7827,13 @@ public final class MainShellViewModel {
         guard !draft.isEmpty || !state.attachments.isEmpty else {
             return (false, "Type a message or attach a file.")
         }
+        // One reason, produced in one place, so the composer placeholder and the message context
+        // menu cannot end up describing the same state differently.
+        if let reason = writeBlockReason(.sendMessage) {
+            return (false, reason)
+        }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Reconnect to send live messages.")
+            return (false, "Reconnect to send messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -7775,8 +7860,13 @@ public final class MainShellViewModel {
         guard let channelID, let channel = snapshot.channelsByID[channelID] else {
             return (false, "Select a channel to send a message.")
         }
+        // One reason, produced in one place, so the composer placeholder and the message context
+        // menu cannot end up describing the same state differently.
+        if let reason = writeBlockReason(.sendMessage) {
+            return (false, reason)
+        }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Reconnect to send live messages.")
+            return (false, "Reconnect to send messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -13418,6 +13508,45 @@ private extension AppLifecyclePhase {
     }
 }
 
+/// The one place the app talks about its connection, shown only when something is wrong.
+struct ConnectionChromeChip: View {
+    let chrome: ConnectionChrome
+    let onAction: () -> Void
+
+    private var tint: Color {
+        switch chrome.level {
+        case .info: .secondary
+        case .warning: .orange
+        case .error: .red
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Image(systemName: chrome.systemImage)
+                    .accessibilityHidden(true)
+                Text(chrome.title)
+                    .lineLimit(1)
+                if let actionTitle = chrome.actionTitle {
+                    Button(actionTitle, action: onAction)
+                        .buttonStyle(.borderless)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(tint)
+            if let detail = chrome.detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel([chrome.title, chrome.detail].compactMap { $0 }.joined(separator: ". "))
+    }
+}
+
 public struct MainShellView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Bindable private var viewModel: MainShellViewModel
@@ -14932,9 +15061,13 @@ public struct ChannelListView: View {
                     Text(headerTitle)
                         .font(StoatTypography.sidebarHeader)
                         .lineLimit(1)
-                    Text(runtimeSubtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    // Nothing at all when connected. The line that used to live here said
+                    // "Connected" permanently.
+                    if let chrome = viewModel.connectionChrome {
+                        ConnectionChromeChip(chrome: chrome) {
+                            Task { await viewModel.reconnectLiveManually() }
+                        }
+                    }
                 }
                 Spacer()
                 if viewModel.selection.serverID != nil {
@@ -14997,32 +15130,6 @@ public struct ChannelListView: View {
         case .discover: "Discover"
         case .directMessages: "Direct Messages"
         case .server: viewModel.selectedServer?.name ?? "Server"
-        }
-    }
-
-    private var runtimeSubtitle: String {
-        switch viewModel.effectiveRuntimeMode {
-        case .mock:
-            return "Preview Data"
-        case .liveManual:
-            switch viewModel.effectiveSessionState {
-            case .connected:
-                return "Connected"
-            case .connecting, .loadingCredential, .validatingCredential:
-                return "Connecting"
-            case .signedOut:
-                return "Signed out"
-            case .readyToConnect, .validatedReady:
-                return "Ready"
-            case .savedCredentialUnvalidated:
-                return "Saved credential"
-            case .invalidSession:
-                return "Invalid session"
-            case .validationFailed, .connectionFailed, .keychainFailed, .failed:
-                return "Needs attention"
-            case .mock:
-                return "Preview Data"
-            }
         }
     }
 

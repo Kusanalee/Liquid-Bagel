@@ -744,6 +744,26 @@ private struct ConnectionSettingsTab: View {
                 }
             }
 
+            Section("Offline") {
+                Toggle("Open with saved content", isOn: Binding(
+                    get: { connectionViewModel.preferences.offlineCacheRestoreOnLaunch },
+                    set: { value in
+                        connectionViewModel.preferences.offlineCacheRestoreOnLaunch = value
+                        Task {
+                            await connectionViewModel.save()
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                ))
+                Text("Shows your servers, channels, and recent messages while Liquid Bagel reconnects. Saved content is encrypted and removed when you sign out.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                LabeledContent("Saved on this Mac", value: viewModel.offlineCacheSizeDescription)
+                Button("Clear Saved Content", role: .destructive) {
+                    Task { await viewModel.clearOfflineCache() }
+                }
+            }
+
             Section("Advanced") {
                 Toggle("Enable Developer Options", isOn: Binding(
                     get: { connectionViewModel.preferences.showDeveloperRuntimeControls },
@@ -759,6 +779,7 @@ private struct ConnectionSettingsTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .task { await viewModel.refreshOfflineCacheSize() }
 
             if let error = connectionViewModel.errorMessage ?? viewModel.sessionCoordinator?.preferenceErrorMessage {
                 Section("Status") {
