@@ -200,8 +200,9 @@ final class StoatUITests: XCTestCase {
         )
         XCTAssertEqual(inlineTokens, ["text::**Bold** ", "emoji:::bagel:"])
 
+        // `code:-::` is the block descriptor's "no fence language" form.
         let codeBlocks = MarkdownMessageContent._testBlockDescriptions(for: "```\nlet value = \":bagel:\"\n```")
-        XCTAssertEqual(codeBlocks, ["code::let value = \":bagel:\""])
+        XCTAssertEqual(codeBlocks, ["code:-::let value = \":bagel:\""])
     }
 
     func testPhase63CSSRoleColorParserHexForms() throws {
@@ -391,6 +392,115 @@ final class StoatUITests: XCTestCase {
         )
     }
 
+    func testPhase72HeadingLevelsAreAllDistinct() {
+        let source = (1...6).map { String(repeating: "#", count: $0) + " h\($0)" }.joined(separator: "\n")
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: source),
+            (1...6).map { "heading\($0)::h\($0)" }
+        )
+
+        // Six markdown levels used to collapse onto two fonts, so ## through ###### looked alike.
+        let fonts = (1...6).map { MarkdownHeadingStyle.font(for: $0) }
+        XCTAssertEqual(Set(fonts).count, 6, "each heading level needs its own font")
+        // Out-of-range levels clamp rather than crash or fall through to body text.
+        XCTAssertEqual(MarkdownHeadingStyle.font(for: 0), MarkdownHeadingStyle.font(for: 1))
+        XCTAssertEqual(MarkdownHeadingStyle.font(for: 7), MarkdownHeadingStyle.font(for: 6))
+    }
+
+    func testPhase72NestedListsKeepTheirDepth() {
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "- a\n  - b\n    - c"),
+            ["list0:-::a", "list1:-::b", "list2:-::c"]
+        )
+        // Indentation used to be trimmed away before depth could be measured.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "            - deep"),
+            ["list4:-::deep"]
+        )
+        // Ordered markers keep the author's numbering.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "1. first\n2. second"),
+            ["list0:1.::first", "list0:2.::second"]
+        )
+        XCTAssertEqual(MarkdownListStyle.glyph(marker: "1.", depth: 0), "1.")
+        XCTAssertNotEqual(
+            MarkdownListStyle.glyph(marker: "-", depth: 0),
+            MarkdownListStyle.glyph(marker: "-", depth: 1)
+        )
+        XCTAssertEqual(MarkdownListStyle.indent(depth: 0), 0)
+        XCTAssertGreaterThan(MarkdownListStyle.indent(depth: 2), MarkdownListStyle.indent(depth: 1))
+    }
+
+    func testPhase72ConsecutiveQuoteLinesFormOneBlock() {
+        // Each `>` line used to become its own block, so one logical quote rendered as several
+        // disconnected bars separated by paragraph gaps.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "> line one\n> line two"),
+            ["quote::line one\\nline two"]
+        )
+        // A blank line still separates two distinct quotes.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "> first\n\n> second"),
+            ["quote::first", "quote::second"]
+        )
+        // An intervening paragraph closes the quote.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "> quoted\nplain"),
+            ["quote::quoted", "text::plain"]
+        )
+    }
+
+    func testPhase72FenceLanguageIsCapturedAndValidated() {
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "```swift\nlet x = 1\n```"),
+            ["code:swift::let x = 1"]
+        )
+        // An arbitrary info string must not become visible UI.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "```<script>alert()\nbody\n```"),
+            ["code:-::body"]
+        )
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "```\(String(repeating: "a", count: 40))\nbody\n```"),
+            ["code:-::body"]
+        )
+    }
+
+    func testPhase72HorizontalRules() {
+        for rule in ["---", "***", "___", "-----"] {
+            XCTAssertEqual(MarkdownMessageContent._testBlockDescriptions(for: rule), ["rule"], "\(rule) should be a rule")
+        }
+        for notRule in ["--", "-- -", "- - -", "text ---"] {
+            XCTAssertNotEqual(MarkdownMessageContent._testBlockDescriptions(for: notRule), ["rule"], "\(notRule) is not a rule")
+        }
+    }
+
+    func testPhase72BlockSpacingTightensConsecutiveListItems() {
+        let listToList = MarkdownBlockSpacing._testSpacing(above: "list", below: "list")
+        let textToText = MarkdownBlockSpacing._testSpacing(above: "text", below: "text")
+        XCTAssertLessThan(listToList, textToText, "consecutive list items should sit tighter than paragraphs")
+
+        XCTAssertEqual(MarkdownBlockSpacing._testSpacing(above: "text", below: nil), 0, "first block gets no leading gap")
+        XCTAssertGreaterThan(
+            MarkdownBlockSpacing._testSpacing(above: "heading", below: "text"),
+            MarkdownBlockSpacing._testSpacing(above: "text", below: "heading")
+        )
+    }
+
+    func testPhase72SanitizerKeepsComparisonProse() {
+        // The old `<[^>]+>` pattern ate everything between angle brackets, so ordinary prose
+        // containing comparisons lost a chunk of its text.
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "5 < 10 > 3"), "5 < 10 > 3")
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "if a<b then swap"), "if a<b then swap")
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "2<3 and 4>1"), "2<3 and 4>1")
+
+        // Real HTML tags are still stripped. Note `<b and c>` is deliberately NOT preserved: it
+        // is a well-formed `<b>` tag with attributes, so treating it as markup is correct.
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "<b>bold</b>"), "bold")
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "<script>x</script>"), "x")
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "a<b and c>d"), "ad")
+    }
+
     func testPhase72AutocompletePopoverHeightGrowsThenCaps() {
         let sizing = ComposerAutocompleteSizing.self
         XCTAssertEqual(sizing.height(candidateCount: 0), 0)
@@ -447,7 +557,7 @@ final class StoatUITests: XCTestCase {
         let mention = MessageInlineReferenceItem(kind: .user, rawID: userID, displayName: "Enka")
 
         let codeBlocks = MarkdownMessageContent._testBlockDescriptions(for: "```\n<@\(userID)>\n```")
-        XCTAssertEqual(codeBlocks, ["code::<@\(userID)>"])
+        XCTAssertEqual(codeBlocks, ["code:-::<@\(userID)>"])
 
         // The inline tokenizer itself (given only the fenced content, as the block parser would
         // hand it) still recognizes the shape -- literalness comes from the block parser routing

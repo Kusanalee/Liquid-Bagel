@@ -208,7 +208,14 @@ final class MarkdownInlineCache: @unchecked Sendable {
             return cached
         }
         lock.unlock()
-        let sanitized = source.replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+        // Strip HTML tags specifically rather than everything between angle brackets: the old
+        // `<[^>]+>` pattern also ate ordinary prose like "5 < 10 > 3". Reference tokens such as
+        // <@ULID> are consumed by the tokenizer before this runs, so they are unaffected.
+        let sanitized = source.replacingOccurrences(
+            of: #"</?(?:a|b|br|div|em|i|img|p|s|script|span|strong|style|u)\b[^>]*>"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
         let parsed = (try? AttributedString(
             markdown: sanitized,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
