@@ -391,6 +391,35 @@ final class StoatUITests: XCTestCase {
         )
     }
 
+    func testPhase72AutocompletePopoverHeightGrowsThenCaps() {
+        let sizing = ComposerAutocompleteSizing.self
+        XCTAssertEqual(sizing.height(candidateCount: 0), 0)
+
+        // Monotonic, and always at least one row tall once there is a candidate.
+        var previous = sizing.height(candidateCount: 1)
+        XCTAssertGreaterThanOrEqual(previous, sizing.rowHeight)
+        for count in [2, 6, 10, 50] {
+            let height = sizing.height(candidateCount: count)
+            XCTAssertGreaterThanOrEqual(height, previous, "height must not shrink at \(count)")
+            XCTAssertLessThanOrEqual(height, sizing.maximumHeight, "height must stay capped at \(count)")
+            previous = height
+        }
+
+        // The cap is what makes the list scroll instead of overflowing the window.
+        XCTAssertEqual(sizing.height(candidateCount: 50), sizing.maximumHeight)
+    }
+
+    func testPhase72AutocompletePopoverSitsAboveTheField() {
+        let sizing = ComposerAutocompleteSizing.self
+        let popover = sizing.height(candidateCount: 6)
+
+        for fieldHeight in [CGFloat(34), 92] {
+            let offset = sizing.offsetAboveField(fieldHeight: fieldHeight, popoverHeight: popover)
+            XCTAssertLessThan(offset, 0, "popover must be lifted above the field")
+            XCTAssertEqual(offset, -(popover + sizing.gap), accuracy: 0.001)
+        }
+    }
+
     func testPhase72InlineEmojiGlyphScaleIsClamped() {
         XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 44), 2, accuracy: 0.001)
         XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 22), 1, accuracy: 0.001)

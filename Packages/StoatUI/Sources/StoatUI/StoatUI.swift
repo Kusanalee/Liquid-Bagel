@@ -1322,7 +1322,16 @@ public struct GlassComposer: View {
                                         onSelect: onSelectMentionCandidate,
                                         onRequestEmojiImage: onRequestAutocompleteEmojiImage
                                     )
-                                    .alignmentGuide(.top) { dimensions in dimensions.height + 4 }
+                                    // Positioned from values already known here rather than from
+                                    // the child's measured height: the popover used to be offset
+                                    // by its own collapsed height, so it sat wrong by exactly the
+                                    // amount that had been clipped away.
+                                    .offset(y: ComposerAutocompleteSizing.offsetAboveField(
+                                        fieldHeight: ComposerTextSizing.height(for: text),
+                                        popoverHeight: ComposerAutocompleteSizing.height(
+                                            candidateCount: mentionAutocompleteCandidates.count
+                                        )
+                                    ))
                                 }
                             }
                         if text.isEmpty {
