@@ -24,6 +24,7 @@ Record categorical outcomes only. No credentials, MFA material, payload bodies, 
 | 6 | While a loaded timeline is visible, let avatars, attachment previews, custom emoji, and identity hydration finish | Existing message groups never disappear; first-time preparation shows an explicit progress state instead of a blank timeline | | |
 | 7 | Copy Developer Verification diagnostics after the run | Main-thread budget-violation counter is zero or explained; timeline cancellation/stale counts are bounded; no redaction leaks | | |
 | 8 | After the Phase 57 large-member/media scenario settles, leave the app untouched for 30 seconds and capture Activity Monitor plus an Instruments sample | CPU averages below 10% on the same machine; image queues settle at zero; eviction/reload and timeline-media-invalidation counters stop increasing; no repeating image/decode/presentation loop | | |
+| 9 | Scroll a long channel containing embeds, multi-line quotes, nested lists, custom emoji, and mentions; capture a sample | No `measureEstimates`/`sizeChildrenIdeally` loop and no sustained main-thread operation above 50 ms. Phase 72 changed per-row rendering, so this lane must be re-run in full before its rows can be promoted | | |
 
 ## Matrix Rows Unlocked
 
