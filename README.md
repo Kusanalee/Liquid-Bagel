@@ -9,12 +9,12 @@ Liquid Bagel is an unofficial, native macOS client for [Stoat](https://stoat.cha
 > [!WARNING]
 > **Version 1.0 is a pre-release and is very unpolished.** Expect missing features, rough edges, and bugs. Do not rely on it as your only way to access Stoat.
 
-Liquid Bagel covers the essentials of day-to-day chat: servers and channels, direct and group messages, friends, roles, moderation tools, custom emoji, attachments, reactions, replies, native notifications, and profile editing. The app uses your real Stoat account; there is no demo mode in the distributed build.
+Liquid Bagel covers the essentials of day-to-day chat: servers and channels, direct and group messages, friends, roles, moderation tools, custom emoji, attachments, reactions, replies, native notifications, and profile editing.
 
 ## Requirements
 
 - macOS 15 or newer
-- A Stoat account
+- A Stoat account — you can [create one at stoat.chat](https://stoat.chat)
 
 ## Download and Install
 
@@ -35,7 +35,7 @@ Liquid Bagel is open source under the [MIT License](LICENSE), so you can inspect
 
 ## Getting Started
 
-1. Launch Liquid Bagel and sign in with your Stoat credentials.
+1. Launch Liquid Bagel and sign in with your Stoat email and password. If your account uses two-factor authentication, you will be asked for a code next.
 2. Wait for the app to connect and load your conversations.
 3. Use the server list, channel list, or direct messages to start chatting.
 
@@ -62,7 +62,6 @@ Version 1.0 intentionally does not include:
 - **Voice or video.** Voice channels and calls are not implemented.
 - **Background push notifications.** Notifications work only while Liquid Bagel is running.
 - **Automatic settings sync.** Cloud settings use manual fetch and push controls.
-- **A demo mode.** A real Stoat account is required.
 
 This list is not exhaustive. Because this is an early pre-release, features that exist may still behave incorrectly. Please report reproducible problems through [GitHub Issues](https://github.com/Kusanalee/Liquid-Bagel/issues).
 

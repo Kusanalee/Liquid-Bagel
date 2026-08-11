@@ -900,6 +900,7 @@ private actor StubLoginAPIClient: StoatAPIClient {
     let continueResponse: SessionLoginResponse
     private(set) var loginCallCount = 0
     private(set) var continueCallCount = 0
+    private(set) var continueRequests: [SessionMFALoginRequest] = []
 
     init(response: SessionLoginResponse, continueResponse: SessionLoginResponse? = nil) {
         self.loginResponse = response
@@ -929,6 +930,74 @@ private actor StubLoginAPIClient: StoatAPIClient {
 
     func continueLogin(request: SessionMFALoginRequest) async throws -> SessionLoginResponse {
         continueCallCount += 1
+        continueRequests.append(request)
         return continueResponse
+    }
+}
+
+// Phase 74 -- sign-in screen.
+extension StoatFeaturesTests {
+    /// Before Phase 74, `submitMFA` always used `allowedMethods.first`, so on an account that
+    /// allows both TOTP and recovery codes a recovery code was submitted as a TOTP code and
+    /// rejected no matter how correct it was. There was no picker to choose otherwise.
+    @MainActor
+    func testPhase74MFARecoveryCodeIsSubmittedAsARecoveryCode() async throws {
+        let loginSuccess = SessionLoginSuccess(id: "sess", userID: "user", token: "token", name: "Mac", lastSeen: Date())
+        let api = StubLoginAPIClient(
+            response: .mfa(ticket: "ticket", allowedMethods: [.totp, .recovery]),
+            continueResponse: .success(loginSuccess)
+        )
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            sessionValidator: StubSessionValidator(user: User(id: "user", username: "user")),
+            apiClientFactory: { _, _ in api },
+            realtimeClientFactory: { RecordingRealtimeClient(statesOnConnect: [.ready]) }
+        )
+        let viewModel = FirstRunLoginViewModel(coordinator: coordinator)
+
+        viewModel.email = "user@example.com"
+        viewModel.password = "password"
+        await viewModel.submitLogin()
+        XCTAssertEqual(viewModel.availableMFAMethods, [.totp, .recovery])
+        XCTAssertEqual(viewModel.effectiveMFAMethod, .totp, "defaults to the first allowed method")
+
+        viewModel.selectedMFAMethod = .recovery
+        viewModel.mfaResponse = "AAAA-BBBB"
+        await viewModel.submitMFA()
+
+        let requests = await api.continueRequests
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.mfaResponse, .recoveryCode("AAAA-BBBB"))
+    }
+
+    @MainActor
+    func testPhase74MFASelectionFallsBackWhenTheMethodIsNotOffered() async throws {
+        let loginSuccess = SessionLoginSuccess(id: "sess", userID: "user", token: "token", name: "Mac", lastSeen: Date())
+        let api = StubLoginAPIClient(
+            response: .mfa(ticket: "ticket", allowedMethods: [.totp]),
+            continueResponse: .success(loginSuccess)
+        )
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            sessionValidator: StubSessionValidator(user: User(id: "user", username: "user")),
+            apiClientFactory: { _, _ in api },
+            realtimeClientFactory: { RecordingRealtimeClient(statesOnConnect: [.ready]) }
+        )
+        let viewModel = FirstRunLoginViewModel(coordinator: coordinator)
+        viewModel.email = "user@example.com"
+        viewModel.password = "password"
+        await viewModel.submitLogin()
+
+        // A stale selection from a previous challenge must not be sent to an account that does
+        // not accept it.
+        viewModel.selectedMFAMethod = .recovery
+        XCTAssertEqual(viewModel.effectiveMFAMethod, .totp)
+    }
+
+    @MainActor
+    func testPhase74LoginScreenNamesTheHostOnlyForCustomServers() async {
+        let production = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
+        XCTAssertNil(FirstRunLoginViewModel(coordinator: production).customEnvironmentLabel)
+        XCTAssertNotNil(FirstRunLoginViewModel(coordinator: production).signUpURL)
     }
 }

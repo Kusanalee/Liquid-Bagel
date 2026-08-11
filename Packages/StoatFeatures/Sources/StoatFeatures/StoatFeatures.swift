@@ -12792,7 +12792,7 @@ public final class LiquidBagelAppModel {
 public final class FirstRunLoginViewModel {
     public var email: String = ""
     public var password: String = ""
-    public var sessionName: String = "Liquid Bagel macOS"
+    public var sessionName: String = FirstRunLoginViewModel.defaultSessionName
     public var mfaResponse: String = ""
     public var manualToken: String = ""
     public var tokenLabel: String = ""
@@ -12821,8 +12821,21 @@ public final class FirstRunLoginViewModel {
         }
     }
 
+    /// The method the user picked, defaulting to the account's first allowed one.
+    ///
+    /// Previously `submitMFA` always used `allowedMethods.first` with no way to change it, so an
+    /// account whose first allowed method was TOTP could not sign in with a recovery code at
+    /// all -- the code went to the server labelled as the wrong kind and was rejected.
+    public var selectedMFAMethod: MFAMethod?
+
+    public var availableMFAMethods: [MFAMethod] { mfaChallenge?.allowedMethods ?? [] }
+
+    public var effectiveMFAMethod: MFAMethod? {
+        selectedMFAMethod.flatMap { availableMFAMethods.contains($0) ? $0 : nil } ?? availableMFAMethods.first
+    }
+
     public func submitMFA() async {
-        guard let challenge = mfaChallenge, let method = challenge.allowedMethods.first else { return }
+        guard let method = effectiveMFAMethod else { return }
         loginError = nil
         let response = mfaResponseValue(method: method, code: mfaResponse)
         await coordinator.continueLoginMFA(response: response, friendlyName: sessionName)
@@ -12834,6 +12847,23 @@ public final class FirstRunLoginViewModel {
         case .password: .password(code)
         case .recovery: .recoveryCode(code)
         case .totp: .totpCode(code)
+        }
+    }
+
+    public static func fieldLabel(for method: MFAMethod?) -> String {
+        switch method {
+        case .totp: "Authentication code"
+        case .recovery: "Recovery code"
+        case .password: "Password"
+        case nil: "Authentication code"
+        }
+    }
+
+    public static func methodLabel(for method: MFAMethod) -> String {
+        switch method {
+        case .totp: "Authenticator app"
+        case .recovery: "Recovery code"
+        case .password: "Password"
         }
     }
 
@@ -12851,11 +12881,25 @@ public final class FirstRunLoginViewModel {
     public func clearForm() {
         email = ""
         password = ""
-        sessionName = "Liquid Bagel macOS"
+        sessionName = Self.defaultSessionName
         mfaResponse = ""
         manualToken = ""
         tokenLabel = ""
+        selectedMFAMethod = nil
         loginError = nil
+    }
+
+    public static let defaultSessionName = "Liquid Bagel"
+
+    /// Where someone without an account goes to make one.
+    public var signUpURL: URL? { coordinator.environment.appBaseURL }
+
+    /// `nil` on production. Naming the host is only meaningful when it is not the obvious one,
+    /// and printing an API URL on a sign-in screen reads as debug output.
+    public var customEnvironmentLabel: String? {
+        let environment = coordinator.environment
+        guard !environment.isProduction else { return nil }
+        return environment.apiBaseURL.host() ?? environment.apiBaseURL.absoluteString
     }
 
     private func updateLoginError() {
@@ -12894,63 +12938,55 @@ public struct FirstRunLoginView: View {
 
     @ViewBuilder
     private var loginCard: some View {
-        VStack(spacing: 24) {
+        VStack(spacing: 20) {
             header
             if let mfaChallenge = viewModel.mfaChallenge {
                 mfaSection(challenge: mfaChallenge)
             } else {
                 credentialsSection
+                signInButton
+                signUpRow
             }
-            if let error = viewModel.loginError {
-                Text(error.localizedDescription)
-                    .foregroundStyle(.red)
-                    .font(.callout)
-                    .multilineTextAlignment(.center)
-                    .accessibilityLabel("Login error: \(error.localizedDescription)")
-            }
+            errorRow
             advancedSection
-            signInButton
         }
         .padding(32)
-        .frame(maxWidth: 440)
+        .frame(maxWidth: 420)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
         .shadow(color: .black.opacity(0.12), radius: 20, y: 4)
     }
 
     @ViewBuilder
     private var header: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             if let appIcon = NSImage(named: "AppIcon") {
                 Image(nsImage: appIcon)
                     .resizable()
-                    .frame(width: 80, height: 80)
-                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .frame(width: 88, height: 88)
+                    .clipShape(RoundedRectangle(cornerRadius: 20))
                     .accessibilityLabel("Liquid Bagel app icon")
             }
-            Text("Liquid Bagel")
-                .font(.title.bold())
-            environmentRow
-        }
-    }
-
-    @ViewBuilder
-    private var environmentRow: some View {
-        let env = coordinator.environment
-        let envLabel = env.isProduction ? "Production" : (env.apiBaseURL.host() ?? env.apiBaseURL.absoluteString)
-        HStack(spacing: 4) {
-            Image(systemName: "network")
+            Text("Sign in to Stoat")
+                .font(.title2.bold())
+            // Only shown for a custom instance. On production the host is the obvious one and
+            // printing an API URL here reads as debug output rather than reassurance.
+            if let label = viewModel.customEnvironmentLabel {
+                HStack(spacing: 4) {
+                    Image(systemName: "network")
+                        .accessibilityHidden(true)
+                    Text(label)
+                }
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text(envLabel)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .accessibilityLabel("Custom server: \(label)")
+            }
         }
-        .accessibilityLabel("Environment: \(envLabel)")
+        .padding(.bottom, 4)
     }
 
     @ViewBuilder
     private var credentialsSection: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             TextField("Email", text: $viewModel.email)
                 .textFieldStyle(.roundedBorder)
                 .textContentType(.emailAddress)
@@ -12966,38 +13002,83 @@ public struct FirstRunLoginView: View {
                 .onSubmit {
                     Task { await viewModel.submitLogin() }
                 }
+        }
+    }
 
-            TextField("Session name", text: $viewModel.sessionName)
-                .textFieldStyle(.roundedBorder)
-                .focused($focused, equals: .sessionName)
-                .accessibilityLabel("Session name")
-                .onSubmit {
-                    Task { await viewModel.submitLogin() }
-                }
+    @ViewBuilder
+    private var signUpRow: some View {
+        if let url = viewModel.signUpURL {
+            HStack(spacing: 4) {
+                Text("Don't have an account?")
+                    .foregroundStyle(.secondary)
+                Link("Create one", destination: url)
+            }
+            .font(.callout)
+        }
+    }
+
+    @ViewBuilder
+    private var errorRow: some View {
+        if let error = viewModel.loginError {
+            let message = error.localizedDescription
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundStyle(.red)
+                    .accessibilityHidden(true)
+                Text(message)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.callout)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Sign-in error: \(message)")
         }
     }
 
     @ViewBuilder
     private func mfaSection(challenge: LoginMFAChallenge) -> some View {
         VStack(spacing: 12) {
-            Text("Two-factor authentication required")
+            Text("Two-factor authentication")
                 .font(.headline)
-            Text("Enter the code from your authenticator app or other MFA method.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            SecureField("Authentication code", text: $viewModel.mfaResponse)
+
+            // A picker whenever the account allows more than one method. Without it the code is
+            // submitted labelled as whichever method happens to sort first, so a recovery code
+            // on a TOTP-first account is rejected no matter how correct it is.
+            if viewModel.availableMFAMethods.count > 1 {
+                Picker("Method", selection: Binding(
+                    get: { viewModel.effectiveMFAMethod ?? challenge.allowedMethods[0] },
+                    set: { viewModel.selectedMFAMethod = $0 }
+                )) {
+                    ForEach(challenge.allowedMethods, id: \.self) { method in
+                        Text(FirstRunLoginViewModel.methodLabel(for: method)).tag(method)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+
+            let fieldLabel = FirstRunLoginViewModel.fieldLabel(for: viewModel.effectiveMFAMethod)
+            SecureField(fieldLabel, text: $viewModel.mfaResponse)
                 .textFieldStyle(.roundedBorder)
                 .focused($focused, equals: .mfaCode)
-                .accessibilityLabel("MFA authentication code")
+                .accessibilityLabel(fieldLabel)
                 .onSubmit {
                     Task { await viewModel.submitMFA() }
                 }
-            Button("Continue") {
-                Task { await viewModel.submitMFA() }
+
+            HStack(spacing: 12) {
+                if viewModel.isLoading {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Continue") {
+                    Task { await viewModel.submitMFA() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!viewModel.canSubmitMFA)
+                .keyboardShortcut(.defaultAction)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!viewModel.canSubmitMFA)
         }
     }
 
@@ -13006,7 +13087,10 @@ public struct FirstRunLoginView: View {
         DisclosureGroup(
             isExpanded: $viewModel.isAdvancedExpanded,
             content: {
-                VStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Sign in with a session token instead of a password.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     SecureField("Session token", text: $viewModel.manualToken)
                         .textFieldStyle(.roundedBorder)
                         .focused($focused, equals: .manualToken)
@@ -13016,11 +13100,21 @@ public struct FirstRunLoginView: View {
                         .focused($focused, equals: .tokenLabel)
                         .accessibilityLabel("Label for the imported token")
                     Button("Import Token") {
-                        Task {
-                            await viewModel.submitToken()
-                        }
+                        Task { await viewModel.submitToken() }
                     }
                     .disabled(!viewModel.canSubmitToken)
+
+                    Divider().padding(.vertical, 2)
+
+                    // Moved out of the main form: it is the name this Mac shows up under in the
+                    // account's session list, which is not something to decide while signing in.
+                    Text("This device appears under this name in your Stoat sessions.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("Device name", text: $viewModel.sessionName)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($focused, equals: .sessionName)
+                        .accessibilityLabel("Device name for this session")
                 }
                 .padding(.top, 8)
             },
@@ -13034,22 +13128,18 @@ public struct FirstRunLoginView: View {
 
     @ViewBuilder
     private var signInButton: some View {
-        if viewModel.mfaChallenge == nil {
-            HStack(spacing: 12) {
-                if viewModel.isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-                Button("Sign In") {
-                    Task {
-                        await viewModel.submitLogin()
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!viewModel.canSubmitLogin)
-                .keyboardShortcut(.defaultAction)
-                .accessibilityLabel("Sign in with email and password")
+        HStack(spacing: 12) {
+            if viewModel.isLoading {
+                ProgressView()
+                    .controlSize(.small)
             }
+            Button("Sign In") {
+                Task { await viewModel.submitLogin() }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!viewModel.canSubmitLogin)
+            .keyboardShortcut(.defaultAction)
+            .accessibilityLabel("Sign in with email and password")
         }
     }
 }
@@ -13077,18 +13167,18 @@ public struct SavedCredentialFailureView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 360)
+                // Two buttons, not three. "Sign In Again" and "Forget Session" both called
+                // forgetLocalSession(), so the screen offered the same action under two
+                // different names and no way to tell them apart.
                 HStack(spacing: 12) {
                     Button("Try Again") {
                         Task { await coordinator.reconnectLiveManually() }
                     }
                     .buttonStyle(.borderedProminent)
-                    Button("Sign In Again") {
+                    .keyboardShortcut(.defaultAction)
+                    Button("Sign Out") {
                         Task { await coordinator.forgetLocalSession() }
                     }
-                    Button("Forget Session") {
-                        Task { await coordinator.forgetLocalSession() }
-                    }
-                    .foregroundStyle(.red)
                 }
             }
             .padding(40)
