@@ -51,6 +51,8 @@ Your session token is stored in the macOS Keychain and scoped to Liquid Bagel. I
 - **Moderation**: kicks, bans, slowmode, and server/channel administration.
 - **Media**: attachment upload, clipboard paste/drag-and-drop, inline image previews, avatars, server icons and banners, and custom emoji (including cross-server emoji).
 - **Notifications**: native macOS notifications, dock badges, and per-server/channel notification preferences.
+- **Offline mode**: your servers, channels, and recent messages are saved on-device and available immediately at launch, even with no connection. Content is encrypted at rest and removed when you sign out.
+- **Settings sync**: appearance and notification preferences follow your account across devices automatically.
 - **Account & identity**: profile and account editing, session/account management, and status.
 - **Native macOS**: a SwiftUI app that follows system appearance, window, and interaction conventions rather than reskinning a web client.
 
@@ -58,10 +60,8 @@ Your session token is stored in the macOS Keychain and scoped to Liquid Bagel. I
 
 Version 1.0 intentionally does not include:
 
-- **Offline access or a persistent message cache.** Messages and media are fetched again after launch.
-- **Voice or video.** Voice channels and calls are not implemented.
-- **Background push notifications.** Notifications work only while Liquid Bagel is running.
-- **Automatic settings sync.** Cloud settings use manual fetch and push controls.
+- **Voice, video, or screen share.** Not implemented.
+- **Background push notifications.** Notifications are delivered while Liquid Bagel is running; there is no push when the app is quit.
 
 This list is not exhaustive. Because this is an early pre-release, features that exist may still behave incorrectly. Please report reproducible problems through [GitHub Issues](https://github.com/Kusanalee/Liquid-Bagel/issues).
 
