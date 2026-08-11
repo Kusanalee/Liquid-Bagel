@@ -670,15 +670,37 @@ public struct SyncedClientPreferences: Codable, Hashable, Sendable {
 
 public protocol ChannelMessageCaching: Sendable {
     func messages(for channelID: ChannelID) async -> [Message]
+    /// The cached page plus what the timeline needs to describe it honestly -- notably whether
+    /// older messages exist beyond it.
+    func history(for channelID: ChannelID) async -> CachedChannelHistory?
+    func store(_ history: CachedChannelHistory) async
     func store(_ messages: [Message], for channelID: ChannelID) async
+    func remove(channelID: ChannelID) async
     func removeAll() async
+}
+
+public extension ChannelMessageCaching {
+    func messages(for channelID: ChannelID) async -> [Message] {
+        await history(for: channelID)?.messages ?? []
+    }
+
+    func store(_ messages: [Message], for channelID: ChannelID) async {
+        guard !messages.isEmpty else { return }
+        await store(CachedChannelHistory(
+            channelID: channelID,
+            messages: messages,
+            hasMoreBefore: false,
+            savedAt: Date()
+        ))
+    }
 }
 
 public struct NoopChannelMessageCache: ChannelMessageCaching {
     public init() {}
 
-    public func messages(for channelID: ChannelID) async -> [Message] { [] }
-    public func store(_ messages: [Message], for channelID: ChannelID) async {}
+    public func history(for channelID: ChannelID) async -> CachedChannelHistory? { nil }
+    public func store(_ history: CachedChannelHistory) async {}
+    public func remove(channelID: ChannelID) async {}
     public func removeAll() async {}
 }
 
@@ -688,50 +710,84 @@ public actor FileChannelMessageCache: ChannelMessageCaching {
         var channelID: ChannelID
         var savedAt: Date
         var messages: [Message]
+        /// Absent in v1 payloads, which predate the field. Those cached pages are treated as
+        /// complete history, which is the conservative reading: it stops the offline timeline
+        /// from advertising older messages it cannot actually fetch.
+        var hasMoreBefore: Bool?
     }
 
-    private static let envelopeVersion = 1
+    private static let envelopeVersion = 2
+    private static let supportedReadVersions: Set<Int> = [1, 2]
+
     private let directory: URL
     private let maxMessagesPerChannel: Int
     private let maxChannels: Int
+    private let maxTotalBytes: Int
     private var isPrepared = false
 
-    public init(scopeIdentifier: String, directory: URL? = nil, maxMessagesPerChannel: Int = 50, maxChannels: Int = 200) {
+    /// - Parameter maxMessagesPerChannel: matches `RealtimeStateStore`'s in-memory cap so a
+    ///   cached channel opens with the same depth a live one has.
+    /// - Parameter maxTotalBytes: a file *count* cap alone is not a size cap. 200 channels of 200
+    ///   messages carrying embeds and attachment metadata runs well past 100 MB.
+    public init(
+        scopeIdentifier: String,
+        directory: URL? = nil,
+        maxMessagesPerChannel: Int = 200,
+        maxChannels: Int = 200,
+        maxTotalBytes: Int = 64 * 1024 * 1024
+    ) {
         let scope = Self.digest(scopeIdentifier)
         if let directory {
             self.directory = directory.appendingPathComponent(scope, isDirectory: true)
         } else {
             let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
                 ?? FileManager.default.temporaryDirectory
-            self.directory = base.appendingPathComponent("LiquidBagel/MessageCache/\(scope)", isDirectory: true)
+            // Under the shared SessionCache root so signing out can remove one directory and
+            // take message history with it.
+            self.directory = base.appendingPathComponent("LiquidBagel/SessionCache/Messages/\(scope)", isDirectory: true)
         }
         self.maxMessagesPerChannel = max(1, maxMessagesPerChannel)
         self.maxChannels = max(1, maxChannels)
+        self.maxTotalBytes = max(1, maxTotalBytes)
     }
 
-    public func messages(for channelID: ChannelID) async -> [Message] {
+    public func history(for channelID: ChannelID) async -> CachedChannelHistory? {
         let url = fileURL(for: channelID)
         guard let data = try? Data(contentsOf: url),
               let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
-              envelope.version == Self.envelopeVersion,
+              Self.supportedReadVersions.contains(envelope.version),
               envelope.channelID == channelID
-        else { return [] }
+        else { return nil }
+        // Touch for LRU.
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
-        return envelope.messages
+        return CachedChannelHistory(
+            channelID: channelID,
+            messages: envelope.messages,
+            hasMoreBefore: envelope.hasMoreBefore ?? false,
+            savedAt: envelope.savedAt
+        )
     }
 
-    public func store(_ messages: [Message], for channelID: ChannelID) async {
-        guard !messages.isEmpty else { return }
+    public func store(_ history: CachedChannelHistory) async {
+        guard !history.messages.isEmpty else { return }
         prepareIfNeeded()
+        let truncated = history.messages.count > maxMessagesPerChannel
         let envelope = Envelope(
             version: Self.envelopeVersion,
-            channelID: channelID,
-            savedAt: Date(),
-            messages: Array(messages.suffix(maxMessagesPerChannel))
+            channelID: history.channelID,
+            savedAt: history.savedAt,
+            messages: Array(history.messages.suffix(maxMessagesPerChannel)),
+            // Dropping the oldest messages to fit the cap creates older history by definition,
+            // whatever the caller believed before truncation.
+            hasMoreBefore: history.hasMoreBefore || truncated
         )
         guard let data = try? JSONEncoder().encode(envelope) else { return }
-        try? data.write(to: fileURL(for: channelID), options: .atomic)
+        try? data.write(to: fileURL(for: history.channelID), options: .atomic)
         evictIfNeeded()
+    }
+
+    public func remove(channelID: ChannelID) async {
+        try? FileManager.default.removeItem(at: fileURL(for: channelID))
     }
 
     public func removeAll() async {
@@ -741,7 +797,11 @@ public actor FileChannelMessageCache: ChannelMessageCaching {
 
     private func prepareIfNeeded() {
         guard !isPrepared else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         isPrepared = true
     }
 
@@ -750,32 +810,25 @@ public actor FileChannelMessageCache: ChannelMessageCaching {
     }
 
     private func evictIfNeeded() {
-        let keys: [URLResourceKey] = [.contentModificationDateKey]
-        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys),
-              urls.count > maxChannels
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys)
         else { return }
-        let dated = urls.map { url -> (url: URL, modified: Date) in
+        let entries = urls.map { url -> (url: URL, modified: Date, size: Int) in
             let values = try? url.resourceValues(forKeys: Set(keys))
-            return (url, values?.contentModificationDate ?? .distantPast)
+            return (url, values?.contentModificationDate ?? .distantPast, values?.fileSize ?? 0)
         }
-        for entry in dated.sorted(by: { $0.modified < $1.modified }).prefix(urls.count - maxChannels) {
-            try? FileManager.default.removeItem(at: entry.url)
+        var remaining = entries.sorted { $0.modified > $1.modified }
+        var totalBytes = remaining.reduce(0) { $0 + $1.size }
+
+        // Least recently read goes first, until under both the file-count and byte caps.
+        while remaining.count > maxChannels || totalBytes > maxTotalBytes {
+            guard let evicted = remaining.popLast() else { break }
+            try? FileManager.default.removeItem(at: evicted.url)
+            totalBytes -= evicted.size
         }
     }
 
     private static func digest(_ value: String) -> String {
         SHA256.hash(data: Data(value.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-public protocol StoatCacheRepository: Sendable {
-    func cachedCurrentUser() async throws -> User?
-}
-
-public struct EmptyStoatCacheRepository: StoatCacheRepository {
-    public init() {}
-
-    public func cachedCurrentUser() async throws -> User? {
-        nil
     }
 }
