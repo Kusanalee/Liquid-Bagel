@@ -392,6 +392,68 @@ final class StoatUITests: XCTestCase {
         )
     }
 
+    func testPhase72EmbedMediaLayoutRespectsDeclaredDimensions() {
+        let maxWidth: CGFloat = 580
+        let maxHeight: CGFloat = 240
+
+        // With a generous height budget a landscape image is width-bound.
+        guard case let .below(wide) = EmbedMediaLayout.placement(width: 1920, height: 1080, size: .large, maxWidth: maxWidth, maxHeight: 400) else {
+            return XCTFail("expected a below placement for a landscape image")
+        }
+        XCTAssertEqual(wide.width, maxWidth, accuracy: 1)
+        XCTAssertEqual(wide.width / wide.height, 16.0 / 9.0, accuracy: 0.05)
+
+        // Against the real 240pt cap the same image is height-bound, and still keeps its ratio
+        // rather than being letterboxed or stretched.
+        guard case let .below(capped) = EmbedMediaLayout.placement(width: 1920, height: 1080, size: .large, maxWidth: maxWidth, maxHeight: maxHeight) else {
+            return XCTFail("expected a below placement when height-bound")
+        }
+        XCTAssertEqual(capped.height, maxHeight, accuracy: 1)
+        XCTAssertLessThan(capped.width, maxWidth)
+        XCTAssertEqual(capped.width / capped.height, 16.0 / 9.0, accuracy: 0.05)
+
+        // A portrait image is height-bound too, rather than being stretched to full width.
+        guard case let .below(tall) = EmbedMediaLayout.placement(width: 1080, height: 1920, size: .large, maxWidth: maxWidth, maxHeight: maxHeight) else {
+            return XCTFail("expected a below placement for a portrait image")
+        }
+        XCTAssertEqual(tall.height, maxHeight, accuracy: 1)
+        XCTAssertLessThan(tall.width, maxWidth)
+
+        // ImageSize.preview is the official clients' side-thumbnail case.
+        guard case let .trailingThumbnail(thumb) = EmbedMediaLayout.placement(width: 400, height: 400, size: .preview, maxWidth: maxWidth, maxHeight: maxHeight) else {
+            return XCTFail("expected a trailing thumbnail for a preview-sized image")
+        }
+        XCTAssertEqual(thumb.width, thumb.height)
+        XCTAssertEqual(thumb.width, EmbedMediaLayout.thumbnailSide, accuracy: 0.001)
+
+        // Missing dimensions still get a sane box; explicitly empty ones render nothing.
+        guard case let .below(fallback) = EmbedMediaLayout.placement(width: nil, height: nil, size: nil, maxWidth: maxWidth, maxHeight: maxHeight) else {
+            return XCTFail("expected a fallback box when dimensions are absent")
+        }
+        XCTAssertEqual(fallback.width / fallback.height, 16.0 / 9.0, accuracy: 0.05)
+        XCTAssertEqual(EmbedMediaLayout.placement(width: 0, height: 0, size: nil, maxWidth: maxWidth, maxHeight: maxHeight), .none)
+    }
+
+    func testPhase72EmbedCardWidthMatchesAttachmentCard() {
+        // Pinned so the two card families cannot drift apart again; embeds used to cap at
+        // 320/420 while attachments capped at 460/620 in the same timeline.
+        XCTAssertEqual(EmbedCardMetrics.maximumWidth(isCompact: true), 460)
+        XCTAssertEqual(EmbedCardMetrics.maximumWidth(isCompact: false), 620)
+        XCTAssertLessThan(
+            EmbedCardMetrics.maximumMediaWidth(isCompact: false),
+            EmbedCardMetrics.maximumWidth(isCompact: false)
+        )
+    }
+
+    func testPhase72EmbedSiteMonogram() {
+        XCTAssertEqual(EmbedSiteMonogram.monogram(for: "example.com"), "E")
+        XCTAssertEqual(EmbedSiteMonogram.monogram(for: "  youtube"), "Y")
+        XCTAssertEqual(EmbedSiteMonogram.monogram(for: "9GAG"), "9")
+        // Never render an empty tile.
+        XCTAssertFalse(EmbedSiteMonogram.monogram(for: "").isEmpty)
+        XCTAssertFalse(EmbedSiteMonogram.monogram(for: "!!!").isEmpty)
+    }
+
     func testPhase72HeadingLevelsAreAllDistinct() {
         let source = (1...6).map { String(repeating: "#", count: $0) + " h\($0)" }.joined(separator: "\n")
         XCTAssertEqual(
