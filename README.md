@@ -7,7 +7,7 @@
 Liquid Bagel is an unofficial, native macOS client for [Stoat](https://stoat.chat). It is built with SwiftUI and connects directly to Stoat's REST and realtime APIs—no Electron and no webview.
 
 > [!WARNING]
-> **Version 1.0 is a pre-release and is very unpolished.** Expect missing features, rough edges, and bugs. Do not rely on it as your only way to access Stoat.
+> **Liquid Bagel is a pre-release and is still unpolished.** Expect missing features, rough edges, and bugs. Do not rely on it as your only way to access Stoat.
 
 Liquid Bagel covers the essentials of day-to-day chat: servers and channels, direct and group messages, friends, roles, moderation tools, custom emoji, attachments, reactions, replies, native notifications, and profile editing.
 
@@ -18,13 +18,13 @@ Liquid Bagel covers the essentials of day-to-day chat: servers and channels, dir
 
 ## Download and Install
 
-1. Download `Liquid-Bagel-1.0.0.dmg` from the [latest GitHub release](https://github.com/Kusanalee/Liquid-Bagel/releases/latest).
+1. Download the DMG from the [latest GitHub release](https://github.com/Kusanalee/Liquid-Bagel/releases/latest).
 2. Open the DMG and drag **Liquid Bagel** into **Applications**.
 3. Open **Liquid Bagel** from your Applications folder.
 
 ### If macOS Says the App Cannot Be Opened
 
-Version 1.0 is not signed with an Apple Developer ID or notarized, so Gatekeeper will warn you before the first launch. Only continue if you downloaded the DMG from this repository and are comfortable running an unsigned pre-release.
+Liquid Bagel is not signed with an Apple Developer ID or notarized, so Gatekeeper will warn you before the first launch. Only continue if you downloaded the DMG from this repository and are comfortable running an unsigned pre-release.
 
 1. Try opening the app once, then dismiss the warning.
 2. Open **System Settings → Privacy & Security**.
@@ -58,7 +58,7 @@ Your session token is stored in the macOS Keychain and scoped to Liquid Bagel. I
 
 ## Current Limitations
 
-Version 1.0 intentionally does not include:
+Liquid Bagel intentionally does not include:
 
 - **Voice, video, or screen share.** Not implemented.
 - **Background push notifications.** Notifications are delivered while Liquid Bagel is running; there is no push when the app is quit.
@@ -94,10 +94,10 @@ The check script tests every local Swift package, verifies that test doubles hav
 - `Packages/StoatUI`: chat shell UI — timeline, composer, markdown rendering, embeds, and shared chat components.
 - `Packages/StoatFeatures`: feature layer (view models, coordinators, and screen-level logic) used by the app target.
 - `Docs/Research.md`: Stoat API/protocol research notes.
-- `Docs/PhaseN.md` (phases 1–73): phase-by-phase implementation history and handoff notes.
+- `Docs/PhaseN.md` (phases 1–74): phase-by-phase implementation history and handoff notes.
 - `Docs/QA/`: manual QA pass notes for release gates (freeze/perf, chat presentation, conversation state, notifications, account/identity, community management, native macOS behavior).
 
-See [Docs/Phase73.md](Docs/Phase73.md) for the most recent architecture notes and [Docs/QA/](Docs/QA/) for release-gate QA coverage.
+See [Docs/Phase74.md](Docs/Phase74.md) for the most recent architecture notes and [Docs/QA/](Docs/QA/) for release-gate QA coverage.
 
 ## Contributing
 
