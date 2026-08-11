@@ -383,8 +383,12 @@ extension StoatFeaturesTests {
         let editCount = await api.editUserCallCount
         XCTAssertEqual(editCount, 1)
         XCTAssertEqual(model.currentUserForPresentation?.status?.text, "keep me")
-        XCTAssertNotNil(model.statusUpdateStatus)
-        XCTAssertTrue(model.statusUpdateStatus?.contains("failed") ?? false)
+        // Phase 74: the failure is reported in plain language rather than by interpolating the
+        // raw API error, so assert it is present and carries no diagnostic detail.
+        let status = model.statusUpdateStatus ?? ""
+        XCTAssertFalse(status.isEmpty)
+        XCTAssertFalse(status.contains("500"))
+        XCTAssertFalse(status.lowercased().contains("http"))
     }
 
     @MainActor

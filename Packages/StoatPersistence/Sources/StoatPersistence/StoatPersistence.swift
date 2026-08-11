@@ -133,6 +133,12 @@ public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
     public var referenceFetchMaxAttempts: Int
     public var referenceFetchCooldownSeconds: Int
     public var ackDebounceMilliseconds: Int
+    /// How far above the viewport an older page starts loading, as a percentage of viewport
+    /// height. 150 means "begin fetching when the oldest loaded message is within 1.5 screens".
+    public var olderPrefetchDistancePercent: Int
+    /// Backstop trigger: fetch when the first visible message is within this many rows of the
+    /// oldest loaded one. Covers the case where the scroll-geometry threshold cannot re-arm.
+    public var olderPrefetchRowThreshold: Int
 
     public init(
         nearNewestMessageThreshold: Int = 2,
@@ -140,7 +146,9 @@ public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
         loadToUnreadMaxAttempts: Int = 4,
         referenceFetchMaxAttempts: Int = 1,
         referenceFetchCooldownSeconds: Int = 60,
-        ackDebounceMilliseconds: Int = 1500
+        ackDebounceMilliseconds: Int = 1500,
+        olderPrefetchDistancePercent: Int = 150,
+        olderPrefetchRowThreshold: Int = 12
     ) {
         self.nearNewestMessageThreshold = nearNewestMessageThreshold
         self.visibleRangeUpdateDebounceMilliseconds = visibleRangeUpdateDebounceMilliseconds
@@ -148,6 +156,38 @@ public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
         self.referenceFetchMaxAttempts = referenceFetchMaxAttempts
         self.referenceFetchCooldownSeconds = referenceFetchCooldownSeconds
         self.ackDebounceMilliseconds = ackDebounceMilliseconds
+        self.olderPrefetchDistancePercent = olderPrefetchDistancePercent
+        self.olderPrefetchRowThreshold = olderPrefetchRowThreshold
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case nearNewestMessageThreshold
+        case visibleRangeUpdateDebounceMilliseconds
+        case loadToUnreadMaxAttempts
+        case referenceFetchMaxAttempts
+        case referenceFetchCooldownSeconds
+        case ackDebounceMilliseconds
+        case olderPrefetchDistancePercent
+        case olderPrefetchRowThreshold
+    }
+
+    /// Decoded key-by-key with per-field fallbacks rather than through the synthesized
+    /// initializer. Synthesized `Decodable` throws on a missing key, so adding a field would
+    /// make every previously stored payload fail to decode and silently reset the user's whole
+    /// preference blob. Same reason `NotificationPreferences` does this.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = TimelineTuningConfiguration()
+        self.init(
+            nearNewestMessageThreshold: try container.decodeIfPresent(Int.self, forKey: .nearNewestMessageThreshold) ?? defaults.nearNewestMessageThreshold,
+            visibleRangeUpdateDebounceMilliseconds: try container.decodeIfPresent(Int.self, forKey: .visibleRangeUpdateDebounceMilliseconds) ?? defaults.visibleRangeUpdateDebounceMilliseconds,
+            loadToUnreadMaxAttempts: try container.decodeIfPresent(Int.self, forKey: .loadToUnreadMaxAttempts) ?? defaults.loadToUnreadMaxAttempts,
+            referenceFetchMaxAttempts: try container.decodeIfPresent(Int.self, forKey: .referenceFetchMaxAttempts) ?? defaults.referenceFetchMaxAttempts,
+            referenceFetchCooldownSeconds: try container.decodeIfPresent(Int.self, forKey: .referenceFetchCooldownSeconds) ?? defaults.referenceFetchCooldownSeconds,
+            ackDebounceMilliseconds: try container.decodeIfPresent(Int.self, forKey: .ackDebounceMilliseconds) ?? defaults.ackDebounceMilliseconds,
+            olderPrefetchDistancePercent: try container.decodeIfPresent(Int.self, forKey: .olderPrefetchDistancePercent) ?? defaults.olderPrefetchDistancePercent,
+            olderPrefetchRowThreshold: try container.decodeIfPresent(Int.self, forKey: .olderPrefetchRowThreshold) ?? defaults.olderPrefetchRowThreshold
+        )
     }
 
     public static var defaults: TimelineTuningConfiguration {
@@ -161,7 +201,9 @@ public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
             loadToUnreadMaxAttempts: Self.clamp(loadToUnreadMaxAttempts, 1...20),
             referenceFetchMaxAttempts: Self.clamp(referenceFetchMaxAttempts, 0...5),
             referenceFetchCooldownSeconds: Self.clamp(referenceFetchCooldownSeconds, 0...3_600),
-            ackDebounceMilliseconds: Self.clamp(ackDebounceMilliseconds, 0...10_000)
+            ackDebounceMilliseconds: Self.clamp(ackDebounceMilliseconds, 0...10_000),
+            olderPrefetchDistancePercent: Self.clamp(olderPrefetchDistancePercent, 0...500),
+            olderPrefetchRowThreshold: Self.clamp(olderPrefetchRowThreshold, 0...100)
         )
     }
 
@@ -198,7 +240,9 @@ public enum TimelineTuningPreset: String, Codable, Hashable, Sendable, CaseItera
                 loadToUnreadMaxAttempts: 5,
                 referenceFetchMaxAttempts: 1,
                 referenceFetchCooldownSeconds: 60,
-                ackDebounceMilliseconds: 1400
+                ackDebounceMilliseconds: 1400,
+                olderPrefetchDistancePercent: 200,
+                olderPrefetchRowThreshold: 15
             )
         case .responsive:
             TimelineTuningConfiguration(
@@ -207,7 +251,9 @@ public enum TimelineTuningPreset: String, Codable, Hashable, Sendable, CaseItera
                 loadToUnreadMaxAttempts: 6,
                 referenceFetchMaxAttempts: 2,
                 referenceFetchCooldownSeconds: 45,
-                ackDebounceMilliseconds: 1000
+                ackDebounceMilliseconds: 1000,
+                olderPrefetchDistancePercent: 300,
+                olderPrefetchRowThreshold: 20
             )
         case .debugStrict:
             TimelineTuningConfiguration(
@@ -216,7 +262,9 @@ public enum TimelineTuningPreset: String, Codable, Hashable, Sendable, CaseItera
                 loadToUnreadMaxAttempts: 2,
                 referenceFetchMaxAttempts: 0,
                 referenceFetchCooldownSeconds: 0,
-                ackDebounceMilliseconds: 0
+                ackDebounceMilliseconds: 0,
+                olderPrefetchDistancePercent: 0,
+                olderPrefetchRowThreshold: 0
             )
         }
     }
@@ -303,6 +351,17 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public var lastSelectedEnvironmentID: String?
     public var environmentProfiles: [EnvironmentProfile]
     public var showDeveloperRuntimeControls: Bool
+    /// Paint the shell from the offline cache before the network is touched.
+    ///
+    /// A kill switch rather than a feature toggle. This is the change most likely to produce a
+    /// subtle staleness bug in the field, and being able to turn it off without shipping a build
+    /// is worth one stored boolean.
+    public var offlineCacheRestoreOnLaunch: Bool
+    /// Sync the allowlisted preference subset through the account without being asked.
+    ///
+    /// Deliberately not part of `SyncedClientPreferences`: a device that opts out of syncing must
+    /// not have that decision overwritten by a device that opted in.
+    public var automaticSettingsSyncEnabled: Bool
     public var lastSelectedServerID: ServerID?
     public var lastSelectedChannelID: ChannelID?
     public var memberPanelVisible: Bool
@@ -328,12 +387,16 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         case timelineTuning
         case notificationPreferences
         case lastSettingsSyncTimestamp
+        case offlineCacheRestoreOnLaunch
+        case automaticSettingsSyncEnabled
     }
 
     public init(
         lastSelectedEnvironmentID: String? = nil,
         environmentProfiles: [EnvironmentProfile] = [EnvironmentProfile.production()],
-        showDeveloperRuntimeControls: Bool = true,
+        showDeveloperRuntimeControls: Bool = false,
+        offlineCacheRestoreOnLaunch: Bool = true,
+        automaticSettingsSyncEnabled: Bool = true,
         lastSelectedServerID: ServerID? = nil,
         lastSelectedChannelID: ChannelID? = nil,
         memberPanelVisible: Bool = true,
@@ -348,6 +411,8 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.lastSelectedEnvironmentID = lastSelectedEnvironmentID
         self.environmentProfiles = Self.normalizedProfiles(environmentProfiles)
         self.showDeveloperRuntimeControls = showDeveloperRuntimeControls
+        self.offlineCacheRestoreOnLaunch = offlineCacheRestoreOnLaunch
+        self.automaticSettingsSyncEnabled = automaticSettingsSyncEnabled
         self.lastSelectedServerID = lastSelectedServerID
         self.lastSelectedChannelID = lastSelectedChannelID
         self.memberPanelVisible = memberPanelVisible
@@ -366,7 +431,9 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.init(
             lastSelectedEnvironmentID: try container.decodeIfPresent(String.self, forKey: .lastSelectedEnvironmentID),
             environmentProfiles: try container.decodeIfPresent([EnvironmentProfile].self, forKey: .environmentProfiles) ?? [EnvironmentProfile.production()],
-            showDeveloperRuntimeControls: try container.decodeIfPresent(Bool.self, forKey: .showDeveloperRuntimeControls) ?? true,
+            showDeveloperRuntimeControls: try container.decodeIfPresent(Bool.self, forKey: .showDeveloperRuntimeControls) ?? false,
+            offlineCacheRestoreOnLaunch: try container.decodeIfPresent(Bool.self, forKey: .offlineCacheRestoreOnLaunch) ?? true,
+            automaticSettingsSyncEnabled: try container.decodeIfPresent(Bool.self, forKey: .automaticSettingsSyncEnabled) ?? true,
             lastSelectedServerID: try container.decodeIfPresent(ServerID.self, forKey: .lastSelectedServerID),
             lastSelectedChannelID: try container.decodeIfPresent(ChannelID.self, forKey: .lastSelectedChannelID),
             memberPanelVisible: try container.decodeIfPresent(Bool.self, forKey: .memberPanelVisible) ?? true,
@@ -385,6 +452,8 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         try container.encodeIfPresent(lastSelectedEnvironmentID, forKey: .lastSelectedEnvironmentID)
         try container.encode(environmentProfiles, forKey: .environmentProfiles)
         try container.encode(showDeveloperRuntimeControls, forKey: .showDeveloperRuntimeControls)
+        try container.encode(offlineCacheRestoreOnLaunch, forKey: .offlineCacheRestoreOnLaunch)
+        try container.encode(automaticSettingsSyncEnabled, forKey: .automaticSettingsSyncEnabled)
         try container.encodeIfPresent(lastSelectedServerID, forKey: .lastSelectedServerID)
         try container.encodeIfPresent(lastSelectedChannelID, forKey: .lastSelectedChannelID)
         try container.encode(memberPanelVisible, forKey: .memberPanelVisible)
@@ -622,15 +691,37 @@ public struct SyncedClientPreferences: Codable, Hashable, Sendable {
 
 public protocol ChannelMessageCaching: Sendable {
     func messages(for channelID: ChannelID) async -> [Message]
+    /// The cached page plus what the timeline needs to describe it honestly -- notably whether
+    /// older messages exist beyond it.
+    func history(for channelID: ChannelID) async -> CachedChannelHistory?
+    func store(_ history: CachedChannelHistory) async
     func store(_ messages: [Message], for channelID: ChannelID) async
+    func remove(channelID: ChannelID) async
     func removeAll() async
+}
+
+public extension ChannelMessageCaching {
+    func messages(for channelID: ChannelID) async -> [Message] {
+        await history(for: channelID)?.messages ?? []
+    }
+
+    func store(_ messages: [Message], for channelID: ChannelID) async {
+        guard !messages.isEmpty else { return }
+        await store(CachedChannelHistory(
+            channelID: channelID,
+            messages: messages,
+            hasMoreBefore: false,
+            savedAt: Date()
+        ))
+    }
 }
 
 public struct NoopChannelMessageCache: ChannelMessageCaching {
     public init() {}
 
-    public func messages(for channelID: ChannelID) async -> [Message] { [] }
-    public func store(_ messages: [Message], for channelID: ChannelID) async {}
+    public func history(for channelID: ChannelID) async -> CachedChannelHistory? { nil }
+    public func store(_ history: CachedChannelHistory) async {}
+    public func remove(channelID: ChannelID) async {}
     public func removeAll() async {}
 }
 
@@ -640,50 +731,84 @@ public actor FileChannelMessageCache: ChannelMessageCaching {
         var channelID: ChannelID
         var savedAt: Date
         var messages: [Message]
+        /// Absent in v1 payloads, which predate the field. Those cached pages are treated as
+        /// complete history, which is the conservative reading: it stops the offline timeline
+        /// from advertising older messages it cannot actually fetch.
+        var hasMoreBefore: Bool?
     }
 
-    private static let envelopeVersion = 1
+    private static let envelopeVersion = 2
+    private static let supportedReadVersions: Set<Int> = [1, 2]
+
     private let directory: URL
     private let maxMessagesPerChannel: Int
     private let maxChannels: Int
+    private let maxTotalBytes: Int
     private var isPrepared = false
 
-    public init(scopeIdentifier: String, directory: URL? = nil, maxMessagesPerChannel: Int = 50, maxChannels: Int = 200) {
+    /// - Parameter maxMessagesPerChannel: matches `RealtimeStateStore`'s in-memory cap so a
+    ///   cached channel opens with the same depth a live one has.
+    /// - Parameter maxTotalBytes: a file *count* cap alone is not a size cap. 200 channels of 200
+    ///   messages carrying embeds and attachment metadata runs well past 100 MB.
+    public init(
+        scopeIdentifier: String,
+        directory: URL? = nil,
+        maxMessagesPerChannel: Int = 200,
+        maxChannels: Int = 200,
+        maxTotalBytes: Int = 64 * 1024 * 1024
+    ) {
         let scope = Self.digest(scopeIdentifier)
         if let directory {
             self.directory = directory.appendingPathComponent(scope, isDirectory: true)
         } else {
             let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
                 ?? FileManager.default.temporaryDirectory
-            self.directory = base.appendingPathComponent("LiquidBagel/MessageCache/\(scope)", isDirectory: true)
+            // Under the shared SessionCache root so signing out can remove one directory and
+            // take message history with it.
+            self.directory = base.appendingPathComponent("LiquidBagel/SessionCache/Messages/\(scope)", isDirectory: true)
         }
         self.maxMessagesPerChannel = max(1, maxMessagesPerChannel)
         self.maxChannels = max(1, maxChannels)
+        self.maxTotalBytes = max(1, maxTotalBytes)
     }
 
-    public func messages(for channelID: ChannelID) async -> [Message] {
+    public func history(for channelID: ChannelID) async -> CachedChannelHistory? {
         let url = fileURL(for: channelID)
         guard let data = try? Data(contentsOf: url),
               let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
-              envelope.version == Self.envelopeVersion,
+              Self.supportedReadVersions.contains(envelope.version),
               envelope.channelID == channelID
-        else { return [] }
+        else { return nil }
+        // Touch for LRU.
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
-        return envelope.messages
+        return CachedChannelHistory(
+            channelID: channelID,
+            messages: envelope.messages,
+            hasMoreBefore: envelope.hasMoreBefore ?? false,
+            savedAt: envelope.savedAt
+        )
     }
 
-    public func store(_ messages: [Message], for channelID: ChannelID) async {
-        guard !messages.isEmpty else { return }
+    public func store(_ history: CachedChannelHistory) async {
+        guard !history.messages.isEmpty else { return }
         prepareIfNeeded()
+        let truncated = history.messages.count > maxMessagesPerChannel
         let envelope = Envelope(
             version: Self.envelopeVersion,
-            channelID: channelID,
-            savedAt: Date(),
-            messages: Array(messages.suffix(maxMessagesPerChannel))
+            channelID: history.channelID,
+            savedAt: history.savedAt,
+            messages: Array(history.messages.suffix(maxMessagesPerChannel)),
+            // Dropping the oldest messages to fit the cap creates older history by definition,
+            // whatever the caller believed before truncation.
+            hasMoreBefore: history.hasMoreBefore || truncated
         )
         guard let data = try? JSONEncoder().encode(envelope) else { return }
-        try? data.write(to: fileURL(for: channelID), options: .atomic)
+        try? data.write(to: fileURL(for: history.channelID), options: .atomic)
         evictIfNeeded()
+    }
+
+    public func remove(channelID: ChannelID) async {
+        try? FileManager.default.removeItem(at: fileURL(for: channelID))
     }
 
     public func removeAll() async {
@@ -693,7 +818,11 @@ public actor FileChannelMessageCache: ChannelMessageCaching {
 
     private func prepareIfNeeded() {
         guard !isPrepared else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         isPrepared = true
     }
 
@@ -702,32 +831,25 @@ public actor FileChannelMessageCache: ChannelMessageCaching {
     }
 
     private func evictIfNeeded() {
-        let keys: [URLResourceKey] = [.contentModificationDateKey]
-        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys),
-              urls.count > maxChannels
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys)
         else { return }
-        let dated = urls.map { url -> (url: URL, modified: Date) in
+        let entries = urls.map { url -> (url: URL, modified: Date, size: Int) in
             let values = try? url.resourceValues(forKeys: Set(keys))
-            return (url, values?.contentModificationDate ?? .distantPast)
+            return (url, values?.contentModificationDate ?? .distantPast, values?.fileSize ?? 0)
         }
-        for entry in dated.sorted(by: { $0.modified < $1.modified }).prefix(urls.count - maxChannels) {
-            try? FileManager.default.removeItem(at: entry.url)
+        var remaining = entries.sorted { $0.modified > $1.modified }
+        var totalBytes = remaining.reduce(0) { $0 + $1.size }
+
+        // Least recently read goes first, until under both the file-count and byte caps.
+        while remaining.count > maxChannels || totalBytes > maxTotalBytes {
+            guard let evicted = remaining.popLast() else { break }
+            try? FileManager.default.removeItem(at: evicted.url)
+            totalBytes -= evicted.size
         }
     }
 
     private static func digest(_ value: String) -> String {
         SHA256.hash(data: Data(value.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-public protocol StoatCacheRepository: Sendable {
-    func cachedCurrentUser() async throws -> User?
-}
-
-public struct EmptyStoatCacheRepository: StoatCacheRepository {
-    public init() {}
-
-    public func cachedCurrentUser() async throws -> User? {
-        nil
     }
 }

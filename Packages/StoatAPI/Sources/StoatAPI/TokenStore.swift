@@ -23,17 +23,38 @@ public struct CredentialScope: Codable, Hashable, Sendable {
         let user = accountUserID?.rawValue ?? "default"
         return "credential.\(environmentID).\(user)"
     }
+
+    /// A separate Keychain item from the credential so that destroying the offline cache key
+    /// never risks touching the session token, and vice versa.
+    public var cacheKeyAccountName: String {
+        let user = accountUserID?.rawValue ?? "default"
+        return "cachekey.\(environmentID).\(user)"
+    }
 }
 
 public protocol ScopedTokenStore: TokenStore {
     func loadCredential(scope: CredentialScope) async throws -> StoatAuthCredential?
     func saveCredential(_ credential: StoatAuthCredential, scope: CredentialScope) async throws
     func clearCredential(scope: CredentialScope) async throws
+
+    /// Symmetric key for the offline session cache, held alongside the credential with the same
+    /// this-device-only accessibility. Deleting it makes every cached shard permanently
+    /// unreadable, which is the backstop for a purge whose file deletions partially fail.
+    func loadCacheKey(scope: CredentialScope) async throws -> Data?
+    func saveCacheKey(_ key: Data, scope: CredentialScope) async throws
+    func clearCacheKey(scope: CredentialScope) async throws
+}
+
+public extension ScopedTokenStore {
+    func loadCacheKey(scope: CredentialScope) async throws -> Data? { nil }
+    func saveCacheKey(_ key: Data, scope: CredentialScope) async throws {}
+    func clearCacheKey(scope: CredentialScope) async throws {}
 }
 
 public actor InMemoryTokenStore: ScopedTokenStore {
     private var credential: StoatAuthCredential?
     private var scopedCredentials: [CredentialScope: StoatAuthCredential] = [:]
+    private var scopedCacheKeys: [CredentialScope: Data] = [:]
 
     public init(credential: StoatAuthCredential? = nil) {
         self.credential = credential
@@ -70,6 +91,18 @@ public actor InMemoryTokenStore: ScopedTokenStore {
         if scope == .production {
             credential = nil
         }
+    }
+
+    public func loadCacheKey(scope: CredentialScope) async throws -> Data? {
+        scopedCacheKeys[scope]
+    }
+
+    public func saveCacheKey(_ key: Data, scope: CredentialScope) async throws {
+        scopedCacheKeys[scope] = key
+    }
+
+    public func clearCacheKey(scope: CredentialScope) async throws {
+        scopedCacheKeys.removeValue(forKey: scope)
     }
 }
 
@@ -178,6 +211,53 @@ public actor KeychainTokenStore: ScopedTokenStore {
 
     private func clearCredential(account: String) async throws {
         let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainTokenStoreError.unexpectedStatus(status)
+        }
+    }
+
+    // MARK: Offline cache key
+
+    public func loadCacheKey(scope: CredentialScope) async throws -> Data? {
+        var query = baseQuery(account: scope.cacheKeyAccountName)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else {
+            throw KeychainTokenStoreError.unexpectedStatus(status)
+        }
+        guard let data = result as? Data else {
+            throw KeychainTokenStoreError.unexpectedData
+        }
+        return data
+    }
+
+    public func saveCacheKey(_ key: Data, scope: CredentialScope) async throws {
+        var query = baseQuery(account: scope.cacheKeyAccountName)
+        query[kSecValueData as String] = key
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            let updateStatus = SecItemUpdate(
+                baseQuery(account: scope.cacheKeyAccountName) as CFDictionary,
+                [kSecValueData as String: key] as CFDictionary
+            )
+            guard updateStatus == errSecSuccess else {
+                throw KeychainTokenStoreError.unexpectedStatus(updateStatus)
+            }
+            return
+        }
+        guard status == errSecSuccess else {
+            throw KeychainTokenStoreError.unexpectedStatus(status)
+        }
+    }
+
+    public func clearCacheKey(scope: CredentialScope) async throws {
+        let status = SecItemDelete(baseQuery(account: scope.cacheKeyAccountName) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainTokenStoreError.unexpectedStatus(status)
         }

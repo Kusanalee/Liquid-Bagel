@@ -43,8 +43,34 @@ public enum AppStartupState: Hashable, Sendable {
     case validatingCredential
     case connectingLive
     case ready
+    /// The main shell, rendering cached content, with no live gateway.
+    case readyOffline(OfflineShellReason)
     case savedCredentialFailed(String)
     case startupFailed(AppStartupFailure)
+
+    /// Both shell states answer yes.
+    ///
+    /// `LiquidBagelRootView` branches on this rather than pattern-matching `.ready` and
+    /// `.readyOffline` as two arms of one switch. Two arms would make SwiftUI build a
+    /// `_ConditionalContent` and tear down `MainShellView` on every online-offline transition,
+    /// resetting scroll position, sheets, focus, and every piece of `@State` inside it.
+    public var showsMainShell: Bool {
+        switch self {
+        case .ready, .readyOffline: true
+        default: false
+        }
+    }
+}
+
+public enum OfflineShellReason: Hashable, Sendable {
+    /// Launch: the cache painted and the first connection attempt is still running.
+    case notYetConnected
+    /// Was connected, dropped, backoff is running.
+    case reconnecting
+    /// The network path is observably down.
+    case networkUnavailable
+    /// Reachable network, unreachable or failing server.
+    case serverUnreachable
 }
 
 public enum AppStartupFailure: Hashable, Sendable {
@@ -585,9 +611,17 @@ public final class MainShellViewModel {
             guard oldValue != localReadStates else { return }
             phase51ShellDataRevision &+= 1
             schedulePhase51ShellPresentationRefresh(reason: "local read state")
+            // Debounced inside the writer. Unread markers surviving a relaunch is most of what
+            // makes an offline launch feel like the app rather than a snapshot of it.
+            sessionCoordinator?.noteReadStatesChanged(localReadStates)
         }
     }
-    public var messageActionStatus: String?
+    /// Outcome of the last message action. Had no render site at all before Phase 74, so
+    /// "Message pinned", "Message text copied", and every failure it recorded were written and
+    /// discarded. Routed to the notice overlay for the same reason `placeholderStatus` is.
+    public var messageActionStatus: String? {
+        didSet { routeLegacyStatusToNotice(messageActionStatus) }
+    }
     public var isCredentialSetupPresented = false
     public var isTestSendConfirmationPresented = false
     public var selectedSettingsTab: SettingsSectionTab = .account
@@ -658,6 +692,7 @@ public final class MainShellViewModel {
     @ObservationIgnored public private(set) var phase60Diagnostics = Phase60Diagnostics()
     @ObservationIgnored public private(set) var phase63ComposerDiagnostics = Phase63ComposerDiagnostics()
     @ObservationIgnored public private(set) var phase68TraceDiagnostics = Phase68TraceDiagnostics()
+    @ObservationIgnored public private(set) var phase74PaginationDiagnostics = Phase74PaginationDiagnostics()
     public private(set) var phase52FreezeDiagnostics = Phase52FreezeDiagnostics()
     public private(set) var timelinePresentationState: TimelinePresentationState = .idle
     public private(set) var timelinePresentationDiagnostics = TimelinePresentationDiagnostics()
@@ -912,6 +947,14 @@ public final class MainShellViewModel {
     @ObservationIgnored private let attachmentValidationPolicy = AttachmentValidationPolicy()
     @ObservationIgnored private let profileMediaValidationPolicy = ProfileEditMediaValidationPolicy()
     @ObservationIgnored private var visibleRangeUpdateTasks: [ChannelID: Task<Void, Never>] = [:]
+    /// Automatic-pagination pacing, per channel. `@ObservationIgnored` deliberately: mutating it
+    /// must not invalidate any SwiftUI body, or a prefetch decision would re-render the timeline
+    /// it is trying to extend.
+    @ObservationIgnored private var olderLoadPacingByChannelID: [ChannelID: OlderLoadPacingState] = [:]
+    @ObservationIgnored private var automaticSettingsPushTask: Task<Void, Never>?
+    @ObservationIgnored private var lastAutomaticSettingsFetchAt: Date?
+    /// Baseline for change detection. Nil means "we have not synced yet, so any state is new".
+    @ObservationIgnored private var lastSyncedPreferences: SyncedClientPreferences?
     @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
     @ObservationIgnored private var selectedTimelineGroupCacheKey: String?
     @ObservationIgnored private var selectedTimelineGroupCacheChannelID: ChannelID?
@@ -1042,12 +1085,16 @@ public final class MainShellViewModel {
         self.appLifecyclePhase = appLifecycleCenter.phase
         self.previousSnapshot = snapshot
         self.seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
+        // Assigned twice on purpose. The real quick switcher captures `self` in its callbacks,
+        // which Swift only permits once every stored property is initialized, so this first
+        // value exists solely to satisfy definite initialization.
         self.quickSwitcherViewModel = QuickSwitcherViewModel(snapshot: snapshot, selection: selection)
         self.quickSwitcherViewModel = QuickSwitcherViewModel(
             snapshot: snapshot,
             selection: selection,
             canPerform: { [weak self] command in self?.canPerform(command) ?? false },
-            disabledReason: { [weak self] command in self?.disabledReason(for: command) }
+            disabledReason: { [weak self] command in self?.disabledReason(for: command) },
+            isDeveloperControlsEnabled: { [weak self] in self?.isDeveloperControlsEnabled ?? false }
         )
         mergePhase43SnapshotIdentities(snapshot, source: .readyUser)
         if let currentUser = self.currentUser {
@@ -1832,6 +1879,129 @@ public final class MainShellViewModel {
         messageController.state(for: selectedConversationChannelID)
     }
 
+    /// Live session that is not currently connected. Offline content may still be on screen.
+    public var isOffline: Bool {
+        effectiveRuntimeMode == .liveManual && effectiveSessionState != .connected
+    }
+
+    /// What the window should say about the connection, or `nil` when there is nothing worth
+    /// saying.
+    ///
+    /// This replaced a permanent "Connected" chip under the sidebar title. A healthy app stating
+    /// that it is healthy is noise, and worse, it trains people to ignore the one place real
+    /// problems would appear. Chrome only when something is wrong.
+    public var connectionChrome: ConnectionChrome? {
+        guard effectiveRuntimeMode == .liveManual else {
+            return ConnectionChrome(level: .info, title: "Preview Data", systemImage: "eye")
+        }
+        switch effectiveSessionState {
+        case .connected:
+            return nil
+        case .connecting, .loadingCredential, .validatingCredential:
+            return ConnectionChrome(level: .info, title: "Connecting…", systemImage: "arrow.clockwise")
+        case .signedOut:
+            return ConnectionChrome(level: .warning, title: "Signed out", systemImage: "person.slash")
+        case .invalidSession:
+            return ConnectionChrome(
+                level: .error,
+                title: "Session expired",
+                detail: "Sign in again to reconnect.",
+                systemImage: "exclamationmark.triangle"
+            )
+        case .readyToConnect, .validatedReady, .savedCredentialUnvalidated,
+             .validationFailed, .connectionFailed, .keychainFailed, .failed:
+            return offlineChrome
+        case .mock:
+            return ConnectionChrome(level: .info, title: "Preview Data", systemImage: "eye")
+        }
+    }
+
+    private var offlineChrome: ConnectionChrome {
+        let detail = sessionCoordinator?.sessionCacheAvailability.map {
+            "Showing content saved \($0.savedAt.formatted(date: .omitted, time: .shortened))."
+        }
+        if sessionCoordinator?.networkPathStatus.isKnownOffline == true {
+            return ConnectionChrome(
+                level: .warning,
+                title: "No internet connection",
+                detail: detail,
+                systemImage: "wifi.slash",
+                actionTitle: nil
+            )
+        }
+        return ConnectionChrome(
+            level: .warning,
+            title: "Offline",
+            detail: detail,
+            systemImage: "wifi.slash",
+            actionTitle: "Reconnect"
+        )
+    }
+
+    /// Formatted size of what offline mode has stored, for Settings.
+    public private(set) var offlineCacheSizeDescription: String = "—"
+
+    public func refreshOfflineCacheSize() async {
+        guard let diagnostics = await sessionCoordinator?.sessionCacheDiagnostics() else { return }
+        offlineCacheSizeDescription = diagnostics.totalBytesOnDisk == 0
+            ? "Nothing saved"
+            : ByteCountFormatter.string(fromByteCount: Int64(diagnostics.totalBytesOnDisk), countStyle: .file)
+    }
+
+    public func clearOfflineCache() async {
+        await sessionCoordinator?.purgeSessionCache()
+        await refreshOfflineCacheSize()
+        presentNotice("Saved content removed.", severity: .success)
+    }
+
+    /// `nil` means the action is allowed. One reason, produced in one place, so the composer and
+    /// the message context menu cannot drift into saying different things about the same state.
+    ///
+    /// Only concerned with connectivity. Permission checks stay where they are, because "you
+    /// don't have permission" and "you're offline" are different problems with different fixes.
+    public func writeBlockReason(_ action: WriteAction) -> String? {
+        guard effectiveRuntimeMode == .liveManual, isOffline else { return nil }
+        return "You're offline. Reconnect to \(action.verb)."
+    }
+
+    /// One sentence anyone can act on, for the Settings connection row. The counter grid it
+    /// replaces is still available behind Developer Options.
+    public var connectionSummaryText: String {
+        guard effectiveRuntimeMode == .liveManual else { return "Preview data" }
+        switch effectiveSessionState {
+        case .connected: return "Connected to Stoat"
+        case .connecting: return "Connecting…"
+        case .signedOut: return "Signed out"
+        case .invalidSession: return "Your session expired. Sign in again."
+        default: return "Not connected"
+        }
+    }
+
+    public var connectionSummarySymbol: String {
+        guard effectiveRuntimeMode == .liveManual else { return "eye" }
+        switch effectiveSessionState {
+        case .connected: return "checkmark.circle.fill"
+        case .connecting: return "arrow.clockwise"
+        default: return "wifi.slash"
+        }
+    }
+
+    /// The single fixed-height slot above loaded history. A pure switch over already-prepared
+    /// values, per the Phase 51 render-safety contract.
+    public var olderHistoryHeaderState: OlderHistoryHeaderState {
+        guard let channelID = selectedConversationChannelID,
+              let history = messageController.historiesByChannelID[channelID],
+              !history.messages.isEmpty
+        else { return .idle }
+
+        if history.isLoadingOlder { return .loading }
+        if let error = history.loadedRange.lastPaginationError { return .failed(message: error) }
+        guard !history.hasMoreBefore else { return .idle }
+        // Out of cached history is not the same fact as the start of the channel.
+        if isOffline { return .unavailableOffline }
+        return .beginning(channelName: selectedConversationChannel?.displayName)
+    }
+
     public var phase27Diagnostics: Phase27Diagnostics {
         let channel = selectedConversationChannel
         let attachments = attachmentDiagnostics()
@@ -2516,19 +2686,16 @@ public final class MainShellViewModel {
         memberHydrationLoadingServerIDs.contains(serverID)
     }
 
+    /// `nil` when the member list is fine, which is almost always.
+    ///
+    /// This used to announce "Members refreshed from Stoat" on success and "Showing Ready
+    /// members" otherwise -- narrating machinery nobody asked about -- and on failure it
+    /// interpolated the internal diagnostic category and a raw `StoatAPIError` description
+    /// straight into the panel. Success is now silent and failure is one short sentence; the
+    /// underlying error is still in the redacted diagnostics behind Developer Options.
     public func memberHydrationStatusMessage(for serverID: ServerID) -> String? {
-        if memberHydrationLoadingServerIDs.contains(serverID) {
-            return "Refreshing members..."
-        }
-        if let error = memberHydrationErrorsByServerID[serverID] {
-            return "Member refresh failed due to \(memberHydrationDiagnostics.apiDiagnostics?.errorCategory ?? "refresh error"): \(error)"
-        }
-        if hydratedMemberServerIDs.contains(serverID) {
-            return "Members refreshed from Stoat"
-        }
-        if knownMemberCount(serverID: serverID) > 0 {
-            return "Showing Ready members"
-        }
+        if memberHydrationLoadingServerIDs.contains(serverID) { return nil }
+        if memberHydrationErrorsByServerID[serverID] != nil { return "Couldn't refresh members." }
         return nil
     }
 
@@ -2728,7 +2895,11 @@ public final class MainShellViewModel {
             return
         }
         let diagnosed = error as? StoatAPIDiagnosedError
-        let message = diagnosed?.apiError.errorDescription ?? error.userFacingMessage
+        // Two different audiences. `diagnosticMessage` keeps the status code and server body for
+        // the developer diagnostics bag; `message` is what a person reads.
+        let diagnosticMessage = diagnosed?.apiError.errorDescription ?? error.userFacingMessage
+        let message = diagnosed.map { UserFacingError.message(for: $0.apiError, context: .members) }
+            ?? UserFacingError.message(for: error, context: .members)
         memberHydrationTasks[serverID] = nil
         memberHydrationLoadingServerIDs.remove(serverID)
         memberHydrationErrorsByServerID[serverID] = message
@@ -2738,12 +2909,12 @@ public final class MainShellViewModel {
             requestedCount: requestedCount,
             missingUserCount: missingUserCount(serverID: serverID),
             isLoading: false,
-            error: message,
+            error: diagnosticMessage,
             apiDiagnostics: diagnosed?.diagnostics,
             lastUpdatedAt: Date()
         )
         if forced {
-            placeholderStatus = "Member refresh failed: \(message)"
+            presentNotice(message, severity: .error)
         }
     }
 
@@ -3226,7 +3397,7 @@ public final class MainShellViewModel {
             if let originalUser {
                 upsertUser(originalUser)
             }
-            statusUpdateStatus = "Status change failed: \(error.userFacingMessage)"
+            statusUpdateStatus = UserFacingError.message(for: error)
             placeholderStatus = statusUpdateStatus
         }
     }
@@ -3289,7 +3460,7 @@ public final class MainShellViewModel {
             if let originalUser {
                 upsertUser(originalUser)
             }
-            statusUpdateStatus = "Status change failed: \(error.userFacingMessage)"
+            statusUpdateStatus = UserFacingError.message(for: error)
             placeholderStatus = statusUpdateStatus
         }
     }
@@ -6495,6 +6666,10 @@ public final class MainShellViewModel {
         selection.serverID = id
         selection.channelID = firstVisibleTextChannel(in: id)?.id
         selection.dmChannelID = nil
+        // Member rosters are only cached for recently visited servers -- persisting every
+        // server's full roster is the difference between a 60 MB and a 600 MB cache on a heavy
+        // account, for a panel that is rarely why anyone opens the app offline.
+        sessionCoordinator?.noteServerSelectedForCache(id)
         clearTimelineSelection()
         updateViewportForSelectedChannel()
         reconcileSearchHighlightsForSelectedChannel()
@@ -6717,6 +6892,7 @@ public final class MainShellViewModel {
     }
 
     public func validateSelection() {
+        defer { resetOlderLoadPacingForDeselectedChannels() }
         switch selection.space {
         case .home, .discover, .directMessages:
             if selection.space == .directMessages,
@@ -6740,7 +6916,33 @@ public final class MainShellViewModel {
 
     public func attachSessionCoordinator(_ coordinator: AppSessionCoordinator) {
         sessionCoordinator = coordinator
+        installSystemPowerHandler()
         syncFromSessionCoordinator()
+    }
+
+    /// Fold read markers restored from disk into the shell, and start caching.
+    ///
+    /// Called once after `restoreCachedSession` and again after the first live connect, because
+    /// reconciliation is only meaningful once there is a snapshot to reconcile against.
+    public func adoptRestoredSessionCache() async {
+        guard let sessionCoordinator else { return }
+        let restored = sessionCoordinator.restoredReadStates
+        if !restored.isEmpty {
+            let reconciled = SessionCacheMapper.reconcileReadStates(
+                cached: restored,
+                snapshot: snapshot,
+                now: Date()
+            )
+            // Merge rather than replace: anything already marked read in this session is fresher
+            // than anything that came off disk.
+            for (channelID, state) in reconciled where localReadStates[channelID] == nil {
+                localReadStates[channelID] = state
+            }
+        }
+        await sessionCoordinator.activateSessionCache()
+        if let serverID = selection.serverID {
+            sessionCoordinator.noteServerSelectedForCache(serverID)
+        }
     }
 
     public func connectLiveManually() async {
@@ -6764,6 +6966,7 @@ public final class MainShellViewModel {
 
     public func syncFromSessionCoordinator() {
         guard let sessionCoordinator else { return }
+        let wasConnected = sessionState == .connected
         let nextMemberHydrationScope = [
             String(describing: sessionCoordinator.mode),
             sessionCoordinator.environment.stableID,
@@ -6791,6 +6994,9 @@ public final class MainShellViewModel {
         schedulePhase51ShellPresentationRefresh(reason: "session snapshot")
         if sessionCoordinator.mode == .liveManual,
            previousNotificationGeneration != sessionCoordinator.liveConnectionGeneration {
+            // Reseeding from the *new* snapshot is what absorbs a whole Ready payload silently.
+            // The offline restore never bumps the generation, so promoting a cached session to a
+            // live one lands here exactly once and does not notify for the backlog.
             seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
             notificationLiveConnectionGeneration = sessionCoordinator.liveConnectionGeneration
             deliveredNotificationIDs.removeAll()
@@ -6852,6 +7058,26 @@ public final class MainShellViewModel {
         if sessionCoordinator.mode == .liveManual, sessionCoordinator.sessionState == .connected {
             loadVisibleIdentityImagesForCurrentSelection()
         }
+        if !wasConnected, sessionState == .connected {
+            // Just connected (including a reconnect). Another device may have changed
+            // preferences while this one was offline.
+            Task { [weak self] in await self?.settingsSyncDidConnect() }
+        }
+        noteLocalPreferencesSynced()
+    }
+
+    /// Detect a local preference change and schedule an automatic push.
+    ///
+    /// The very first call after attaching a coordinator establishes the baseline rather than
+    /// treating the loaded preferences as a "change" -- otherwise every launch would push once,
+    /// unconditionally, before anything was actually edited.
+    private func noteLocalPreferencesSynced() {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        guard lastSyncedPreferences != nil else {
+            lastSyncedPreferences = currentSyncedPreferences
+            return
+        }
+        settingsChangedLocally()
     }
 
     public func observe(snapshotSource: any ShellSnapshotSource) {
@@ -7298,7 +7524,7 @@ public final class MainShellViewModel {
                 composerError = nil
                 lastAttachmentAction = "Queued attachment"
             } catch {
-                composerError = error.userFacingMessage
+                composerError = UserFacingError.message(for: error, context: .attachment)
             }
         }
         composerDrafts[channelID] = state
@@ -7390,7 +7616,7 @@ public final class MainShellViewModel {
                 items: [AttachmentDropReviewItem(filename: "Pasted Image.png", error: error)],
                 blockedReason: nil
             )
-            composerError = error.userFacingMessage
+            composerError = UserFacingError.message(for: error, context: .attachment)
             lastAttachmentAction = "Paste image rejected by validation"
         }
     }
@@ -7409,7 +7635,7 @@ public final class MainShellViewModel {
             composerError = nil
             lastAttachmentAction = "Queued pasted image"
         } catch {
-            composerError = error.userFacingMessage
+            composerError = UserFacingError.message(for: error, context: .attachment)
         }
         composerDrafts[channelID] = state
     }
@@ -7626,8 +7852,13 @@ public final class MainShellViewModel {
         guard !draft.isEmpty || !state.attachments.isEmpty else {
             return (false, "Type a message or attach a file.")
         }
+        // One reason, produced in one place, so the composer placeholder and the message context
+        // menu cannot end up describing the same state differently.
+        if let reason = writeBlockReason(.sendMessage) {
+            return (false, reason)
+        }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Reconnect to send live messages.")
+            return (false, "Reconnect to send messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -7654,8 +7885,13 @@ public final class MainShellViewModel {
         guard let channelID, let channel = snapshot.channelsByID[channelID] else {
             return (false, "Select a channel to send a message.")
         }
+        // One reason, produced in one place, so the composer placeholder and the message context
+        // menu cannot end up describing the same state differently.
+        if let reason = writeBlockReason(.sendMessage) {
+            return (false, reason)
+        }
         guard isRuntimeSendCapable else {
-            return (false, effectiveRuntimeMode == .mock ? "Preview data cannot send messages." : "Reconnect to send live messages.")
+            return (false, "Reconnect to send messages.")
         }
         if let permissions = resolvedPermissions(for: channel), !permissions.contains(.sendMessage) {
             return (false, "You do not have permission to send messages here.")
@@ -8970,7 +9206,7 @@ public final class MainShellViewModel {
         } catch {
             var updated = composerDraftState(for: channelID)
             guard let updatedIndex = updated.attachments.firstIndex(where: { $0.id == attachmentID }) else { return }
-            updated.attachments[updatedIndex].status = .failed(error.userFacingMessage)
+            updated.attachments[updatedIndex].status = .failed(UserFacingError.message(for: error, context: .attachment))
             composerDrafts[channelID] = updated
             composerError = "Attachment upload failed."
             lastAttachmentAction = "Attachment upload failed"
@@ -8985,19 +9221,114 @@ public final class MainShellViewModel {
         reconcileTimelineSelection()
     }
 
+    /// Explicit request for an older page -- the developer harness button and the unread-recovery
+    /// affordance. Bypasses the automatic pacing budget and the failure cooldown.
     public func loadOlderSelectedMessages() async {
         guard let channelID = selectedConversationChannelID else { return }
-        let anchor = timelineViewport.visibleRange?.firstVisibleMessageID ?? selectedTimelineMessages.first?.message.id
+        await requestOlderMessagesIfNeeded(channelID: channelID, trigger: .explicitCommand)
+    }
+
+    /// Called when the timeline crosses the prefetch threshold in either direction.
+    ///
+    /// Crossing *away* from the top is what re-arms automatic pagination and refunds the
+    /// consecutive-page budget: the user demonstrably moved, so they are reading rather than
+    /// sitting in a channel too short to scroll.
+    public func timelineOlderPrefetchThresholdChanged(_ isNearOldest: Bool) {
+        guard let channelID = selectedConversationChannelID else { return }
+        guard isNearOldest else {
+            var pacing = olderLoadPacingByChannelID[channelID] ?? OlderLoadPacingState()
+            guard pacing.consecutiveAutomaticPages != 0 else { return }
+            pacing.consecutiveAutomaticPages = 0
+            olderLoadPacingByChannelID[channelID] = pacing
+            return
+        }
+        Task { await requestOlderMessagesIfNeeded(channelID: channelID, trigger: .scrollPrefetch) }
+    }
+
+    @discardableResult
+    public func requestOlderMessagesIfNeeded(channelID: ChannelID, trigger: OlderLoadTrigger) async -> Bool {
+        if let reason = olderLoadSuppressionReason(channelID: channelID, trigger: trigger) {
+            phase74PaginationDiagnostics.prefetchSuppressedCount += 1
+            phase74PaginationDiagnostics.lastSuppressionReason = reason
+            return false
+        }
+
+        phase74PaginationDiagnostics.prefetchTriggerCount += 1
+        phase74PaginationDiagnostics.lastTrigger = trigger
+
+        var pacing = olderLoadPacingByChannelID[channelID] ?? OlderLoadPacingState()
+        pacing.isInFlight = true
+        if trigger.isAutomatic {
+            pacing.consecutiveAutomaticPages += 1
+        }
+        olderLoadPacingByChannelID[channelID] = pacing
+
+        // Anchor on what the user is actually looking at, not on the oldest loaded message --
+        // after the prepend we scroll this row back to the top so the content under the cursor
+        // does not move.
+        let anchor = timelineViewport.visibleRange?.firstVisibleMessageID
+            ?? selectedTimelineMessages.first?.message.id
         let loaded = await messageController.loadOlderMessages(channelID: channelID)
+
+        // The channel may have changed while the request was in flight; drop the pacing entry
+        // rather than writing stale state back over a fresh channel's bookkeeping.
+        if var updated = olderLoadPacingByChannelID[channelID] {
+            updated.isInFlight = false
+            if !loaded {
+                updated.lastFailureAt = Date()
+            }
+            olderLoadPacingByChannelID[channelID] = updated
+        }
+
+        guard channelID == selectedConversationChannelID else { return loaded }
+
         if loaded {
+            phase74PaginationDiagnostics.pageLoadedCount += 1
             let loadedIDs = Set(selectedTimelineMessages.map(\.message.id))
-            let target = anchor.flatMap { loadedIDs.contains($0) ? $0 : nil } ?? selectedTimelineMessages.first?.message.id
+            let target = anchor.flatMap { loadedIDs.contains($0) ? $0 : nil }
+                ?? selectedTimelineMessages.first?.message.id
             timelineViewport = viewportReducer.preserveAfterPrepend(timelineViewport, previousOldestID: target)
             lastTimelineActionResult = "Loaded older messages"
             recordTimelineCalibrationObservation(kind: .afterLoadOlder)
         } else {
+            phase74PaginationDiagnostics.pageFailedCount += 1
             lastTimelineActionResult = "Load older unavailable or failed"
         }
+        return loaded
+    }
+
+    private func olderLoadSuppressionReason(
+        channelID: ChannelID,
+        trigger: OlderLoadTrigger
+    ) -> OlderLoadSuppressionReason? {
+        guard channelID == selectedConversationChannelID else { return .notSelectedChannel }
+        let pacing = olderLoadPacingByChannelID[channelID] ?? OlderLoadPacingState()
+        guard !pacing.isInFlight else { return .alreadyInFlight }
+        guard let history = messageController.historiesByChannelID[channelID] else { return .noLoadedHistory }
+        guard !history.messages.isEmpty else { return .noLoadedHistory }
+        guard !history.isLoadingInitial else { return .initialLoadInFlight }
+        guard !history.isLoadingOlder else { return .pageAlreadyLoading }
+        guard history.hasMoreBefore else { return .noMoreBefore }
+        // Unread recovery walks backwards page by page toward a specific target. A prefetch
+        // racing it would consume the page it is waiting for and confuse its attempt counting.
+        if case .loadingToTarget = history.unreadRecoveryState { return .unreadRecoveryInProgress }
+
+        guard trigger.isAutomatic else { return nil }
+        if let lastFailureAt = pacing.lastFailureAt,
+           Date().timeIntervalSince(lastFailureAt) < OlderLoadPacingState.failureCooldown {
+            return .failureCooldown
+        }
+        if pacing.consecutiveAutomaticPages >= OlderLoadPacingState.maximumConsecutiveAutomaticPages {
+            return .automaticPageBudgetExhausted
+        }
+        return nil
+    }
+
+    /// Drop pacing state for every channel that is no longer selected. Without this, returning to
+    /// a channel would inherit its exhausted page budget or an expired failure cooldown.
+    private func resetOlderLoadPacingForDeselectedChannels() {
+        let selected = selectedConversationChannelID
+        olderLoadPacingByChannelID = olderLoadPacingByChannelID.filter { $0.key == selected }
     }
 
     public func beginEditing(_ timelineMessage: TimelineMessage) {
@@ -9063,7 +9394,7 @@ public final class MainShellViewModel {
             requestFocus(.timeline)
         } catch {
             editState.isSaving = false
-            editState.errorMessage = "Edit failed: \(error.userFacingMessage)"
+            editState.errorMessage = UserFacingError.message(for: error, context: .sendMessage)
             inlineEditState = editState
             messageActionStatus = editState.errorMessage
         }
@@ -9107,7 +9438,7 @@ public final class MainShellViewModel {
             self.pendingDeletion = nil
             messageActionStatus = nil
         } catch {
-            messageActionStatus = "Delete failed: \(error.userFacingMessage)"
+            messageActionStatus = "Couldn't delete that message."
         }
     }
 
@@ -9189,10 +9520,10 @@ public final class MainShellViewModel {
                 userID: currentUserID,
                 isAdding: hasReacted
             )
-            messageActionStatus = "Reaction failed: \(error.userFacingMessage)"
+            messageActionStatus = "Couldn't add that reaction."
             phase59ReactionDiagnostics.rollbackCount += 1
             phase59ReactionDiagnostics.lastOutcome = "rolled back after failure"
-            presentNotice("Reaction failed: \(error.userFacingMessage)", severity: .error)
+            presentNotice("Couldn't add that reaction.", severity: .error)
         }
     }
 
@@ -9245,7 +9576,7 @@ public final class MainShellViewModel {
             } else {
                 phase44Diagnostics.unpinActionFailureCount += 1
             }
-            messageActionStatus = "Pin action failed: \(error.userFacingMessage)"
+            messageActionStatus = "Couldn't update the pin."
         }
     }
 
@@ -9401,8 +9732,11 @@ public final class MainShellViewModel {
         return String(fallback.prefix(maxLength)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
     }
 
+    /// Developer surfaces are opt-in. The nil-coordinator case falls closed for the same reason
+    /// the stored default does: an unconfigured shell is not evidence that the user asked to see
+    /// internals.
     public var isDeveloperControlsEnabled: Bool {
-        sessionCoordinator?.preferences.showDeveloperRuntimeControls ?? true
+        sessionCoordinator?.preferences.showDeveloperRuntimeControls ?? false
     }
 
     public func typingUsers(for channelID: ChannelID?) -> [User] {
@@ -9641,6 +9975,17 @@ public final class MainShellViewModel {
         if timelineViewport.isAtNewest {
             acknowledgeSelectedChannel()
             scheduleLiveAckIfNeeded(channelID: channelID)
+        }
+
+        // Backstop for the scroll-geometry trigger, which only fires on a threshold crossing and
+        // therefore cannot re-arm if a prepend restoration leaves the offset inside the
+        // threshold. `loadedIDs` is already computed above, so this costs one index lookup.
+        if let firstVisible = timelineViewport.visibleRange?.firstVisibleMessageID,
+           TimelinePrefetchPolicy.isNearOldestRow(
+               firstVisibleIndex: loadedIDs.firstIndex(of: firstVisible),
+               rowThreshold: timelineTuning.olderPrefetchRowThreshold
+           ) {
+            Task { await requestOlderMessagesIfNeeded(channelID: channelID, trigger: .visibleRangeNearOldest) }
         }
     }
 
@@ -10176,8 +10521,18 @@ public final class MainShellViewModel {
             return
         }
         appLifecyclePhase = phase
+        if phase != .active {
+            // Leaving the app is a good moment to checkpoint: it is quiet, and it is often the
+            // last thing that happens before the process goes away.
+            Task { [weak self] in await self?.sessionCoordinator?.flushSessionCache() }
+        }
         if phase == .active {
             refreshNotificationPermissionStatus()
+            // Coming back to the app is a weak, frequent signal, so the supervisor's own cooldown
+            // decides whether it turns into an attempt. Worth having: a connection that failed
+            // while the app sat in the background should not need a menu command to recover.
+            Task { [weak self] in await self?.sessionCoordinator?.handleAppBecameActive() }
+            Task { [weak self] in await self?.settingsSyncAppBecameActive() }
         }
         reconcileNotificationLifecycle()
     }
@@ -10201,7 +10556,15 @@ public final class MainShellViewModel {
                 self?.notificationPermissionStatus = result.statusAfter
                 self?.notificationDiagnostics.lastPermissionRequest = result
                 self?.lastNotificationPermissionRequest = result.summary
-                self?.placeholderStatus = "Notification permission: \(result.statusAfter.rawValue)"
+                // The raw enum case name ("notDetermined", "provisional") is diagnostics, not copy.
+                switch result.statusAfter {
+                case .authorized, .provisional, .ephemeral:
+                    self?.presentNotice("Notifications are on.", severity: .success)
+                case .denied:
+                    self?.presentNotice("Notifications are turned off in System Settings.", severity: .warning)
+                case .notDetermined, .unknown:
+                    self?.presentNotice("macOS hasn't recorded a choice yet.", severity: .warning)
+                }
                 self?.updateNotificationDiagnostics()
             }
         }
@@ -10349,6 +10712,84 @@ public final class MainShellViewModel {
 
     private var lastSettingsSyncTimestamp: Int64? {
         sessionCoordinator?.preferences.lastSettingsSyncTimestamp ?? localSettingsSyncTimestamp
+    }
+
+    // MARK: - Automatic settings sync (Phase 74)
+
+    /// Quiescence before an automatic push.
+    ///
+    /// The debounce exists because a slider is a stream of changes, not one. Dragging the Liquid
+    /// Glass transparency control would otherwise be dozens of writes.
+    static let automaticSettingsPushDelay: Duration = .seconds(3)
+    /// Floor between automatic fetches, so activating the app repeatedly is not a poll loop.
+    static let automaticSettingsFetchCooldown: TimeInterval = 60
+
+    /// The synced subset as it currently stands locally.
+    ///
+    /// Compared by value to decide whether a push is warranted. Comparing whole `AppPreferences`
+    /// would push on every channel selection, since `lastSelectedChannelID` lives in there.
+    private var currentSyncedPreferences: SyncedClientPreferences {
+        SyncedClientPreferences(
+            messageDensity: messageDensity,
+            liquidGlassTransparency: liquidGlassTransparency,
+            inlineImagePreviewPolicy: inlineImagePreviewPolicy,
+            notificationPreferences: notificationPreferences
+        )
+    }
+
+    /// Note that a local preference may have changed, and push if it actually did.
+    public func settingsChangedLocally() {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        let current = currentSyncedPreferences
+        guard current != lastSyncedPreferences else { return }
+        automaticSettingsPushTask?.cancel()
+        automaticSettingsPushTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.automaticSettingsPushDelay)
+            guard !Task.isCancelled else { return }
+            await self?.pushCloudPreferencesAutomatically()
+        }
+    }
+
+    /// Pull once a session is live. Other devices may have changed things while this one was off.
+    public func settingsSyncDidConnect() async {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        await fetchCloudPreferencesAutomatically(force: true)
+    }
+
+    /// The gateway already tells us when another device changed account settings. Before Phase 74
+    /// the app received `UserSettingsUpdate` and did nothing with it for preference purposes,
+    /// which is most of why sync had to be manual at all.
+    public func settingsSyncRemoteSettingsChanged() async {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        await fetchCloudPreferencesAutomatically(force: true)
+    }
+
+    public func settingsSyncAppBecameActive() async {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        await fetchCloudPreferencesAutomatically(force: false)
+    }
+
+    public var isAutomaticSettingsSyncEnabled: Bool {
+        sessionCoordinator?.preferences.automaticSettingsSyncEnabled ?? false
+    }
+
+    private func fetchCloudPreferencesAutomatically(force: Bool) async {
+        guard effectiveSessionState == .connected else { return }
+        if !force, let last = lastAutomaticSettingsFetchAt,
+           Date().timeIntervalSince(last) < Self.automaticSettingsFetchCooldown {
+            return
+        }
+        lastAutomaticSettingsFetchAt = Date()
+        await fetchCloudPreferences()
+        // Whatever the cloud had is now the baseline, so applying it does not immediately look
+        // like a local change and bounce straight back as a push.
+        lastSyncedPreferences = currentSyncedPreferences
+    }
+
+    private func pushCloudPreferencesAutomatically() async {
+        guard effectiveSessionState == .connected else { return }
+        await pushCloudPreferences()
+        lastSyncedPreferences = currentSyncedPreferences
     }
 
     public func fetchCloudPreferences(applyOlder: Bool = false) async {
@@ -10736,7 +11177,7 @@ public final class MainShellViewModel {
             phase44Diagnostics.lastSafeStatus = items.isEmpty ? "Pinned list empty" : "Pinned list loaded"
             recordPhase44Duration("pinnedList", startedAt: started)
         } catch {
-            let message = "Pinned messages failed: \(error.userFacingMessage)"
+            let message = "Couldn't load pinned messages."
             pinnedMessagesState.loadState = .failed(channelID, message)
             phase44Diagnostics.pinnedListFailureCount += 1
             phase44Diagnostics.lastSafeStatus = message
@@ -10784,7 +11225,7 @@ public final class MainShellViewModel {
             messageActionStatus = "Message unpinned"
             phase44Diagnostics.unpinActionSuccessCount += 1
         } catch {
-            messageActionStatus = "Unpin failed: \(error.userFacingMessage)"
+            messageActionStatus = "Couldn't unpin that message."
             phase44Diagnostics.unpinActionFailureCount += 1
         }
     }
@@ -10858,7 +11299,7 @@ public final class MainShellViewModel {
                 recordPhase44SearchBucket(remote: query.mode != .loadedOnly, count: results.count)
                 lastTimelineActionResult = "Selected-channel search completed"
             } catch {
-                let message = "Selected-channel search failed: \(error.userFacingMessage)"
+                let message = UserFacingError.message(for: error, context: .search)
                 channelSearchState = .failed(query, message)
                 remoteSearchResults = []
                 remoteSearchStatus = message
@@ -11070,7 +11511,7 @@ public final class MainShellViewModel {
             refreshSearchHighlightState()
         } catch {
             remoteSearchResults = []
-            remoteSearchStatus = "Selected-channel search failed: \(error.userFacingMessage)"
+            remoteSearchStatus = UserFacingError.message(for: error, context: .search)
             lastTimelineActionResult = "Selected-channel search failed"
             searchHighlightState = nil
         }
@@ -11350,6 +11791,12 @@ public final class MainShellViewModel {
            effectiveRuntimeMode == .liveManual,
            effectiveSessionState == .connected {
             loadVisibleIdentityImagesForCurrentSelection()
+        }
+        if update.changes.userSettingsChanged {
+            // The gateway is telling us another device changed account settings. Before this,
+            // the app received the event and did nothing with it for preference purposes, which
+            // is most of why sync had to be a manual button at all.
+            Task { [weak self] in await self?.settingsSyncRemoteSettingsChanged() }
         }
     }
 
@@ -11669,6 +12116,17 @@ public final class MainShellViewModel {
         }
     }
 
+    /// Route sleep/wake to the coordinator's connectivity supervisor. Installed from
+    /// `attachSessionCoordinator` rather than `init` so a shell built without a coordinator --
+    /// which every test does -- never claims the process-wide handler.
+    private func installSystemPowerHandler() {
+        SystemPowerCenter.shared.setHandler { [weak self] event in
+            Task { @MainActor [weak self] in
+                await self?.sessionCoordinator?.handleSystemPowerEvent(event)
+            }
+        }
+    }
+
     private func reconcileNotificationLifecycle() {
         expiredNotificationRouteCount += removeExpiredQueuedNotificationRoutes()
         pruneNotificationBanners()
@@ -11888,9 +12346,9 @@ public final class MainShellViewModel {
         case .loading:
             return "loading"
         case let .loaded(messages, hasMoreBefore):
+            let loadingOlder = messageController.historiesByChannelID[channelID]?.isLoadingOlder ?? false
             return "loaded \(messages.count), hasMoreBefore \(hasMoreBefore ? "yes" : "no")"
-        case let .loadingOlder(messages):
-            return "loading older \(messages.count)"
+                + (loadingOlder ? ", loading older" : "")
         case .empty:
             return "empty"
         case let .failed(error, cachedMessages):
@@ -12574,7 +13032,15 @@ public final class LiquidBagelAppModel {
     public let shell: MainShellViewModel
     public let loginViewModel: FirstRunLoginViewModel
 
-    public init(coordinator: AppSessionCoordinator = AppSessionCoordinator()) {
+    /// The shipping app gets a real path monitor and a real on-disk cache. Tests construct the
+    /// coordinator themselves and get an in-memory cache and no monitor, so no test ever reads
+    /// or writes the developer's own cache.
+    public init(
+        coordinator: AppSessionCoordinator = AppSessionCoordinator(
+            networkPathMonitor: NWPathNetworkMonitor(),
+            sessionCache: FileSessionSnapshotStore()
+        )
+    ) {
         self.coordinator = coordinator
         self.shell = MainShellViewModel(
             snapshot: RealtimeSnapshot(),
@@ -12592,22 +13058,57 @@ public final class LiquidBagelAppModel {
         case .signedOut:
             return .noCredential
         case .loadingCredential, .validatingCredential:
-            return coordinator.hasSavedCredential ? .validatingCredential : .noCredential
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            return offlineOr(.validatingCredential, reason: .notYetConnected)
         case .savedCredentialUnvalidated:
-            return coordinator.hasSavedCredential ? .savedCredentialFailed("A saved session is available for this environment. Retry connection when you are ready.") : .noCredential
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            return offlineOr(
+                .savedCredentialFailed("A saved session is available for this environment. Retry connection when you are ready."),
+                reason: .reconnecting
+            )
         case .validatedReady, .readyToConnect:
-            return coordinator.hasSavedCredential ? .savedCredentialFailed("The saved session is ready, but realtime is not connected.") : .noCredential
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            return offlineOr(
+                .savedCredentialFailed("The saved session is ready, but realtime is not connected."),
+                reason: .reconnecting
+            )
         case .connecting:
-            return .connectingLive
+            return offlineOr(.connectingLive, reason: .notYetConnected)
         case .connected:
             return .ready
-        case let .validationFailed(msg), let .invalidSession(msg), let .connectionFailed(msg):
+        case let .connectionFailed(msg):
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            return offlineOr(.savedCredentialFailed(msg), reason: offlineReasonForConnectFailure)
+        case let .validationFailed(msg):
+            guard coordinator.hasSavedCredential else { return .noCredential }
+            // A network-class validation failure means we could not reach the server to ask, not
+            // that the answer was no. Anything else is a real credential problem.
+            return coordinator.lastConnectFailureCategory == .networkError
+                ? offlineOr(.savedCredentialFailed(msg), reason: offlineReasonForConnectFailure)
+                : .savedCredentialFailed(msg)
+        case let .invalidSession(msg):
+            // Never show cached content behind a session the server has rejected.
             return coordinator.hasSavedCredential ? .savedCredentialFailed(msg) : .noCredential
         case let .keychainFailed(msg):
             return .startupFailed(.keychainUnavailable(msg))
         case let .failed(msg):
             return .startupFailed(.unknown(msg))
         }
+    }
+
+    /// Substitute the offline shell for `fallback` when there is something to show and the reason
+    /// we are not connected is not an authentication problem.
+    private func offlineOr(_ fallback: AppStartupState, reason: OfflineShellReason) -> AppStartupState {
+        guard coordinator.isUsingCachedSession,
+              coordinator.sessionCacheAvailability != nil,
+              coordinator.hasSavedCredential
+        else { return fallback }
+        return .readyOffline(reason)
+    }
+
+    private var offlineReasonForConnectFailure: OfflineShellReason {
+        if coordinator.networkPathStatus.isKnownOffline { return .networkUnavailable }
+        return .serverUnreachable
     }
 }
 
@@ -12616,7 +13117,7 @@ public final class LiquidBagelAppModel {
 public final class FirstRunLoginViewModel {
     public var email: String = ""
     public var password: String = ""
-    public var sessionName: String = "Liquid Bagel macOS"
+    public var sessionName: String = FirstRunLoginViewModel.defaultSessionName
     public var mfaResponse: String = ""
     public var manualToken: String = ""
     public var tokenLabel: String = ""
@@ -12645,8 +13146,21 @@ public final class FirstRunLoginViewModel {
         }
     }
 
+    /// The method the user picked, defaulting to the account's first allowed one.
+    ///
+    /// Previously `submitMFA` always used `allowedMethods.first` with no way to change it, so an
+    /// account whose first allowed method was TOTP could not sign in with a recovery code at
+    /// all -- the code went to the server labelled as the wrong kind and was rejected.
+    public var selectedMFAMethod: MFAMethod?
+
+    public var availableMFAMethods: [MFAMethod] { mfaChallenge?.allowedMethods ?? [] }
+
+    public var effectiveMFAMethod: MFAMethod? {
+        selectedMFAMethod.flatMap { availableMFAMethods.contains($0) ? $0 : nil } ?? availableMFAMethods.first
+    }
+
     public func submitMFA() async {
-        guard let challenge = mfaChallenge, let method = challenge.allowedMethods.first else { return }
+        guard let method = effectiveMFAMethod else { return }
         loginError = nil
         let response = mfaResponseValue(method: method, code: mfaResponse)
         await coordinator.continueLoginMFA(response: response, friendlyName: sessionName)
@@ -12658,6 +13172,23 @@ public final class FirstRunLoginViewModel {
         case .password: .password(code)
         case .recovery: .recoveryCode(code)
         case .totp: .totpCode(code)
+        }
+    }
+
+    public static func fieldLabel(for method: MFAMethod?) -> String {
+        switch method {
+        case .totp: "Authentication code"
+        case .recovery: "Recovery code"
+        case .password: "Password"
+        case nil: "Authentication code"
+        }
+    }
+
+    public static func methodLabel(for method: MFAMethod) -> String {
+        switch method {
+        case .totp: "Authenticator app"
+        case .recovery: "Recovery code"
+        case .password: "Password"
         }
     }
 
@@ -12675,11 +13206,25 @@ public final class FirstRunLoginViewModel {
     public func clearForm() {
         email = ""
         password = ""
-        sessionName = "Liquid Bagel macOS"
+        sessionName = Self.defaultSessionName
         mfaResponse = ""
         manualToken = ""
         tokenLabel = ""
+        selectedMFAMethod = nil
         loginError = nil
+    }
+
+    public static let defaultSessionName = "Liquid Bagel"
+
+    /// Where someone without an account goes to make one.
+    public var signUpURL: URL? { coordinator.environment.appBaseURL }
+
+    /// `nil` on production. Naming the host is only meaningful when it is not the obvious one,
+    /// and printing an API URL on a sign-in screen reads as debug output.
+    public var customEnvironmentLabel: String? {
+        let environment = coordinator.environment
+        guard !environment.isProduction else { return nil }
+        return environment.apiBaseURL.host() ?? environment.apiBaseURL.absoluteString
     }
 
     private func updateLoginError() {
@@ -12718,63 +13263,55 @@ public struct FirstRunLoginView: View {
 
     @ViewBuilder
     private var loginCard: some View {
-        VStack(spacing: 24) {
+        VStack(spacing: 20) {
             header
             if let mfaChallenge = viewModel.mfaChallenge {
                 mfaSection(challenge: mfaChallenge)
             } else {
                 credentialsSection
+                signInButton
+                signUpRow
             }
-            if let error = viewModel.loginError {
-                Text(error.localizedDescription)
-                    .foregroundStyle(.red)
-                    .font(.callout)
-                    .multilineTextAlignment(.center)
-                    .accessibilityLabel("Login error: \(error.localizedDescription)")
-            }
+            errorRow
             advancedSection
-            signInButton
         }
         .padding(32)
-        .frame(maxWidth: 440)
+        .frame(maxWidth: 420)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
         .shadow(color: .black.opacity(0.12), radius: 20, y: 4)
     }
 
     @ViewBuilder
     private var header: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             if let appIcon = NSImage(named: "AppIcon") {
                 Image(nsImage: appIcon)
                     .resizable()
-                    .frame(width: 80, height: 80)
-                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .frame(width: 88, height: 88)
+                    .clipShape(RoundedRectangle(cornerRadius: 20))
                     .accessibilityLabel("Liquid Bagel app icon")
             }
-            Text("Liquid Bagel")
-                .font(.title.bold())
-            environmentRow
-        }
-    }
-
-    @ViewBuilder
-    private var environmentRow: some View {
-        let env = coordinator.environment
-        let envLabel = env.isProduction ? "Production" : (env.apiBaseURL.host() ?? env.apiBaseURL.absoluteString)
-        HStack(spacing: 4) {
-            Image(systemName: "network")
+            Text("Sign in to Stoat")
+                .font(.title2.bold())
+            // Only shown for a custom instance. On production the host is the obvious one and
+            // printing an API URL here reads as debug output rather than reassurance.
+            if let label = viewModel.customEnvironmentLabel {
+                HStack(spacing: 4) {
+                    Image(systemName: "network")
+                        .accessibilityHidden(true)
+                    Text(label)
+                }
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text(envLabel)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .accessibilityLabel("Custom server: \(label)")
+            }
         }
-        .accessibilityLabel("Environment: \(envLabel)")
+        .padding(.bottom, 4)
     }
 
     @ViewBuilder
     private var credentialsSection: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             TextField("Email", text: $viewModel.email)
                 .textFieldStyle(.roundedBorder)
                 .textContentType(.emailAddress)
@@ -12790,38 +13327,83 @@ public struct FirstRunLoginView: View {
                 .onSubmit {
                     Task { await viewModel.submitLogin() }
                 }
+        }
+    }
 
-            TextField("Session name", text: $viewModel.sessionName)
-                .textFieldStyle(.roundedBorder)
-                .focused($focused, equals: .sessionName)
-                .accessibilityLabel("Session name")
-                .onSubmit {
-                    Task { await viewModel.submitLogin() }
-                }
+    @ViewBuilder
+    private var signUpRow: some View {
+        if let url = viewModel.signUpURL {
+            HStack(spacing: 4) {
+                Text("Don't have an account?")
+                    .foregroundStyle(.secondary)
+                Link("Create one", destination: url)
+            }
+            .font(.callout)
+        }
+    }
+
+    @ViewBuilder
+    private var errorRow: some View {
+        if let error = viewModel.loginError {
+            let message = error.localizedDescription
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundStyle(.red)
+                    .accessibilityHidden(true)
+                Text(message)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.callout)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Sign-in error: \(message)")
         }
     }
 
     @ViewBuilder
     private func mfaSection(challenge: LoginMFAChallenge) -> some View {
         VStack(spacing: 12) {
-            Text("Two-factor authentication required")
+            Text("Two-factor authentication")
                 .font(.headline)
-            Text("Enter the code from your authenticator app or other MFA method.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            SecureField("Authentication code", text: $viewModel.mfaResponse)
+
+            // A picker whenever the account allows more than one method. Without it the code is
+            // submitted labelled as whichever method happens to sort first, so a recovery code
+            // on a TOTP-first account is rejected no matter how correct it is.
+            if viewModel.availableMFAMethods.count > 1 {
+                Picker("Method", selection: Binding(
+                    get: { viewModel.effectiveMFAMethod ?? challenge.allowedMethods[0] },
+                    set: { viewModel.selectedMFAMethod = $0 }
+                )) {
+                    ForEach(challenge.allowedMethods, id: \.self) { method in
+                        Text(FirstRunLoginViewModel.methodLabel(for: method)).tag(method)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+
+            let fieldLabel = FirstRunLoginViewModel.fieldLabel(for: viewModel.effectiveMFAMethod)
+            SecureField(fieldLabel, text: $viewModel.mfaResponse)
                 .textFieldStyle(.roundedBorder)
                 .focused($focused, equals: .mfaCode)
-                .accessibilityLabel("MFA authentication code")
+                .accessibilityLabel(fieldLabel)
                 .onSubmit {
                     Task { await viewModel.submitMFA() }
                 }
-            Button("Continue") {
-                Task { await viewModel.submitMFA() }
+
+            HStack(spacing: 12) {
+                if viewModel.isLoading {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Continue") {
+                    Task { await viewModel.submitMFA() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!viewModel.canSubmitMFA)
+                .keyboardShortcut(.defaultAction)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!viewModel.canSubmitMFA)
         }
     }
 
@@ -12830,7 +13412,10 @@ public struct FirstRunLoginView: View {
         DisclosureGroup(
             isExpanded: $viewModel.isAdvancedExpanded,
             content: {
-                VStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Sign in with a session token instead of a password.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     SecureField("Session token", text: $viewModel.manualToken)
                         .textFieldStyle(.roundedBorder)
                         .focused($focused, equals: .manualToken)
@@ -12840,11 +13425,21 @@ public struct FirstRunLoginView: View {
                         .focused($focused, equals: .tokenLabel)
                         .accessibilityLabel("Label for the imported token")
                     Button("Import Token") {
-                        Task {
-                            await viewModel.submitToken()
-                        }
+                        Task { await viewModel.submitToken() }
                     }
                     .disabled(!viewModel.canSubmitToken)
+
+                    Divider().padding(.vertical, 2)
+
+                    // Moved out of the main form: it is the name this Mac shows up under in the
+                    // account's session list, which is not something to decide while signing in.
+                    Text("This device appears under this name in your Stoat sessions.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("Device name", text: $viewModel.sessionName)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($focused, equals: .sessionName)
+                        .accessibilityLabel("Device name for this session")
                 }
                 .padding(.top, 8)
             },
@@ -12858,22 +13453,18 @@ public struct FirstRunLoginView: View {
 
     @ViewBuilder
     private var signInButton: some View {
-        if viewModel.mfaChallenge == nil {
-            HStack(spacing: 12) {
-                if viewModel.isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-                Button("Sign In") {
-                    Task {
-                        await viewModel.submitLogin()
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!viewModel.canSubmitLogin)
-                .keyboardShortcut(.defaultAction)
-                .accessibilityLabel("Sign in with email and password")
+        HStack(spacing: 12) {
+            if viewModel.isLoading {
+                ProgressView()
+                    .controlSize(.small)
             }
+            Button("Sign In") {
+                Task { await viewModel.submitLogin() }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!viewModel.canSubmitLogin)
+            .keyboardShortcut(.defaultAction)
+            .accessibilityLabel("Sign in with email and password")
         }
     }
 }
@@ -12901,18 +13492,18 @@ public struct SavedCredentialFailureView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 360)
+                // Two buttons, not three. "Sign In Again" and "Forget Session" both called
+                // forgetLocalSession(), so the screen offered the same action under two
+                // different names and no way to tell them apart.
                 HStack(spacing: 12) {
                     Button("Try Again") {
                         Task { await coordinator.reconnectLiveManually() }
                     }
                     .buttonStyle(.borderedProminent)
-                    Button("Sign In Again") {
+                    .keyboardShortcut(.defaultAction)
+                    Button("Sign Out") {
                         Task { await coordinator.forgetLocalSession() }
                     }
-                    Button("Forget Session") {
-                        Task { await coordinator.forgetLocalSession() }
-                    }
-                    .foregroundStyle(.red)
                 }
             }
             .padding(40)
@@ -12972,23 +13563,39 @@ public struct LiquidBagelRootView: View {
 
     public var body: some View {
         Group {
-            switch appModel.startupState {
-            case .loadingPreferences, .validatingCredential, .connectingLive:
-                StartupProgressView()
-            case .noCredential:
-                FirstRunLoginView(viewModel: appModel.loginViewModel, coordinator: appModel.coordinator)
-            case let .savedCredentialFailed(message):
-                SavedCredentialFailureView(message: message, coordinator: appModel.coordinator)
-            case let .startupFailed(failure):
-                StartupFailureView(failure: failure)
-            case .ready:
+            // One shell branch, deliberately. Making `.ready` and `.readyOffline` two arms of the
+            // same switch would build a `_ConditionalContent`, and SwiftUI would tear down and
+            // rebuild `MainShellView` every time the connection came or went -- losing scroll
+            // position, open sheets, focus, and every piece of `@State` in the shell.
+            if appModel.startupState.showsMainShell {
                 MainShellView(viewModel: appModel.shell)
+            } else {
+                switch appModel.startupState {
+                case .loadingPreferences, .validatingCredential, .connectingLive:
+                    StartupProgressView()
+                case .noCredential:
+                    FirstRunLoginView(viewModel: appModel.loginViewModel, coordinator: appModel.coordinator)
+                case let .savedCredentialFailed(message):
+                    SavedCredentialFailureView(message: message, coordinator: appModel.coordinator)
+                case let .startupFailed(failure):
+                    StartupFailureView(failure: failure)
+                case .ready, .readyOffline:
+                    EmptyView()
+                }
             }
         }
         .task {
             appModel.shell.attachSessionCoordinator(appModel.coordinator)
+            // Paint from disk first. This is local and fast, so the shell is on screen before
+            // the network is touched at all -- offline it is the only thing that will appear,
+            // and online it beats a spinner.
+            await appModel.coordinator.restoreCachedSession()
+            appModel.shell.syncFromSessionCoordinator()
+            await appModel.shell.adoptRestoredSessionCache()
+            await appModel.coordinator.startConnectivitySupervision()
             await appModel.coordinator.startLiveFirstSession()
             appModel.shell.syncFromSessionCoordinator()
+            await appModel.shell.adoptRestoredSessionCache()
         }
         .onChange(of: scenePhase) { _, phase in
             appModel.shell.updateAppLifecyclePhase(AppLifecyclePhase(phase))
@@ -13011,12 +13618,60 @@ private extension AppLifecyclePhase {
     }
 }
 
+/// The one place the app talks about its connection, shown only when something is wrong.
+struct ConnectionChromeChip: View {
+    let chrome: ConnectionChrome
+    let onAction: () -> Void
+
+    private var tint: Color {
+        switch chrome.level {
+        case .info: .secondary
+        case .warning: .orange
+        case .error: .red
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Image(systemName: chrome.systemImage)
+                    .accessibilityHidden(true)
+                Text(chrome.title)
+                    .lineLimit(1)
+                if let actionTitle = chrome.actionTitle {
+                    Button(actionTitle, action: onAction)
+                        .buttonStyle(.borderless)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(tint)
+            if let detail = chrome.detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel([chrome.title, chrome.detail].compactMap { $0 }.joined(separator: ". "))
+    }
+}
+
 public struct MainShellView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Bindable private var viewModel: MainShellViewModel
 
     public init(viewModel: MainShellViewModel) {
         self.viewModel = viewModel
+    }
+
+    private func noticeTint(_ severity: TransientAppNoticeSeverity) -> Color {
+        switch severity {
+        case .success: .green
+        case .info: .accentColor
+        case .warning: .orange
+        case .error: .red
+        }
     }
 
     public var body: some View {
@@ -13243,7 +13898,7 @@ public struct MainShellView: View {
             if let notice = viewModel.transientNotice {
                 HStack(spacing: StoatSpacing.small) {
                     Image(systemName: notice.severity.systemImage)
-                        .foregroundStyle(notice.severity == .error ? Color.red : Color.orange)
+                        .foregroundStyle(noticeTint(notice.severity))
                         .accessibilityHidden(true)
                     Text(notice.message)
                         .font(.callout)
@@ -13262,10 +13917,7 @@ public struct MainShellView: View {
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
-                        .strokeBorder(
-                            (notice.severity == .error ? Color.red : Color.orange).opacity(0.28),
-                            lineWidth: 1
-                        )
+                        .strokeBorder(noticeTint(notice.severity).opacity(0.28), lineWidth: 1)
                 }
                 .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
                 .padding(.top, StoatSpacing.small)
@@ -14519,9 +15171,13 @@ public struct ChannelListView: View {
                     Text(headerTitle)
                         .font(StoatTypography.sidebarHeader)
                         .lineLimit(1)
-                    Text(runtimeSubtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    // Nothing at all when connected. The line that used to live here said
+                    // "Connected" permanently.
+                    if let chrome = viewModel.connectionChrome {
+                        ConnectionChromeChip(chrome: chrome) {
+                            Task { await viewModel.reconnectLiveManually() }
+                        }
+                    }
                 }
                 Spacer()
                 if viewModel.selection.serverID != nil {
@@ -14584,32 +15240,6 @@ public struct ChannelListView: View {
         case .discover: "Discover"
         case .directMessages: "Direct Messages"
         case .server: viewModel.selectedServer?.name ?? "Server"
-        }
-    }
-
-    private var runtimeSubtitle: String {
-        switch viewModel.effectiveRuntimeMode {
-        case .mock:
-            return "Preview Data"
-        case .liveManual:
-            switch viewModel.effectiveSessionState {
-            case .connected:
-                return "Connected"
-            case .connecting, .loadingCredential, .validatingCredential:
-                return "Connecting"
-            case .signedOut:
-                return "Signed out"
-            case .readyToConnect, .validatedReady:
-                return "Ready"
-            case .savedCredentialUnvalidated:
-                return "Saved credential"
-            case .invalidSession:
-                return "Invalid session"
-            case .validationFailed, .connectionFailed, .keychainFailed, .failed:
-                return "Needs attention"
-            case .mock:
-                return "Preview Data"
-            }
         }
     }
 
@@ -14886,6 +15516,32 @@ private struct SelectedChannelComposerView: View {
         self.channelID = channelID
     }
 
+    @ViewBuilder private var composerErrorBanner: some View {
+        if let message = viewModel.composerError {
+            HStack(spacing: StoatSpacing.small) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
+                Text(message)
+                    .font(.caption)
+                    .lineLimit(2)
+                Spacer()
+                Button {
+                    viewModel.composerError = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+            }
+            .padding(.horizontal, StoatSpacing.medium)
+            .padding(.vertical, StoatSpacing.xSmall)
+            .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+            .accessibilityElement(children: .combine)
+        }
+    }
+
     var body: some View {
         if let channel = viewModel.snapshot.channelsByID[channelID] {
             let sendReadiness = viewModel.composerReadiness(for: channelID)
@@ -14893,6 +15549,11 @@ private struct SelectedChannelComposerView: View {
             let draftState = viewModel.composerDraftState(for: channelID)
             let attachmentPresentation = viewModel.composerAttachmentPresentation(for: channelID)
             let emojiSections = viewModel.composerEmojiSections
+            // `composerError` was set from 26 places and rendered from none, so "File too large"
+            // and "Attachment upload failed" were invisible. It belongs next to the composer
+            // rather than in the top-of-window notice overlay, because it is always about the
+            // thing the user is currently typing.
+            composerErrorBanner
             GlassComposer(
                 text: Binding(
                     get: { viewModel.draft(for: channelID) },
@@ -14983,6 +15644,20 @@ public struct MessageTimelineView: View {
                 performScroll(intent, proxy: proxy)
                 viewModel.consumeScrollIntent()
             }
+            // Pure observation -- it reads the scroll geometry, it does not participate in
+            // layout, so it cannot provoke the Phase 64 ideal-height probe. The transform must
+            // stay this cheap and must return a `Bool`: SwiftUI only calls `action` when the
+            // transformed value changes, so quantising here turns a per-frame callback into one
+            // call per threshold crossing.
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                TimelinePrefetchPolicy.isNearOldest(
+                    contentOffsetY: geometry.contentOffset.y,
+                    containerHeight: geometry.containerSize.height,
+                    distancePercent: viewModel.timelineTuning.olderPrefetchDistancePercent
+                )
+            } action: { _, isNearOldest in
+                viewModel.timelineOlderPrefetchThresholdChanged(isNearOldest)
+            }
         }
         .task(id: viewModel.selectedTimelinePresentationToken) {
             await viewModel.prepareSelectedTimelineRows()
@@ -15020,10 +15695,10 @@ public struct MessageTimelineView: View {
             renderItems: viewModel.selectedTimelineRenderItems
         )
         let scroll = { proxy.scrollTo(resolvedTarget, anchor: anchor) }
-        if reduceMotion {
-            scroll()
-        } else {
+        if TimelineScrollAnimationPolicy.shouldAnimate(intent: intent, reduceMotion: reduceMotion) {
             withAnimation(.easeInOut(duration: 0.18), scroll)
+        } else {
+            scroll()
         }
     }
 
@@ -15043,7 +15718,7 @@ public struct MessageTimelineView: View {
                 LoadingStateView()
                     .frame(maxWidth: .infinity)
             } else {
-                timelineMessages(showLoadOlder: false, isLoadingOlder: false)
+                timelineMessages()
             }
         case .empty:
             EmptyStateView(title: "Nothing here yet", message: "No messages are loaded for this channel.")
@@ -15055,17 +15730,15 @@ public struct MessageTimelineView: View {
                 retryButton
             } else {
                 inlineError(message)
-                timelineMessages(showLoadOlder: false, isLoadingOlder: false)
+                timelineMessages()
             }
-        case let .loaded(messages, hasMoreBefore):
+        case let .loaded(messages, _):
             if messages.isEmpty {
                 EmptyStateView(title: "Nothing here yet", message: "No messages are loaded for this channel.")
                     .frame(maxWidth: .infinity)
             } else {
-                timelineMessages(showLoadOlder: hasMoreBefore, isLoadingOlder: false)
+                timelineMessages()
             }
-        case .loadingOlder:
-            timelineMessages(showLoadOlder: false, isLoadingOlder: true)
         }
     }
 
@@ -15095,27 +15768,56 @@ public struct MessageTimelineView: View {
         return "Pick a server channel or DM to open the timeline."
     }
 
-    @ViewBuilder private func timelineMessages(showLoadOlder: Bool, isLoadingOlder: Bool) -> some View {
+    /// The slot above loaded history.
+    ///
+    /// Always rendered and always exactly `olderHistoryHeaderHeight` tall. The previous
+    /// implementation swapped a button, a spinner and a caption -- three different heights -- at
+    /// index 0 of the `LazyVStack`, so every pagination state change shifted all content below
+    /// it. That is a jump no scroll-anchor mechanism can undo, and it is why this reserves space
+    /// even when idle.
+    ///
+    /// The fixed frame is on a leaf view. It is a concrete size, not an ideal-size request on the
+    /// enclosing `ScrollView`, so it does not interact with the Phase 64 freeze.
+    @ViewBuilder private var olderHistoryHeader: some View {
+        Group {
+            switch viewModel.olderHistoryHeaderState {
+            case .idle:
+                Color.clear
+            case .loading:
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Loading older messages")
+            case let .beginning(channelName):
+                Text(channelName.map { "This is the beginning of \($0)." } ?? "This is the beginning of the conversation.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .unavailableOffline:
+                Label("Older messages are unavailable offline.", systemImage: "wifi.slash")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case let .failed(message):
+                HStack(spacing: StoatSpacing.small) {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Button("Retry") {
+                        Task { await viewModel.loadOlderSelectedMessages() }
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: olderHistoryHeaderHeight, maxHeight: olderHistoryHeaderHeight)
+    }
+
+    private var olderHistoryHeaderHeight: CGFloat { 32 }
+
+    @ViewBuilder private func timelineMessages() -> some View {
         unreadRecoveryBanner
         searchHighlightAffordance
-        if isLoadingOlder {
-            ProgressView("Loading older messages")
-                .controlSize(.small)
-                .frame(maxWidth: .infinity)
-        } else if showLoadOlder {
-            Button {
-                Task { await viewModel.loadOlderSelectedMessages() }
-            } label: {
-                Label("Load Older Messages", systemImage: "arrow.up.to.line")
-            }
-            .buttonStyle(GlassButtonStyle())
-            .frame(maxWidth: .infinity)
-        } else if viewModel.selectedChannelMessageState.timelineMessages.isEmpty == false {
-            Text("Beginning of loaded history")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity)
-        }
+        olderHistoryHeader
         unreadSeparator
         let renderItems = viewModel.selectedTimelineRenderItems
         if renderItems.isEmpty, !viewModel.selectedTimelineMessages.isEmpty {
@@ -15203,9 +15905,9 @@ public struct MessageTimelineView: View {
             case let .targetUnloaded(messageID):
                 HStack(spacing: StoatSpacing.small) {
                     Image(systemName: "text.line.first.and.arrowtriangle.forward")
-                    Text("Unread message is outside the loaded range.")
+                    Text("Your first unread message is further back.")
                     Spacer()
-                    Button("Load Older") {
+                    Button("Jump to Unread") {
                         Task { await viewModel.loadToFirstUnreadMessage() }
                     }
                     .buttonStyle(GlassButtonStyle())
@@ -15213,7 +15915,7 @@ public struct MessageTimelineView: View {
                 .font(.caption)
                 .padding(StoatSpacing.medium)
                 .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
-                .accessibilityLabel("Unread message is outside the loaded range. Load older messages to reach it. Target \(messageID.rawValue).")
+                .accessibilityLabel("Your first unread message is further back than the loaded history. Jump to it. Target \(messageID.rawValue).")
             case let .loadingToTarget(_, attempts):
                 HStack(spacing: StoatSpacing.small) {
                     ProgressView()
@@ -15854,17 +16556,28 @@ public struct MemberPanelView: View {
     }
 
     @ViewBuilder private func serverMembersPanel(groups: [MemberListGroup]) -> some View {
-        if case let .serverMembers(serverID, _) = context,
-           let status = viewModel.memberHydrationStatusMessage(for: serverID) {
-            HStack(spacing: StoatSpacing.small) {
-                if viewModel.isMemberHydrationLoading(serverID: serverID) {
+        if case let .serverMembers(serverID, _) = context {
+            // Refreshing is a bare spinner with no commentary; a healthy list says nothing at
+            // all. Only a failure gets words, and then it gets a way out of the failure too.
+            if viewModel.isMemberHydrationLoading(serverID: serverID) {
+                HStack(spacing: StoatSpacing.small) {
                     ProgressView().controlSize(.small)
+                    Spacer()
                 }
-                Text(status)
+                .accessibilityLabel("Refreshing members")
+            } else if let status = viewModel.memberHydrationStatusMessage(for: serverID) {
+                HStack(spacing: StoatSpacing.small) {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Button("Retry") {
+                        Task { await viewModel.hydrateServerMembers(serverID: serverID, force: true, reason: "member panel retry") }
+                    }
+                    .buttonStyle(.borderless)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                Spacer()
+                    Spacer()
+                }
             }
         }
         if groups.isEmpty {
@@ -18463,10 +19176,12 @@ public struct ServerOverviewView: View {
                             Label("Refresh Bans", systemImage: "arrow.clockwise")
                         }
                         .disabled(!viewModel.serverManagementCapabilities().isConnectedForLiveActions)
-                        Button {
-                            viewModel.copyRedactedModerationDiagnostics()
-                        } label: {
-                            Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                        if viewModel.isDeveloperControlsEnabled {
+                            Button {
+                                viewModel.copyRedactedModerationDiagnostics()
+                            } label: {
+                                Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                            }
                         }
                     }
                     if moderationPermissionSummary(in: details) != nil {
@@ -18614,10 +19329,12 @@ public struct ServerOverviewView: View {
                             } label: {
                                 Label("Retry", systemImage: "arrow.clockwise")
                             }
-                            Button {
-                                viewModel.copyRedactedModerationDiagnostics()
-                            } label: {
-                                Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                            if viewModel.isDeveloperControlsEnabled {
+                                Button {
+                                    viewModel.copyRedactedModerationDiagnostics()
+                                } label: {
+                                    Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                                }
                             }
                         }
                     }

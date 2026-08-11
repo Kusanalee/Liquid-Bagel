@@ -59,9 +59,11 @@ public struct AccountConnectionSettingsView: View {
                 .tabItem { Label("Notifications", systemImage: "bell.badge") }
                 .tag(SettingsSectionTab.notifications)
 
-            DeveloperVerificationTab(viewModel: viewModel)
-                .tabItem { Label("Developer", systemImage: "checklist") }
-                .tag(SettingsSectionTab.developer)
+            if viewModel.isDeveloperControlsEnabled {
+                DeveloperVerificationTab(viewModel: viewModel)
+                    .tabItem { Label("Developer", systemImage: "checklist") }
+                    .tag(SettingsSectionTab.developer)
+            }
         }
         .padding()
         .frame(width: 760, height: 780)
@@ -78,6 +80,18 @@ public struct AccountConnectionSettingsView: View {
         .onChange(of: viewModel.selectedSettingsTab) { _, tab in
             if tab == .sessions {
                 Task { await accountViewModel.refreshSessions() }
+            }
+        }
+        // Turning developer options off removes the tab it is selecting from underneath itself,
+        // which would leave the TabView with a tag that matches nothing and render blank.
+        .onChange(of: viewModel.isDeveloperControlsEnabled) { _, enabled in
+            if !enabled, viewModel.selectedSettingsTab == .developer {
+                viewModel.selectedSettingsTab = .connection
+            }
+        }
+        .task {
+            if !viewModel.isDeveloperControlsEnabled, viewModel.selectedSettingsTab == .developer {
+                viewModel.selectedSettingsTab = .account
             }
         }
         .confirmationDialog(
@@ -174,20 +188,22 @@ private struct AccountSettingsTab: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    LabeledContent("User ID") {
-                        HStack {
-                            Text(user.id.rawValue)
-                                .textSelection(.enabled)
-                            Button {
-                                #if canImport(AppKit)
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(user.id.rawValue, forType: .string)
-                                #endif
-                            } label: {
-                                Image(systemName: "doc.on.doc")
+                    if viewModel.isDeveloperControlsEnabled {
+                        LabeledContent("User ID") {
+                            HStack {
+                                Text(user.id.rawValue)
+                                    .textSelection(.enabled)
+                                Button {
+                                    #if canImport(AppKit)
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(user.id.rawValue, forType: .string)
+                                    #endif
+                                } label: {
+                                    Image(systemName: "doc.on.doc")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Copy User ID")
                             }
-                            .buttonStyle(.borderless)
-                            .help("Copy User ID")
                         }
                     }
                 } else {
@@ -242,8 +258,11 @@ private struct AccountSettingsTab: View {
                 }
             }
 
-            Section("Connection Health") {
-                if let coordinator = viewModel.sessionCoordinator {
+            Section("Connection") {
+                // Everyone gets one plain-language line. The counter grid underneath is for
+                // people who turned Developer Options on and know what hydration means.
+                Label(viewModel.connectionSummaryText, systemImage: viewModel.connectionSummarySymbol)
+                if viewModel.isDeveloperControlsEnabled, let coordinator = viewModel.sessionCoordinator {
                     LabeledContent("Health", value: Phase6UIHelpers.connectionHealthText(state: coordinator.connectionState, diagnostics: coordinator.diagnostics, hydration: coordinator.hydrationStatus))
                     LabeledContent("Hydration", value: Phase6UIHelpers.hydrationLabel(coordinator.hydrationStatus))
                     LabeledContent("Ready", value: coordinator.hydrationStatus.readyReceived ? "Received" : "Waiting")
@@ -266,8 +285,6 @@ private struct AccountSettingsTab: View {
                         LabeledContent("Ping latency", value: "\(latency) ms")
                     }
                     LabeledContent("Reconnect attempts", value: "\(coordinator.diagnostics?.reconnectAttempt ?? 0)")
-                } else {
-                    ContentUnavailableView("Connection unavailable", systemImage: "network.slash")
                 }
             }
         }
@@ -727,6 +744,43 @@ private struct ConnectionSettingsTab: View {
                 }
             }
 
+            Section("Offline") {
+                Toggle("Open with saved content", isOn: Binding(
+                    get: { connectionViewModel.preferences.offlineCacheRestoreOnLaunch },
+                    set: { value in
+                        connectionViewModel.preferences.offlineCacheRestoreOnLaunch = value
+                        Task {
+                            await connectionViewModel.save()
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                ))
+                Text("Shows your servers, channels, and recent messages while Liquid Bagel reconnects. Saved content is encrypted and removed when you sign out.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                LabeledContent("Saved on this Mac", value: viewModel.offlineCacheSizeDescription)
+                Button("Clear Saved Content", role: .destructive) {
+                    Task { await viewModel.clearOfflineCache() }
+                }
+            }
+
+            Section("Advanced") {
+                Toggle("Enable Developer Options", isOn: Binding(
+                    get: { connectionViewModel.preferences.showDeveloperRuntimeControls },
+                    set: { value in
+                        connectionViewModel.preferences.showDeveloperRuntimeControls = value
+                        Task {
+                            await connectionViewModel.save()
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                ))
+                Text("Adds a Developer tab, runtime diagnostics, and ID-copying actions throughout the app. Off by default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .task { await viewModel.refreshOfflineCacheSize() }
+
             if let error = connectionViewModel.errorMessage ?? viewModel.sessionCoordinator?.preferenceErrorMessage {
                 Section("Status") {
                     Text(error).foregroundStyle(.red)
@@ -797,10 +851,6 @@ private struct AppearanceSettingsTab: View {
             }
 
             Section("Interface") {
-                Toggle("Show developer runtime controls", isOn: Binding(
-                    get: { connectionViewModel.preferences.showDeveloperRuntimeControls },
-                    set: { connectionViewModel.preferences.showDeveloperRuntimeControls = $0 }
-                ))
                 Toggle("Member panel visible", isOn: Binding(
                     get: { connectionViewModel.preferences.memberPanelVisible },
                     set: { value in
@@ -820,29 +870,56 @@ private struct AppearanceSettingsTab: View {
             }
 
             Section("Cloud Sync") {
-                Text("Sync appearance and notification preferences across devices through your account. Fetch and push are explicit; nothing syncs automatically.")
+                Toggle("Sync automatically", isOn: Binding(
+                    get: { connectionViewModel.preferences.automaticSettingsSyncEnabled },
+                    set: { value in
+                        connectionViewModel.preferences.automaticSettingsSyncEnabled = value
+                        Task {
+                            await connectionViewModel.save()
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                ))
+                Text("Appearance and notification preferences follow this account to your other devices.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
-                    Button("Fetch From Cloud") {
-                        Task { await viewModel.fetchCloudPreferences() }
+                    if settingsSyncWorking {
+                        ProgressView().controlSize(.small)
                     }
-                    .disabled(settingsSyncWorking)
-                    Button("Push To Cloud") {
-                        Task { await viewModel.pushCloudPreferences() }
-                    }
-                    .disabled(settingsSyncWorking)
-                    if case .staleRemote = viewModel.settingsSyncState {
-                        Button("Apply Older Cloud Copy") {
-                            Task { await viewModel.fetchCloudPreferences(applyOlder: true) }
-                        }
-                        .disabled(settingsSyncWorking)
-                    }
-                }
-                if let status = settingsSyncStatusText {
-                    Text(status)
+                    Text(settingsSyncStatusText ?? "Synced")
                         .font(.caption)
                         .foregroundStyle(settingsSyncStatusIsError ? .red : .secondary)
+                    Spacer()
+                    Button("Sync Now") {
+                        Task {
+                            await viewModel.pushCloudPreferences()
+                            await viewModel.fetchCloudPreferences()
+                        }
+                    }
+                    .disabled(settingsSyncWorking)
+                }
+
+                // The explicit fetch/push/apply-older triad stays available for troubleshooting,
+                // behind the same flag as the rest of the engineering surface.
+                if viewModel.isDeveloperControlsEnabled {
+                    HStack {
+                        Button("Fetch From Cloud") {
+                            Task { await viewModel.fetchCloudPreferences() }
+                        }
+                        .disabled(settingsSyncWorking)
+                        Button("Push To Cloud") {
+                            Task { await viewModel.pushCloudPreferences() }
+                        }
+                        .disabled(settingsSyncWorking)
+                        if case .staleRemote = viewModel.settingsSyncState {
+                            Button("Apply Older Cloud Copy") {
+                                Task { await viewModel.fetchCloudPreferences(applyOlder: true) }
+                            }
+                            .disabled(settingsSyncWorking)
+                        }
+                    }
+                    .font(.caption)
                 }
             }
 
@@ -899,12 +976,12 @@ private struct DeveloperVerificationTab: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: StoatSpacing.large) {
+                // The whole tab is behind Developer Options now, so nothing in it needs a
+                // second gate of its own.
                 CredentialSetupView(viewModel: viewModel)
                     .frame(minHeight: 220)
-                if viewModel.sessionCoordinator?.preferences.showDeveloperRuntimeControls == true {
-                    LoginDiagnosticsSection(coordinator: viewModel.sessionCoordinator)
-                    ProfileEditDiagnosticsSection(viewModel: viewModel)
-                }
+                LoginDiagnosticsSection(coordinator: viewModel.sessionCoordinator)
+                ProfileEditDiagnosticsSection(viewModel: viewModel)
                 TimelineValidationHarnessView(viewModel: viewModel)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -999,17 +1076,21 @@ private struct NotificationSettingsTab: View {
         Form {
             Section("Permission") {
                 LabeledContent("System status", value: viewModel.notificationPermissionStatus.rawValue)
-                LabeledContent("Authorizer", value: viewModel.notificationAuthorizerKind)
-                LabeledContent("Last request", value: viewModel.lastNotificationPermissionRequest ?? "-")
-                if let request = viewModel.notificationDiagnostics.lastPermissionRequest {
-                    LabeledContent("Request called", value: request.requestAuthorizationCalled ? "Yes" : "No")
-                    LabeledContent("Options", value: request.requestedOptions.joined(separator: ", "))
-                    LabeledContent("Completion", value: request.granted.map { $0 ? "Granted" : "Not granted" } ?? "No completion result")
-                    LabeledContent("Named error", value: request.errorCodeName ?? "-")
-                    if let error = request.errorDescription {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.orange)
+                if viewModel.isDeveloperControlsEnabled {
+                    LabeledContent("Authorizer", value: viewModel.notificationAuthorizerKind)
+                    LabeledContent("Last request", value: viewModel.lastNotificationPermissionRequest ?? "-")
+                    if let request = viewModel.notificationDiagnostics.lastPermissionRequest {
+                        LabeledContent("Request called", value: request.requestAuthorizationCalled ? "Yes" : "No")
+                        LabeledContent("Options", value: request.requestedOptions.joined(separator: ", "))
+                        LabeledContent("Completion", value: request.granted.map { $0 ? "Granted" : "Not granted" } ?? "No completion result")
+                        LabeledContent("Named error", value: request.errorCodeName ?? "-")
+                        // Raw UNError text. Developer-only: the actionable version for everyone
+                        // else is the System Settings guidance below.
+                        if let error = request.errorDescription {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
                     }
                 }
                 Button("Request Notification Permission") {
@@ -1028,7 +1109,7 @@ private struct NotificationSettingsTab: View {
                 } else if viewModel.notificationPermissionStatus == .notDetermined,
                           let request = viewModel.notificationDiagnostics.lastPermissionRequest,
                           request.requestAuthorizationCalled {
-                    Text("The authorization request ran but macOS still reports notDetermined. Check System Settings > Notifications > Liquid Bagel, confirm this is a signed app with a stable bundle identifier, and verify the authorizer is not the mock.")
+                    Text("macOS has not recorded a decision yet. Open System Settings > Notifications > Liquid Bagel to allow notifications.")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -1074,6 +1155,7 @@ private struct NotificationSettingsTab: View {
                 }
             }
 
+            if viewModel.isDeveloperControlsEnabled {
             Section("Diagnostics") {
                 let readiness = viewModel.notificationBuildReadinessDiagnostics
                 LabeledContent("Lifecycle", value: viewModel.notificationDiagnostics.lifecyclePhase.rawValue)
@@ -1107,6 +1189,7 @@ private struct NotificationSettingsTab: View {
                     Button("Run Self-Test") { viewModel.runNotificationSelfTest() }
                     Button("Reset Diagnostics") { viewModel.resetNotificationDiagnostics() }
                 }
+            }
             }
         }
         .formStyle(.grouped)
@@ -1158,6 +1241,7 @@ private struct TimelineValidationHarnessView: View {
             warningList(diagnostics.validationWarnings)
             actionGrid
             tuningControls
+            paginationDiagnostics
             defaultTuningDecisionControls
             calibrationControls
             findControls
@@ -1263,6 +1347,22 @@ private struct TimelineValidationHarnessView: View {
             Stepper("Load-to-unread attempts: \(viewModel.timelineTuning.loadToUnreadMaxAttempts)", value: binding(\.loadToUnreadMaxAttempts), in: 1...20)
             Stepper("Reference cooldown: \(viewModel.timelineTuning.referenceFetchCooldownSeconds) sec", value: binding(\.referenceFetchCooldownSeconds), in: 0...3600, step: 10)
             Stepper("Ack debounce: \(viewModel.timelineTuning.ackDebounceMilliseconds) ms", value: binding(\.ackDebounceMilliseconds), in: 0...10000, step: 100)
+            Stepper("Older prefetch distance: \(viewModel.timelineTuning.olderPrefetchDistancePercent)% of viewport", value: binding(\.olderPrefetchDistancePercent), in: 0...500, step: 25)
+            Stepper("Older prefetch row backstop: \(viewModel.timelineTuning.olderPrefetchRowThreshold) rows", value: binding(\.olderPrefetchRowThreshold), in: 0...100)
+        }
+        .font(.caption)
+    }
+
+    private var paginationDiagnostics: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            Text("Older-Message Prefetch").font(.subheadline.weight(.semibold))
+            let diagnostics = viewModel.phase74PaginationDiagnostics
+            LabeledContent("Triggered", value: "\(diagnostics.prefetchTriggerCount)")
+            LabeledContent("Suppressed", value: "\(diagnostics.prefetchSuppressedCount)")
+            LabeledContent("Pages loaded", value: "\(diagnostics.pageLoadedCount)")
+            LabeledContent("Pages failed", value: "\(diagnostics.pageFailedCount)")
+            LabeledContent("Last trigger", value: diagnostics.lastTrigger.map { String(describing: $0) } ?? "-")
+            LabeledContent("Last suppression", value: diagnostics.lastSuppressionReason?.rawValue ?? "-")
         }
         .font(.caption)
     }

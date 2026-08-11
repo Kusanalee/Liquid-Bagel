@@ -469,7 +469,11 @@ extension StoatFeaturesTests {
         XCTAssertEqual(model.memberHydrationDiagnostics.source, MemberHydrationSource.readyOnly)
         XCTAssertEqual(model.memberHydrationDiagnostics.apiDiagnostics?.topLevelResponseShape, "array[1]")
         XCTAssertEqual(model.memberHydrationDiagnostics.apiDiagnostics?.errorCategory, "decode")
-        XCTAssertTrue(model.memberHydrationStatusMessage(for: serverID)?.contains("decode") == true)
+        // Phase 74: the panel says one plain sentence. The diagnostic category and the raw API
+        // description stay in `memberHydrationDiagnostics`, behind Developer Options.
+        let status = model.memberHydrationStatusMessage(for: serverID)
+        XCTAssertEqual(status, "Couldn't refresh members.")
+        XCTAssertFalse(status?.contains("decode") ?? false)
     }
 
     @MainActor

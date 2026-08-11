@@ -863,7 +863,7 @@ extension StoatFeaturesTests {
     }
 
     @MainActor
-    func testPhase29ChannelContextMenuContainsSettingsAndDeveloperActions() throws {
+    func testPhase29ChannelContextMenuContainsSettingsAndDeveloperActions() async throws {
         let model = MainShellViewModel(snapshot: TestShellData.snapshot, runtimeMode: .mock, sessionState: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = try XCTUnwrap(model.servers.first)
         model.selectServer(server.id)
@@ -873,8 +873,19 @@ extension StoatFeaturesTests {
 
         XCTAssertTrue(items.contains { $0.kind == .settings && $0.title == "Channel Settings" })
         XCTAssertTrue(items.contains { $0.kind == .createChannel })
-        XCTAssertTrue(items.contains { $0.kind == .copyChannelID && $0.isDeveloperOnly })
         XCTAssertTrue(items.contains { $0.kind == .deleteChannel && $0.isDestructive })
+        // Phase 74: developer options are opt-in, so ID copying is absent until asked for.
+        XCTAssertFalse(items.contains { $0.kind == .copyChannelID })
+
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(),
+            preferencesStore: InMemoryAppPreferencesStore(preferences: AppPreferences(showDeveloperRuntimeControls: true))
+        )
+        await coordinator.loadPreferences()
+        model.attachSessionCoordinator(coordinator)
+
+        let developerItems = model.channelContextMenuItems(for: channel)
+        XCTAssertTrue(developerItems.contains { $0.kind == .copyChannelID && $0.isDeveloperOnly })
     }
 
     @MainActor
