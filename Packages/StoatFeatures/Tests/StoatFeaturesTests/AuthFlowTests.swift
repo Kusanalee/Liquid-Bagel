@@ -20,11 +20,11 @@ final class Phase38StartupStateTests: XCTestCase {
     }
 
     @MainActor
-    func testStartupStateIsReadyForMockMode() async {
+    func testStartupStateIsSignedOutWithoutACredential() async {
         let coordinator = AppSessionCoordinator(tokenStore: InMemoryTokenStore())
-        await coordinator.startMockSession()
+        await coordinator.startLiveFirstSession()
         let appModel = LiquidBagelAppModel(coordinator: coordinator)
-        XCTAssertEqual(appModel.startupState, .ready)
+        XCTAssertEqual(appModel.startupState, .noCredential)
     }
 
     @MainActor
@@ -525,7 +525,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         )
         let switchAppModel = LiquidBagelAppModel(coordinator: switchCoordinator)
 
-        await switchCoordinator.startMockSession()
+        await switchCoordinator.loadPreferences()
         await switchCoordinator.selectEnvironmentProfile(id: custom.id)
         XCTAssertTrue(switchCoordinator.hasSavedCredential)
         if case .savedCredentialFailed = switchAppModel.startupState {
@@ -669,8 +669,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         )
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
-            snapshot: snapshot
-        )
+            snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.prepareSelectedTimelinePresentation()
         let firstBuildCount = model.phase51PerformanceDiagnostics.timelineBuildCount
@@ -707,8 +706,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
             snapshot: snapshot,
-            currentUser: snapshot.usersByID[currentUserID]
-        )
+            currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         await model.prepareSelectedTimelinePresentation()
         XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [message.id])
 
@@ -773,8 +771,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
             let model = MainShellViewModel(
                 selection: route.1,
                 snapshot: snapshot,
-                currentUser: snapshot.usersByID[currentUserID]
-            )
+                currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
             await model.prepareSelectedTimelinePresentation()
             XCTAssertEqual(model.selectedTimelineMessageGroups.flatMap(\.messages).map(\.message.id), [message.id])
@@ -801,8 +798,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: firstID),
             snapshot: snapshot,
-            currentUser: snapshot.usersByID[currentUserID]
-        )
+            currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         await model.prepareSelectedTimelinePresentation()
 
         model.selectChannel(secondID)
@@ -833,8 +829,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
             runtimeMode: .liveManual,
             sessionState: .connected,
             currentUser: snapshot.usersByID[currentUserID],
-            messageController: controller
-        )
+            messageController: controller, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectChannel(channelID)
         try? await Task.sleep(for: .milliseconds(30))
 
@@ -867,8 +862,7 @@ final class Phase39StartupAuthStabilizationTests: XCTestCase {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
             snapshot: snapshot,
-            currentUser: snapshot.usersByID[currentUserID]
-        )
+            currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         await model.prepareSelectedTimelinePresentation()
 
         var deletedSnapshot = snapshot

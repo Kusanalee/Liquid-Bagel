@@ -14,20 +14,20 @@ import XCTest
 extension StoatFeaturesTests {
     @MainActor
     func testCurrentUserExcludedFromTypingDisplayAndUnreadClearsOnSelection() {
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         let channelID = server.channelIDs[1]
-        snapshot.typingUsersByChannelID[channelID, default: []].insert(MockShellData.currentUserID)
-        let model = MainShellViewModel(snapshot: snapshot)
+        snapshot.typingUsersByChannelID[channelID, default: []].insert(TestShellData.currentUserID)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.selectChannel(channelID)
 
-        XCTAssertFalse(model.typingUsers(for: channelID).contains { $0.id == MockShellData.currentUserID })
+        XCTAssertFalse(model.typingUsers(for: channelID).contains { $0.id == TestShellData.currentUserID })
         XCTAssertNil(model.unread(for: channelID)?.lastMessageID)
     }
 
     func testSelectionRestorerRestoresPersistedServerAndChannel() throws {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = try XCTUnwrap(snapshot.serversByID.values.first { $0.name == "Bagel Lab" })
         let channel = try XCTUnwrap(snapshot.channelsByID.values.first { $0.displayName == "macos-native" })
         let preferences = AppPreferences(lastSelectedServerID: server.id, lastSelectedChannelID: channel.id)
@@ -46,7 +46,7 @@ extension StoatFeaturesTests {
     }
 
     func testSelectionRestorerFallsBackToFirstTextChannelWhenChannelMissing() throws {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = try XCTUnwrap(snapshot.serversByID.values.first { $0.name == "Bagel Lab" })
         let preferences = AppPreferences(lastSelectedServerID: server.id, lastSelectedChannelID: "missing")
 
@@ -69,7 +69,7 @@ extension StoatFeaturesTests {
         let result = ShellSelectionRestorer().restore(
             preferredSelection: nil,
             preferences: preferences,
-            snapshot: MockShellData.snapshot,
+            snapshot: TestShellData.snapshot,
             mode: .liveManual
         )
 
@@ -113,7 +113,7 @@ extension StoatFeaturesTests {
         let result = ShellSelectionRestorer().restore(
             preferredSelection: ShellSelection(space: .home),
             preferences: .defaults,
-            snapshot: MockShellData.snapshot,
+            snapshot: TestShellData.snapshot,
             mode: .liveManual
         )
 
@@ -125,11 +125,11 @@ extension StoatFeaturesTests {
     func testReadyEventUpdatesHydrationStatus() async throws {
         let store = InMemoryTokenStore(credential: .sessionToken("token"))
         let ready = StoatGatewayEvent.ready(ReadyPayload(
-            users: Array(MockShellData.snapshot.usersByID.values),
-            servers: Array(MockShellData.snapshot.serversByID.values),
-            channels: Array(MockShellData.snapshot.channelsByID.values),
-            members: MockShellData.snapshot.membersByServerAndUserID.values.map { $0 },
-            channelUnreads: Array(MockShellData.snapshot.unreadsByChannelID.values)
+            users: Array(TestShellData.snapshot.usersByID.values),
+            servers: Array(TestShellData.snapshot.serversByID.values),
+            channels: Array(TestShellData.snapshot.channelsByID.values),
+            members: TestShellData.snapshot.membersByServerAndUserID.values.map { $0 },
+            channelUnreads: Array(TestShellData.snapshot.unreadsByChannelID.values)
         ))
         let realtime = RecordingRealtimeClient(statesOnConnect: [.connecting, .authenticated, .ready], eventsOnConnect: [ready])
         let session = AppSessionCoordinator(
@@ -143,8 +143,8 @@ extension StoatFeaturesTests {
         try await Task.sleep(for: .milliseconds(50))
 
         XCTAssertTrue(session.hydrationStatus.readyReceived)
-        XCTAssertEqual(session.hydrationStatus.serverCount, MockShellData.snapshot.serversByID.count)
-        XCTAssertEqual(session.hydrationStatus.channelCount, MockShellData.snapshot.channelsByID.count)
+        XCTAssertEqual(session.hydrationStatus.serverCount, TestShellData.snapshot.serversByID.count)
+        XCTAssertEqual(session.hydrationStatus.channelCount, TestShellData.snapshot.channelsByID.count)
         XCTAssertNil(session.hydrationStatus.warning)
     }
 
@@ -166,7 +166,7 @@ extension StoatFeaturesTests {
             realtimeClientFactory: { realtime }
         )
 
-        await session.startMockSession()
+        await session.loadPreferences()
         await session.connectLiveManually()
         await session.reconnectLiveManually()
 
@@ -180,11 +180,11 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testRefreshBehaviorByRuntimeState() async throws {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.refreshCurrentContext()
         XCTAssertEqual(model.placeholderStatus, "Mock data refreshed")
 
-        let live = MainShellViewModel(runtimeMode: .liveManual, sessionState: .readyToConnect, currentUser: nil)
+        let live = MainShellViewModel(runtimeMode: .liveManual, sessionState: .readyToConnect, currentUser: nil, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         live.refreshCurrentContext()
         XCTAssertEqual(live.placeholderStatus, "Reconnect to refresh live state")
     }
@@ -199,7 +199,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testCommandRouterOpensQuickSwitcherAndFocusesComposer() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         XCTAssertTrue(model.canPerform(.openQuickSwitcher))
 
         model.perform(.openQuickSwitcher)
@@ -218,7 +218,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testCommandRouterUnavailableCommandsNoOpSafely() {
-        let model = MainShellViewModel(snapshot: RealtimeSnapshot())
+        let model = MainShellViewModel(snapshot: RealtimeSnapshot(), currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         XCTAssertFalse(model.canPerform(.selectServer(index: 1)))
         model.perform(.selectServer(index: 1))
@@ -232,12 +232,11 @@ extension StoatFeaturesTests {
             preferencesStore: store,
             apiClientFactory: { _, _ in RecordingAPIClient() }
         )
-        await session.startMockSession()
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, sessionCoordinator: session)
+        await session.loadPreferences()
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], sessionCoordinator: session, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.syncFromSessionCoordinator()
 
         model.perform(.refresh)
-        XCTAssertEqual(model.placeholderStatus, "Mock data refreshed")
 
         model.perform(.toggleMemberPanel)
         try await Task.sleep(for: .milliseconds(30))
@@ -254,8 +253,8 @@ extension StoatFeaturesTests {
             preferencesStore: InMemoryAppPreferencesStore(preferences: preferences),
             apiClientFactory: { _, _ in RecordingAPIClient() }
         )
-        await session.startMockSession()
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, sessionCoordinator: session)
+        await session.loadPreferences()
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], sessionCoordinator: session, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.syncFromSessionCoordinator()
 
@@ -265,7 +264,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testQuickSwitcherIndexesFiltersAndActivatesLocalResults() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.perform(.openQuickSwitcher)
 
         XCTAssertTrue(model.quickSwitcherViewModel.results.contains { $0.title == "Bagel Lab" })
@@ -288,7 +287,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testQuickSwitcherEmptySnapshotStillShowsRoutesAndCommands() {
-        let model = MainShellViewModel(snapshot: RealtimeSnapshot())
+        let model = MainShellViewModel(snapshot: RealtimeSnapshot(), currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.perform(.openQuickSwitcher)
         let titles = model.quickSwitcherViewModel.results.map(\.title)
 
@@ -298,7 +297,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testNavigationHelpersMoveServersChannelsAndUnreadChannels() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let lab = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(lab.id)
         XCTAssertEqual(model.selectedChannel?.displayName, "general")
@@ -315,7 +314,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testNavigationPausesWhileComposerFocused() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         model.requestFocus(.composer)
 
@@ -326,7 +325,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testTimelineSelectionMovesFallsBackAndCopiesContentOnly() async {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
 
         model.perform(.selectNextMessage)
@@ -391,11 +390,11 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase9InlineEditStateSavesAndPreservesComposerDraft() async {
-        let handler = MockMessageActionHandler()
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let handler = StubMessageActionHandler()
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = model.selection.channelID!
-        let ownMessage = model.selectedTimelineMessages.first { $0.message.authorID == MockShellData.currentUserID }!
+        let ownMessage = model.selectedTimelineMessages.first { $0.message.authorID == TestShellData.currentUserID }!
 
         model.updateDraft("composer survives", for: channelID)
         model.beginEditing(ownMessage)
@@ -414,10 +413,10 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase9DeleteDiscardAndSelectionFallback() async {
-        let handler = MockMessageActionHandler()
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let handler = StubMessageActionHandler()
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
-        let ownMessage = model.selectedTimelineMessages.first { $0.message.authorID == MockShellData.currentUserID }!
+        let ownMessage = model.selectedTimelineMessages.first { $0.message.authorID == TestShellData.currentUserID }!
         model.timelineSelection = TimelineSelection(channelID: ownMessage.message.channelID, messageID: ownMessage.message.id)
 
         model.requestDelete(ownMessage)
@@ -431,8 +430,8 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase9FailedMessageDiscardDoesNotCallAPIAndCommandsPauseWhileEditing() async {
-        let handler = MockMessageActionHandler(sendError: MessageActionError.unavailable("send failed"))
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let handler = StubMessageActionHandler(sendError: MessageActionError.unavailable("send failed"))
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = model.selection.channelID!
         model.updateDraft("hello", for: channelID)
@@ -446,17 +445,17 @@ extension StoatFeaturesTests {
         let deletedCount = await handler.deletedMessages.count
         XCTAssertEqual(deletedCount, 0)
 
-        model.beginEditing(model.selectedTimelineMessages.first { $0.message.authorID == MockShellData.currentUserID }!)
+        model.beginEditing(model.selectedTimelineMessages.first { $0.message.authorID == TestShellData.currentUserID }!)
         XCTAssertFalse(model.canPerform(.copySelectedMessage))
     }
 
     @MainActor
     func testPhase9PinReactionAndJumpCommandsRouteThroughSelection() async throws {
-        let handler = MockMessageActionHandler()
-        var snapshot = MockShellData.snapshot
+        let handler = StubMessageActionHandler()
+        var snapshot = TestShellData.snapshot
         let channelID = try XCTUnwrap(snapshot.channelsByID.values.first { $0.displayName == "general" }?.id)
         snapshot.channelsByID[channelID]?.permissions = [.viewChannel, .readMessageHistory, .sendMessage, .react, .manageMessages]
-        let model = MainShellViewModel(snapshot: snapshot, messageActionHandler: handler)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         model.selectChannel(channelID)
         let message = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
         model.timelineSelection = TimelineSelection(channelID: channelID, messageID: message.message.id)
@@ -471,7 +470,7 @@ extension StoatFeaturesTests {
         try await Task.sleep(for: .milliseconds(30))
         let reactionCount = await handler.addedReactions.count
         XCTAssertEqual(reactionCount, 1)
-        XCTAssertEqual(model.selectedTimelineMessage?.message.reactions["✅"], [MockShellData.currentUserID])
+        XCTAssertEqual(model.selectedTimelineMessage?.message.reactions["✅"], [TestShellData.currentUserID])
 
         model.jumpToNewestMessage()
         XCTAssertEqual(model.timelineSelection.messageID, model.selectedTimelineMessages.last?.message.id)
@@ -479,7 +478,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase9LocalUnreadStatePreservesMentionAndJumpsFirstUnread() throws {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channel = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "macos-native" })
 
         model.selectChannel(channel.id)
@@ -493,7 +492,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase58MarkChannelReadCommandRoutes() throws {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channel = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "macos-native" })
         model.selectChannel(channel.id)
         let mentionCountBefore = model.localReadStates[channel.id]?.mentionCount ?? 0
@@ -515,7 +514,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase58MarkServerReadCommandActsOnEveryChannel() throws {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channel = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "macos-native" })
         guard let serverID = channel.serverID else {
             XCTFail("Expected a server channel")
@@ -533,7 +532,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase58MarkChannelAndServerReadDisabledWithoutSelection() {
-        let model = MainShellViewModel(snapshot: RealtimeSnapshot())
+        let model = MainShellViewModel(snapshot: RealtimeSnapshot(), currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         XCTAssertFalse(model.canPerform(.markSelectedChannelRead))
         XCTAssertFalse(model.canPerform(.markSelectedServerRead))
     }
@@ -562,8 +561,8 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase10ReplyContextComposerAndSendPayload() async throws {
-        let handler = MockMessageActionHandler()
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let handler = StubMessageActionHandler()
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
         let target = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
@@ -584,7 +583,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase10CancelReplyPreservesDraftAndCommandsGateWhileTyping() throws {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
         let target = try XCTUnwrap(model.selectedTimelineMessages.first { $0.status == .confirmed })
@@ -603,14 +602,13 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase10LiveAckDebouncesAndClearsMentionAfterSuccess() async throws {
-        let channelID = try XCTUnwrap(MockShellData.snapshot.channelsByID.values.first { $0.displayName == "macos-native" }?.id)
+        let channelID = try XCTUnwrap(TestShellData.snapshot.channelsByID.values.first { $0.displayName == "macos-native" }?.id)
         let sender = RecordingChannelAckSender()
         let model = MainShellViewModel(
-            snapshot: MockShellData.snapshot,
+            snapshot: TestShellData.snapshot,
             runtimeMode: .liveManual,
             sessionState: .connected,
-            channelAckSender: sender
-        )
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), channelAckSender: sender, communityAPIClient: StubStoatAPIClient())
 
         model.selectChannel(channelID)
         model.updateTimelineAtNewest(true)
@@ -624,7 +622,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase10MissingFirstUnreadIsRecoverableStatus() throws {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channel = try XCTUnwrap(model.snapshot.channelsByID.values.first { $0.displayName == "macos-native" })
         model.selectChannel(channel.id)
         model.localReadStates[channel.id] = LocalReadState(channelID: channel.id, firstUnreadMessageID: "missing", unreadCount: 1, mentionCount: 1)
@@ -700,8 +698,8 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase11FailedSendPreservesRetryMetadataAndPreventsDoubleRetry() async throws {
-        let handler = MockMessageActionHandler(sendError: MessageActionError.unavailable("offline"))
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let handler = StubMessageActionHandler(sendError: MessageActionError.unavailable("offline"))
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
         let channelID = try XCTUnwrap(model.selection.channelID)
         let target = try XCTUnwrap(model.selectedTimelineMessages.first)

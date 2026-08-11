@@ -13,21 +13,21 @@ import XCTest
 
 extension StoatFeaturesTests {
     func testMockSnapshotSourceEmitsInitialSnapshot() async {
-        var iterator = MockShellSnapshotSource(snapshot: MockShellData.snapshot).updates.makeAsyncIterator()
+        var iterator = StaticShellSnapshotSource(snapshot: TestShellData.snapshot).updates.makeAsyncIterator()
         let update = await iterator.next()
 
-        XCTAssertEqual(update?.snapshot, MockShellData.snapshot)
+        XCTAssertEqual(update?.snapshot, TestShellData.snapshot)
     }
 
     @MainActor
     func testViewModelObservesSnapshotAndKeepsValidSelection() async throws {
-        let source = MutableSnapshotSource(snapshot: MockShellData.snapshot)
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, snapshotSource: source)
+        let source = MutableSnapshotSource(snapshot: TestShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], snapshotSource: source, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let selected = try XCTUnwrap(model.selection.channelID)
 
-        source.yield(MockShellData.snapshot)
+        source.yield(TestShellData.snapshot)
         try await Task.sleep(for: .milliseconds(30))
 
         XCTAssertEqual(model.selection.channelID, selected)
@@ -35,12 +35,12 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testDeletedSelectedChannelFallsBackSafely() async throws {
-        let source = MutableSnapshotSource(snapshot: MockShellData.snapshot)
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, snapshotSource: source)
+        let source = MutableSnapshotSource(snapshot: TestShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], snapshotSource: source, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
         let deleted = try XCTUnwrap(model.selection.channelID)
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         snapshot.channelsByID.removeValue(forKey: deleted)
         snapshot.serversByID[server.id]?.channelIDs.removeAll { $0 == deleted }
 
@@ -53,11 +53,11 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testDeletedSelectedServerFallsBackHome() async throws {
-        let source = MutableSnapshotSource(snapshot: MockShellData.snapshot)
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, snapshotSource: source)
+        let source = MutableSnapshotSource(snapshot: TestShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], snapshotSource: source, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
         model.selectServer(server.id)
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         snapshot.serversByID.removeValue(forKey: server.id)
 
         source.yield(snapshot)
@@ -70,9 +70,9 @@ extension StoatFeaturesTests {
     func testMessageLoadingUsesSnapshotInMockModeAndDoesNotCallAPI() async {
         let api = RecordingAPIClient()
         let controller = ChannelMessageController(runtimeMode: .mock, apiClient: api)
-        let channelID = MockShellData.snapshot.messagesByChannelID.keys.first!
+        let channelID = TestShellData.snapshot.messagesByChannelID.keys.first!
 
-        await controller.loadInitialMessages(channelID: channelID, snapshotMessages: MockShellData.snapshot.messagesByChannelID[channelID] ?? [])
+        await controller.loadInitialMessages(channelID: channelID, snapshotMessages: TestShellData.snapshot.messagesByChannelID[channelID] ?? [])
 
         XCTAssertTrue(controller.state(for: channelID).hasMessages)
         let fetchMessagesCallCount = await api.fetchMessagesCallCount

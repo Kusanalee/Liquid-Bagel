@@ -16,7 +16,7 @@ extension StoatFeaturesTests {
     func testAccountSessionViewModelLoadsRenamesAndRevokesSessions() async throws {
         let currentID: SessionID = "01J00000000000000000000001"
         let otherID: SessionID = "01J00000010000000000000001"
-        let manager = MockSessionManager(sessions: [
+        let manager = StubSessionManager(sessions: [
             SessionInfo(id: currentID, name: "Mac"),
             SessionInfo(id: otherID, name: "Phone")
         ])
@@ -43,7 +43,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testAccountSessionViewModelStatesAndValidation() async {
         let empty = AccountSessionViewModel(
-            sessionManager: MockSessionManager(),
+            sessionManager: StubSessionManager(),
             credentialProvider: { .sessionToken("secret") }
         )
 
@@ -54,7 +54,7 @@ extension StoatFeaturesTests {
         XCTAssertTrue(empty.errorMessage?.contains("cannot be blank") == true)
 
         let failing = AccountSessionViewModel(
-            sessionManager: MockSessionManager(error: MessageActionError.unavailable("api failed")),
+            sessionManager: StubSessionManager(error: MessageActionError.unavailable("api failed")),
             credentialProvider: { .sessionToken("secret") }
         )
         await failing.refreshSessions()
@@ -67,7 +67,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testRevokeAllOtherSessionsUsesRevokeSelfFalse() async {
-        let manager = MockSessionManager(sessions: [
+        let manager = StubSessionManager(sessions: [
             SessionInfo(id: "01J00000000000000000000001", name: "Mac"),
             SessionInfo(id: "01J00000010000000000000001", name: "Phone")
         ])

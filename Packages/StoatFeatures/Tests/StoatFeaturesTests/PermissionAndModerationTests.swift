@@ -57,12 +57,12 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase26MemberRoleAssignmentRequiresDiffConfirmation() async {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         let targetUserID: UserID = "01HX0000000000000000000002"
         let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
         let targetMember = snapshot.membersByServerAndUserID[targetKey]!
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.selectServer(server.id)
         model.openServerOverview()
@@ -84,9 +84,9 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase26PermissionEditorShowsDiffAndSavesThroughMockAPI() async {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let key = Phase26Permissions.editableKeys.first { $0.permission == .managePermissions }!
 
         model.selectServer(server.id)
@@ -109,12 +109,12 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase42MemberModerationUsesCentralConfirmationAndDoesNotAutoLoadBans() async {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         let targetUserID: UserID = "01HX0000000000000000000002"
         let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
         let targetMember = snapshot.membersByServerAndUserID[targetKey]!
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.selectServer(server.id)
         model.openServerOverview()
@@ -313,8 +313,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            currentUser: snapshot.usersByID[current]
-        )
+            currentUser: snapshot.usersByID[current], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selection.channelID = nil
 
         let beforeChannels = model.channelsForServerInvocationCount
@@ -365,8 +364,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            currentUser: snapshot.usersByID[current]
-        )
+            currentUser: snapshot.usersByID[current], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         let beforeChannels = model.channelsForServerInvocationCount
         let state = model.memberModerationMenuState(targetUserID: target, member: targetMember)
@@ -403,8 +401,7 @@ extension StoatFeaturesTests {
             snapshot: snapshot,
             runtimeMode: .liveManual,
             sessionState: .connected,
-            currentUser: snapshot.usersByID[current]
-        )
+            currentUser: snapshot.usersByID[current], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         XCTAssertFalse(model.memberModerationMenuState(targetUserID: target, member: targetMember)[.ban].isDisabled)
         model.sessionState = .signedOut
@@ -451,8 +448,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelIDs[0]),
             snapshot: snapshot,
             runtimeMode: .mock,
-            currentUser: users[current]
-        )
+            currentUser: users[current], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         let beforeChannels = model.channelsForServerInvocationCount
         let beforePermissionMisses = model.moderationCacheDiagnostics.permissionResolutionCacheMisses
@@ -502,8 +498,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            currentUser: snapshot.usersByID[current]
-        )
+            currentUser: snapshot.usersByID[current], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         let beforeRenderLookup = model.moderationCacheDiagnostics
         let preparing = model.cachedMemberModerationMenuState(targetUserID: target, member: targetMember)
@@ -551,8 +546,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            currentUser: snapshot.usersByID[current]
-        )
+            currentUser: snapshot.usersByID[current], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.memberPanelBecameVisibleForModerationPrewarm()
         let afterFirstPrewarm = model.phase46FreezePreventionDiagnostics
@@ -595,8 +589,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            currentUser: snapshot.usersByID[current]
-        )
+            currentUser: snapshot.usersByID[current], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         await model.memberPanelBecameVisibleForModerationPrewarm()
         let preparedKey = model.phase46MemberPanelPrewarmState.preparedKey
         let token = model.memberPanelModerationPrewarmToken
@@ -616,13 +609,13 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase42BanAndUnbanPatchListsWithoutReaddingMember() async {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         let targetUserID: UserID = "01HX0000000000000000000003"
         let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
         let targetMember = snapshot.membersByServerAndUserID[targetKey]!
-        let api = MockStoatAPIClient()
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: api)
+        let api = StubStoatAPIClient()
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.selectServer(server.id)
         await model.refreshBanList()
@@ -653,12 +646,12 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase42KickPreservesIdentityAndFailurePreservesMember() async {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         let targetUserID: UserID = "01HX0000000000000000000003"
         let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
         let targetMember = snapshot.membersByServerAndUserID[targetKey]!
-        let failingModel = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: RecordingAPIClient())
+        let failingModel = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: RecordingAPIClient())
 
         failingModel.selectServer(server.id)
         failingModel.requestModerationAction(.kick, targetUserID: targetUserID, member: targetMember)
@@ -668,7 +661,7 @@ extension StoatFeaturesTests {
             return XCTFail("Expected failed moderation state")
         }
 
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(server.id)
         model.requestModerationAction(.kick, targetUserID: targetUserID, member: targetMember)
         await model.confirmPendingModerationAction()
@@ -678,12 +671,12 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase42TimeoutPresetAndRemoveTimeoutUpdateMember() async {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         let targetUserID: UserID = "01HX0000000000000000000002"
         let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
         let targetMember = snapshot.membersByServerAndUserID[targetKey]!
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: MockStoatAPIClient())
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.selectServer(server.id)
         model.requestModerationAction(.timeout, targetUserID: targetUserID, member: targetMember)
@@ -745,9 +738,9 @@ extension StoatFeaturesTests {
     }
 
     @MainActor func testCapabilityCachePopulatedOnInit() {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(server.id)
         let caps = model.serverManagementCapabilities()
         // Mock mode is always connected — cache must reflect this immediately without re-scanning channels.
@@ -756,9 +749,9 @@ extension StoatFeaturesTests {
     }
 
     @MainActor func testCapabilityCacheUpdatesWhenSnapshotChanges() {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(server.id)
 
         let before = model.cachedServerCapabilities
@@ -771,9 +764,9 @@ extension StoatFeaturesTests {
     }
 
     @MainActor func testCapabilityCacheUpdatesWhenSelectionChanges() {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         let beforeSelect = model.cachedServerCapabilities
         model.selectServer(server.id)
@@ -782,12 +775,12 @@ extension StoatFeaturesTests {
     }
 
     @MainActor func testMemberActionDisabledReasonUsesCache() {
-        let snapshot = MockShellData.snapshot
+        let snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         let targetUserID: UserID = "01HX0000000000000000000002"
         let targetKey = ServerMemberKey(serverID: server.id, userID: targetUserID)
         let targetMember = snapshot.membersByServerAndUserID[targetKey]!
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(server.id)
 
         // Call four times — this should read from the cache each time, not re-scan channels.
@@ -814,7 +807,7 @@ extension StoatFeaturesTests {
             serversByID: [server.id: server],
             channelsByID: [ch1.id: ch1, ch2.id: ch2]
         )
-        let model = MainShellViewModel(snapshot: snap, runtimeMode: .mock)
+        let model = MainShellViewModel(snapshot: snap, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channels = model.channels(for: serverID)
         // Ordered by channelIDs list (ch2 first), NOT alphabetically.
         XCTAssertEqual(channels.map(\.id), [ch2.id, ch1.id])
@@ -882,7 +875,7 @@ extension StoatFeaturesTests {
         snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userOrdinary)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userOrdinary), joinedAt: Date(), roles: [ordinaryID])
         snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userBot)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userBot), joinedAt: Date(), roles: [])
         snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userUnknown)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userUnknown), joinedAt: Date(), roles: ["phase37-missing-role"])
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.prepareMemberListGroups(for: serverID)
         let groups = model.cachedMemberListGroups(for: serverID)
@@ -911,7 +904,7 @@ extension StoatFeaturesTests {
         snapshot.usersByID[userID] = User(id: userID, username: "helper", displayName: "Helper", status: UserStatus(text: "Testing", presence: .focus), bot: BotInformation(ownerID: ownerID))
         snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date(), roles: [roleID])
         let api = RecordingAPIClient(currentUser: snapshot.usersByID[ownerID]!, profilesByUserID: [userID: UserProfile(content: "**hello**")])
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, communityAPIClient: api)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         model.showUserProfile(userID, source: .memberRow, serverID: serverID)
         try await Task.sleep(for: .milliseconds(30))
@@ -942,7 +935,7 @@ extension StoatFeaturesTests {
         snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: userID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date())
         snapshot.messagesByChannelID[channelID] = [Message(id: "01J00000000000000000370001", channelID: channelID, authorID: userID, content: "hello **markdown**")]
         let loader = SlowImageResourceLoader(delayNanoseconds: 500_000_000)
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, imageResourceLoader: loader)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
 
         await model.prepareMemberListGroups(for: serverID)
         await model.prepareMemberListGroups(for: serverID)
@@ -976,8 +969,7 @@ extension StoatFeaturesTests {
         let server = Server(id: "phase44-server", ownerID: rawAuthorID, name: "Phase44", channelIDs: [channelID])
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: channelID),
-            snapshot: RealtimeSnapshot(serversByID: [server.id: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [original, reply, missingReply]])
-        )
+            snapshot: RealtimeSnapshot(serversByID: [server.id: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [original, reply, missingReply]]), currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         let loaded = model.replyPreviewState(for: reply)
         XCTAssertEqual(loaded?.resolution, .loaded)
@@ -998,8 +990,7 @@ extension StoatFeaturesTests {
         let server = Server(id: "phase44-server", ownerID: "phase44-author", name: "Phase44", channelIDs: [channelID])
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: channelID),
-            snapshot: RealtimeSnapshot(serversByID: [server.id: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [original, reply]])
-        )
+            snapshot: RealtimeSnapshot(serversByID: [server.id: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [original, reply]]), currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.openReplyPreview(for: reply)
 

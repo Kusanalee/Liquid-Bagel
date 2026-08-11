@@ -227,7 +227,7 @@ actor RecordingAPIClient: StoatAPIClient {
     private let removeGroupRecipientError: (any Error & Sendable)?
 
     init(
-        currentUser: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
+        currentUser: User = User(id: TestShellData.currentUserID, username: "liquidbagel"),
         messagesByChannel: [ChannelID: [Message]] = [:],
         membersByServer: [ServerID: [ServerMember]] = [:],
         usersByServer: [ServerID: [User]] = [:],
@@ -609,11 +609,11 @@ actor RecordingAttachmentMessageActionHandler: MessageActionHandling {
         let files = attachments?.map {
             File(id: $0, tag: "attachments", filename: "\($0.rawValue).txt", contentType: "text/plain", size: 1)
         }
-        return Message(id: "01J00000100000000000009999", channelID: channelID, authorID: MockShellData.currentUserID, content: content, nonce: nonce, attachments: files, replies: replies?.map(\.id))
+        return Message(id: "01J00000100000000000009999", channelID: channelID, authorID: TestShellData.currentUserID, content: content, nonce: nonce, attachments: files, replies: replies?.map(\.id))
     }
 
     func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
-        Message(id: messageID, channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+        Message(id: messageID, channelID: channelID, authorID: TestShellData.currentUserID, content: content)
     }
 
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
@@ -637,7 +637,7 @@ actor DelayedMessageActionHandler: MessageActionHandling {
         return Message(
             id: "01J00000100000000000030000",
             channelID: channelID,
-            authorID: MockShellData.currentUserID,
+            authorID: TestShellData.currentUserID,
             content: content,
             nonce: nonce,
             replies: replies?.map(\.id)
@@ -645,7 +645,7 @@ actor DelayedMessageActionHandler: MessageActionHandling {
     }
 
     func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
-        Message(id: messageID, channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+        Message(id: messageID, channelID: channelID, authorID: TestShellData.currentUserID, content: content)
     }
 
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
@@ -669,11 +669,11 @@ actor Phase59ReactionHandler: MessageActionHandling {
     }
 
     func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]?, attachments: [FileID]?) async throws -> Message {
-        Message(id: "phase59-send", channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+        Message(id: "phase59-send", channelID: channelID, authorID: TestShellData.currentUserID, content: content)
     }
 
     func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
-        Message(id: messageID, channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+        Message(id: messageID, channelID: channelID, authorID: TestShellData.currentUserID, content: content)
     }
 
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
@@ -761,11 +761,11 @@ actor ImageAttachmentMessageActionHandler: MessageActionHandling {
         let files = attachments?.map {
             File(id: $0, tag: "attachments", filename: "\($0.rawValue).png", metadata: .image(width: 1, height: 1, thumbhash: nil, animated: false), contentType: "image/png", size: 8)
         }
-        return Message(id: "01J00000100000000000020000", channelID: channelID, authorID: MockShellData.currentUserID, content: content, nonce: nonce, attachments: files, replies: replies?.map(\.id))
+        return Message(id: "01J00000100000000000020000", channelID: channelID, authorID: TestShellData.currentUserID, content: content, nonce: nonce, attachments: files, replies: replies?.map(\.id))
     }
 
     func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
-        Message(id: messageID, channelID: channelID, authorID: MockShellData.currentUserID, content: content)
+        Message(id: messageID, channelID: channelID, authorID: TestShellData.currentUserID, content: content)
     }
 
     func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {}
@@ -782,7 +782,7 @@ struct StubSessionValidator: SessionValidating {
     var error: (any Error & Sendable)?
 
     init(
-        user: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
+        user: User = User(id: TestShellData.currentUserID, username: "liquidbagel"),
         error: (any Error & Sendable)? = nil
     ) {
         self.user = user
@@ -803,7 +803,7 @@ actor RecordingSessionValidator: SessionValidating {
     private(set) var validateCallCount = 0
 
     init(
-        user: User = User(id: MockShellData.currentUserID, username: "liquidbagel"),
+        user: User = User(id: TestShellData.currentUserID, username: "liquidbagel"),
         errors: [any Error & Sendable] = []
     ) {
         self.user = user

@@ -24,7 +24,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testInitialSelectionDefaultsToHome() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         XCTAssertEqual(model.selection.space, .home)
         XCTAssertNil(model.selection.serverID)
         XCTAssertNil(model.selection.channelID)
@@ -32,7 +32,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testSelectingServerUpdatesSelectionAndAutoSelectsFirstTextChannel() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = model.servers.first { $0.name == "Bagel Lab" }!
 
         model.selectServer(server.id)
@@ -45,7 +45,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testSelectingChannelUpdatesChannelAndServerRoute() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channel = model.snapshot.channelsByID.values.first { $0.displayName == "macos-native" }!
 
         model.selectChannel(channel.id)
@@ -57,7 +57,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testHomeAndDiscoverClearServerChannelSelection() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.selectServer(model.servers[0].id)
 
         model.selectHome()
@@ -73,7 +73,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testToggleMemberPanel() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         XCTAssertTrue(model.selection.isMemberPanelVisible)
         model.toggleMemberPanel()
         XCTAssertFalse(model.selection.isMemberPanelVisible)
@@ -81,18 +81,17 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testInvalidSelectedChannelFallsBackSafely() {
-        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let server = TestShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: "missing"),
-            snapshot: MockShellData.snapshot
-        )
+            snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         XCTAssertEqual(model.selectedChannel?.displayName, "general")
     }
 
     @MainActor
     func testServerIndexSelectionHandlesValidAndOutOfRangeIndexes() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         model.selectServer(atOneBasedIndex: 1)
         XCTAssertEqual(model.selection.serverID, model.servers[0].id)

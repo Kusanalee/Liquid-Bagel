@@ -713,10 +713,10 @@ public protocol ShellSnapshotSource: Sendable {
     func currentSnapshot() async -> RealtimeSnapshot
 }
 
-public struct MockShellSnapshotSource: ShellSnapshotSource {
+public struct StaticShellSnapshotSource: ShellSnapshotSource {
     private let snapshot: RealtimeSnapshot
 
-    public init(snapshot: RealtimeSnapshot = MockShellData.snapshot) {
+    public init(snapshot: RealtimeSnapshot = RealtimeSnapshot()) {
         self.snapshot = snapshot
     }
 
@@ -779,95 +779,6 @@ public protocol MessageActionHandling: Sendable {
     func endTyping(channelID: ChannelID) async throws
 }
 
-public actor MockMessageActionHandler: MessageActionHandling {
-    public private(set) var sentMessages: [Message] = []
-    public private(set) var editedMessages: [(ChannelID, MessageID, String)] = []
-    public private(set) var deletedMessages: [(ChannelID, MessageID)] = []
-    public private(set) var addedReactions: [(ChannelID, MessageID, String)] = []
-    public private(set) var removedReactions: [(ChannelID, MessageID, String)] = []
-    public private(set) var pinnedMessages: [(ChannelID, MessageID)] = []
-    public private(set) var unpinnedMessages: [(ChannelID, MessageID)] = []
-    public private(set) var typingEvents: [ClientGatewayEvent] = []
-
-    private let currentUserID: UserID
-    private var nextMessageCounter = 0
-    private var sendError: (any Error & Sendable)?
-
-    public init(currentUserID: UserID = MockShellData.currentUserID, sendError: (any Error & Sendable)? = nil) {
-        self.currentUserID = currentUserID
-        self.sendError = sendError
-    }
-
-    public func setSendError(_ error: (any Error & Sendable)?) {
-        sendError = error
-    }
-
-    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil, attachments: [FileID]? = nil) async throws -> Message {
-        if let sendError {
-            throw sendError
-        }
-        nextMessageCounter += 1
-        let files = attachments?.map {
-            File(id: $0, tag: "attachments", filename: "\($0.rawValue)", contentType: "application/octet-stream", size: 0)
-        }
-        let message = Message(
-            id: MessageID(rawValue: Self.mockMessageID(counter: nextMessageCounter)),
-            channelID: channelID,
-            authorID: currentUserID,
-            content: content,
-            nonce: nonce,
-            attachments: files,
-            replies: replies?.map(\.id)
-        )
-        sentMessages.append(message)
-        return message
-    }
-
-    public func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
-        editedMessages.append((channelID, messageID, content))
-        return Message(id: messageID, channelID: channelID, authorID: currentUserID, content: content, editedAt: Date())
-    }
-
-    public func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {
-        deletedMessages.append((channelID, messageID))
-    }
-
-    public func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
-        addedReactions.append((channelID, messageID, emoji))
-    }
-
-    public func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
-        removedReactions.append((channelID, messageID, emoji))
-    }
-
-    public func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {
-        pinnedMessages.append((channelID, messageID))
-    }
-
-    public func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {
-        unpinnedMessages.append((channelID, messageID))
-    }
-
-    public func beginTyping(channelID: ChannelID) async throws {
-        typingEvents.append(.beginTyping(channel: channelID))
-    }
-
-    public func endTyping(channelID: ChannelID) async throws {
-        typingEvents.append(.endTyping(channel: channelID))
-    }
-
-    private static func mockMessageID(counter: Int) -> String {
-        let timestamp = UInt64(Date().timeIntervalSince1970 * 1000)
-        let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
-        var value = timestamp
-        var prefix = Array(repeating: alphabet[0], count: 10)
-        for index in stride(from: 9, through: 0, by: -1) {
-            prefix[index] = alphabet[Int(value % 32)]
-            value /= 32
-        }
-        return String(prefix) + String(format: "%016X", counter).suffix(16)
-    }
-}
 
 public actor LiveMessageActionHandler: MessageActionHandling {
     private let apiClient: any StoatAPIClient
@@ -985,7 +896,7 @@ public final class ChannelMessageController {
     public init(
         runtimeMode: AppRuntimeMode = .mock,
         apiClient: (any StoatAPIClient)? = nil,
-        currentUserID: UserID? = MockShellData.currentUserID,
+        currentUserID: UserID? = nil,
         pageSize: Int = 50,
         messageCapPerChannel: Int = 250
     ) {
@@ -1609,8 +1520,6 @@ public final class AppSessionCoordinator {
     @ObservationIgnored private let tokenStore: any TokenStore
     @ObservationIgnored private let preferencesStore: any AppPreferencesStore
     @ObservationIgnored private let readyFields: Set<ReadyField>
-    @ObservationIgnored private let mockSnapshot: RealtimeSnapshot
-    @ObservationIgnored private let mockCurrentUserID: UserID
     @ObservationIgnored private let sessionValidator: any SessionValidating
     @ObservationIgnored private let apiClientFactory: @Sendable (StoatAPIEnvironment, any CredentialProvider) -> any StoatAPIClient
     @ObservationIgnored private let realtimeClientFactory: @Sendable () -> any StoatRealtimeClient
@@ -1631,8 +1540,6 @@ public final class AppSessionCoordinator {
         preferencesStore: any AppPreferencesStore = UserDefaultsAppPreferencesStore(),
         environment: StoatAPIEnvironment = .production,
         readyFields: Set<ReadyField> = Set([.users, .servers, .channels, .members, .emojis, .userSettings, .channelUnreads, .policyChanges]),
-        mockSnapshot: RealtimeSnapshot = MockShellData.snapshot,
-        mockCurrentUserID: UserID = MockShellData.currentUserID,
         sessionValidator: (any SessionValidating)? = nil,
         apiClientFactory: @escaping @Sendable (StoatAPIEnvironment, any CredentialProvider) -> any StoatAPIClient = { environment, provider in
             LiveStoatAPIClient(environment: environment, credentialProvider: provider)
@@ -1648,8 +1555,6 @@ public final class AppSessionCoordinator {
         self.preferencesStore = preferencesStore
         self.environment = environment
         self.readyFields = readyFields
-        self.mockSnapshot = mockSnapshot
-        self.mockCurrentUserID = mockCurrentUserID
         self.sessionValidator = sessionValidator ?? LiveSessionValidator(apiClientFactory: apiClientFactory)
         self.apiClientFactory = apiClientFactory
         self.realtimeClientFactory = realtimeClientFactory
@@ -1676,7 +1581,7 @@ public final class AppSessionCoordinator {
         self.startupAuthDiagnostics = StartupAuthDiagnostics()
         self.autoConnectAttemptCount = 0
         self.liveFirstStartupAttemptedEnvironmentIDs = []
-        self.snapshotSource = MockShellSnapshotSource(snapshot: RealtimeSnapshot())
+        self.snapshotSource = StaticShellSnapshotSource(snapshot: RealtimeSnapshot())
         self.messageActionHandler = UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
     }
 
@@ -1684,10 +1589,6 @@ public final class AppSessionCoordinator {
         eventTask?.cancel()
         connectionTask?.cancel()
         diagnosticsTask?.cancel()
-    }
-
-    public func startMockSession() async {
-        await startMockSession(loadStoredPreferences: true)
     }
 
     public func startLiveFirstSession() async {
@@ -1735,31 +1636,6 @@ public final class AppSessionCoordinator {
         await connectLive(source: .startupAuto)
     }
 
-    private func startMockSession(loadStoredPreferences: Bool) async {
-        if loadStoredPreferences {
-            await loadPreferences()
-        }
-        await disconnectActiveRealtime()
-        mode = .mock
-        sessionState = .mock
-        connectionState = .idle
-        diagnostics = nil
-        lastErrorMessage = nil
-        validatedSession = nil
-        pendingValidatedSession = nil
-        mfaChallenge = nil
-        verificationState = LiveVerificationState()
-        hydrationStatus = .empty
-        snapshot = mockSnapshot
-        currentUser = mockSnapshot.usersByID[mockCurrentUserID]
-        snapshotSource = MockShellSnapshotSource(snapshot: mockSnapshot)
-        apiClient = nil
-        messageActionHandler = MockMessageActionHandler(currentUserID: mockCurrentUserID)
-        await refreshCredentialAvailability()
-        if hasSavedCredential {
-            sessionState = .readyToConnect
-        }
-    }
 
     public func loadPreferences() async {
         do {
@@ -2318,10 +2194,6 @@ public final class AppSessionCoordinator {
         verificationState.lastMessageActionResult = result
     }
 
-    public func resetToMock() async {
-        await startMockSession(loadStoredPreferences: false)
-    }
-
     private func startObservingRealtime(realtimeClient: any StoatRealtimeClient, store: RealtimeStateStore) {
         eventTask?.cancel()
         connectionTask?.cancel()
@@ -2420,7 +2292,7 @@ public final class AppSessionCoordinator {
 
     private func installLiveSafeSnapshot() {
         snapshot = RealtimeSnapshot()
-        snapshotSource = MockShellSnapshotSource(snapshot: snapshot)
+        snapshotSource = StaticShellSnapshotSource(snapshot: snapshot)
         hydrationStatus = .empty
     }
 

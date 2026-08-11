@@ -14,7 +14,7 @@ import XCTest
 extension StoatFeaturesTests {
     @MainActor
     func testPhase28TimelineDiagnosticsAvoidNoOpVisibleRangeSpam() async throws {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let server = try XCTUnwrap(model.servers.first)
         model.selectServer(server.id)
         let channelID = try XCTUnwrap(model.selectedConversationChannel?.id)
@@ -46,8 +46,8 @@ extension StoatFeaturesTests {
         snapshot.messagesByChannelID[dmID] = [
             Message(id: "01J00000000000000000290001", channelID: dmID, authorID: otherUserID, content: "hello")
         ]
-        let handler = MockMessageActionHandler(currentUserID: currentUserID)
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: handler)
+        let handler = StubMessageActionHandler(currentUserID: currentUserID)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
 
         model.selectChannel(dmID)
         try? await Task.sleep(for: .milliseconds(25))
@@ -75,7 +75,7 @@ extension StoatFeaturesTests {
         let dmID: ChannelID = "phase29-existing-dm"
         snapshot.usersByID[currentUserID] = User(id: currentUserID, username: "me")
         snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, active: true, recipients: [currentUserID, missingUserID])
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID])
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.openDirectMessage(with: missingUserID)
 
@@ -94,7 +94,7 @@ extension StoatFeaturesTests {
         snapshot.channelsByID[serverChannelID] = Channel(id: serverChannelID, kind: .textChannel, serverID: serverID, name: "general")
         snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, recipients: ["me", "other"])
         let selection = ShellSelection(space: .directMessages, serverID: serverID, channelID: serverChannelID, dmChannelID: dmID)
-        let model = MainShellViewModel(selection: selection, snapshot: snapshot)
+        let model = MainShellViewModel(selection: selection, snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         XCTAssertEqual(model.selectedConversationChannelID, dmID)
         XCTAssertEqual(model.selectedConversationChannel?.id, dmID)
@@ -116,7 +116,7 @@ extension StoatFeaturesTests {
                 nickname: index == 1 ? "Nickname" : nil
             )
         }
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let groups = model.memberListGroups(for: serverID)
         let allItems = groups.flatMap(\.items)
 
@@ -131,11 +131,11 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase33CustomEmojiResolverAndPickerUseReadyEmoji() {
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         let serverID = snapshot.serversByID.values.first!.id
-        let emoji = Emoji(id: "01J00000000000000000330001", parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagel")
+        let emoji = Emoji(id: "01J00000000000000000330001", parent: .server(serverID), creatorID: TestShellData.currentUserID, name: "bagel")
         snapshot.emojisByID[emoji.id] = emoji
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         let itemByID = model.customEmojiDisplayItem(for: emoji.id.rawValue)
         let itemByName = model.customEmojiDisplayItem(for: ":bagel:")
@@ -147,7 +147,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase34RightSidebarContextTracksRouteWithoutStaleMembers() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         XCTAssertEqual(model.rightSidebarContext, .hidden)
 
@@ -182,7 +182,7 @@ extension StoatFeaturesTests {
             joinedAt: Date()
         )
 
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let groups = model.memberListGroups(for: serverID)
 
         XCTAssertEqual(groups.flatMap(\.items).count, 1)
@@ -207,7 +207,7 @@ extension StoatFeaturesTests {
             joinedAt: Date(),
             roles: [lowRoleID, highRoleID]
         )
-        let model = MainShellViewModel(snapshot: snapshot)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let serverMessage = Message(id: "01J00000000000000000340001", channelID: channelID, authorID: userID, content: "hi")
         let dmID: ChannelID = "phase34-dm"
         snapshot.channelsByID[dmID] = Channel(id: dmID, kind: .directMessage, active: true, recipients: [userID])
@@ -222,13 +222,13 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase34CustomEmojiInsertionAndInlineResolverUseReadyEmoji() {
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         let server = snapshot.serversByID.values.first { !$0.channelIDs.isEmpty }!
         let serverID = server.id
         let channelID = server.channelIDs[0]
-        let emoji = Emoji(id: "01J00000000000000000340004", parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagelparty")
+        let emoji = Emoji(id: "01J00000000000000000340004", parent: .server(serverID), creatorID: TestShellData.currentUserID, name: "bagelparty")
         snapshot.emojisByID[emoji.id] = emoji
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         let pickerItem = model.composerEmojiSections.first(where: { $0.id == "current-server" })?.items.first
         XCTAssertEqual(pickerItem?.displayName, "bagelparty")
@@ -237,12 +237,12 @@ extension StoatFeaturesTests {
         XCTAssertEqual(model.draft(for: channelID), ":\(emoji.id.rawValue):")
         XCTAssertEqual(model.emojiPickerDiagnostics, "Inserted custom emoji shortcode")
 
-        let officialMessage = Message(id: "01J00000000000000000340003", channelID: channelID, authorID: MockShellData.currentUserID, content: "hello :\(emoji.id.rawValue):")
+        let officialMessage = Message(id: "01J00000000000000000340003", channelID: channelID, authorID: TestShellData.currentUserID, content: "hello :\(emoji.id.rawValue):")
         let officialInline = model.inlineCustomEmojiItems(for: officialMessage)
         XCTAssertEqual(officialInline.map(\.shortcode), [":\(emoji.id.rawValue):"])
         XCTAssertEqual(officialInline.first?.name, "bagelparty")
 
-        let legacyMessage = Message(id: "01J00000000000000000340005", channelID: channelID, authorID: MockShellData.currentUserID, content: "hello :bagelparty:")
+        let legacyMessage = Message(id: "01J00000000000000000340005", channelID: channelID, authorID: TestShellData.currentUserID, content: "hello :bagelparty:")
         XCTAssertEqual(model.inlineCustomEmojiItems(for: legacyMessage).map(\.shortcode), [":bagelparty:"])
     }
 
@@ -277,7 +277,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            communityAPIClient: api
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api
         )
         let publicationBeforeHydration = model.phase68TraceDiagnostics.selectedMemberListPublicationCount
 
@@ -326,7 +326,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            communityAPIClient: api
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api
         )
 
         await model.hydrateServerMembers(serverID: serverID, force: true, reason: "test")
@@ -360,7 +360,7 @@ extension StoatFeaturesTests {
                 channelsByID: [channelID: channel]
             ),
             runtimeMode: .mock,
-            communityAPIClient: api
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api
         )
 
         await model.hydrateServerMembers(serverID: serverID, force: true, reason: "overlay test")
@@ -415,7 +415,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            communityAPIClient: api
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api
         )
 
         await model.hydrateServerMembers(serverID: serverID, force: true, reason: "phase52 stress")
@@ -459,7 +459,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            communityAPIClient: api
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api
         )
 
         await model.hydrateServerMembers(serverID: serverID, force: true, reason: "test")
@@ -492,7 +492,7 @@ extension StoatFeaturesTests {
             selection: ShellSelection(space: .server(serverA), serverID: serverA, channelID: channelA),
             snapshot: snapshot,
             runtimeMode: .mock,
-            communityAPIClient: api
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api
         )
 
         let task = Task { await model.hydrateServerMembers(serverID: serverA, force: true, reason: "test") }
@@ -507,7 +507,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase35ImageResourceQueueCapsConcurrentLoads() async throws {
         let loader = SlowImageResourceLoader(delayNanoseconds: 500_000_000)
-        let model = MainShellViewModel(runtimeMode: .mock, imageResourceLoader: loader)
+        let model = MainShellViewModel(runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         for index in 0..<10 {
             let file = File(id: FileID(rawValue: "phase35-avatar-\(index)"), tag: "avatars", filename: "avatar\(index).png", contentType: "image/png", size: 100)
             model.loadImageResource(for: file, kind: .userAvatar)
@@ -526,7 +526,7 @@ extension StoatFeaturesTests {
         let background = File(id: "phase35-background", tag: "backgrounds", filename: "banner.png", contentType: "image/png", size: 100)
         snapshot.usersByID[userID] = User(id: userID, username: "profile", displayName: "Profile User")
         let api = RecordingAPIClient(profilesByUserID: [userID: UserProfile(content: "# Bio\n- one", background: background)])
-        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, communityAPIClient: api)
+        let model = MainShellViewModel(snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api)
 
         let before = await api.fetchUserProfileCallCount
         model.showUserProfile(userID)
@@ -550,7 +550,7 @@ extension StoatFeaturesTests {
         snapshot.serversByID[serverID] = Server(id: serverID, ownerID: knownID, name: "Events")
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "events")
         snapshot.usersByID[knownID] = User(id: knownID, username: "known", displayName: "Known")
-        let model = MainShellViewModel(snapshot: snapshot)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let unknown = Message(id: "01J00000000000000000350001", channelID: channelID, authorID: unknownID, system: SystemMessage(kind: .userJoined, by: unknownID))
         let pinned = Message(id: "01J00000000000000000350002", channelID: channelID, authorID: knownID, system: SystemMessage(kind: .messagePinned, by: knownID))
 
@@ -561,17 +561,17 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase35EmojiSectionsGroupCurrentAndOtherServers() {
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         let currentServerID: ServerID = "phase35-emoji-current"
         let otherServerID: ServerID = "phase35-emoji-other"
         let channelID: ChannelID = "phase35-emoji-channel"
         let currentEmojiID: EmojiID = "01J00000000000000000350001"
         let otherEmojiID: EmojiID = "01J00000000000000000350002"
-        snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: MockShellData.currentUserID, name: "Current")
+        snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: TestShellData.currentUserID, name: "Current")
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: currentServerID, name: "general")
-        snapshot.emojisByID[currentEmojiID] = Emoji(id: currentEmojiID, parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "currentparty")
-        snapshot.emojisByID[otherEmojiID] = Emoji(id: otherEmojiID, parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "otherparty")
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID), snapshot: snapshot)
+        snapshot.emojisByID[currentEmojiID] = Emoji(id: currentEmojiID, parent: .server(currentServerID), creatorID: TestShellData.currentUserID, name: "currentparty")
+        snapshot.emojisByID[otherEmojiID] = Emoji(id: otherEmojiID, parent: .server(otherServerID), creatorID: TestShellData.currentUserID, name: "otherparty")
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let sections = model.composerEmojiSections
         let current = sections.first { $0.id == "current-server" }?.items.map(\.insertionText) ?? []
         let other = sections.first { $0.id == "other-servers" }?.items.map(\.insertionText) ?? []
@@ -582,20 +582,19 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase65EmojiCatalogPrefersCurrentServerForDuplicateNameWhileUsingIDToken() throws {
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         let currentServerID: ServerID = "phase65-emoji-current"
         let otherServerID: ServerID = "phase65-emoji-other"
         let channelID: ChannelID = "phase65-emoji-channel"
         let currentEmojiID: EmojiID = "01J00000000000000000650001"
         let otherEmojiID: EmojiID = "01J00000000000000000650002"
-        snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: MockShellData.currentUserID, name: "Current")
+        snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: TestShellData.currentUserID, name: "Current")
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: currentServerID, name: "general")
-        snapshot.emojisByID[currentEmojiID] = Emoji(id: currentEmojiID, parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "wave")
-        snapshot.emojisByID[otherEmojiID] = Emoji(id: otherEmojiID, parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "wave")
+        snapshot.emojisByID[currentEmojiID] = Emoji(id: currentEmojiID, parent: .server(currentServerID), creatorID: TestShellData.currentUserID, name: "wave")
+        snapshot.emojisByID[otherEmojiID] = Emoji(id: otherEmojiID, parent: .server(otherServerID), creatorID: TestShellData.currentUserID, name: "wave")
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID),
-            snapshot: snapshot
-        )
+            snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         let current = try XCTUnwrap(model.composerEmojiSections.first { $0.id == "current-server" })
         let wave = try XCTUnwrap(current.items.first { $0.insertionText == ":\(currentEmojiID.rawValue):" })
@@ -608,21 +607,20 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase65ComposerCustomEmojiArtworkLoadsOnlyAfterVisibleRequest() async throws {
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         let serverID: ServerID = "phase65-art-server"
         let channelID: ChannelID = "phase65-art-channel"
         let emojiID: EmojiID = "01J00000000000000000650003"
-        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: MockShellData.currentUserID, name: "Artwork")
+        snapshot.serversByID[serverID] = Server(id: serverID, ownerID: TestShellData.currentUserID, name: "Artwork")
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
-        snapshot.emojisByID[emojiID] = Emoji(id: emojiID, parent: .server(serverID), creatorID: MockShellData.currentUserID, name: "bagelwave")
+        snapshot.emojisByID[emojiID] = Emoji(id: emojiID, parent: .server(serverID), creatorID: TestShellData.currentUserID, name: "bagelwave")
         let data = Data("phase65-custom-art".utf8)
-        let loader = MockImageResourceLoader(result: .success(data))
+        let loader = StubImageResourceLoader(result: .success(data))
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
             runtimeMode: .mock,
-            imageResourceLoader: loader
-        )
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
 
         var item = try XCTUnwrap(
             model.composerEmojiSections
@@ -744,7 +742,7 @@ extension StoatFeaturesTests {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
-            communityAPIClient: api
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: api
         )
         let initialToken = model.memberListPresentationToken
         let initialInvalidations = model.phase68TraceDiagnostics.memberListRelevantInvalidationCount
@@ -793,8 +791,7 @@ extension StoatFeaturesTests {
         )
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
-            snapshot: snapshot
-        )
+            snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         var previousToken = model.memberListPresentationToken
         user.status = UserStatus(text: "Away", presence: .idle)
@@ -852,8 +849,7 @@ extension StoatFeaturesTests {
         )
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
-            snapshot: snapshot
-        )
+            snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.prepareMemberListGroups(for: serverID)
         XCTAssertEqual(model.cachedMemberListGroups(for: serverID).flatMap(\.items).first?.displayName, "Unknown member")
@@ -948,10 +944,10 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase68EmojiIndexReusesCatalogAndInvalidatesOnlyForEmojiChanges() {
-        var snapshot = MockShellData.snapshot
-        let emoji = Emoji(id: "phase68-index-one", parent: .detached, creatorID: MockShellData.currentUserID, name: "indexed")
+        var snapshot = TestShellData.snapshot
+        let emoji = Emoji(id: "phase68-index-one", parent: .detached, creatorID: TestShellData.currentUserID, name: "indexed")
         snapshot.emojisByID = [emoji.id: emoji]
-        let model = MainShellViewModel(snapshot: snapshot)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         _ = model.composerEmojiSections
         _ = model.composerEmojiSections
@@ -961,14 +957,14 @@ extension StoatFeaturesTests {
 
         model.mutateSnapshotForTesting { value in
             value.messagesByChannelID["phase68-unrelated-channel"] = [
-                Message(id: "01J00000000000000000680001", channelID: "phase68-unrelated-channel", authorID: MockShellData.currentUserID, content: "ordinary")
+                Message(id: "01J00000000000000000680001", channelID: "phase68-unrelated-channel", authorID: TestShellData.currentUserID, content: "ordinary")
             ]
         }
         _ = model.composerEmojiSections
         XCTAssertEqual(model.phase68TraceDiagnostics.emojiIndexBuildCount, 1)
 
         model.mutateSnapshotForTesting { value in
-            let added = Emoji(id: "phase68-index-two", parent: .detached, creatorID: MockShellData.currentUserID, name: "added")
+            let added = Emoji(id: "phase68-index-two", parent: .detached, creatorID: TestShellData.currentUserID, name: "added")
             value.emojisByID[added.id] = added
         }
         _ = model.composerEmojiSections
@@ -989,12 +985,11 @@ extension StoatFeaturesTests {
             channelsByID: [channelID: Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")],
             emojisByID: [one.id: one, two.id: two, unused.id: unused, other.id: other]
         )
-        let loader = MockImageResourceLoader(result: .success(Data("emoji".utf8)))
+        let loader = StubImageResourceLoader(result: .success(Data("emoji".utf8)))
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
             snapshot: snapshot,
-            imageResourceLoader: loader
-        )
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
         let message = Message(
             id: "01J00000000000000000680002",
             channelID: channelID,
@@ -1044,8 +1039,7 @@ extension StoatFeaturesTests {
         )
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID),
-            snapshot: snapshot
-        )
+            snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         for _ in 0..<24 {
             model.noteVisibleSystemEvent(event)
@@ -1077,8 +1071,7 @@ extension StoatFeaturesTests {
                 usersByID: [userID: user],
                 channelsByID: [channelID: Channel(id: channelID, kind: .directMessage, recipients: [userID])],
                 messagesByChannelID: [channelID: [event]]
-            )
-        )
+            ), currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let gate = Phase68DiagnosticsBuildGate()
         model.setPhase68VisibleIdentityDiagnosticsPreparerForTesting { input in
             await gate.prepare(input)
@@ -1099,16 +1092,16 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase36CustomEmojiContextHidesOtherServersInMessages() {
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         let currentServerID: ServerID = "phase36-emoji-current"
         let otherServerID: ServerID = "phase36-emoji-other"
         let channelID: ChannelID = "phase36-emoji-channel"
-        snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: MockShellData.currentUserID, name: "Current")
+        snapshot.serversByID[currentServerID] = Server(id: currentServerID, ownerID: TestShellData.currentUserID, name: "Current")
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: currentServerID, name: "general")
-        snapshot.emojisByID["phase36-current"] = Emoji(id: "phase36-current", parent: .server(currentServerID), creatorID: MockShellData.currentUserID, name: "currentparty")
-        snapshot.emojisByID["phase36-other"] = Emoji(id: "phase36-other", parent: .server(otherServerID), creatorID: MockShellData.currentUserID, name: "otherparty")
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID), snapshot: snapshot)
-        let message = Message(id: "01J00000000000000000360001", channelID: channelID, authorID: MockShellData.currentUserID, content: ":currentparty: :otherparty:")
+        snapshot.emojisByID["phase36-current"] = Emoji(id: "phase36-current", parent: .server(currentServerID), creatorID: TestShellData.currentUserID, name: "currentparty")
+        snapshot.emojisByID["phase36-other"] = Emoji(id: "phase36-other", parent: .server(otherServerID), creatorID: TestShellData.currentUserID, name: "otherparty")
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(currentServerID), serverID: currentServerID, channelID: channelID), snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
+        let message = Message(id: "01J00000000000000000360001", channelID: channelID, authorID: TestShellData.currentUserID, content: ":currentparty: :otherparty:")
 
         XCTAssertEqual(model.inlineCustomEmojiItems(for: message).map(\.shortcode), [":currentparty:"])
     }
@@ -1128,7 +1121,7 @@ extension StoatFeaturesTests {
             joinedAt: Date(),
             nickname: "Member Nick"
         )
-        let model = MainShellViewModel(snapshot: snapshot)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let joined = Message(id: "01J00000000000000000290002", channelID: channelID, authorID: namedUserID, system: SystemMessage(kind: .userJoined, by: namedUserID))
         let left = Message(id: "01J00000000000000000290003", channelID: channelID, authorID: unknownUserID, system: SystemMessage(kind: .userLeft, by: unknownUserID))
 
@@ -1146,7 +1139,7 @@ extension StoatFeaturesTests {
         snapshot.serversByID[serverID] = Server(id: serverID, ownerID: "owner", name: "Phase 33")
         snapshot.channelsByID[channelID] = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "events")
         let message = Message(id: "01J00000000000000000330001", channelID: channelID, authorID: zeroUserID, system: SystemMessage(kind: .userJoined, by: zeroUserID))
-        let model = MainShellViewModel(snapshot: snapshot)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         XCTAssertEqual(model.systemEventText(for: message), "A member joined")
     }
@@ -1168,8 +1161,7 @@ extension StoatFeaturesTests {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: serverChannelID),
             snapshot: snapshot,
-            currentUser: snapshot.usersByID[currentUserID]
-        )
+            currentUser: snapshot.usersByID[currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let item = try XCTUnwrap(model.directMessageItems.first { $0.id == dmID })
 
         model.selectDirectMessageItem(item)

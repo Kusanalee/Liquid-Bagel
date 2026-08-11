@@ -1,7 +1,21 @@
-import Foundation
-import StoatModels
+//  Moved out of the library targets in Phase 73.
+//
+//  These lived in Sources/, which is why they shipped in the built product and why
+//  MainShellViewModel.init constructed them as its defaults. As test-target files they get
+//  @testable access and cannot reach production.
 
-public actor MockStoatAPIClient: StoatAPIClient {
+import Foundation
+import Observation
+import SwiftUI
+import StoatAPI
+import StoatDesignSystem
+import StoatModels
+import StoatPersistence
+import StoatRealtime
+import StoatUI
+@testable import StoatFeatures
+
+public actor StubStoatAPIClient: StoatAPIClient {
     private var currentUser: User
     private var users: [UserID: User]
     private var servers: [Server]
@@ -942,5 +956,398 @@ public actor MockStoatAPIClient: StoatAPIClient {
             currentUser.relations.append(Relationship(id: userID, status: status))
         }
         return user
+    }
+}
+public enum TestShellData {
+    public static let currentUserID: UserID = "01HX0000000000000000000001"
+    public static let snapshot: RealtimeSnapshot = makeSnapshot()
+
+    public static func makeSnapshot() -> RealtimeSnapshot {
+        let user = User(id: currentUserID, username: "liquidbagel", discriminator: "0001", displayName: "Liquid Bagel", status: UserStatus(text: "Building the native shell", presence: .online), relationship: .user, online: true)
+        let stoat = User(id: "01HX0000000000000000000002", username: "stoat-system", displayName: "Stoat System", relationship: .friend, online: true)
+        let design = User(id: "01HX0000000000000000000003", username: "designpilot", displayName: "Design Pilot", relationship: .friend, online: false)
+        let ops = User(id: "01HX0000000000000000000004", username: "macops", displayName: "Mac Ops", relationship: .friend, online: true)
+
+        let general: ChannelID = "01HX0000000000000000000101"
+        let api: ChannelID = "01HX0000000000000000000102"
+        let native: ChannelID = "01HX0000000000000000000103"
+        let voice: ChannelID = "01HX0000000000000000000104"
+        let dm: ChannelID = "01HX0000000000000000000105"
+        let lab: ServerID = "01HX0000000000000000000201"
+        let orchard: ServerID = "01HX0000000000000000000202"
+
+        let permissions: Permissions = [.viewChannel, .readMessageHistory, .sendMessage, .uploadFiles, .react]
+        let role = Role(id: "01HX0000000000000000000301", name: "Core Crew", permissions: PermissionOverride(allow: permissions), colour: "#62D6E8", hoist: true, rank: 1)
+
+        let servers = [
+            Server(id: lab, ownerID: user.id, name: "Bagel Lab", description: "Native macOS client workshop", channelIDs: [general, api, native, voice], categories: [
+                ServerCategory(id: "cat-text", title: "Text Channels", channels: [general, api, native]),
+                ServerCategory(id: "cat-voice", title: "Voice", channels: [voice])
+            ], roles: [role.id: role], defaultPermissions: permissions),
+            Server(id: orchard, ownerID: design.id, name: "Stoat Orchard", description: "Quiet preview server", channelIDs: [], defaultPermissions: [.viewChannel, .readMessageHistory])
+        ]
+
+        let channels = [
+            Channel(id: general, kind: .textChannel, serverID: lab, name: "general", description: "Daily shell progress and native app notes"),
+            Channel(id: api, kind: .textChannel, serverID: lab, name: "api-research", description: "REST and realtime research"),
+            Channel(id: native, kind: .textChannel, serverID: lab, name: "macos-native", description: "SwiftUI, materials, and keyboard polish"),
+            Channel(id: voice, kind: .voiceChannel, serverID: lab, name: "design crit", description: "Voice is deferred", permissions: [.viewChannel]),
+            Channel(id: dm, kind: .directMessage, active: true, recipients: [user.id, design.id])
+        ]
+
+        let messagesByChannel: [ChannelID: [Message]] = [
+            general: [
+                Message(id: "01J00000000000000000000001", channelID: general, authorID: user.id, content: "Phase 3 is finally making the shell feel like an actual native client."),
+                Message(id: "01J00000010000000000000001", channelID: general, authorID: user.id, content: "The composer is intentionally local-only for now, but it already has the right weight."),
+                Message(id: "01J00000020000000000000001", channelID: general, authorID: stoat.id, content: "Realtime snapshots can hydrate this later without changing the view hierarchy.", reactions: ["🥯": [user.id, design.id]]),
+                Message(id: "01J00000030000000000000001", channelID: general, authorID: design.id, content: "The rail/sidebar/chat/member layout is stable enough to build the MVP on top of."),
+                Message(id: "01J000000A0000000000000001", channelID: general, authorID: ops.id, content: "I added a note: avoid auto-connecting on launch until login and runtime mode are explicit.", editedAt: Date(timeIntervalSince1970: 1_725_000_000))
+            ],
+            api: [
+                Message(id: "01J00000040000000000000001", channelID: api, authorID: design.id, content: "Ready hydration is the source of truth for server/channel collections."),
+                Message(id: "01J00000050000000000000001", channelID: api, authorID: stoat.id, content: "REST remains available for verified channel/message endpoints once credentials exist.")
+            ],
+            native: [
+                Message(id: "01J00000060000000000000001", channelID: native, authorID: user.id, content: "Use standard SwiftUI controls first, then glass only where it clarifies hierarchy."),
+                Message(id: "01J00000070000000000000001", channelID: native, authorID: ops.id, content: "Focus rings, labels, and reduced transparency are already part of the foundation.")
+            ],
+            dm: [
+                Message(id: "01J00000080000000000000001", channelID: dm, authorID: design.id, content: "DMs are represented as a placeholder route for now."),
+                Message(id: "01J00000090000000000000001", channelID: dm, authorID: user.id, content: "Perfect. Full friends and messaging can land in later phases.")
+            ]
+        ]
+
+        let members = [user, stoat, design, ops].map {
+            ServerMember(id: MemberCompositeKey(serverID: lab, userID: $0.id), joinedAt: Date(timeIntervalSince1970: 1_700_000_000), roles: $0.id == user.id ? [role.id] : [])
+        }
+
+        return RealtimeSnapshot(
+            usersByID: Dictionary(uniqueKeysWithValues: [user, stoat, design, ops].map { ($0.id, $0) }),
+            serversByID: Dictionary(uniqueKeysWithValues: servers.map { ($0.id, $0) }),
+            channelsByID: Dictionary(uniqueKeysWithValues: channels.map { ($0.id, $0) }),
+            messagesByChannelID: messagesByChannel,
+            membersByServerAndUserID: Dictionary(uniqueKeysWithValues: members.map { (ServerMemberKey($0.id), $0) }),
+            unreadsByChannelID: [
+                api: ChannelUnread(id: ChannelCompositeKey(channelID: api, userID: user.id), lastMessageID: "01J00000040000000000000001", mentions: []),
+                native: ChannelUnread(id: ChannelCompositeKey(channelID: native, userID: user.id), lastMessageID: "01J00000060000000000000001", mentions: ["01J00000070000000000000001"])
+            ],
+            typingUsersByChannelID: [general: [design.id]]
+        )
+    }
+}
+public actor StubMessageActionHandler: MessageActionHandling {
+    public private(set) var sentMessages: [Message] = []
+    public private(set) var editedMessages: [(ChannelID, MessageID, String)] = []
+    public private(set) var deletedMessages: [(ChannelID, MessageID)] = []
+    public private(set) var addedReactions: [(ChannelID, MessageID, String)] = []
+    public private(set) var removedReactions: [(ChannelID, MessageID, String)] = []
+    public private(set) var pinnedMessages: [(ChannelID, MessageID)] = []
+    public private(set) var unpinnedMessages: [(ChannelID, MessageID)] = []
+    public private(set) var typingEvents: [ClientGatewayEvent] = []
+
+    private let currentUserID: UserID
+    private var nextMessageCounter = 0
+    private var sendError: (any Error & Sendable)?
+
+    public init(currentUserID: UserID = TestShellData.currentUserID, sendError: (any Error & Sendable)? = nil) {
+        self.currentUserID = currentUserID
+        self.sendError = sendError
+    }
+
+    public func setSendError(_ error: (any Error & Sendable)?) {
+        sendError = error
+    }
+
+    public func sendMessage(channelID: ChannelID, content: String, nonce: String?, replies: [MessageReply]? = nil, attachments: [FileID]? = nil) async throws -> Message {
+        if let sendError {
+            throw sendError
+        }
+        nextMessageCounter += 1
+        let files = attachments?.map {
+            File(id: $0, tag: "attachments", filename: "\($0.rawValue)", contentType: "application/octet-stream", size: 0)
+        }
+        let message = Message(
+            id: MessageID(rawValue: Self.mockMessageID(counter: nextMessageCounter)),
+            channelID: channelID,
+            authorID: currentUserID,
+            content: content,
+            nonce: nonce,
+            attachments: files,
+            replies: replies?.map(\.id)
+        )
+        sentMessages.append(message)
+        return message
+    }
+
+    public func editMessage(channelID: ChannelID, messageID: MessageID, content: String) async throws -> Message {
+        editedMessages.append((channelID, messageID, content))
+        return Message(id: messageID, channelID: channelID, authorID: currentUserID, content: content, editedAt: Date())
+    }
+
+    public func deleteMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        deletedMessages.append((channelID, messageID))
+    }
+
+    public func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
+        addedReactions.append((channelID, messageID, emoji))
+    }
+
+    public func removeReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
+        removedReactions.append((channelID, messageID, emoji))
+    }
+
+    public func pinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        pinnedMessages.append((channelID, messageID))
+    }
+
+    public func unpinMessage(channelID: ChannelID, messageID: MessageID) async throws {
+        unpinnedMessages.append((channelID, messageID))
+    }
+
+    public func beginTyping(channelID: ChannelID) async throws {
+        typingEvents.append(.beginTyping(channel: channelID))
+    }
+
+    public func endTyping(channelID: ChannelID) async throws {
+        typingEvents.append(.endTyping(channel: channelID))
+    }
+
+    private static func mockMessageID(counter: Int) -> String {
+        let timestamp = UInt64(Date().timeIntervalSince1970 * 1000)
+        let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+        var value = timestamp
+        var prefix = Array(repeating: alphabet[0], count: 10)
+        for index in stride(from: 9, through: 0, by: -1) {
+            prefix[index] = alphabet[Int(value % 32)]
+            value /= 32
+        }
+        return String(prefix) + String(format: "%016X", counter).suffix(16)
+    }
+}
+public actor StubSessionManager: SessionManaging {
+    public private(set) var revokeAllArguments: [Bool] = []
+    public private(set) var revokedSessionIDs: [SessionID] = []
+    public private(set) var renamedSessions: [(SessionID, String)] = []
+    public private(set) var logoutCallCount = 0
+
+    private var sessions: [SessionInfo]
+    private let error: (any Error & Sendable)?
+
+    public init(sessions: [SessionInfo] = [], error: (any Error & Sendable)? = nil) {
+        self.sessions = sessions
+        self.error = error
+    }
+
+    public func listSessions(environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws -> [SessionInfo] {
+        if let error { throw error }
+        return sessions
+    }
+
+    public func renameSession(id: SessionID, friendlyName: String, environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws -> SessionInfo {
+        if let error { throw error }
+        let renamed = SessionInfo(id: id, name: friendlyName)
+        sessions.removeAll { $0.id == id }
+        sessions.append(renamed)
+        renamedSessions.append((id, friendlyName))
+        return renamed
+    }
+
+    public func revokeSession(id: SessionID, environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws {
+        if let error { throw error }
+        sessions.removeAll { $0.id == id }
+        revokedSessionIDs.append(id)
+    }
+
+    public func revokeAllSessions(revokeSelf: Bool, environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws {
+        if let error { throw error }
+        revokeAllArguments.append(revokeSelf)
+        if revokeSelf {
+            sessions.removeAll()
+        }
+    }
+
+    public func logoutCurrentSession(environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws {
+        if let error { throw error }
+        logoutCallCount += 1
+    }
+}
+public actor StubNotificationService: NotificationDelivering {
+    public private(set) var deliveredEvents: [NotificationEvent] = []
+
+    public init() {}
+
+    public func deliver(_ event: NotificationEvent) async throws {
+        deliveredEvents.append(event)
+    }
+
+    public func events() -> [NotificationEvent] {
+        deliveredEvents
+    }
+}
+public actor StubNotificationPermissionManager: NotificationPermissionManaging {
+    public var currentStatus: NotificationPermissionStatus
+    public private(set) var requestCount = 0
+
+    public init(status: NotificationPermissionStatus = .notDetermined) {
+        self.currentStatus = status
+    }
+
+    public func status() async -> NotificationPermissionStatus {
+        currentStatus
+    }
+
+    public func requestAuthorization() async -> NotificationPermissionRequestResult {
+        let before = currentStatus
+        requestCount += 1
+        if currentStatus == .notDetermined {
+            currentStatus = .authorized
+        }
+        return NotificationPermissionRequestResult(
+            authorizerKind: "StubNotificationPermissionManager",
+            statusBefore: before,
+            requestAuthorizationCalled: true,
+            granted: currentStatus == .authorized,
+            statusAfter: currentStatus,
+            usedMockAuthorizer: true
+        )
+    }
+}
+public actor StubDockBadgeManager: DockBadgeManaging {
+    public private(set) var badgeCounts: [Int] = []
+
+    public init() {}
+
+    public func setBadgeCount(_ count: Int) async {
+        badgeCounts.append(count)
+    }
+}
+public actor StubMessageCopier: MessageCopying {
+    public private(set) var copiedValues: [String] = []
+
+    public init() {}
+
+    public func copy(_ value: String) async {
+        copiedValues.append(value)
+    }
+
+    public func lastCopiedValue() -> String? {
+        copiedValues.last
+    }
+}
+public actor StubAttachmentUploadHandler: AttachmentUploadHandling {
+    public private(set) var uploads: [ComposerAttachmentDraft] = []
+    private var uploadError: (any Error & Sendable)?
+
+    public init(uploadError: (any Error & Sendable)? = nil) {
+        self.uploadError = uploadError
+    }
+
+    public func setUploadError(_ error: (any Error & Sendable)?) {
+        uploadError = error
+    }
+
+    public func uploadCount() -> Int {
+        uploads.count
+    }
+
+    public func upload(_ attachment: ComposerAttachmentDraft) async throws -> UploadedFile {
+        if let uploadError {
+            throw uploadError
+        }
+        uploads.append(attachment)
+        return UploadedFile(id: FileID(rawValue: "mock-attachments-\(abs(attachment.filename.hashValue))"))
+    }
+}
+public actor StubImageResourceLoader: ImageResourceLoading {
+    public private(set) var calls: [ImageResourceRequest] = []
+    private var result: Result<Data, any Error & Sendable>
+
+    public init(result: Result<Data, any Error & Sendable> = .success(Data())) {
+        self.result = result
+    }
+
+    public func setResult(_ result: Result<Data, any Error & Sendable>) {
+        self.result = result
+    }
+
+    public func callCount() -> Int {
+        calls.count
+    }
+
+    public func loadImage(_ request: ImageResourceRequest) async throws -> ImageResourceResult {
+        calls.append(request)
+        switch result {
+        case let .success(data):
+            return ImageResourceResult(request: request, contentType: "image/png", data: data)
+        case let .failure(error):
+            throw error
+        }
+    }
+}
+public actor StubRemoteAttachmentLoader: RemoteAttachmentLoading {
+    public private(set) var calls: [(String, RemoteAttachmentLoadPurpose)] = []
+    private var result: Result<RemoteAttachmentData, any Error & Sendable>
+
+    public init(result: Result<RemoteAttachmentData, any Error & Sendable> = .success(RemoteAttachmentData(filename: "mock.txt", contentType: "text/plain", byteCount: 4, data: Data("mock".utf8)))) {
+        self.result = result
+    }
+
+    public func setResult(_ result: Result<RemoteAttachmentData, any Error & Sendable>) {
+        self.result = result
+    }
+
+    public func callCount() -> Int {
+        calls.count
+    }
+
+    public func load(_ item: AttachmentDisplayItem, purpose: RemoteAttachmentLoadPurpose) async throws -> RemoteAttachmentData {
+        calls.append((item.id, purpose))
+        switch result {
+        case let .success(data):
+            return RemoteAttachmentData(fileID: item.fileID ?? data.fileID, filename: item.displayName, contentType: item.contentType ?? data.contentType, byteCount: item.byteCount ?? data.byteCount, data: data.data)
+        case let .failure(error):
+            throw error
+        }
+    }
+}
+public actor StubAttachmentSaver: AttachmentSaving {
+    public private(set) var saves: [(String, Int)] = []
+    public var error: (any Error & Sendable)?
+
+    public init(error: (any Error & Sendable)? = nil) {
+        self.error = error
+    }
+
+    public func save(data: Data, suggestedFilename: String) async throws {
+        if let error {
+            throw error
+        }
+        saves.append((AttachmentDisplayFormatting.safeFilename(suggestedFilename), data.count))
+    }
+
+    public func saveCount() -> Int {
+        saves.count
+    }
+}
+public actor StubAttachmentOpener: AttachmentOpening {
+    public private(set) var opened: [URL] = []
+    public var error: (any Error & Sendable)?
+
+    public init(error: (any Error & Sendable)? = nil) {
+        self.error = error
+    }
+
+    public func open(_ localFile: URL) async throws {
+        if let error {
+            throw error
+        }
+        guard !AttachmentSafety.isExecutableLike(localFile) else {
+            throw AttachmentActionError.unsafeToOpen
+        }
+        opened.append(localFile)
+    }
+
+    public func openCount() -> Int {
+        opened.count
     }
 }

@@ -440,19 +440,6 @@ public protocol NotificationDelivering: Sendable {
     func deliver(_ event: NotificationEvent) async throws
 }
 
-public actor MockNotificationService: NotificationDelivering {
-    public private(set) var deliveredEvents: [NotificationEvent] = []
-
-    public init() {}
-
-    public func deliver(_ event: NotificationEvent) async throws {
-        deliveredEvents.append(event)
-    }
-
-    public func events() -> [NotificationEvent] {
-        deliveredEvents
-    }
-}
 
 public struct UserNotificationsNotificationService: NotificationDelivering {
     public init() {}
@@ -585,34 +572,6 @@ private enum UserNotificationsAvailability {
     }
 }
 
-public actor MockNotificationPermissionManager: NotificationPermissionManaging {
-    public var currentStatus: NotificationPermissionStatus
-    public private(set) var requestCount = 0
-
-    public init(status: NotificationPermissionStatus = .notDetermined) {
-        self.currentStatus = status
-    }
-
-    public func status() async -> NotificationPermissionStatus {
-        currentStatus
-    }
-
-    public func requestAuthorization() async -> NotificationPermissionRequestResult {
-        let before = currentStatus
-        requestCount += 1
-        if currentStatus == .notDetermined {
-            currentStatus = .authorized
-        }
-        return NotificationPermissionRequestResult(
-            authorizerKind: "MockNotificationPermissionManager",
-            statusBefore: before,
-            requestAuthorizationCalled: true,
-            granted: currentStatus == .authorized,
-            statusAfter: currentStatus,
-            usedMockAuthorizer: true
-        )
-    }
-}
 
 public protocol DockBadgeManaging: Sendable {
     func setBadgeCount(_ count: Int) async
@@ -631,15 +590,6 @@ public struct AppKitDockBadgeManager: DockBadgeManaging {
     }
 }
 
-public actor MockDockBadgeManager: DockBadgeManaging {
-    public private(set) var badgeCounts: [Int] = []
-
-    public init() {}
-
-    public func setBadgeCount(_ count: Int) async {
-        badgeCounts.append(count)
-    }
-}
 
 @MainActor
 public final class NotificationRouteCenter {

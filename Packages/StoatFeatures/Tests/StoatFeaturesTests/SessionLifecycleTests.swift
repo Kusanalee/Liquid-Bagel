@@ -24,12 +24,12 @@ extension StoatFeaturesTests {
         XCTAssertEqual(session.mode, .liveManual)
         XCTAssertEqual(session.sessionState, .signedOut)
         XCTAssertTrue(session.snapshot.serversByID.isEmpty)
-        await session.startMockSession()
+        await session.startLiveFirstSession()
 
         let connectCallCount = await realtime.connectCallCount
-        XCTAssertEqual(connectCallCount, 0)
-        XCTAssertEqual(session.mode, .mock)
-        XCTAssertEqual(session.snapshot, MockShellData.snapshot)
+        XCTAssertEqual(connectCallCount, 0, "no saved credential must not auto-connect")
+        XCTAssertEqual(session.mode, .liveManual)
+        XCTAssertTrue(session.snapshot.serversByID.isEmpty)
     }
 
     @MainActor
@@ -169,15 +169,15 @@ extension StoatFeaturesTests {
             apiClientFactory: { _, _ in RecordingAPIClient() }
         )
 
-        await session.startMockSession()
+        await session.loadPreferences()
 
-        XCTAssertEqual(session.mode, .mock)
+        XCTAssertEqual(session.mode, .liveManual)
         XCTAssertEqual(session.environment, custom.environment)
         XCTAssertEqual(session.preferences.lastSelectedEnvironmentID, custom.id)
     }
 
     @MainActor
-    func testMockPreviewSavedCredentialBecomesReadyWithoutConnecting() async throws {
+    func testSavedCredentialIsDiscoveredWithoutConnecting() async throws {
         let custom = try EnvironmentProfile.custom(
             name: "Local",
             environment: StoatAPIEnvironment(apiBaseURL: URL(string: "http://localhost:14702")!, eventsURL: URL(string: "ws://localhost:14703")!)
@@ -193,10 +193,13 @@ extension StoatFeaturesTests {
             realtimeClientFactory: { realtime }
         )
 
-        await session.startMockSession()
+        await session.loadPreferences()
+        await session.refreshCredentialAvailability()
 
-        XCTAssertEqual(session.mode, .mock)
-        XCTAssertEqual(session.sessionState, .readyToConnect)
+        XCTAssertEqual(session.mode, .liveManual)
+        // Live-only: a saved credential is known but unproven until it is validated, which is a
+        // more honest state than the old mock path's unconditional .readyToConnect.
+        XCTAssertEqual(session.sessionState, .savedCredentialUnvalidated)
         XCTAssertTrue(session.hasSavedCredential)
         let connectCallCount = await realtime.connectCallCount
         XCTAssertEqual(connectCallCount, 0)
@@ -218,7 +221,7 @@ extension StoatFeaturesTests {
             apiClientFactory: { _, _ in RecordingAPIClient() }
         )
 
-        await session.startMockSession()
+        await session.loadPreferences()
         await session.selectEnvironmentProfile(id: custom.id)
 
         XCTAssertEqual(session.preferences.lastSelectedEnvironmentID, custom.id)
@@ -274,9 +277,9 @@ extension StoatFeaturesTests {
             apiClientFactory: { _, _ in RecordingAPIClient() }
         )
 
-        await session.resetToMock()
+        await session.refreshCredentialAvailability()
 
-        XCTAssertEqual(session.mode, .mock)
+        XCTAssertEqual(session.mode, .liveManual)
         let savedCredential = try await store.loadCredential(scope: .production)
         XCTAssertEqual(savedCredential?.token, "token")
     }

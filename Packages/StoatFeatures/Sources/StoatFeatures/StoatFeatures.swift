@@ -805,7 +805,7 @@ public final class MainShellViewModel {
     @ObservationIgnored public var notificationDeliverer: any NotificationDelivering
     @ObservationIgnored public var notificationPermissionManager: any NotificationPermissionManaging
     @ObservationIgnored public var dockBadgeManager: any DockBadgeManaging
-    @ObservationIgnored public var communityAPIClient: any StoatAPIClient
+    @ObservationIgnored public var communityAPIClient: (any StoatAPIClient)?
     @ObservationIgnored public var notificationRouteCenter: NotificationRouteCenter
     @ObservationIgnored public var appLifecycleCenter: AppLifecycleCenter
     @ObservationIgnored private var snapshotObservationTask: Task<Void, Never>?
@@ -983,7 +983,7 @@ public final class MainShellViewModel {
 
     public init(
         selection: ShellSelection = ShellSelection(),
-        snapshot: RealtimeSnapshot = MockShellData.snapshot,
+        snapshot: RealtimeSnapshot = RealtimeSnapshot(),
         connectionState: RealtimeConnectionState = .idle,
         diagnostics: RealtimeDiagnostics? = nil,
         runtimeMode: AppRuntimeMode = .mock,
@@ -1016,15 +1016,15 @@ public final class MainShellViewModel {
         self.diagnostics = diagnostics
         self.runtimeMode = runtimeMode
         self.sessionState = sessionState
-        self.currentUser = currentUser ?? snapshot.usersByID[MockShellData.currentUserID]
+        self.currentUser = currentUser
         self.sessionCoordinator = sessionCoordinator
-        self.messageController = messageController ?? ChannelMessageController(runtimeMode: runtimeMode, currentUserID: currentUser?.id ?? MockShellData.currentUserID)
-        self.messageActionHandler = messageActionHandler ?? MockMessageActionHandler(currentUserID: currentUser?.id ?? MockShellData.currentUserID)
+        self.messageController = messageController ?? ChannelMessageController(runtimeMode: runtimeMode, currentUserID: currentUser?.id)
+        self.messageActionHandler = messageActionHandler ?? UnavailableMessageActionHandler(message: "Set up a session before sending messages.")
         self.messageCopier = messageCopier ?? AppKitMessageCopier()
-        self.attachmentUploadHandler = attachmentUploadHandler ?? MockAttachmentUploadHandler()
-        self.remoteAttachmentLoader = remoteAttachmentLoader ?? MockRemoteAttachmentLoader()
+        self.attachmentUploadHandler = attachmentUploadHandler ?? UnavailableAttachmentUploadHandler()
+        self.remoteAttachmentLoader = remoteAttachmentLoader ?? UnavailableRemoteAttachmentLoader()
         self.imageMemoryCache = imageMemoryCache
-        self.imageResourceLoader = imageResourceLoader ?? MockImageResourceLoader()
+        self.imageResourceLoader = imageResourceLoader ?? UnavailableImageResourceLoader()
         self.attachmentSaver = attachmentSaver ?? AppKitAttachmentSaver()
         self.attachmentOpener = attachmentOpener ?? AppKitAttachmentOpener()
         self.channelAckSender = channelAckSender ?? NoopChannelAckSender()
@@ -1033,7 +1033,7 @@ public final class MainShellViewModel {
         self.notificationPermissionManager = notificationPermissionManager ?? UserNotificationsPermissionManager()
         self.notificationAuthorizerKind = String(describing: type(of: self.notificationPermissionManager))
         self.dockBadgeManager = dockBadgeManager ?? AppKitDockBadgeManager()
-        self.communityAPIClient = communityAPIClient ?? MockStoatAPIClient()
+        self.communityAPIClient = communityAPIClient
         self.notificationRouteCenter = notificationRouteCenter
         self.appLifecycleCenter = appLifecycleCenter
         if let notificationSignatureStatusPreparer {
@@ -1889,7 +1889,7 @@ public final class MainShellViewModel {
 
     public var currentUserID: UserID? {
         if effectiveRuntimeMode == .mock {
-            return (sessionCoordinator?.currentUser ?? currentUser)?.id ?? MockShellData.currentUserID
+            return (sessionCoordinator?.currentUser ?? currentUser)?.id
         }
         return sessionCoordinator?.currentUser?.id ?? currentUser?.id
     }
@@ -6804,7 +6804,7 @@ public final class MainShellViewModel {
         }
         messageActionHandler = sessionCoordinator.messageActionHandler
         let liveAPIClient = sessionCoordinator.mode == .liveManual ? sessionCoordinator.apiClient : nil
-        attachmentUploadHandler = liveAPIClient.map { LiveAttachmentUploadHandler(apiClient: $0) } ?? MockAttachmentUploadHandler()
+        attachmentUploadHandler = liveAPIClient.map { LiveAttachmentUploadHandler(apiClient: $0) } ?? UnavailableAttachmentUploadHandler()
         if sessionCoordinator.mode == .liveManual {
             if imageDiskCache is NoopImageDiskCache {
                 imageDiskCache = FileImageDiskCache()
@@ -6812,8 +6812,8 @@ public final class MainShellViewModel {
             remoteAttachmentLoader = LiveRemoteAttachmentLoader(environment: sessionCoordinator.environment, diskCache: imageDiskCache)
             imageResourceLoader = LiveImageResourceLoader(cache: imageMemoryCache, diskCache: imageDiskCache)
         } else {
-            remoteAttachmentLoader = MockRemoteAttachmentLoader()
-            imageResourceLoader = MockImageResourceLoader()
+            remoteAttachmentLoader = UnavailableRemoteAttachmentLoader()
+            imageResourceLoader = UnavailableImageResourceLoader()
         }
         channelAckSender = liveAPIClient.map { LiveChannelAckSender(apiClient: $0) } ?? NoopChannelAckSender()
         if sessionCoordinator.mode == .mock {
@@ -6833,7 +6833,7 @@ public final class MainShellViewModel {
         messageController.configure(
             runtimeMode: sessionCoordinator.mode,
             apiClient: liveAPIClient,
-            currentUserID: sessionCoordinator.currentUser?.id ?? (sessionCoordinator.mode == .mock ? MockShellData.currentUserID : nil),
+            currentUserID: sessionCoordinator.currentUser?.id,
             loadGeneration: sessionCoordinator.mode == .liveManual ? sessionCoordinator.liveConnectionGeneration : nil,
             messageCache: channelMessageCache
         )
@@ -9037,10 +9037,17 @@ public final class MainShellViewModel {
             requestFocus(.timeline)
             return
         }
+        // Editing requires an authenticated user. This used to fall back to a synthetic ULID,
+        // which fabricated a message author in a real edit rather than refusing the action.
+        guard let currentUserID else {
+            editState.errorMessage = "Reconnect before editing messages."
+            inlineEditState = editState
+            return
+        }
         editState.isSaving = true
         editState.errorMessage = nil
         inlineEditState = editState
-        editingDraft = EditingMessageDraft(message: selectedTimelineMessages.first { $0.message.id == editState.messageID }?.message ?? Message(id: editState.messageID, channelID: editState.channelID, authorID: currentUserID ?? MockShellData.currentUserID), content: editState.draftContent)
+        editingDraft = EditingMessageDraft(message: selectedTimelineMessages.first { $0.message.id == editState.messageID }?.message ?? Message(id: editState.messageID, channelID: editState.channelID, authorID: currentUserID), content: editState.draftContent)
         do {
             let edited = try await messageActionHandler.editMessage(
                 channelID: editState.channelID,
@@ -12559,83 +12566,6 @@ extension MainShellViewModel: AppCommandHandling {
     }
 }
 
-public enum MockShellData {
-    public static let currentUserID: UserID = "01HX0000000000000000000001"
-    public static let snapshot: RealtimeSnapshot = makeSnapshot()
-
-    public static func makeSnapshot() -> RealtimeSnapshot {
-        let user = User(id: currentUserID, username: "liquidbagel", discriminator: "0001", displayName: "Liquid Bagel", status: UserStatus(text: "Building the native shell", presence: .online), relationship: .user, online: true)
-        let stoat = User(id: "01HX0000000000000000000002", username: "stoat-system", displayName: "Stoat System", relationship: .friend, online: true)
-        let design = User(id: "01HX0000000000000000000003", username: "designpilot", displayName: "Design Pilot", relationship: .friend, online: false)
-        let ops = User(id: "01HX0000000000000000000004", username: "macops", displayName: "Mac Ops", relationship: .friend, online: true)
-
-        let general: ChannelID = "01HX0000000000000000000101"
-        let api: ChannelID = "01HX0000000000000000000102"
-        let native: ChannelID = "01HX0000000000000000000103"
-        let voice: ChannelID = "01HX0000000000000000000104"
-        let dm: ChannelID = "01HX0000000000000000000105"
-        let lab: ServerID = "01HX0000000000000000000201"
-        let orchard: ServerID = "01HX0000000000000000000202"
-
-        let permissions: Permissions = [.viewChannel, .readMessageHistory, .sendMessage, .uploadFiles, .react]
-        let role = Role(id: "01HX0000000000000000000301", name: "Core Crew", permissions: PermissionOverride(allow: permissions), colour: "#62D6E8", hoist: true, rank: 1)
-
-        let servers = [
-            Server(id: lab, ownerID: user.id, name: "Bagel Lab", description: "Native macOS client workshop", channelIDs: [general, api, native, voice], categories: [
-                ServerCategory(id: "cat-text", title: "Text Channels", channels: [general, api, native]),
-                ServerCategory(id: "cat-voice", title: "Voice", channels: [voice])
-            ], roles: [role.id: role], defaultPermissions: permissions),
-            Server(id: orchard, ownerID: design.id, name: "Stoat Orchard", description: "Quiet preview server", channelIDs: [], defaultPermissions: [.viewChannel, .readMessageHistory])
-        ]
-
-        let channels = [
-            Channel(id: general, kind: .textChannel, serverID: lab, name: "general", description: "Daily shell progress and native app notes"),
-            Channel(id: api, kind: .textChannel, serverID: lab, name: "api-research", description: "REST and realtime research"),
-            Channel(id: native, kind: .textChannel, serverID: lab, name: "macos-native", description: "SwiftUI, materials, and keyboard polish"),
-            Channel(id: voice, kind: .voiceChannel, serverID: lab, name: "design crit", description: "Voice is deferred", permissions: [.viewChannel]),
-            Channel(id: dm, kind: .directMessage, active: true, recipients: [user.id, design.id])
-        ]
-
-        let messagesByChannel: [ChannelID: [Message]] = [
-            general: [
-                Message(id: "01J00000000000000000000001", channelID: general, authorID: user.id, content: "Phase 3 is finally making the shell feel like an actual native client."),
-                Message(id: "01J00000010000000000000001", channelID: general, authorID: user.id, content: "The composer is intentionally local-only for now, but it already has the right weight."),
-                Message(id: "01J00000020000000000000001", channelID: general, authorID: stoat.id, content: "Realtime snapshots can hydrate this later without changing the view hierarchy.", reactions: ["🥯": [user.id, design.id]]),
-                Message(id: "01J00000030000000000000001", channelID: general, authorID: design.id, content: "The rail/sidebar/chat/member layout is stable enough to build the MVP on top of."),
-                Message(id: "01J000000A0000000000000001", channelID: general, authorID: ops.id, content: "I added a note: avoid auto-connecting on launch until login and runtime mode are explicit.", editedAt: Date(timeIntervalSince1970: 1_725_000_000))
-            ],
-            api: [
-                Message(id: "01J00000040000000000000001", channelID: api, authorID: design.id, content: "Ready hydration is the source of truth for server/channel collections."),
-                Message(id: "01J00000050000000000000001", channelID: api, authorID: stoat.id, content: "REST remains available for verified channel/message endpoints once credentials exist.")
-            ],
-            native: [
-                Message(id: "01J00000060000000000000001", channelID: native, authorID: user.id, content: "Use standard SwiftUI controls first, then glass only where it clarifies hierarchy."),
-                Message(id: "01J00000070000000000000001", channelID: native, authorID: ops.id, content: "Focus rings, labels, and reduced transparency are already part of the foundation.")
-            ],
-            dm: [
-                Message(id: "01J00000080000000000000001", channelID: dm, authorID: design.id, content: "DMs are represented as a placeholder route for now."),
-                Message(id: "01J00000090000000000000001", channelID: dm, authorID: user.id, content: "Perfect. Full friends and messaging can land in later phases.")
-            ]
-        ]
-
-        let members = [user, stoat, design, ops].map {
-            ServerMember(id: MemberCompositeKey(serverID: lab, userID: $0.id), joinedAt: Date(timeIntervalSince1970: 1_700_000_000), roles: $0.id == user.id ? [role.id] : [])
-        }
-
-        return RealtimeSnapshot(
-            usersByID: Dictionary(uniqueKeysWithValues: [user, stoat, design, ops].map { ($0.id, $0) }),
-            serversByID: Dictionary(uniqueKeysWithValues: servers.map { ($0.id, $0) }),
-            channelsByID: Dictionary(uniqueKeysWithValues: channels.map { ($0.id, $0) }),
-            messagesByChannelID: messagesByChannel,
-            membersByServerAndUserID: Dictionary(uniqueKeysWithValues: members.map { (ServerMemberKey($0.id), $0) }),
-            unreadsByChannelID: [
-                api: ChannelUnread(id: ChannelCompositeKey(channelID: api, userID: user.id), lastMessageID: "01J00000040000000000000001", mentions: []),
-                native: ChannelUnread(id: ChannelCompositeKey(channelID: native, userID: user.id), lastMessageID: "01J00000060000000000000001", mentions: ["01J00000070000000000000001"])
-            ],
-            typingUsersByChannelID: [general: [design.id]]
-        )
-    }
-}
 
 @MainActor
 @Observable
@@ -19679,376 +19609,3 @@ public struct PhaseOneStatus: Equatable, Sendable {
 public typealias PhaseZeroStatus = PhaseOneStatus
 public typealias PhaseThreeStatus = PhaseOneStatus
 public typealias PhaseFourStatus = PhaseOneStatus
-
-@MainActor
-private func phase30DMPreviewModel(reduceGlass: Bool = false) -> MainShellViewModel {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.reduceGlassIntensity = reduceGlass
-    model.liquidGlassTransparency = reduceGlass ? 0.35 : 1.0
-    if let item = model.directMessageItems.first {
-        model.selectDirectMessageItem(item)
-    }
-    return model
-}
-
-@MainActor
-private func phase37PreviewModel(reduceGlass: Bool = false, highContrast: Bool = false) -> MainShellViewModel {
-    var snapshot = MockShellData.snapshot
-    let serverID: ServerID = "01HX0000000000000000000201"
-    let adminRole = Role(id: "phase37-admin-role", name: "Administrators", permissions: PermissionOverride(allow: [.manageServer, .manageRole, .manageMessages]), colour: "#FF5C7A", hoist: true, rank: 90)
-    let managerRole = Role(id: "phase37-manager-role", name: "Managers", permissions: PermissionOverride(allow: [.manageServer, .manageChannel]), colour: "#5FA8FF", hoist: true, rank: 70)
-    let botRole = Role(id: "phase37-bot-role", name: "Automation", permissions: PermissionOverride(allow: [.sendMessage, .react]), colour: "#49C98A", hoist: true, rank: 40)
-    let memberRole = Role(id: "phase37-member-role", name: "Members", permissions: PermissionOverride(allow: [.viewChannel, .readMessageHistory]), colour: "#B38CFF", hoist: false, rank: 10)
-    snapshot.serversByID[serverID]?.roles[adminRole.id] = adminRole
-    snapshot.serversByID[serverID]?.roles[managerRole.id] = managerRole
-    snapshot.serversByID[serverID]?.roles[botRole.id] = botRole
-    snapshot.serversByID[serverID]?.roles[memberRole.id] = memberRole
-
-    let adminID: UserID = "phase37-admin-user"
-    let botID: UserID = "phase37-bot-user"
-    let offlineID: UserID = "phase37-offline-user"
-    let unknownRoleID: UserID = "phase37-unknown-role-user"
-    snapshot.usersByID[adminID] = User(id: adminID, username: "admin", discriminator: "1001", displayName: "Admin Ada", status: UserStatus(text: "Keeping order", presence: .online), relationship: .friend, online: true)
-    snapshot.usersByID[botID] = User(id: botID, username: "bagelbot", discriminator: "2002", displayName: "Bagel Bot", status: UserStatus(text: "Automating triage", presence: .focus), bot: BotInformation(ownerID: MockShellData.currentUserID), relationship: .none, online: true)
-    snapshot.usersByID[offlineID] = User(id: offlineID, username: "quietops", discriminator: "3003", displayName: "Quiet Ops", status: UserStatus(text: nil, presence: .invisible), relationship: .friend, online: false)
-    snapshot.usersByID[unknownRoleID] = User(id: unknownRoleID, username: "driftcase", discriminator: "4004", displayName: "Role Drift", status: UserStatus(text: "Testing fallback", presence: .idle), relationship: .none, online: true)
-
-    let joinedAt = Date(timeIntervalSince1970: 1_700_000_000)
-    snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: adminID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: adminID), joinedAt: joinedAt, nickname: "Ada Admin", roles: [memberRole.id, adminRole.id])
-    snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: botID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: botID), joinedAt: joinedAt, roles: [botRole.id])
-    snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: offlineID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: offlineID), joinedAt: joinedAt, roles: [memberRole.id])
-    snapshot.membersByServerAndUserID[ServerMemberKey(serverID: serverID, userID: unknownRoleID)] = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: unknownRoleID), joinedAt: joinedAt, roles: ["phase37-missing-role"])
-
-    let model = MainShellViewModel(snapshot: snapshot)
-    model.reduceGlassIntensity = reduceGlass
-    model.liquidGlassTransparency = reduceGlass ? 0.35 : 1.0
-    model.selectServer(serverID)
-    model.userProfilesByID[botID] = UserProfile(content: "### About\nAutomation helper for **member hydration** and _safe media_ checks.", background: File(id: "phase37-profile-background", tag: "backgrounds", filename: "banner.png", metadata: .image(width: 1200, height: 360, thumbhash: nil, animated: false), contentType: "image/png", size: 128_000, userID: botID))
-    model.showUserProfile(botID, source: .memberRow, serverID: serverID)
-    return model
-}
-
-@available(macOS 15.0, *)
-#Preview("Shell Dark") {
-    MainShellView(viewModel: MainShellViewModel(snapshot: MockShellData.snapshot, runtimeMode: .mock))
-        .preferredColorScheme(.dark)
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Shell Light") {
-    MainShellView(viewModel: MainShellViewModel(snapshot: MockShellData.snapshot, runtimeMode: .mock))
-        .preferredColorScheme(.light)
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("No Server Selected") {
-    MainShellView(viewModel: MainShellViewModel(selection: ShellSelection(space: .home), snapshot: MockShellData.snapshot, runtimeMode: .mock))
-        .frame(width: 980, height: 640)
-}
-
-@available(macOS 15.0, *)
-#Preview("Quick Switcher") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.showQuickSwitcher()
-    return QuickSwitcherView(viewModel: model)
-}
-
-@available(macOS 15.0, *)
-#Preview("Focused Composer") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selectServer(model.servers[0].id)
-    model.focusComposer()
-    return ChatPlaceholderView(viewModel: model)
-        .frame(width: 760, height: 620)
-}
-
-@available(macOS 15.0, *)
-#Preview("Selected Message") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selectServer(model.servers[0].id)
-    model.jumpToNewestMessage()
-    return MessageTimelineView(viewModel: model)
-        .frame(width: 760, height: 520)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 11 Unloaded Unread") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    if let channel = model.snapshot.channelsByID.values.first(where: { $0.displayName == "macos-native" }) {
-        model.selectChannel(channel.id)
-        model.localReadStates[channel.id] = LocalReadState(channelID: channel.id, firstUnreadMessageID: "missing-unread", unreadCount: 1, mentionCount: 0)
-        model.jumpToFirstUnreadMessage()
-    }
-    return MessageTimelineView(viewModel: model)
-        .frame(width: 760, height: 520)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 29 Timeline Without Diagnostics") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selectServer(model.servers[0].id)
-    if let channelID = model.selection.channelID {
-        for message in model.selectedTimelineMessages.suffix(2) {
-            model.updateTimelineVisibility(messageID: message.message.id, channelID: channelID, isVisible: true)
-        }
-    }
-    return MessageTimelineView(viewModel: model)
-        .frame(width: 760, height: 520)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 29 DM Loaded") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selectDirectMessages()
-    return MainShellView(viewModel: model)
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 29 Developer Diagnostics") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selectServer(model.servers[0].id)
-    model.showCredentialSetup()
-    return CredentialSetupView(viewModel: model)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 30 DM Selected Loaded") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    if let item = model.directMessageItems.first {
-        model.selectDirectMessageItem(item)
-    }
-    return MainShellView(viewModel: model)
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 30 DM Participants Sidebar") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    if let item = model.directMessageItems.first {
-        model.selectDirectMessageItem(item)
-    }
-    return MemberPanelView(viewModel: model)
-        .frame(width: 300, height: 620)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 30 DM Trace Developer Panel") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    if let item = model.directMessageItems.first {
-        model.selectDirectMessageItem(item)
-    }
-    model.showCredentialSetup()
-    return CredentialSetupView(viewModel: model)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 30 Parity Matrix Summary") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.showCredentialSetup()
-    return CredentialSetupView(viewModel: model)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 30 High Contrast DM") {
-    MainShellView(viewModel: phase30DMPreviewModel())
-        .preferredColorScheme(.dark)
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 30 Reduce Transparency DM") {
-    MainShellView(viewModel: phase30DMPreviewModel(reduceGlass: true))
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 34 Compact Home") {
-    MainShellView(viewModel: MainShellViewModel(snapshot: MockShellData.snapshot))
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 34 Server Members Role Colors") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selectServer(model.servers[0].id)
-    return MemberPanelView(viewModel: model, context: model.rightSidebarContext)
-        .frame(width: 300, height: 620)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 37 Role Ordered Member List") {
-    let model = phase37PreviewModel()
-    return MemberPanelView(viewModel: model, context: model.rightSidebarContext)
-        .frame(width: 320, height: 680)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 37 Role Colored Message Authors") {
-    let model = phase37PreviewModel()
-    return MessageTimelineView(viewModel: model)
-        .frame(width: 760, height: 560)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 37 Native Profile Popover") {
-    let model = phase37PreviewModel()
-    return UserProfileCardView(viewModel: model, user: model.profilePresentationUser ?? model.snapshot.usersByID["phase37-bot-user"]!)
-        .frame(width: 420)
-        .preferredColorScheme(.dark)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 37 Mutual Profile Tabs") {
-    let model = phase37PreviewModel(reduceGlass: true)
-    model.profileSelectedTab = .mutualServers
-    return UserProfileCardView(viewModel: model, user: model.profilePresentationUser ?? model.snapshot.usersByID["phase37-bot-user"]!)
-        .frame(width: 420)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 37 High Contrast Role Colors") {
-    let model = phase37PreviewModel(highContrast: true)
-    MainShellView(viewModel: model)
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 37 Media Safe Mode Placeholder") {
-    let model = phase37PreviewModel()
-    model.freezePerformanceDiagnostics.mediaSafeModeEnabled = true
-    model.lastImageResourceAction = "Media safe mode: showing visible tap-to-load placeholders."
-    return CredentialSetupView(viewModel: model)
-        .frame(width: 620, height: 620)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 37 Notification Build Readiness") {
-    let model = phase37PreviewModel()
-    model.showCredentialSetup()
-    model.selectedSettingsTab = .notifications
-    return CredentialSetupView(viewModel: model)
-        .frame(width: 620, height: 620)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 34 Home No Member Sidebar") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selection.isMemberPanelVisible = true
-    return MainShellView(viewModel: model)
-        .frame(width: 980, height: 640)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 29 Compact Composer") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selectServer(model.servers[0].id)
-    return ChatPlaceholderView(viewModel: model)
-        .frame(width: 760, height: 620)
-}
-
-@available(macOS 15.0, *)
-#Preview("Phase 29 Capped Composer") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selectServer(model.servers[0].id)
-    if let channelID = model.selectedConversationChannelID {
-        model.updateDraft(String(repeating: "Long composer preview line. ", count: 32), for: channelID)
-    }
-    return ChatPlaceholderView(viewModel: model)
-        .frame(width: 760, height: 620)
-}
-
-@available(macOS 15.0, *)
-#Preview("Compact Density") {
-    let model = MainShellViewModel(snapshot: MockShellData.snapshot)
-    model.selectServer(model.servers[0].id)
-    model.messageDensity = .compact
-    return ChatPlaceholderView(viewModel: model)
-        .frame(width: 760, height: 620)
-}
-
-@available(macOS 15.0, *)
-#Preview("Member Panel Hidden") {
-    MainShellView(viewModel: MainShellViewModel(selection: ShellSelection(space: .server("01HX0000000000000000000201"), serverID: "01HX0000000000000000000201", channelID: "01HX0000000000000000000101", isMemberPanelVisible: false), snapshot: MockShellData.snapshot, runtimeMode: .mock))
-        .preferredColorScheme(.dark)
-        .frame(width: 980, height: 640)
-}
-
-@available(macOS 15.0, *)
-#Preview("Credential Setup - No Credential") {
-    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .signedOut, currentUser: nil))
-}
-
-@available(macOS 15.0, *)
-#Preview("Credential Setup - Token Entry") {
-    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .signedOut, currentUser: nil))
-}
-
-@available(macOS 15.0, *)
-#Preview("Credential Setup - Validating") {
-    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .validatingCredential, currentUser: nil))
-}
-
-@available(macOS 15.0, *)
-#Preview("Credential Setup - Validation Failed") {
-    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .validationFailed("The session could not be validated."), currentUser: nil))
-}
-
-@available(macOS 15.0, *)
-#Preview("Credential Setup - Ready") {
-    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .readyToConnect, currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID]))
-}
-
-@available(macOS 15.0, *)
-#Preview("Credential Setup - Connected Diagnostics") {
-    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .connected, currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID]))
-}
-
-@available(macOS 15.0, *)
-#Preview("Credential Setup - Invalid Session") {
-    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .invalidSession("The saved session expired."), currentUser: nil))
-}
-
-@available(macOS 15.0, *)
-#Preview("Credential Setup - Custom Environment") {
-    CredentialSetupView(viewModel: MainShellViewModel(runtimeMode: .liveManual, sessionState: .savedCredentialUnvalidated, currentUser: nil))
-}
-
-@available(macOS 15.0, *)
-#Preview("Live - Ready To Connect") {
-    MainShellView(viewModel: MainShellViewModel(snapshot: RealtimeSnapshot(), runtimeMode: .liveManual, sessionState: .readyToConnect, currentUser: nil))
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Live - Connecting") {
-    MainShellView(viewModel: MainShellViewModel(snapshot: RealtimeSnapshot(), connectionState: .authenticating, runtimeMode: .liveManual, sessionState: .connecting, currentUser: nil))
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Live - Ready Snapshot") {
-    MainShellView(viewModel: MainShellViewModel(
-        selection: ShellSelection(space: .server("01HX0000000000000000000201"), serverID: "01HX0000000000000000000201", channelID: "01HX0000000000000000000101"),
-        snapshot: MockShellData.snapshot,
-        connectionState: .ready,
-        runtimeMode: .liveManual,
-        sessionState: .connected,
-        currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID]
-    ))
-    .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Live - No Servers") {
-    MainShellView(viewModel: MainShellViewModel(snapshot: RealtimeSnapshot(), connectionState: .ready, runtimeMode: .liveManual, sessionState: .connected, currentUser: nil))
-        .frame(width: 1180, height: 760)
-}
-
-@available(macOS 15.0, *)
-#Preview("Live - Reconnecting") {
-    MainShellView(viewModel: MainShellViewModel(snapshot: MockShellData.snapshot, connectionState: .reconnecting(attempt: 2, nextDelay: .seconds(4)), runtimeMode: .liveManual, sessionState: .connecting, currentUser: MockShellData.snapshot.usersByID[MockShellData.currentUserID]))
-        .frame(width: 1180, height: 760)
-}

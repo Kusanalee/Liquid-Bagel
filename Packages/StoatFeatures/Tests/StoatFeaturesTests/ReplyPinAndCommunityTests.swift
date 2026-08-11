@@ -14,12 +14,12 @@ import XCTest
 extension StoatFeaturesTests {
     @MainActor
     func testPhase44ReplyComposerClearsAfterSuccessAndPersistsAfterFailure() async throws {
-        let channelID = try XCTUnwrap(MockShellData.snapshot.channelsByID.values.first { $0.kind == .textChannel }?.id)
-        let target = try XCTUnwrap(MockShellData.snapshot.messagesByChannelID[channelID]?.first)
+        let channelID = try XCTUnwrap(TestShellData.snapshot.channelsByID.values.first { $0.kind == .textChannel }?.id)
+        let target = try XCTUnwrap(TestShellData.snapshot.messagesByChannelID[channelID]?.first)
 
         let failingHandler = RecordingAttachmentMessageActionHandler()
         await failingHandler.setSendError(MessageActionError.unavailable("offline"))
-        let failingModel = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: failingHandler)
+        let failingModel = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: failingHandler, communityAPIClient: StubStoatAPIClient())
         failingModel.selectChannel(channelID)
         failingModel.beginReply(to: TimelineMessage(message: target, status: .confirmed))
         failingModel.updateDraft("still here", for: channelID)
@@ -30,7 +30,7 @@ extension StoatFeaturesTests {
         XCTAssertEqual(failingModel.phase44Diagnostics.replyComposerPreservedAfterFailureCount, 1)
 
         let successHandler = RecordingAttachmentMessageActionHandler()
-        let successModel = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: successHandler)
+        let successModel = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: successHandler, communityAPIClient: StubStoatAPIClient())
         successModel.selectChannel(channelID)
         successModel.beginReply(to: TimelineMessage(message: target, status: .confirmed))
         successModel.updateDraft("send", for: channelID)
@@ -43,7 +43,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase44PinnedListUsesSelectedChannelSearchJumpAndUnpin() async throws {
-        let current = User(id: MockShellData.currentUserID, username: "me")
+        let current = User(id: TestShellData.currentUserID, username: "me")
         let author = User(id: "phase44-pin-author", username: "pin-author", displayName: "Pin Author")
         let serverID: ServerID = "phase44-pin-server"
         let channelID: ChannelID = "phase44-pin-channel"
@@ -81,7 +81,7 @@ extension StoatFeaturesTests {
         let serverID: ServerID = "phase44-notification-server"
         let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "general")
         let server = Server(id: serverID, ownerID: "owner", name: "Notify", channelIDs: [channelID])
-        let model = MainShellViewModel(snapshot: RealtimeSnapshot(serversByID: [serverID: server], channelsByID: [channelID: channel]))
+        let model = MainShellViewModel(snapshot: RealtimeSnapshot(serversByID: [serverID: server], channelsByID: [channelID: channel]), currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.openNotificationRoute(NotificationRoute(serverID: serverID, channelID: channelID, messageID: "phase44-missing-message"))
 
@@ -110,14 +110,14 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase44AckDedupeAndClearsUnreadOnlyAfterSuccess() async throws {
         let sender = RecordingChannelAckSender()
-        let currentUserID = MockShellData.currentUserID
+        let currentUserID = TestShellData.currentUserID
         let channelID: ChannelID = "phase44-ack-channel"
         let message = Message(id: MessageID(rawValue: ulid(milliseconds: 1_000)), channelID: channelID, authorID: "phase44-other", content: "ack me")
         let channel = Channel(id: channelID, kind: .textChannel, serverID: "phase44-ack-server", name: "ack")
         let server = Server(id: "phase44-ack-server", ownerID: currentUserID, name: "Ack", channelIDs: [channelID])
         var snapshot = RealtimeSnapshot(serversByID: [server.id: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [message]])
         snapshot.unreadsByChannelID[channelID] = ChannelUnread(id: ChannelCompositeKey(channelID: channelID, userID: currentUserID), lastMessageID: message.id, mentions: [])
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: channelID), snapshot: snapshot, runtimeMode: .liveManual, sessionState: .connected, currentUser: User(id: currentUserID, username: "me"), channelAckSender: sender)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: channelID), snapshot: snapshot, runtimeMode: .liveManual, sessionState: .connected, currentUser: User(id: currentUserID, username: "me"), messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), channelAckSender: sender, communityAPIClient: StubStoatAPIClient())
         model.timelineTuning.ackDebounceMilliseconds = 5
 
         model.selectChannel(channelID)
@@ -149,20 +149,20 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase47EmbedDisplayItemsUseModeledMediaAndImageResourceQueue() async throws {
         let data = Data("embed-image".utf8)
-        let loader = MockImageResourceLoader(result: .success(data))
+        let loader = StubImageResourceLoader(result: .success(data))
         let serverID: ServerID = "phase47-embed-server"
         let channelID: ChannelID = "phase47-embed-channel"
         let file = File(id: "phase47-embed-media", tag: "attachments", filename: "embed.png", metadata: .image(width: 64, height: 64, thumbhash: nil, animated: false), contentType: "image/png", size: 512)
         let message = Message(
             id: "01J00000000000000000470001",
             channelID: channelID,
-            authorID: MockShellData.currentUserID,
+            authorID: TestShellData.currentUserID,
             embeds: [Embed(kind: .image, title: "Modeled image", media: file)]
         )
         let channel = Channel(id: channelID, kind: .textChannel, serverID: serverID, name: "embeds")
-        let server = Server(id: serverID, ownerID: MockShellData.currentUserID, name: "Embeds", channelIDs: [channelID])
+        let server = Server(id: serverID, ownerID: TestShellData.currentUserID, name: "Embeds", channelIDs: [channelID])
         let snapshot = RealtimeSnapshot(serversByID: [serverID: server], channelsByID: [channelID: channel], messagesByChannelID: [channelID: [message]])
-        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, runtimeMode: .mock, imageResourceLoader: loader)
+        let model = MainShellViewModel(selection: ShellSelection(space: .server(serverID), serverID: serverID, channelID: channelID), snapshot: snapshot, runtimeMode: .mock, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), imageResourceLoader: loader, communityAPIClient: StubStoatAPIClient())
 
         var items = model.embedDisplayItems(for: message)
         XCTAssertEqual(items.first?.title, "Modeled image")
@@ -188,7 +188,7 @@ extension StoatFeaturesTests {
         let website = Message(
             id: "01J00000000000000000470002",
             channelID: channelID,
-            authorID: MockShellData.currentUserID,
+            authorID: TestShellData.currentUserID,
             embeds: [Embed(kind: .website, url: "https://example.com/private?token=secret", title: "<b>Launch notes</b>", siteName: "Example")]
         )
 
@@ -198,7 +198,7 @@ extension StoatFeaturesTests {
         let imageOnly = Message(
             id: "01J00000000000000000470003",
             channelID: channelID,
-            authorID: MockShellData.currentUserID,
+            authorID: TestShellData.currentUserID,
             embeds: [Embed(kind: .image, media: file)]
         )
 
@@ -208,7 +208,7 @@ extension StoatFeaturesTests {
     // MARK: - Phase 25 CategoryEditorForm reorder tests
 
     func testCategoryEditorFormMoveCategoriesChangesOrder() {
-        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let server = TestShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         var form = CategoryEditorForm(server: server)
         XCTAssertEqual(form.categories.map(\.id), ["cat-text", "cat-voice"])
 
@@ -217,7 +217,7 @@ extension StoatFeaturesTests {
     }
 
     func testCategoryEditorFormMoveCategoriesNoOpLeavesUnchanged() {
-        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let server = TestShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         var form = CategoryEditorForm(server: server)
         let original = form.categories.map(\.id)
 
@@ -226,7 +226,7 @@ extension StoatFeaturesTests {
     }
 
     func testCategoryEditorFormMoveChannelsChangesOrderWithinCategory() {
-        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let server = TestShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         var form = CategoryEditorForm(server: server)
         let general: ChannelID = "01HX0000000000000000000101"
         let api: ChannelID = "01HX0000000000000000000102"
@@ -238,7 +238,7 @@ extension StoatFeaturesTests {
     }
 
     func testCategoryEditorFormMoveChannelsNoOpLeavesUnchanged() {
-        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let server = TestShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         var form = CategoryEditorForm(server: server)
         let general: ChannelID = "01HX0000000000000000000101"
         let api: ChannelID = "01HX0000000000000000000102"
@@ -249,7 +249,7 @@ extension StoatFeaturesTests {
     }
 
     func testCategoryEditorFormMoveChannelsUnknownCategoryIsNoop() {
-        let server = MockShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
+        let server = TestShellData.snapshot.serversByID.values.first { $0.name == "Bagel Lab" }!
         var form = CategoryEditorForm(server: server)
         let before = form
 
@@ -261,13 +261,13 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testOpenNewDirectMessageCanPerformInMockMode() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         XCTAssertTrue(model.canPerform(.openNewDirectMessage))
     }
 
     @MainActor
     func testOpenNewDirectMessagePerformSetsPresentationFlag() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         XCTAssertFalse(model.isPresentingNewDirectMessage)
 
         model.perform(.openNewDirectMessage)
@@ -277,7 +277,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testOpenNewDirectMessageResetsSearchBeforePresenting() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.newDirectMessageSearch = "old query"
 
         model.openNewDirectMessage()
@@ -288,7 +288,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testNewDirectMessageCandidatesEmptyForNonMatchingSearch() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.newDirectMessageSearch = "zzznonexistentxxx"
         XCTAssertTrue(model.newDirectMessageCandidates.isEmpty)
     }
@@ -429,8 +429,7 @@ extension StoatFeaturesTests {
         )
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: channelID),
-            snapshot: snapshot
-        )
+            snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         await model.prepareSelectedTimelinePresentation()
 
@@ -476,8 +475,7 @@ extension StoatFeaturesTests {
         )
         let model = MainShellViewModel(
             selection: ShellSelection(space: .directMessages, dmChannelID: firstChannelID),
-            snapshot: snapshot
-        )
+            snapshot: snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         await model.prepareSelectedTimelinePresentation()
 
         for _ in 0..<200 {
@@ -559,7 +557,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase62ComposerPasteDiagnosticsAreCategoricalAndSurfaceUnsupportedPayload() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         model.recordComposerPasteDiagnostic(
             ComposerPasteDiagnostic(source: .keyEquivalent, outcome: .unsupported, providerCount: 1)
         )
@@ -573,7 +571,7 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase62ComposerPasteDiagnosticMarksValidationLimitAsRejected() {
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
         let channelID = model.snapshot.channelsByID.values.first { $0.displayName == "general" }!.id
 
         model.addPastedImageDataFromClipboard(
@@ -744,7 +742,7 @@ extension StoatFeaturesTests {
             username: "gateway-user",
             status: UserStatus(text: "Busy", presence: .idle)
         )
-        let model = MainShellViewModel(snapshot: snapshot, currentUser: readyUser)
+        let model = MainShellViewModel(snapshot: snapshot, currentUser: readyUser, messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient())
 
         XCTAssertEqual(model.currentUserForPresentation?.avatar?.id, avatar.id)
         XCTAssertEqual(model.currentUserForPresentation?.displayName, "Ready display")
@@ -755,7 +753,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase61VisibilityTrackingMigratesToConfirmedIDWithoutRetriggeringAvatarResource() async throws {
         let handler = DelayedMessageActionHandler(delay: .milliseconds(80))
-        let model = MainShellViewModel(snapshot: MockShellData.snapshot, messageActionHandler: handler)
+        let model = MainShellViewModel(snapshot: TestShellData.snapshot, currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         let server = try XCTUnwrap(model.servers.first { $0.name == "Bagel Lab" })
         model.selectServer(server.id)
         let channelID = try XCTUnwrap(model.selection.channelID)
@@ -822,7 +820,7 @@ extension StoatFeaturesTests {
     @MainActor
     func testPhase70SignatureReadinessIsLazyCoalescedAndCached() async throws {
         let counter = LockedInvocationCounter()
-        let model = MainShellViewModel(notificationSignatureStatusPreparer: { _ in
+        let model = MainShellViewModel(currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID), communityAPIClient: StubStoatAPIClient(), notificationSignatureStatusPreparer: { _ in
             counter.increment()
             try? await Task.sleep(for: .milliseconds(40))
             return "signed and valid"
@@ -861,13 +859,13 @@ extension StoatFeaturesTests {
 
     @MainActor
     func testPhase70OfficialEmojiContentIsIdenticalWhileOptimisticAndConfirmed() async throws {
-        var snapshot = MockShellData.snapshot
+        var snapshot = TestShellData.snapshot
         let server = try XCTUnwrap(snapshot.serversByID.values.first { !$0.channelIDs.isEmpty })
         let channelID = try XCTUnwrap(server.channelIDs.first)
         let emoji = Emoji(
             id: "01J00000000000000000700001",
             parent: .server(server.id),
-            creatorID: MockShellData.currentUserID,
+            creatorID: TestShellData.currentUserID,
             name: "interoperable"
         )
         snapshot.emojisByID[emoji.id] = emoji
@@ -875,8 +873,7 @@ extension StoatFeaturesTests {
         let model = MainShellViewModel(
             selection: ShellSelection(space: .server(server.id), serverID: server.id, channelID: channelID),
             snapshot: snapshot,
-            messageActionHandler: handler
-        )
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID], messageActionHandler: handler, communityAPIClient: StubStoatAPIClient())
         let content = "before :\(emoji.id.rawValue): after"
         model.updateDraft(content, for: channelID)
 
