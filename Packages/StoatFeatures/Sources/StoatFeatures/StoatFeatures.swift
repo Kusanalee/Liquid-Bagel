@@ -587,7 +587,12 @@ public final class MainShellViewModel {
             schedulePhase51ShellPresentationRefresh(reason: "local read state")
         }
     }
-    public var messageActionStatus: String?
+    /// Outcome of the last message action. Had no render site at all before Phase 74, so
+    /// "Message pinned", "Message text copied", and every failure it recorded were written and
+    /// discarded. Routed to the notice overlay for the same reason `placeholderStatus` is.
+    public var messageActionStatus: String? {
+        didSet { routeLegacyStatusToNotice(messageActionStatus) }
+    }
     public var isCredentialSetupPresented = false
     public var isTestSendConfirmationPresented = false
     public var selectedSettingsTab: SettingsSectionTab = .account
@@ -2568,19 +2573,16 @@ public final class MainShellViewModel {
         memberHydrationLoadingServerIDs.contains(serverID)
     }
 
+    /// `nil` when the member list is fine, which is almost always.
+    ///
+    /// This used to announce "Members refreshed from Stoat" on success and "Showing Ready
+    /// members" otherwise -- narrating machinery nobody asked about -- and on failure it
+    /// interpolated the internal diagnostic category and a raw `StoatAPIError` description
+    /// straight into the panel. Success is now silent and failure is one short sentence; the
+    /// underlying error is still in the redacted diagnostics behind Developer Options.
     public func memberHydrationStatusMessage(for serverID: ServerID) -> String? {
-        if memberHydrationLoadingServerIDs.contains(serverID) {
-            return "Refreshing members..."
-        }
-        if let error = memberHydrationErrorsByServerID[serverID] {
-            return "Member refresh failed due to \(memberHydrationDiagnostics.apiDiagnostics?.errorCategory ?? "refresh error"): \(error)"
-        }
-        if hydratedMemberServerIDs.contains(serverID) {
-            return "Members refreshed from Stoat"
-        }
-        if knownMemberCount(serverID: serverID) > 0 {
-            return "Showing Ready members"
-        }
+        if memberHydrationLoadingServerIDs.contains(serverID) { return nil }
+        if memberHydrationErrorsByServerID[serverID] != nil { return "Couldn't refresh members." }
         return nil
     }
 
@@ -2780,7 +2782,11 @@ public final class MainShellViewModel {
             return
         }
         let diagnosed = error as? StoatAPIDiagnosedError
-        let message = diagnosed?.apiError.errorDescription ?? error.userFacingMessage
+        // Two different audiences. `diagnosticMessage` keeps the status code and server body for
+        // the developer diagnostics bag; `message` is what a person reads.
+        let diagnosticMessage = diagnosed?.apiError.errorDescription ?? error.userFacingMessage
+        let message = diagnosed.map { UserFacingError.message(for: $0.apiError, context: .members) }
+            ?? UserFacingError.message(for: error, context: .members)
         memberHydrationTasks[serverID] = nil
         memberHydrationLoadingServerIDs.remove(serverID)
         memberHydrationErrorsByServerID[serverID] = message
@@ -2790,12 +2796,12 @@ public final class MainShellViewModel {
             requestedCount: requestedCount,
             missingUserCount: missingUserCount(serverID: serverID),
             isLoading: false,
-            error: message,
+            error: diagnosticMessage,
             apiDiagnostics: diagnosed?.diagnostics,
             lastUpdatedAt: Date()
         )
         if forced {
-            placeholderStatus = "Member refresh failed: \(message)"
+            presentNotice(message, severity: .error)
         }
     }
 
@@ -3278,7 +3284,7 @@ public final class MainShellViewModel {
             if let originalUser {
                 upsertUser(originalUser)
             }
-            statusUpdateStatus = "Status change failed: \(error.userFacingMessage)"
+            statusUpdateStatus = UserFacingError.message(for: error)
             placeholderStatus = statusUpdateStatus
         }
     }
@@ -3341,7 +3347,7 @@ public final class MainShellViewModel {
             if let originalUser {
                 upsertUser(originalUser)
             }
-            statusUpdateStatus = "Status change failed: \(error.userFacingMessage)"
+            statusUpdateStatus = UserFacingError.message(for: error)
             placeholderStatus = statusUpdateStatus
         }
     }
@@ -7351,7 +7357,7 @@ public final class MainShellViewModel {
                 composerError = nil
                 lastAttachmentAction = "Queued attachment"
             } catch {
-                composerError = error.userFacingMessage
+                composerError = UserFacingError.message(for: error, context: .attachment)
             }
         }
         composerDrafts[channelID] = state
@@ -7443,7 +7449,7 @@ public final class MainShellViewModel {
                 items: [AttachmentDropReviewItem(filename: "Pasted Image.png", error: error)],
                 blockedReason: nil
             )
-            composerError = error.userFacingMessage
+            composerError = UserFacingError.message(for: error, context: .attachment)
             lastAttachmentAction = "Paste image rejected by validation"
         }
     }
@@ -7462,7 +7468,7 @@ public final class MainShellViewModel {
             composerError = nil
             lastAttachmentAction = "Queued pasted image"
         } catch {
-            composerError = error.userFacingMessage
+            composerError = UserFacingError.message(for: error, context: .attachment)
         }
         composerDrafts[channelID] = state
     }
@@ -9023,7 +9029,7 @@ public final class MainShellViewModel {
         } catch {
             var updated = composerDraftState(for: channelID)
             guard let updatedIndex = updated.attachments.firstIndex(where: { $0.id == attachmentID }) else { return }
-            updated.attachments[updatedIndex].status = .failed(error.userFacingMessage)
+            updated.attachments[updatedIndex].status = .failed(UserFacingError.message(for: error, context: .attachment))
             composerDrafts[channelID] = updated
             composerError = "Attachment upload failed."
             lastAttachmentAction = "Attachment upload failed"
@@ -9211,7 +9217,7 @@ public final class MainShellViewModel {
             requestFocus(.timeline)
         } catch {
             editState.isSaving = false
-            editState.errorMessage = "Edit failed: \(error.userFacingMessage)"
+            editState.errorMessage = UserFacingError.message(for: error, context: .sendMessage)
             inlineEditState = editState
             messageActionStatus = editState.errorMessage
         }
@@ -9255,7 +9261,7 @@ public final class MainShellViewModel {
             self.pendingDeletion = nil
             messageActionStatus = nil
         } catch {
-            messageActionStatus = "Delete failed: \(error.userFacingMessage)"
+            messageActionStatus = "Couldn't delete that message."
         }
     }
 
@@ -9337,10 +9343,10 @@ public final class MainShellViewModel {
                 userID: currentUserID,
                 isAdding: hasReacted
             )
-            messageActionStatus = "Reaction failed: \(error.userFacingMessage)"
+            messageActionStatus = "Couldn't add that reaction."
             phase59ReactionDiagnostics.rollbackCount += 1
             phase59ReactionDiagnostics.lastOutcome = "rolled back after failure"
-            presentNotice("Reaction failed: \(error.userFacingMessage)", severity: .error)
+            presentNotice("Couldn't add that reaction.", severity: .error)
         }
     }
 
@@ -9393,7 +9399,7 @@ public final class MainShellViewModel {
             } else {
                 phase44Diagnostics.unpinActionFailureCount += 1
             }
-            messageActionStatus = "Pin action failed: \(error.userFacingMessage)"
+            messageActionStatus = "Couldn't update the pin."
         }
     }
 
@@ -10363,7 +10369,15 @@ public final class MainShellViewModel {
                 self?.notificationPermissionStatus = result.statusAfter
                 self?.notificationDiagnostics.lastPermissionRequest = result
                 self?.lastNotificationPermissionRequest = result.summary
-                self?.placeholderStatus = "Notification permission: \(result.statusAfter.rawValue)"
+                // The raw enum case name ("notDetermined", "provisional") is diagnostics, not copy.
+                switch result.statusAfter {
+                case .authorized, .provisional, .ephemeral:
+                    self?.presentNotice("Notifications are on.", severity: .success)
+                case .denied:
+                    self?.presentNotice("Notifications are turned off in System Settings.", severity: .warning)
+                case .notDetermined, .unknown:
+                    self?.presentNotice("macOS hasn't recorded a choice yet.", severity: .warning)
+                }
                 self?.updateNotificationDiagnostics()
             }
         }
@@ -10898,7 +10912,7 @@ public final class MainShellViewModel {
             phase44Diagnostics.lastSafeStatus = items.isEmpty ? "Pinned list empty" : "Pinned list loaded"
             recordPhase44Duration("pinnedList", startedAt: started)
         } catch {
-            let message = "Pinned messages failed: \(error.userFacingMessage)"
+            let message = "Couldn't load pinned messages."
             pinnedMessagesState.loadState = .failed(channelID, message)
             phase44Diagnostics.pinnedListFailureCount += 1
             phase44Diagnostics.lastSafeStatus = message
@@ -10946,7 +10960,7 @@ public final class MainShellViewModel {
             messageActionStatus = "Message unpinned"
             phase44Diagnostics.unpinActionSuccessCount += 1
         } catch {
-            messageActionStatus = "Unpin failed: \(error.userFacingMessage)"
+            messageActionStatus = "Couldn't unpin that message."
             phase44Diagnostics.unpinActionFailureCount += 1
         }
     }
@@ -11020,7 +11034,7 @@ public final class MainShellViewModel {
                 recordPhase44SearchBucket(remote: query.mode != .loadedOnly, count: results.count)
                 lastTimelineActionResult = "Selected-channel search completed"
             } catch {
-                let message = "Selected-channel search failed: \(error.userFacingMessage)"
+                let message = UserFacingError.message(for: error, context: .search)
                 channelSearchState = .failed(query, message)
                 remoteSearchResults = []
                 remoteSearchStatus = message
@@ -11232,7 +11246,7 @@ public final class MainShellViewModel {
             refreshSearchHighlightState()
         } catch {
             remoteSearchResults = []
-            remoteSearchStatus = "Selected-channel search failed: \(error.userFacingMessage)"
+            remoteSearchStatus = UserFacingError.message(for: error, context: .search)
             lastTimelineActionResult = "Selected-channel search failed"
             searchHighlightState = nil
         }
@@ -13181,6 +13195,15 @@ public struct MainShellView: View {
         self.viewModel = viewModel
     }
 
+    private func noticeTint(_ severity: TransientAppNoticeSeverity) -> Color {
+        switch severity {
+        case .success: .green
+        case .info: .accentColor
+        case .warning: .orange
+        case .error: .red
+        }
+    }
+
     public var body: some View {
         HStack(spacing: 0) {
             ServerRailView(viewModel: viewModel)
@@ -13405,7 +13428,7 @@ public struct MainShellView: View {
             if let notice = viewModel.transientNotice {
                 HStack(spacing: StoatSpacing.small) {
                     Image(systemName: notice.severity.systemImage)
-                        .foregroundStyle(notice.severity == .error ? Color.red : Color.orange)
+                        .foregroundStyle(noticeTint(notice.severity))
                         .accessibilityHidden(true)
                     Text(notice.message)
                         .font(.callout)
@@ -13424,10 +13447,7 @@ public struct MainShellView: View {
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous)
-                        .strokeBorder(
-                            (notice.severity == .error ? Color.red : Color.orange).opacity(0.28),
-                            lineWidth: 1
-                        )
+                        .strokeBorder(noticeTint(notice.severity).opacity(0.28), lineWidth: 1)
                 }
                 .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
                 .padding(.top, StoatSpacing.small)
@@ -15048,6 +15068,32 @@ private struct SelectedChannelComposerView: View {
         self.channelID = channelID
     }
 
+    @ViewBuilder private var composerErrorBanner: some View {
+        if let message = viewModel.composerError {
+            HStack(spacing: StoatSpacing.small) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
+                Text(message)
+                    .font(.caption)
+                    .lineLimit(2)
+                Spacer()
+                Button {
+                    viewModel.composerError = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+            }
+            .padding(.horizontal, StoatSpacing.medium)
+            .padding(.vertical, StoatSpacing.xSmall)
+            .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+            .accessibilityElement(children: .combine)
+        }
+    }
+
     var body: some View {
         if let channel = viewModel.snapshot.channelsByID[channelID] {
             let sendReadiness = viewModel.composerReadiness(for: channelID)
@@ -15055,6 +15101,11 @@ private struct SelectedChannelComposerView: View {
             let draftState = viewModel.composerDraftState(for: channelID)
             let attachmentPresentation = viewModel.composerAttachmentPresentation(for: channelID)
             let emojiSections = viewModel.composerEmojiSections
+            // `composerError` was set from 26 places and rendered from none, so "File too large"
+            // and "Attachment upload failed" were invisible. It belongs next to the composer
+            // rather than in the top-of-window notice overlay, because it is always about the
+            // thing the user is currently typing.
+            composerErrorBanner
             GlassComposer(
                 text: Binding(
                     get: { viewModel.draft(for: channelID) },
@@ -16057,17 +16108,28 @@ public struct MemberPanelView: View {
     }
 
     @ViewBuilder private func serverMembersPanel(groups: [MemberListGroup]) -> some View {
-        if case let .serverMembers(serverID, _) = context,
-           let status = viewModel.memberHydrationStatusMessage(for: serverID) {
-            HStack(spacing: StoatSpacing.small) {
-                if viewModel.isMemberHydrationLoading(serverID: serverID) {
+        if case let .serverMembers(serverID, _) = context {
+            // Refreshing is a bare spinner with no commentary; a healthy list says nothing at
+            // all. Only a failure gets words, and then it gets a way out of the failure too.
+            if viewModel.isMemberHydrationLoading(serverID: serverID) {
+                HStack(spacing: StoatSpacing.small) {
                     ProgressView().controlSize(.small)
+                    Spacer()
                 }
-                Text(status)
+                .accessibilityLabel("Refreshing members")
+            } else if let status = viewModel.memberHydrationStatusMessage(for: serverID) {
+                HStack(spacing: StoatSpacing.small) {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Button("Retry") {
+                        Task { await viewModel.hydrateServerMembers(serverID: serverID, force: true, reason: "member panel retry") }
+                    }
+                    .buttonStyle(.borderless)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                Spacer()
+                    Spacer()
+                }
             }
         }
         if groups.isEmpty {

@@ -427,3 +427,91 @@ extension StoatFeaturesTests {
         XCTAssertEqual(tuning.olderPrefetchRowThreshold, TimelineTuningConfiguration.defaults.olderPrefetchRowThreshold)
     }
 }
+
+// Phase 74 -- user-facing error copy.
+extension StoatFeaturesTests {
+    /// The contract, asserted mechanically: nothing a user reads carries a status code, a
+    /// decoder path, a diagnostic category, a URL, or a bare enum case name.
+    func testPhase74UserFacingErrorsNeverLeakDiagnosticDetail() {
+        let leaky: [any Error] = [
+            StoatAPIError.serverError(statusCode: 500, message: "upstream connect error 111"),
+            StoatAPIError.unknown(statusCode: 502, body: "<html>bad gateway</html>"),
+            StoatAPIError.decodingFailed("keyNotFound(CodingKeys(stringValue: \"_id\"))"),
+            StoatAPIError.transport("The request timed out. https://api.stoat.chat/users/@me"),
+            StoatAPIError.rateLimited(retryAfterMilliseconds: 4_312),
+            StoatAPIError.unauthorized,
+            StoatAPIError.forbidden
+        ]
+
+        for error in leaky {
+            let message = UserFacingError.message(for: error)
+            for forbidden in ["500", "502", "111", "4312", "CodingKeys", "keyNotFound", "http", "<html>"] {
+                XCTAssertFalse(
+                    message.lowercased().contains(forbidden.lowercased()),
+                    "\(error) produced \"\(message)\", which leaks \(forbidden)"
+                )
+            }
+            XCTAssertFalse(message.isEmpty)
+            XCTAssertTrue(message.hasSuffix(".") , "\(message) should be a complete sentence")
+        }
+    }
+
+    func testPhase74AlreadyUserFacingErrorsKeepTheirOwnWords() {
+        // Sanitising is for errors that leak internals. An error that already names the thing
+        // the user can fix must survive untouched.
+        XCTAssertEqual(
+            UserFacingError.message(for: AttachmentValidationError.tooLarge(maxBytes: 20 * 1024 * 1024), context: .attachment),
+            "File too large. Liquid Bagel currently supports files up to 20 MB."
+        )
+        XCTAssertEqual(
+            UserFacingError.message(for: AttachmentValidationError.tooManyAttachments(5), context: .attachment),
+            "Attach up to 5 files per message."
+        )
+    }
+
+    func testPhase74ErrorCopyIsContextual() {
+        let error = StoatAPIError.serverError(statusCode: 503, message: nil)
+        XCTAssertEqual(
+            UserFacingError.message(for: error, context: .sendMessage),
+            UserFacingError.message(for: error, context: .members),
+            "server trouble reads the same everywhere"
+        )
+        // A missing resource, though, depends on what the user was doing.
+        XCTAssertNotEqual(
+            UserFacingError.message(for: StoatAPIError.notFound, context: .sendMessage),
+            UserFacingError.message(for: StoatAPIError.notFound, context: .members)
+        )
+    }
+
+    func testPhase74NoticePolicyNowRecognisesConfirmations() {
+        // These all previously returned nil and were dropped on the floor.
+        XCTAssertEqual(TransientAppNoticePolicy.severity(for: "Attachment saved"), .success)
+        XCTAssertEqual(TransientAppNoticePolicy.severity(for: "Message pinned"), .success)
+        XCTAssertEqual(TransientAppNoticePolicy.severity(for: "Profile updated."), .success)
+        XCTAssertEqual(TransientAppNoticePolicy.severity(for: "Message ID copied"), .success)
+        // Failures and warnings keep classifying as before.
+        XCTAssertEqual(TransientAppNoticePolicy.severity(for: "Attachment upload failed."), .error)
+        XCTAssertEqual(TransientAppNoticePolicy.severity(for: "Reconnect to refresh live state"), .warning)
+        // Unrecognised text stays silent rather than becoming a toast, so adding a new status
+        // string cannot accidentally start interrupting people.
+        XCTAssertNil(TransientAppNoticePolicy.severity(for: "Timeline calibration started"))
+        XCTAssertNil(TransientAppNoticePolicy.severity(for: ""))
+    }
+
+    @MainActor
+    func testPhase74MemberPanelIsSilentWhenHealthy() async {
+        let model = MainShellViewModel(
+            snapshot: TestShellData.snapshot,
+            runtimeMode: .mock,
+            sessionState: .mock,
+            currentUser: TestShellData.snapshot.usersByID[TestShellData.currentUserID],
+            messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID),
+            communityAPIClient: StubStoatAPIClient()
+        )
+        let serverID = TestShellData.snapshot.serversByID.values.first!.id
+
+        // No error, not loading: the panel says nothing at all. It used to narrate
+        // "Members refreshed from Stoat" / "Showing Ready members".
+        XCTAssertNil(model.memberHydrationStatusMessage(for: serverID))
+    }
+}
