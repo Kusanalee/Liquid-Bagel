@@ -951,6 +951,10 @@ public final class MainShellViewModel {
     /// must not invalidate any SwiftUI body, or a prefetch decision would re-render the timeline
     /// it is trying to extend.
     @ObservationIgnored private var olderLoadPacingByChannelID: [ChannelID: OlderLoadPacingState] = [:]
+    @ObservationIgnored private var automaticSettingsPushTask: Task<Void, Never>?
+    @ObservationIgnored private var lastAutomaticSettingsFetchAt: Date?
+    /// Baseline for change detection. Nil means "we have not synced yet, so any state is new".
+    @ObservationIgnored private var lastSyncedPreferences: SyncedClientPreferences?
     @ObservationIgnored private var failedReferenceFetchMessageIDs: Set<MessageID> = []
     @ObservationIgnored private var selectedTimelineGroupCacheKey: String?
     @ObservationIgnored private var selectedTimelineGroupCacheChannelID: ChannelID?
@@ -6962,6 +6966,7 @@ public final class MainShellViewModel {
 
     public func syncFromSessionCoordinator() {
         guard let sessionCoordinator else { return }
+        let wasConnected = sessionState == .connected
         let nextMemberHydrationScope = [
             String(describing: sessionCoordinator.mode),
             sessionCoordinator.environment.stableID,
@@ -7053,6 +7058,26 @@ public final class MainShellViewModel {
         if sessionCoordinator.mode == .liveManual, sessionCoordinator.sessionState == .connected {
             loadVisibleIdentityImagesForCurrentSelection()
         }
+        if !wasConnected, sessionState == .connected {
+            // Just connected (including a reconnect). Another device may have changed
+            // preferences while this one was offline.
+            Task { [weak self] in await self?.settingsSyncDidConnect() }
+        }
+        noteLocalPreferencesSynced()
+    }
+
+    /// Detect a local preference change and schedule an automatic push.
+    ///
+    /// The very first call after attaching a coordinator establishes the baseline rather than
+    /// treating the loaded preferences as a "change" -- otherwise every launch would push once,
+    /// unconditionally, before anything was actually edited.
+    private func noteLocalPreferencesSynced() {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        guard lastSyncedPreferences != nil else {
+            lastSyncedPreferences = currentSyncedPreferences
+            return
+        }
+        settingsChangedLocally()
     }
 
     public func observe(snapshotSource: any ShellSnapshotSource) {
@@ -10507,6 +10532,7 @@ public final class MainShellViewModel {
             // decides whether it turns into an attempt. Worth having: a connection that failed
             // while the app sat in the background should not need a menu command to recover.
             Task { [weak self] in await self?.sessionCoordinator?.handleAppBecameActive() }
+            Task { [weak self] in await self?.settingsSyncAppBecameActive() }
         }
         reconcileNotificationLifecycle()
     }
@@ -10686,6 +10712,84 @@ public final class MainShellViewModel {
 
     private var lastSettingsSyncTimestamp: Int64? {
         sessionCoordinator?.preferences.lastSettingsSyncTimestamp ?? localSettingsSyncTimestamp
+    }
+
+    // MARK: - Automatic settings sync (Phase 74)
+
+    /// Quiescence before an automatic push.
+    ///
+    /// The debounce exists because a slider is a stream of changes, not one. Dragging the Liquid
+    /// Glass transparency control would otherwise be dozens of writes.
+    static let automaticSettingsPushDelay: Duration = .seconds(3)
+    /// Floor between automatic fetches, so activating the app repeatedly is not a poll loop.
+    static let automaticSettingsFetchCooldown: TimeInterval = 60
+
+    /// The synced subset as it currently stands locally.
+    ///
+    /// Compared by value to decide whether a push is warranted. Comparing whole `AppPreferences`
+    /// would push on every channel selection, since `lastSelectedChannelID` lives in there.
+    private var currentSyncedPreferences: SyncedClientPreferences {
+        SyncedClientPreferences(
+            messageDensity: messageDensity,
+            liquidGlassTransparency: liquidGlassTransparency,
+            inlineImagePreviewPolicy: inlineImagePreviewPolicy,
+            notificationPreferences: notificationPreferences
+        )
+    }
+
+    /// Note that a local preference may have changed, and push if it actually did.
+    public func settingsChangedLocally() {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        let current = currentSyncedPreferences
+        guard current != lastSyncedPreferences else { return }
+        automaticSettingsPushTask?.cancel()
+        automaticSettingsPushTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.automaticSettingsPushDelay)
+            guard !Task.isCancelled else { return }
+            await self?.pushCloudPreferencesAutomatically()
+        }
+    }
+
+    /// Pull once a session is live. Other devices may have changed things while this one was off.
+    public func settingsSyncDidConnect() async {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        await fetchCloudPreferencesAutomatically(force: true)
+    }
+
+    /// The gateway already tells us when another device changed account settings. Before Phase 74
+    /// the app received `UserSettingsUpdate` and did nothing with it for preference purposes,
+    /// which is most of why sync had to be manual at all.
+    public func settingsSyncRemoteSettingsChanged() async {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        await fetchCloudPreferencesAutomatically(force: true)
+    }
+
+    public func settingsSyncAppBecameActive() async {
+        guard isAutomaticSettingsSyncEnabled else { return }
+        await fetchCloudPreferencesAutomatically(force: false)
+    }
+
+    public var isAutomaticSettingsSyncEnabled: Bool {
+        sessionCoordinator?.preferences.automaticSettingsSyncEnabled ?? false
+    }
+
+    private func fetchCloudPreferencesAutomatically(force: Bool) async {
+        guard effectiveSessionState == .connected else { return }
+        if !force, let last = lastAutomaticSettingsFetchAt,
+           Date().timeIntervalSince(last) < Self.automaticSettingsFetchCooldown {
+            return
+        }
+        lastAutomaticSettingsFetchAt = Date()
+        await fetchCloudPreferences()
+        // Whatever the cloud had is now the baseline, so applying it does not immediately look
+        // like a local change and bounce straight back as a push.
+        lastSyncedPreferences = currentSyncedPreferences
+    }
+
+    private func pushCloudPreferencesAutomatically() async {
+        guard effectiveSessionState == .connected else { return }
+        await pushCloudPreferences()
+        lastSyncedPreferences = currentSyncedPreferences
     }
 
     public func fetchCloudPreferences(applyOlder: Bool = false) async {
@@ -11687,6 +11791,12 @@ public final class MainShellViewModel {
            effectiveRuntimeMode == .liveManual,
            effectiveSessionState == .connected {
             loadVisibleIdentityImagesForCurrentSelection()
+        }
+        if update.changes.userSettingsChanged {
+            // The gateway is telling us another device changed account settings. Before this,
+            // the app received the event and did nothing with it for preference purposes, which
+            // is most of why sync had to be a manual button at all.
+            Task { [weak self] in await self?.settingsSyncRemoteSettingsChanged() }
         }
     }
 

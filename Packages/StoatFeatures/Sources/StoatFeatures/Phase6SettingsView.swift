@@ -870,29 +870,56 @@ private struct AppearanceSettingsTab: View {
             }
 
             Section("Cloud Sync") {
-                Text("Sync appearance and notification preferences across devices through your account. Fetch and push are explicit; nothing syncs automatically.")
+                Toggle("Sync automatically", isOn: Binding(
+                    get: { connectionViewModel.preferences.automaticSettingsSyncEnabled },
+                    set: { value in
+                        connectionViewModel.preferences.automaticSettingsSyncEnabled = value
+                        Task {
+                            await connectionViewModel.save()
+                            viewModel.syncFromSessionCoordinator()
+                        }
+                    }
+                ))
+                Text("Appearance and notification preferences follow this account to your other devices.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
-                    Button("Fetch From Cloud") {
-                        Task { await viewModel.fetchCloudPreferences() }
+                    if settingsSyncWorking {
+                        ProgressView().controlSize(.small)
                     }
-                    .disabled(settingsSyncWorking)
-                    Button("Push To Cloud") {
-                        Task { await viewModel.pushCloudPreferences() }
-                    }
-                    .disabled(settingsSyncWorking)
-                    if case .staleRemote = viewModel.settingsSyncState {
-                        Button("Apply Older Cloud Copy") {
-                            Task { await viewModel.fetchCloudPreferences(applyOlder: true) }
-                        }
-                        .disabled(settingsSyncWorking)
-                    }
-                }
-                if let status = settingsSyncStatusText {
-                    Text(status)
+                    Text(settingsSyncStatusText ?? "Synced")
                         .font(.caption)
                         .foregroundStyle(settingsSyncStatusIsError ? .red : .secondary)
+                    Spacer()
+                    Button("Sync Now") {
+                        Task {
+                            await viewModel.pushCloudPreferences()
+                            await viewModel.fetchCloudPreferences()
+                        }
+                    }
+                    .disabled(settingsSyncWorking)
+                }
+
+                // The explicit fetch/push/apply-older triad stays available for troubleshooting,
+                // behind the same flag as the rest of the engineering surface.
+                if viewModel.isDeveloperControlsEnabled {
+                    HStack {
+                        Button("Fetch From Cloud") {
+                            Task { await viewModel.fetchCloudPreferences() }
+                        }
+                        .disabled(settingsSyncWorking)
+                        Button("Push To Cloud") {
+                            Task { await viewModel.pushCloudPreferences() }
+                        }
+                        .disabled(settingsSyncWorking)
+                        if case .staleRemote = viewModel.settingsSyncState {
+                            Button("Apply Older Cloud Copy") {
+                                Task { await viewModel.fetchCloudPreferences(applyOlder: true) }
+                            }
+                            .disabled(settingsSyncWorking)
+                        }
+                    }
+                    .font(.caption)
                 }
             }
 

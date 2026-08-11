@@ -357,6 +357,11 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     /// subtle staleness bug in the field, and being able to turn it off without shipping a build
     /// is worth one stored boolean.
     public var offlineCacheRestoreOnLaunch: Bool
+    /// Sync the allowlisted preference subset through the account without being asked.
+    ///
+    /// Deliberately not part of `SyncedClientPreferences`: a device that opts out of syncing must
+    /// not have that decision overwritten by a device that opted in.
+    public var automaticSettingsSyncEnabled: Bool
     public var lastSelectedServerID: ServerID?
     public var lastSelectedChannelID: ChannelID?
     public var memberPanelVisible: Bool
@@ -383,6 +388,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         case notificationPreferences
         case lastSettingsSyncTimestamp
         case offlineCacheRestoreOnLaunch
+        case automaticSettingsSyncEnabled
     }
 
     public init(
@@ -390,6 +396,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         environmentProfiles: [EnvironmentProfile] = [EnvironmentProfile.production()],
         showDeveloperRuntimeControls: Bool = false,
         offlineCacheRestoreOnLaunch: Bool = true,
+        automaticSettingsSyncEnabled: Bool = true,
         lastSelectedServerID: ServerID? = nil,
         lastSelectedChannelID: ChannelID? = nil,
         memberPanelVisible: Bool = true,
@@ -405,6 +412,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.environmentProfiles = Self.normalizedProfiles(environmentProfiles)
         self.showDeveloperRuntimeControls = showDeveloperRuntimeControls
         self.offlineCacheRestoreOnLaunch = offlineCacheRestoreOnLaunch
+        self.automaticSettingsSyncEnabled = automaticSettingsSyncEnabled
         self.lastSelectedServerID = lastSelectedServerID
         self.lastSelectedChannelID = lastSelectedChannelID
         self.memberPanelVisible = memberPanelVisible
@@ -425,6 +433,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
             environmentProfiles: try container.decodeIfPresent([EnvironmentProfile].self, forKey: .environmentProfiles) ?? [EnvironmentProfile.production()],
             showDeveloperRuntimeControls: try container.decodeIfPresent(Bool.self, forKey: .showDeveloperRuntimeControls) ?? false,
             offlineCacheRestoreOnLaunch: try container.decodeIfPresent(Bool.self, forKey: .offlineCacheRestoreOnLaunch) ?? true,
+            automaticSettingsSyncEnabled: try container.decodeIfPresent(Bool.self, forKey: .automaticSettingsSyncEnabled) ?? true,
             lastSelectedServerID: try container.decodeIfPresent(ServerID.self, forKey: .lastSelectedServerID),
             lastSelectedChannelID: try container.decodeIfPresent(ChannelID.self, forKey: .lastSelectedChannelID),
             memberPanelVisible: try container.decodeIfPresent(Bool.self, forKey: .memberPanelVisible) ?? true,
@@ -444,6 +453,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         try container.encode(environmentProfiles, forKey: .environmentProfiles)
         try container.encode(showDeveloperRuntimeControls, forKey: .showDeveloperRuntimeControls)
         try container.encode(offlineCacheRestoreOnLaunch, forKey: .offlineCacheRestoreOnLaunch)
+        try container.encode(automaticSettingsSyncEnabled, forKey: .automaticSettingsSyncEnabled)
         try container.encodeIfPresent(lastSelectedServerID, forKey: .lastSelectedServerID)
         try container.encodeIfPresent(lastSelectedChannelID, forKey: .lastSelectedChannelID)
         try container.encode(memberPanelVisible, forKey: .memberPanelVisible)

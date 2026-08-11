@@ -436,3 +436,153 @@ extension StoatFeaturesTests {
         XCTAssertEqual(readiness.reason, model.writeBlockReason(.sendMessage))
     }
 }
+
+// Phase 74 -- automatic settings sync.
+extension StoatFeaturesTests {
+    @MainActor
+    private func syncedModel(api: RecordingAPIClient) async -> MainShellViewModel {
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(credential: .sessionToken("token")),
+            // Without this, the coordinator's default preferencesStore reads the real
+            // "LiquidBagel.AppPreferences" UserDefaults suite, which other tests in this same
+            // process also write to -- causing a spurious diff against the sync baseline that
+            // has nothing to do with anything this test did.
+            preferencesStore: InMemoryAppPreferencesStore(),
+            sessionValidator: StubSessionValidator(user: User(id: "u1", username: "u1")),
+            apiClientFactory: { _, _ in api },
+            realtimeClientFactory: { RecordingRealtimeClient(statesOnConnect: [.connected, .ready]) }
+        )
+        let model = MainShellViewModel(
+            snapshot: RealtimeSnapshot(),
+            runtimeMode: .liveManual,
+            sessionState: .signedOut,
+            currentUser: nil,
+            messageActionHandler: StubMessageActionHandler(currentUserID: "u1"),
+            communityAPIClient: StubStoatAPIClient()
+        )
+        model.attachSessionCoordinator(coordinator)
+        await coordinator.startLiveFirstSession()
+        for _ in 0..<40 where coordinator.sessionState != .connected {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        model.syncFromSessionCoordinator()
+        return model
+    }
+
+    @MainActor
+    func testPhase74ConnectingFetchesCloudPreferencesOnce() async throws {
+        let api = RecordingAPIClient()
+        let synced = SyncedClientPreferences(messageDensity: .compact)
+        await api.overrideSyncedSetting(
+            key: MainShellViewModel.cloudPreferencesKey,
+            value: SyncedSettingValue(timestamp: 1, rawValue: String(decoding: try JSONEncoder().encode(synced), as: UTF8.self))
+        )
+        let model = await syncedModel(api: api)
+        try await Task.sleep(for: .milliseconds(80))
+
+        XCTAssertEqual(model.messageDensity, .compact, "the connect-triggered fetch should have applied the cloud value")
+        let fetchedKeys = await api.fetchedSettingsKeys
+        XCTAssertEqual(fetchedKeys.count, 1, "connecting must fetch exactly once, not repeatedly")
+    }
+
+    @MainActor
+    func testPhase74LocalChangesPushAfterQuiescingRatherThanImmediately() async throws {
+        let api = RecordingAPIClient()
+        let model = await syncedModel(api: api)
+        try await Task.sleep(for: .milliseconds(60))
+        let baselineFetches = await api.fetchedSettingsKeys.count
+
+        model.messageDensity = .compact
+        model.settingsChangedLocally()
+        let immediatePushes = await api.setSettingsPayloads.count
+        XCTAssertEqual(immediatePushes, 0, "a single change must debounce, not push instantly")
+
+        try await Task.sleep(for: MainShellViewModel.automaticSettingsPushDelay + .milliseconds(300))
+        let pushesAfterDebounce = await api.setSettingsPayloads.count
+        XCTAssertEqual(pushesAfterDebounce, 1)
+        _ = baselineFetches
+    }
+
+    @MainActor
+    func testPhase74RapidLocalChangesCollapseToOnePush() async throws {
+        // A slider drag is a stream of changes, not one. Each should reset the debounce rather
+        // than queue a push of its own.
+        let api = RecordingAPIClient()
+        let model = await syncedModel(api: api)
+        try await Task.sleep(for: .milliseconds(60))
+
+        for density: MessageDensityPreference in [.compact, .comfortable, .compact, .comfortable] {
+            model.messageDensity = density
+            model.settingsChangedLocally()
+            try await Task.sleep(for: .milliseconds(200))
+        }
+        try await Task.sleep(for: MainShellViewModel.automaticSettingsPushDelay + .milliseconds(300))
+
+        let pushes = await api.setSettingsPayloads.count
+        XCTAssertEqual(pushes, 1)
+    }
+
+    @MainActor
+    func testPhase74NoLocalChangeMeansNoPush() async throws {
+        let api = RecordingAPIClient()
+        let model = await syncedModel(api: api)
+        try await Task.sleep(for: MainShellViewModel.automaticSettingsPushDelay + .milliseconds(300))
+
+        let pushes = await api.setSettingsPayloads.count
+        XCTAssertEqual(pushes, 0, "connecting must not itself look like a local edit")
+        _ = model
+    }
+
+    @MainActor
+    func testPhase74RemoteUserSettingsUpdateTriggersAFetch() async throws {
+        let api = RecordingAPIClient()
+        let model = await syncedModel(api: api)
+        try await Task.sleep(for: .milliseconds(60))
+        let fetchesAfterConnect = await api.fetchedSettingsKeys.count
+
+        var changes = RealtimeSnapshotChangeSet()
+        changes.userSettingsChanged = true
+        await model.settingsSyncRemoteSettingsChanged()
+
+        let fetchesAfterEvent = await api.fetchedSettingsKeys.count
+        XCTAssertGreaterThan(fetchesAfterEvent, fetchesAfterConnect)
+    }
+
+    @MainActor
+    func testPhase74DisablingAutomaticSyncStopsBothDirections() async throws {
+        let api = RecordingAPIClient()
+        let coordinator = AppSessionCoordinator(
+            tokenStore: InMemoryTokenStore(credential: .sessionToken("token")),
+            preferencesStore: InMemoryAppPreferencesStore(
+                preferences: AppPreferences(automaticSettingsSyncEnabled: false)
+            ),
+            sessionValidator: StubSessionValidator(user: User(id: "u1", username: "u1")),
+            apiClientFactory: { _, _ in api },
+            realtimeClientFactory: { RecordingRealtimeClient(statesOnConnect: [.connected, .ready]) }
+        )
+        let model = MainShellViewModel(
+            snapshot: RealtimeSnapshot(),
+            runtimeMode: .liveManual,
+            sessionState: .signedOut,
+            currentUser: nil,
+            messageActionHandler: StubMessageActionHandler(currentUserID: "u1"),
+            communityAPIClient: StubStoatAPIClient()
+        )
+        model.attachSessionCoordinator(coordinator)
+        await coordinator.startLiveFirstSession()
+        for _ in 0..<40 where coordinator.sessionState != .connected {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        model.syncFromSessionCoordinator()
+        try await Task.sleep(for: .milliseconds(60))
+
+        model.messageDensity = .compact
+        model.settingsChangedLocally()
+        try await Task.sleep(for: MainShellViewModel.automaticSettingsPushDelay + .milliseconds(300))
+
+        let fetches = await api.fetchedSettingsKeys.count
+        let pushes = await api.setSettingsPayloads.count
+        XCTAssertEqual(fetches, 0)
+        XCTAssertEqual(pushes, 0)
+    }
+}
