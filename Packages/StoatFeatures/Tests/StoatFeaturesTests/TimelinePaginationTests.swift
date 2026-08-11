@@ -378,3 +378,52 @@ extension StoatFeaturesTests {
         return model
     }
 }
+
+// Phase 74 -- developer options are opt-in.
+extension StoatFeaturesTests {
+    @MainActor
+    func testPhase74DeveloperControlsAreOffByDefaultAndWhenUnconfigured() async {
+        XCTAssertFalse(AppPreferences.defaults.showDeveloperRuntimeControls)
+
+        // A shell with no coordinator attached must also fall closed. An unconfigured shell is
+        // not evidence that the user asked to see internals.
+        let model = MainShellViewModel(
+            snapshot: RealtimeSnapshot(),
+            runtimeMode: .liveManual,
+            sessionState: .signedOut,
+            currentUser: nil,
+            messageActionHandler: StubMessageActionHandler(currentUserID: "a"),
+            communityAPIClient: StubStoatAPIClient()
+        )
+        XCTAssertFalse(model.isDeveloperControlsEnabled)
+    }
+
+    func testPhase74StoredPreferencesWithoutTheDeveloperKeyStayOff() throws {
+        // An upgrade from a build that predates the key must not silently opt the user in.
+        let json = Data("""
+        { "messageDensity": "compact" }
+        """.utf8)
+        let preferences = try JSONDecoder.stoat.decode(AppPreferences.self, from: json)
+        XCTAssertFalse(preferences.showDeveloperRuntimeControls)
+    }
+
+    func testPhase74TimelineTuningDecodesPayloadsWrittenBeforePrefetchExisted() throws {
+        // TimelineTuningConfiguration used synthesized Codable, which throws on a missing key.
+        // Adding the prefetch fields would have invalidated every stored preference blob.
+        let json = Data("""
+        {
+          "nearNewestMessageThreshold": 3,
+          "visibleRangeUpdateDebounceMilliseconds": 90,
+          "loadToUnreadMaxAttempts": 5,
+          "referenceFetchMaxAttempts": 1,
+          "referenceFetchCooldownSeconds": 30,
+          "ackDebounceMilliseconds": 1200
+        }
+        """.utf8)
+        let tuning = try JSONDecoder.stoat.decode(TimelineTuningConfiguration.self, from: json)
+
+        XCTAssertEqual(tuning.nearNewestMessageThreshold, 3)
+        XCTAssertEqual(tuning.olderPrefetchDistancePercent, TimelineTuningConfiguration.defaults.olderPrefetchDistancePercent)
+        XCTAssertEqual(tuning.olderPrefetchRowThreshold, TimelineTuningConfiguration.defaults.olderPrefetchRowThreshold)
+    }
+}

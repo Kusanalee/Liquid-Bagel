@@ -381,7 +381,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public init(
         lastSelectedEnvironmentID: String? = nil,
         environmentProfiles: [EnvironmentProfile] = [EnvironmentProfile.production()],
-        showDeveloperRuntimeControls: Bool = true,
+        showDeveloperRuntimeControls: Bool = false,
         lastSelectedServerID: ServerID? = nil,
         lastSelectedChannelID: ChannelID? = nil,
         memberPanelVisible: Bool = true,
@@ -414,7 +414,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.init(
             lastSelectedEnvironmentID: try container.decodeIfPresent(String.self, forKey: .lastSelectedEnvironmentID),
             environmentProfiles: try container.decodeIfPresent([EnvironmentProfile].self, forKey: .environmentProfiles) ?? [EnvironmentProfile.production()],
-            showDeveloperRuntimeControls: try container.decodeIfPresent(Bool.self, forKey: .showDeveloperRuntimeControls) ?? true,
+            showDeveloperRuntimeControls: try container.decodeIfPresent(Bool.self, forKey: .showDeveloperRuntimeControls) ?? false,
             lastSelectedServerID: try container.decodeIfPresent(ServerID.self, forKey: .lastSelectedServerID),
             lastSelectedChannelID: try container.decodeIfPresent(ChannelID.self, forKey: .lastSelectedChannelID),
             memberPanelVisible: try container.decodeIfPresent(Bool.self, forKey: .memberPanelVisible) ?? true,

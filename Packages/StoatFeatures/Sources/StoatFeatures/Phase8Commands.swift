@@ -225,6 +225,7 @@ public final class QuickSwitcherViewModel {
     @ObservationIgnored private let navigation = ShellNavigationHelper()
     @ObservationIgnored private let canPerform: (AppCommand) -> Bool
     @ObservationIgnored private let disabledReason: (AppCommand) -> String?
+    @ObservationIgnored private let isDeveloperControlsEnabled: () -> Bool
     @ObservationIgnored private var indexTask: Task<Void, Never>?
     @ObservationIgnored private var filterTask: Task<Void, Never>?
     @ObservationIgnored private var indexGeneration = 0
@@ -234,12 +235,14 @@ public final class QuickSwitcherViewModel {
         snapshot: RealtimeSnapshot,
         selection: ShellSelection = ShellSelection(),
         canPerform: @escaping (AppCommand) -> Bool = { _ in true },
-        disabledReason: @escaping (AppCommand) -> String? = { _ in nil }
+        disabledReason: @escaping (AppCommand) -> String? = { _ in nil },
+        isDeveloperControlsEnabled: @escaping () -> Bool = { false }
     ) {
         self.snapshot = snapshot
         self.selection = selection
         self.canPerform = canPerform
         self.disabledReason = disabledReason
+        self.isDeveloperControlsEnabled = isDeveloperControlsEnabled
         rebuildIndex()
         rebuildFilteredResults()
     }
@@ -470,13 +473,6 @@ public final class QuickSwitcherViewModel {
             commandResult(.clearSearchHighlights, title: "Clear Search Highlights", subtitle: "Clear selected-channel search highlights"),
             commandResult(.replyToSelectedMessage, title: "Reply to Message", subtitle: "Reply to the focused message"),
             commandResult(.cancelReply, title: "Cancel Reply", subtitle: "Clear the active reply context"),
-            commandResult(.startTimelineCalibration, title: "Start Timeline Calibration", subtitle: "Begin a manual calibration run"),
-            commandResult(.addTimelineCalibrationCheckpoint, title: "Add Calibration Checkpoint", subtitle: "Record current timeline diagnostics"),
-            commandResult(.importCalibrationNotes, title: "Import Calibration Notes", subtitle: "Redact and import pasted calibration notes"),
-            commandResult(.applyTimelineCalibrationRecommendation, title: "Apply Calibration Recommendation", subtitle: "Apply the visible timeline tuning recommendation"),
-            commandResult(.resetTimelineTuningDefault, title: "Reset Timeline Tuning", subtitle: "Restore conservative timeline tuning defaults"),
-            commandResult(.copyTimelineCalibration, title: "Copy Calibration Summary", subtitle: "Copy redacted timeline calibration output"),
-            commandResult(.copyTimelineDiagnostics, title: "Copy Timeline Diagnostics", subtitle: "Copy redacted timeline diagnostics"),
             commandResult(.toggleMemberPanel, title: "Toggle Member Panel", subtitle: "Show or hide the member panel"),
             commandResult(.openAccountSettings, title: "Account Settings", subtitle: "Open Account & Connection settings"),
             commandResult(.openConnectionSettings, title: "Connection Settings", subtitle: "Open connection settings"),
@@ -484,6 +480,22 @@ public final class QuickSwitcherViewModel {
             commandResult(.openNotificationSettings, title: "Notification Settings", subtitle: "Open notification settings"),
             commandResult(.markSelectedChannelRead, title: "Mark Channel Read", subtitle: "Mark the selected channel read and focus the composer"),
             commandResult(.markSelectedServerRead, title: "Mark Server Read", subtitle: "Mark every channel in the selected server read")
+        ] + developerCommandResults()
+    }
+
+    /// Calibration and diagnostics belong to Developer Options, not to a command palette a
+    /// normal user opens to switch channels.
+    private func developerCommandResults() -> [QuickSwitcherResult] {
+        guard isDeveloperControlsEnabled() else { return [] }
+        return [
+            commandResult(.toggleDeveloperControls, title: "Disable Developer Options", subtitle: "Hide developer tabs, diagnostics, and ID actions"),
+            commandResult(.startTimelineCalibration, title: "Start Timeline Calibration", subtitle: "Begin a manual calibration run"),
+            commandResult(.addTimelineCalibrationCheckpoint, title: "Add Calibration Checkpoint", subtitle: "Record current timeline diagnostics"),
+            commandResult(.importCalibrationNotes, title: "Import Calibration Notes", subtitle: "Redact and import pasted calibration notes"),
+            commandResult(.applyTimelineCalibrationRecommendation, title: "Apply Calibration Recommendation", subtitle: "Apply the visible timeline tuning recommendation"),
+            commandResult(.resetTimelineTuningDefault, title: "Reset Timeline Tuning", subtitle: "Restore conservative timeline tuning defaults"),
+            commandResult(.copyTimelineCalibration, title: "Copy Calibration Summary", subtitle: "Copy redacted timeline calibration output"),
+            commandResult(.copyTimelineDiagnostics, title: "Copy Timeline Diagnostics", subtitle: "Copy redacted timeline diagnostics")
         ]
     }
 

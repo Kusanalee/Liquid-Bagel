@@ -1047,12 +1047,16 @@ public final class MainShellViewModel {
         self.appLifecyclePhase = appLifecycleCenter.phase
         self.previousSnapshot = snapshot
         self.seenNotificationMessageIDsByChannelID = Self.messageIDMap(snapshot)
+        // Assigned twice on purpose. The real quick switcher captures `self` in its callbacks,
+        // which Swift only permits once every stored property is initialized, so this first
+        // value exists solely to satisfy definite initialization.
         self.quickSwitcherViewModel = QuickSwitcherViewModel(snapshot: snapshot, selection: selection)
         self.quickSwitcherViewModel = QuickSwitcherViewModel(
             snapshot: snapshot,
             selection: selection,
             canPerform: { [weak self] command in self?.canPerform(command) ?? false },
-            disabledReason: { [weak self] command in self?.disabledReason(for: command) }
+            disabledReason: { [weak self] command in self?.disabledReason(for: command) },
+            isDeveloperControlsEnabled: { [weak self] in self?.isDeveloperControlsEnabled ?? false }
         )
         mergePhase43SnapshotIdentities(snapshot, source: .readyUser)
         if let currentUser = self.currentUser {
@@ -1840,6 +1844,28 @@ public final class MainShellViewModel {
     /// Live session that is not currently connected. Offline content may still be on screen.
     public var isOffline: Bool {
         effectiveRuntimeMode == .liveManual && effectiveSessionState != .connected
+    }
+
+    /// One sentence anyone can act on, for the Settings connection row. The counter grid it
+    /// replaces is still available behind Developer Options.
+    public var connectionSummaryText: String {
+        guard effectiveRuntimeMode == .liveManual else { return "Preview data" }
+        switch effectiveSessionState {
+        case .connected: return "Connected to Stoat"
+        case .connecting: return "Connecting…"
+        case .signedOut: return "Signed out"
+        case .invalidSession: return "Your session expired. Sign in again."
+        default: return "Not connected"
+        }
+    }
+
+    public var connectionSummarySymbol: String {
+        guard effectiveRuntimeMode == .liveManual else { return "eye" }
+        switch effectiveSessionState {
+        case .connected: return "checkmark.circle.fill"
+        case .connecting: return "arrow.clockwise"
+        default: return "wifi.slash"
+        }
     }
 
     /// The single fixed-height slot above loaded history. A pure switch over already-prepared
@@ -9523,8 +9549,11 @@ public final class MainShellViewModel {
         return String(fallback.prefix(maxLength)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
     }
 
+    /// Developer surfaces are opt-in. The nil-coordinator case falls closed for the same reason
+    /// the stored default does: an unconfigured shell is not evidence that the user asked to see
+    /// internals.
     public var isDeveloperControlsEnabled: Bool {
-        sessionCoordinator?.preferences.showDeveloperRuntimeControls ?? true
+        sessionCoordinator?.preferences.showDeveloperRuntimeControls ?? false
     }
 
     public func typingUsers(for channelID: ChannelID?) -> [User] {
@@ -18637,10 +18666,12 @@ public struct ServerOverviewView: View {
                             Label("Refresh Bans", systemImage: "arrow.clockwise")
                         }
                         .disabled(!viewModel.serverManagementCapabilities().isConnectedForLiveActions)
-                        Button {
-                            viewModel.copyRedactedModerationDiagnostics()
-                        } label: {
-                            Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                        if viewModel.isDeveloperControlsEnabled {
+                            Button {
+                                viewModel.copyRedactedModerationDiagnostics()
+                            } label: {
+                                Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                            }
                         }
                     }
                     if moderationPermissionSummary(in: details) != nil {
@@ -18788,10 +18819,12 @@ public struct ServerOverviewView: View {
                             } label: {
                                 Label("Retry", systemImage: "arrow.clockwise")
                             }
-                            Button {
-                                viewModel.copyRedactedModerationDiagnostics()
-                            } label: {
-                                Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                            if viewModel.isDeveloperControlsEnabled {
+                                Button {
+                                    viewModel.copyRedactedModerationDiagnostics()
+                                } label: {
+                                    Label("Copy Safe Diagnostics", systemImage: "doc.on.doc")
+                                }
                             }
                         }
                     }
