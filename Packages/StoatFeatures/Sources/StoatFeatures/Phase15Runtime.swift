@@ -279,30 +279,6 @@ public protocol AttachmentUploadHandling: Sendable {
     func upload(_ attachment: ComposerAttachmentDraft) async throws -> UploadedFile
 }
 
-public actor MockAttachmentUploadHandler: AttachmentUploadHandling {
-    public private(set) var uploads: [ComposerAttachmentDraft] = []
-    private var uploadError: (any Error & Sendable)?
-
-    public init(uploadError: (any Error & Sendable)? = nil) {
-        self.uploadError = uploadError
-    }
-
-    public func setUploadError(_ error: (any Error & Sendable)?) {
-        uploadError = error
-    }
-
-    public func uploadCount() -> Int {
-        uploads.count
-    }
-
-    public func upload(_ attachment: ComposerAttachmentDraft) async throws -> UploadedFile {
-        if let uploadError {
-            throw uploadError
-        }
-        uploads.append(attachment)
-        return UploadedFile(id: FileID(rawValue: "mock-attachments-\(abs(attachment.filename.hashValue))"))
-    }
-}
 
 public actor LiveAttachmentUploadHandler: AttachmentUploadHandling {
     private let apiClient: any StoatAPIClient

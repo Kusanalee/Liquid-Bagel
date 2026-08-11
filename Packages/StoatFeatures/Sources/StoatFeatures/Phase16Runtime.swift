@@ -359,32 +359,6 @@ public actor FileImageDiskCache: ImageDiskCaching {
     }
 }
 
-public actor MockImageResourceLoader: ImageResourceLoading {
-    public private(set) var calls: [ImageResourceRequest] = []
-    private var result: Result<Data, any Error & Sendable>
-
-    public init(result: Result<Data, any Error & Sendable> = .success(Data())) {
-        self.result = result
-    }
-
-    public func setResult(_ result: Result<Data, any Error & Sendable>) {
-        self.result = result
-    }
-
-    public func callCount() -> Int {
-        calls.count
-    }
-
-    public func loadImage(_ request: ImageResourceRequest) async throws -> ImageResourceResult {
-        calls.append(request)
-        switch result {
-        case let .success(data):
-            return ImageResourceResult(request: request, contentType: "image/png", data: data)
-        case let .failure(error):
-            throw error
-        }
-    }
-}
 
 public struct LiveImageResourceLoader: ImageResourceLoading {
     public var cache: ImageMemoryCache
@@ -530,32 +504,6 @@ public struct DefaultAttachmentURLResolver: AttachmentURLResolving {
     }
 }
 
-public actor MockRemoteAttachmentLoader: RemoteAttachmentLoading {
-    public private(set) var calls: [(String, RemoteAttachmentLoadPurpose)] = []
-    private var result: Result<RemoteAttachmentData, any Error & Sendable>
-
-    public init(result: Result<RemoteAttachmentData, any Error & Sendable> = .success(RemoteAttachmentData(filename: "mock.txt", contentType: "text/plain", byteCount: 4, data: Data("mock".utf8)))) {
-        self.result = result
-    }
-
-    public func setResult(_ result: Result<RemoteAttachmentData, any Error & Sendable>) {
-        self.result = result
-    }
-
-    public func callCount() -> Int {
-        calls.count
-    }
-
-    public func load(_ item: AttachmentDisplayItem, purpose: RemoteAttachmentLoadPurpose) async throws -> RemoteAttachmentData {
-        calls.append((item.id, purpose))
-        switch result {
-        case let .success(data):
-            return RemoteAttachmentData(fileID: item.fileID ?? data.fileID, filename: item.displayName, contentType: item.contentType ?? data.contentType, byteCount: item.byteCount ?? data.byteCount, data: data.data)
-        case let .failure(error):
-            throw error
-        }
-    }
-}
 
 public struct LiveRemoteAttachmentLoader: RemoteAttachmentLoading {
     public var environment: StoatAPIEnvironment
@@ -727,48 +675,7 @@ public struct AppKitAttachmentOpener: AttachmentOpening {
     }
 }
 
-public actor MockAttachmentSaver: AttachmentSaving {
-    public private(set) var saves: [(String, Int)] = []
-    public var error: (any Error & Sendable)?
 
-    public init(error: (any Error & Sendable)? = nil) {
-        self.error = error
-    }
-
-    public func save(data: Data, suggestedFilename: String) async throws {
-        if let error {
-            throw error
-        }
-        saves.append((AttachmentDisplayFormatting.safeFilename(suggestedFilename), data.count))
-    }
-
-    public func saveCount() -> Int {
-        saves.count
-    }
-}
-
-public actor MockAttachmentOpener: AttachmentOpening {
-    public private(set) var opened: [URL] = []
-    public var error: (any Error & Sendable)?
-
-    public init(error: (any Error & Sendable)? = nil) {
-        self.error = error
-    }
-
-    public func open(_ localFile: URL) async throws {
-        if let error {
-            throw error
-        }
-        guard !AttachmentSafety.isExecutableLike(localFile) else {
-            throw AttachmentActionError.unsafeToOpen
-        }
-        opened.append(localFile)
-    }
-
-    public func openCount() -> Int {
-        opened.count
-    }
-}
 
 public enum AttachmentSafety {
     public static func isExecutableLike(_ url: URL) -> Bool {

@@ -37,8 +37,8 @@ public struct MessageSendDiagnostics: Hashable, Sendable {
 
     public init(
         selectedChannelID: ChannelID? = nil,
-        runtimeMode: AppRuntimeMode = .mock,
-        sessionState: AppSessionState = .mock,
+        runtimeMode: AppRuntimeMode = .liveManual,
+        sessionState: AppSessionState = .signedOut,
         connectionStateDescription: String = "idle",
         canSend: Bool = false,
         disabledReason: String? = nil,

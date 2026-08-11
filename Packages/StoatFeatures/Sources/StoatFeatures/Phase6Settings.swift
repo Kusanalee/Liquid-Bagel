@@ -49,53 +49,6 @@ public struct LiveSessionManager: SessionManaging {
     }
 }
 
-public actor MockSessionManager: SessionManaging {
-    public private(set) var revokeAllArguments: [Bool] = []
-    public private(set) var revokedSessionIDs: [SessionID] = []
-    public private(set) var renamedSessions: [(SessionID, String)] = []
-    public private(set) var logoutCallCount = 0
-
-    private var sessions: [SessionInfo]
-    private let error: (any Error & Sendable)?
-
-    public init(sessions: [SessionInfo] = [], error: (any Error & Sendable)? = nil) {
-        self.sessions = sessions
-        self.error = error
-    }
-
-    public func listSessions(environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws -> [SessionInfo] {
-        if let error { throw error }
-        return sessions
-    }
-
-    public func renameSession(id: SessionID, friendlyName: String, environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws -> SessionInfo {
-        if let error { throw error }
-        let renamed = SessionInfo(id: id, name: friendlyName)
-        sessions.removeAll { $0.id == id }
-        sessions.append(renamed)
-        renamedSessions.append((id, friendlyName))
-        return renamed
-    }
-
-    public func revokeSession(id: SessionID, environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws {
-        if let error { throw error }
-        sessions.removeAll { $0.id == id }
-        revokedSessionIDs.append(id)
-    }
-
-    public func revokeAllSessions(revokeSelf: Bool, environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws {
-        if let error { throw error }
-        revokeAllArguments.append(revokeSelf)
-        if revokeSelf {
-            sessions.removeAll()
-        }
-    }
-
-    public func logoutCurrentSession(environment: StoatAPIEnvironment, credential: StoatAuthCredential) async throws {
-        if let error { throw error }
-        logoutCallCount += 1
-    }
-}
 
 public struct AccountSession: Hashable, Identifiable, Sendable {
     public var id: SessionID

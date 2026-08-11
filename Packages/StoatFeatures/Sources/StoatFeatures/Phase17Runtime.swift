@@ -130,19 +130,6 @@ public struct AppKitMessageCopier: MessageCopying {
     }
 }
 
-public actor MockMessageCopier: MessageCopying {
-    public private(set) var copiedValues: [String] = []
-
-    public init() {}
-
-    public func copy(_ value: String) async {
-        copiedValues.append(value)
-    }
-
-    public func lastCopiedValue() -> String? {
-        copiedValues.last
-    }
-}
 
 public struct MessageActionDiagnostics: Hashable, Sendable {
     public var visibleActionCount: Int

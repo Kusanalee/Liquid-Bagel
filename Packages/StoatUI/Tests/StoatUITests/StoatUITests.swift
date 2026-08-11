@@ -200,8 +200,9 @@ final class StoatUITests: XCTestCase {
         )
         XCTAssertEqual(inlineTokens, ["text::**Bold** ", "emoji:::bagel:"])
 
+        // `code:-::` is the block descriptor's "no fence language" form.
         let codeBlocks = MarkdownMessageContent._testBlockDescriptions(for: "```\nlet value = \":bagel:\"\n```")
-        XCTAssertEqual(codeBlocks, ["code::let value = \":bagel:\""])
+        XCTAssertEqual(codeBlocks, ["code:-::let value = \":bagel:\""])
     }
 
     func testPhase63CSSRoleColorParserHexForms() throws {
@@ -292,34 +293,313 @@ final class StoatUITests: XCTestCase {
         assertPoints(270, start: UnitPoint(x: 1, y: 0.5), end: UnitPoint(x: 0, y: 0.5))  // to left
     }
 
-    func testPhase62PlainMarkdownUsesWrappingTextFlow() {
+    func testPhase62PlainMarkdownComposesTextSegments() {
         let longBio = "Star Rail codes. /FetchZZZ — Fetch all active Zenless Zone Zero codes. /FetchHI3 — Fetch all active Honkai Impact 3rd codes."
-        XCTAssertEqual(
-            MarkdownMessageContent._testInlineRenderingStrategy(for: longBio),
-            "wrappingText"
-        )
-        XCTAssertEqual(
-            MarkdownMessageContent._testInlineRenderingStrategy(for: "**Bold text** and a [link](https://example.invalid)"),
-            "wrappingText"
-        )
+        XCTAssertEqual(MarkdownMessageContent._testInlineSegmentDescriptions(for: longBio), ["text::\(longBio)"])
+
+        let styled = "**Bold text** and a [link](https://example.invalid)"
+        XCTAssertEqual(MarkdownMessageContent._testInlineSegmentDescriptions(for: styled), ["text::\(styled)"])
     }
 
-    func testPhase62InlineMediaAndReferencesKeepTokenRow() {
+    /// Phase 72 replaces `testPhase62InlineMediaAndReferencesKeepTokenRow`, which asserted that
+    /// emoji and mentions forced a non-wrapping `HStack`. That assertion encoded the bug: an
+    /// `HStack` cannot line-break, so any paragraph containing a mention or custom emoji refused
+    /// to wrap and truncated. All three token kinds now compose into one wrapping `Text`.
+    func testPhase72InlineMediaAndReferencesComposeIntoOneText() {
         let emoji = MessageInlineCustomEmojiItem(shortcode: ":bagel:", name: "bagel")
         XCTAssertEqual(
-            MarkdownMessageContent._testInlineRenderingStrategy(for: "hello :bagel:", customEmojiItems: [emoji]),
-            "tokenRow"
+            MarkdownMessageContent._testInlineSegmentDescriptions(for: "hello :bagel:", customEmojiItems: [emoji]),
+            ["text::hello ", "emoji:::bagel:"]
         )
 
         let userID = "01FD58YK5W7QRV5H3D64KTQYX3"
         let mention = MessageInlineReferenceItem(kind: .user, rawID: userID, displayName: "Enka")
         XCTAssertEqual(
-            MarkdownMessageContent._testInlineRenderingStrategy(
-                for: "hello <@\(userID)>",
+            MarkdownMessageContent._testInlineSegmentDescriptions(
+                for: "hello <@\(userID)> bye",
                 referenceItems: ["<@\(userID)>": mention]
             ),
-            "tokenRow"
+            ["text::hello ", "reference:user::\(userID)", "text:: bye"]
         )
+    }
+
+    func testPhase72MentionRunIsUnbreakableAndPadded() {
+        let item = MessageInlineReferenceItem(kind: .user, rawID: "01FD58YK5W7QRV5H3D64KTQYX3", displayName: "Design Pilot")
+        let run = MarkdownMessageContent._testMentionRunText(for: item)
+
+        // No ordinary space anywhere, so the mention wraps to the next line whole rather than
+        // splitting into two tinted fragments.
+        XCTAssertFalse(run.contains(" "), "mention run must not contain U+0020: \(run.debugDescription)")
+        XCTAssertTrue(run.contains("Design\u{00A0}Pilot"))
+        XCTAssertTrue(run.hasPrefix("\u{00A0}@"))
+        XCTAssertTrue(run.hasSuffix("\u{00A0}"))
+    }
+
+    func testPhase72OnlyUserMentionsAreTappable() {
+        let id = "01FD58YK5W7QRV5H3D64KTQYX3"
+        XCTAssertTrue(MarkdownMessageContent._testMentionHasLink(
+            for: MessageInlineReferenceItem(kind: .user, rawID: id, displayName: "Enka")
+        ))
+        // Channel and role mentions were inert before and stay inert.
+        XCTAssertFalse(MarkdownMessageContent._testMentionHasLink(
+            for: MessageInlineReferenceItem(kind: .channel, rawID: id, displayName: "general")
+        ))
+        XCTAssertFalse(MarkdownMessageContent._testMentionHasLink(
+            for: MessageInlineReferenceItem(kind: .role, rawID: id, displayName: "Core Crew")
+        ))
+    }
+
+    func testPhase72MentionLinkRouteRoundTripsAndRejectsBadInput() throws {
+        let id = "01FD58YK5W7QRV5H3D64KTQYX3"
+        let item = MessageInlineReferenceItem(kind: .user, rawID: id, displayName: "Enka")
+        let url = try XCTUnwrap(MentionLinkRoute.url(for: item))
+        XCTAssertEqual(url.absoluteString, "liquidbagel-mention://user/\(id)")
+        XCTAssertEqual(MentionLinkRoute.parse(url)?.rawValue, id)
+
+        // Ordinary links must fall through to the system so real URLs in messages still open.
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "https://example.invalid/\(id)")!))
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "liquidbagel-mention://role/\(id)")!))
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "liquidbagel-mention://user/0000")!))
+        // I, L, O and U are outside the Crockford ULID alphabet.
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "liquidbagel-mention://user/01FD58YK5W7QRV5H3D64KTQYXI")!))
+        XCTAssertNil(MentionLinkRoute.parse(URL(string: "liquidbagel-mention://user/01fd58yk5w7qrv5h3d64ktqyx3")!))
+    }
+
+    func testPhase72AccessibleDescriptionExpandsMentionKinds() {
+        let id = "01FD58YK5W7QRV5H3D64KTQYX3"
+        func description(_ item: MessageInlineReferenceItem) -> String {
+            MarkdownMessageContent._testAccessibleDescription(
+                for: "hi <@\(id)>",
+                referenceItems: ["<@\(id)>": item]
+            )
+        }
+
+        XCTAssertEqual(
+            description(MessageInlineReferenceItem(kind: .user, rawID: id, displayName: "Enka")),
+            "hi mention, Enka"
+        )
+        XCTAssertEqual(
+            description(MessageInlineReferenceItem(kind: .user, rawID: id, displayName: "Enka", isCurrentUser: true)),
+            "hi mentions you"
+        )
+        XCTAssertEqual(
+            description(MessageInlineReferenceItem(kind: .channel, rawID: id, displayName: "general")),
+            "hi channel mention, general"
+        )
+        XCTAssertEqual(
+            description(MessageInlineReferenceItem(kind: .role, rawID: id, displayName: "Core Crew")),
+            "hi role mention, Core Crew"
+        )
+    }
+
+    func testPhase72EmbedMediaLayoutRespectsDeclaredDimensions() {
+        let maxWidth: CGFloat = 580
+        let maxHeight: CGFloat = 240
+
+        // With a generous height budget a landscape image is width-bound.
+        guard case let .below(wide) = EmbedMediaLayout.placement(width: 1920, height: 1080, size: .large, maxWidth: maxWidth, maxHeight: 400) else {
+            return XCTFail("expected a below placement for a landscape image")
+        }
+        XCTAssertEqual(wide.width, maxWidth, accuracy: 1)
+        XCTAssertEqual(wide.width / wide.height, 16.0 / 9.0, accuracy: 0.05)
+
+        // Against the real 240pt cap the same image is height-bound, and still keeps its ratio
+        // rather than being letterboxed or stretched.
+        guard case let .below(capped) = EmbedMediaLayout.placement(width: 1920, height: 1080, size: .large, maxWidth: maxWidth, maxHeight: maxHeight) else {
+            return XCTFail("expected a below placement when height-bound")
+        }
+        XCTAssertEqual(capped.height, maxHeight, accuracy: 1)
+        XCTAssertLessThan(capped.width, maxWidth)
+        XCTAssertEqual(capped.width / capped.height, 16.0 / 9.0, accuracy: 0.05)
+
+        // A portrait image is height-bound too, rather than being stretched to full width.
+        guard case let .below(tall) = EmbedMediaLayout.placement(width: 1080, height: 1920, size: .large, maxWidth: maxWidth, maxHeight: maxHeight) else {
+            return XCTFail("expected a below placement for a portrait image")
+        }
+        XCTAssertEqual(tall.height, maxHeight, accuracy: 1)
+        XCTAssertLessThan(tall.width, maxWidth)
+
+        // ImageSize.preview is the official clients' side-thumbnail case.
+        guard case let .trailingThumbnail(thumb) = EmbedMediaLayout.placement(width: 400, height: 400, size: .preview, maxWidth: maxWidth, maxHeight: maxHeight) else {
+            return XCTFail("expected a trailing thumbnail for a preview-sized image")
+        }
+        XCTAssertEqual(thumb.width, thumb.height)
+        XCTAssertEqual(thumb.width, EmbedMediaLayout.thumbnailSide, accuracy: 0.001)
+
+        // Missing dimensions still get a sane box; explicitly empty ones render nothing.
+        guard case let .below(fallback) = EmbedMediaLayout.placement(width: nil, height: nil, size: nil, maxWidth: maxWidth, maxHeight: maxHeight) else {
+            return XCTFail("expected a fallback box when dimensions are absent")
+        }
+        XCTAssertEqual(fallback.width / fallback.height, 16.0 / 9.0, accuracy: 0.05)
+        XCTAssertEqual(EmbedMediaLayout.placement(width: 0, height: 0, size: nil, maxWidth: maxWidth, maxHeight: maxHeight), .none)
+    }
+
+    func testPhase72EmbedCardWidthMatchesAttachmentCard() {
+        // Pinned so the two card families cannot drift apart again; embeds used to cap at
+        // 320/420 while attachments capped at 460/620 in the same timeline.
+        XCTAssertEqual(EmbedCardMetrics.maximumWidth(isCompact: true), 460)
+        XCTAssertEqual(EmbedCardMetrics.maximumWidth(isCompact: false), 620)
+        XCTAssertLessThan(
+            EmbedCardMetrics.maximumMediaWidth(isCompact: false),
+            EmbedCardMetrics.maximumWidth(isCompact: false)
+        )
+    }
+
+    func testPhase72EmbedSiteMonogram() {
+        XCTAssertEqual(EmbedSiteMonogram.monogram(for: "example.com"), "E")
+        XCTAssertEqual(EmbedSiteMonogram.monogram(for: "  youtube"), "Y")
+        XCTAssertEqual(EmbedSiteMonogram.monogram(for: "9GAG"), "9")
+        // Never render an empty tile.
+        XCTAssertFalse(EmbedSiteMonogram.monogram(for: "").isEmpty)
+        XCTAssertFalse(EmbedSiteMonogram.monogram(for: "!!!").isEmpty)
+    }
+
+    func testPhase72HeadingLevelsAreAllDistinct() {
+        let source = (1...6).map { String(repeating: "#", count: $0) + " h\($0)" }.joined(separator: "\n")
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: source),
+            (1...6).map { "heading\($0)::h\($0)" }
+        )
+
+        // Six markdown levels used to collapse onto two fonts, so ## through ###### looked alike.
+        let fonts = (1...6).map { MarkdownHeadingStyle.font(for: $0) }
+        XCTAssertEqual(Set(fonts).count, 6, "each heading level needs its own font")
+        // Out-of-range levels clamp rather than crash or fall through to body text.
+        XCTAssertEqual(MarkdownHeadingStyle.font(for: 0), MarkdownHeadingStyle.font(for: 1))
+        XCTAssertEqual(MarkdownHeadingStyle.font(for: 7), MarkdownHeadingStyle.font(for: 6))
+    }
+
+    func testPhase72NestedListsKeepTheirDepth() {
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "- a\n  - b\n    - c"),
+            ["list0:-::a", "list1:-::b", "list2:-::c"]
+        )
+        // Indentation used to be trimmed away before depth could be measured.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "            - deep"),
+            ["list4:-::deep"]
+        )
+        // Ordered markers keep the author's numbering.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "1. first\n2. second"),
+            ["list0:1.::first", "list0:2.::second"]
+        )
+        XCTAssertEqual(MarkdownListStyle.glyph(marker: "1.", depth: 0), "1.")
+        XCTAssertNotEqual(
+            MarkdownListStyle.glyph(marker: "-", depth: 0),
+            MarkdownListStyle.glyph(marker: "-", depth: 1)
+        )
+        XCTAssertEqual(MarkdownListStyle.indent(depth: 0), 0)
+        XCTAssertGreaterThan(MarkdownListStyle.indent(depth: 2), MarkdownListStyle.indent(depth: 1))
+    }
+
+    func testPhase72ConsecutiveQuoteLinesFormOneBlock() {
+        // Each `>` line used to become its own block, so one logical quote rendered as several
+        // disconnected bars separated by paragraph gaps.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "> line one\n> line two"),
+            ["quote::line one\\nline two"]
+        )
+        // A blank line still separates two distinct quotes.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "> first\n\n> second"),
+            ["quote::first", "quote::second"]
+        )
+        // An intervening paragraph closes the quote.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "> quoted\nplain"),
+            ["quote::quoted", "text::plain"]
+        )
+    }
+
+    func testPhase72FenceLanguageIsCapturedAndValidated() {
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "```swift\nlet x = 1\n```"),
+            ["code:swift::let x = 1"]
+        )
+        // An arbitrary info string must not become visible UI.
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "```<script>alert()\nbody\n```"),
+            ["code:-::body"]
+        )
+        XCTAssertEqual(
+            MarkdownMessageContent._testBlockDescriptions(for: "```\(String(repeating: "a", count: 40))\nbody\n```"),
+            ["code:-::body"]
+        )
+    }
+
+    func testPhase72HorizontalRules() {
+        for rule in ["---", "***", "___", "-----"] {
+            XCTAssertEqual(MarkdownMessageContent._testBlockDescriptions(for: rule), ["rule"], "\(rule) should be a rule")
+        }
+        for notRule in ["--", "-- -", "- - -", "text ---"] {
+            XCTAssertNotEqual(MarkdownMessageContent._testBlockDescriptions(for: notRule), ["rule"], "\(notRule) is not a rule")
+        }
+    }
+
+    func testPhase72BlockSpacingTightensConsecutiveListItems() {
+        let listToList = MarkdownBlockSpacing._testSpacing(above: "list", below: "list")
+        let textToText = MarkdownBlockSpacing._testSpacing(above: "text", below: "text")
+        XCTAssertLessThan(listToList, textToText, "consecutive list items should sit tighter than paragraphs")
+
+        XCTAssertEqual(MarkdownBlockSpacing._testSpacing(above: "text", below: nil), 0, "first block gets no leading gap")
+        XCTAssertGreaterThan(
+            MarkdownBlockSpacing._testSpacing(above: "heading", below: "text"),
+            MarkdownBlockSpacing._testSpacing(above: "text", below: "heading")
+        )
+    }
+
+    func testPhase72SanitizerKeepsComparisonProse() {
+        // The old `<[^>]+>` pattern ate everything between angle brackets, so ordinary prose
+        // containing comparisons lost a chunk of its text.
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "5 < 10 > 3"), "5 < 10 > 3")
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "if a<b then swap"), "if a<b then swap")
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "2<3 and 4>1"), "2<3 and 4>1")
+
+        // Real HTML tags are still stripped. Note `<b and c>` is deliberately NOT preserved: it
+        // is a well-formed `<b>` tag with attributes, so treating it as markup is correct.
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "<b>bold</b>"), "bold")
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "<script>x</script>"), "x")
+        XCTAssertEqual(MarkdownMessageContent._testAttributedPlainText(for: "a<b and c>d"), "ad")
+    }
+
+    func testPhase72AutocompletePopoverHeightGrowsThenCaps() {
+        let sizing = ComposerAutocompleteSizing.self
+        XCTAssertEqual(sizing.height(candidateCount: 0), 0)
+
+        // Monotonic, and always at least one row tall once there is a candidate.
+        var previous = sizing.height(candidateCount: 1)
+        XCTAssertGreaterThanOrEqual(previous, sizing.rowHeight)
+        for count in [2, 6, 10, 50] {
+            let height = sizing.height(candidateCount: count)
+            XCTAssertGreaterThanOrEqual(height, previous, "height must not shrink at \(count)")
+            XCTAssertLessThanOrEqual(height, sizing.maximumHeight, "height must stay capped at \(count)")
+            previous = height
+        }
+
+        // The cap is what makes the list scroll instead of overflowing the window.
+        XCTAssertEqual(sizing.height(candidateCount: 50), sizing.maximumHeight)
+    }
+
+    func testPhase72AutocompletePopoverSitsAboveTheField() {
+        let sizing = ComposerAutocompleteSizing.self
+        let popover = sizing.height(candidateCount: 6)
+
+        for fieldHeight in [CGFloat(34), 92] {
+            let offset = sizing.offsetAboveField(fieldHeight: fieldHeight, popoverHeight: popover)
+            XCTAssertLessThan(offset, 0, "popover must be lifted above the field")
+            XCTAssertEqual(offset, -(popover + sizing.gap), accuracy: 0.001)
+        }
+    }
+
+    func testPhase72InlineEmojiGlyphScaleIsClamped() {
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 44), 2, accuracy: 0.001)
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 22), 1, accuracy: 0.001)
+        // Never scale below 1 -- a tiny bitmap should not be blown up past its natural size.
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 11), 1, accuracy: 0.001)
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 0), 1, accuracy: 0.001)
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: -5), 1, accuracy: 0.001)
+        XCTAssertEqual(InlineEmojiGlyphMetrics.scale(pixelHeight: 10_000), 8, accuracy: 0.001)
     }
 
     func testPhase58MentionTokenizerExtractsUserMentionsOutsideCode() {
@@ -339,7 +619,7 @@ final class StoatUITests: XCTestCase {
         let mention = MessageInlineReferenceItem(kind: .user, rawID: userID, displayName: "Enka")
 
         let codeBlocks = MarkdownMessageContent._testBlockDescriptions(for: "```\n<@\(userID)>\n```")
-        XCTAssertEqual(codeBlocks, ["code::<@\(userID)>"])
+        XCTAssertEqual(codeBlocks, ["code:-::<@\(userID)>"])
 
         // The inline tokenizer itself (given only the fenced content, as the block parser would
         // hand it) still recognizes the shape -- literalness comes from the block parser routing
