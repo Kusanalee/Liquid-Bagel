@@ -3,6 +3,7 @@ import StoatDesignSystem
 import StoatModels
 import StoatPersistence
 import StoatUI
+import StoatVoice
 import SwiftUI
 
 #if canImport(AppKit)
@@ -58,6 +59,10 @@ public struct AccountConnectionSettingsView: View {
             NotificationSettingsTab(viewModel: viewModel)
                 .tabItem { Label("Notifications", systemImage: "bell.badge") }
                 .tag(SettingsSectionTab.notifications)
+
+            VoiceSettingsTab(viewModel: viewModel)
+                .tabItem { Label("Voice", systemImage: "mic") }
+                .tag(SettingsSectionTab.voice)
 
             if viewModel.isDeveloperControlsEnabled {
                 DeveloperVerificationTab(viewModel: viewModel)
@@ -1224,6 +1229,176 @@ private struct NotificationSettingsTab: View {
                 }
             }
         )
+    }
+}
+
+private struct VoiceSettingsTab: View {
+    @Bindable var viewModel: MainShellViewModel
+    @State private var isCapturingPushToTalkKey = false
+    @State private var pushToTalkCaptureMonitor: Any?
+    @State private var localAudioLevel: Float = 0
+
+    var body: some View {
+        Form {
+            Section("Permission") {
+                LabeledContent("System status", value: viewModel.microphonePermissionStatus.rawValue)
+                Button("Request Microphone Permission") {
+                    viewModel.requestMicrophonePermission()
+                }
+                Button("Refresh Status") {
+                    viewModel.refreshMicrophonePermissionStatus()
+                }
+                Button("Open macOS Microphone Settings") {
+                    viewModel.openMacOSMicrophoneSettings()
+                }
+                if viewModel.microphonePermissionStatus == .denied || viewModel.microphonePermissionStatus == .restricted {
+                    Text("Microphone access is denied in macOS System Settings. Open System Settings > Privacy & Security > Microphone and allow Liquid Bagel, then refresh this status.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                Text("Voice channels need microphone access to publish audio. You can still join and listen without it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Devices") {
+                Picker("Input", selection: inputDeviceBinding) {
+                    Text("System Default").tag(String?.none)
+                    ForEach(viewModel.voiceInputDevices) { device in
+                        Text(device.name).tag(String?.some(device.id))
+                    }
+                }
+                Picker("Output", selection: outputDeviceBinding) {
+                    Text("System Default").tag(String?.none)
+                    ForEach(viewModel.voiceOutputDevices) { device in
+                        Text(device.name).tag(String?.some(device.id))
+                    }
+                }
+                if viewModel.voiceInputDevices.isEmpty && viewModel.voiceOutputDevices.isEmpty {
+                    Text("No audio devices found yet. The list populates once macOS reports connected devices.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("Processing") {
+                Toggle("Echo cancellation", isOn: preferenceBinding(\.echoCancellation))
+                Toggle("Noise suppression", isOn: preferenceBinding(\.noiseSuppression))
+                Text("Changes apply the next time your microphone (re)publishes — muting and unmuting is enough.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Push-to-Talk") {
+                Toggle("Push-to-talk", isOn: preferenceBinding(\.pushToTalkEnabled))
+                HStack {
+                    Text("Key")
+                    Spacer()
+                    Text(pushToTalkKeyDescription)
+                        .foregroundStyle(.secondary)
+                    Button(isCapturingPushToTalkKey ? "Press any key…" : "Set Key") {
+                        startCapturingPushToTalkKey()
+                    }
+                    .disabled(isCapturingPushToTalkKey)
+                }
+                if !viewModel.voicePreferences.pushToTalkEnabled {
+                    VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+                        Text("Input sensitivity")
+                        Slider(value: preferenceBinding(\.inputSensitivity), in: 0...1)
+                        if viewModel.activeVoiceCall.isActive {
+                            ProgressView(value: Double(localAudioLevel), total: 1)
+                                .tint(Double(localAudioLevel) >= viewModel.voicePreferences.inputSensitivity ? .green : .secondary)
+                        } else {
+                            Text("Join a voice channel to preview your microphone level.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Text("Push-to-talk works only while Liquid Bagel is the focused app. A hotkey that works while another app is focused needs macOS Input Monitoring permission and isn't supported yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .task {
+            viewModel.refreshMicrophonePermissionStatus()
+        }
+        .task(id: viewModel.activeVoiceCall.isActive) {
+            await observeLocalAudioLevel()
+        }
+        .onDisappear {
+            #if canImport(AppKit)
+            if let pushToTalkCaptureMonitor {
+                NSEvent.removeMonitor(pushToTalkCaptureMonitor)
+            }
+            #endif
+        }
+    }
+
+    private var inputDeviceBinding: Binding<String?> {
+        Binding(
+            get: { viewModel.voicePreferences.inputDeviceID },
+            set: { viewModel.voicePreferences.inputDeviceID = $0 }
+        )
+    }
+
+    private var outputDeviceBinding: Binding<String?> {
+        Binding(
+            get: { viewModel.voicePreferences.outputDeviceID },
+            set: { viewModel.voicePreferences.outputDeviceID = $0 }
+        )
+    }
+
+    private func preferenceBinding<Value>(_ keyPath: WritableKeyPath<VoicePreferences, Value>) -> Binding<Value> {
+        Binding(
+            get: { viewModel.voicePreferences[keyPath: keyPath] },
+            set: { viewModel.voicePreferences[keyPath: keyPath] = $0 }
+        )
+    }
+
+    private var pushToTalkKeyDescription: String {
+        guard let keyCode = viewModel.voicePreferences.pushToTalkKeyCode else { return "Not set" }
+        return PushToTalkKeyNaming.name(for: keyCode)
+    }
+
+    private func startCapturingPushToTalkKey() {
+        #if canImport(AppKit)
+        isCapturingPushToTalkKey = true
+        pushToTalkCaptureMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            viewModel.voicePreferences.pushToTalkKeyCode = event.keyCode
+            isCapturingPushToTalkKey = false
+            if let pushToTalkCaptureMonitor {
+                NSEvent.removeMonitor(pushToTalkCaptureMonitor)
+            }
+            pushToTalkCaptureMonitor = nil
+            return nil
+        }
+        #endif
+    }
+
+    private func observeLocalAudioLevel() async {
+        guard viewModel.activeVoiceCall.isActive else { return }
+        for await level in viewModel.voiceEngine.localAudioLevel {
+            if Task.isCancelled { break }
+            localAudioLevel = level
+        }
+    }
+}
+
+/// Human-readable names for the handful of macOS virtual keycodes people actually pick for
+/// push-to-talk (function/modifier keys that don't collide with typing). Anything else falls
+/// back to a raw key-code label rather than guessing.
+private enum PushToTalkKeyNaming {
+    private static let names: [UInt16: String] = [
+        49: "Space", 48: "Tab", 50: "` (Grave)",
+        54: "Right ⌘", 55: "Left ⌘", 58: "Left ⌥", 61: "Right ⌥",
+        59: "Left ⌃", 62: "Right ⌃", 56: "Left ⇧", 60: "Right ⇧",
+        105: "F13", 107: "F14", 113: "F15", 106: "F16", 64: "F17", 79: "F18", 80: "F19", 90: "F20"
+    ]
+
+    static func name(for keyCode: UInt16) -> String {
+        names[keyCode] ?? "Key code \(keyCode)"
     }
 }
 

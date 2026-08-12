@@ -106,6 +106,68 @@ final class StoatRealtimeTests: XCTestCase {
         XCTAssertEvent("auth_delete_session") { if case .auth(.deleteSession) = $0 { true } else { false } }
     }
 
+    func testPhase75ServerMemberUpdateDecodesVoiceChannelAndCanPublishReceive() throws {
+        let json = """
+        {
+          "type": "ServerMemberUpdate",
+          "id": { "server": "phase75-server", "user": "phase75-user" },
+          "data": { "voice_channel": "phase75-voice-channel", "can_publish": false, "can_receive": true },
+          "clear": []
+        }
+        """
+        let event = try decoder.decode(StoatGatewayEvent.self, from: Data(json.utf8))
+        guard case let .serverMemberUpdate(update) = event else {
+            return XCTFail("Expected serverMemberUpdate")
+        }
+        XCTAssertEqual(update.data.voiceChannel, "phase75-voice-channel")
+        XCTAssertEqual(update.data.canPublish, false)
+        XCTAssertEqual(update.data.canReceive, true)
+    }
+
+    func testPhase75RealtimeStateStoreAppliesVoiceChannelJoinAndLeave() async throws {
+        let store = RealtimeStateStore()
+        var iterator = store.updates.makeAsyncIterator()
+        let serverID: ServerID = "phase75-server"
+        let userID: UserID = "phase75-user"
+        let voiceChannelID: ChannelID = "phase75-voice-channel"
+        let member = ServerMember(id: MemberCompositeKey(serverID: serverID, userID: userID), joinedAt: Date())
+
+        _ = await store.apply(.serverMemberJoin(ServerMemberJoinEvent(id: serverID, userID: userID, member: member)))
+        _ = await iterator.next()
+
+        // Joining voice rides the existing ServerMemberUpdate event, not a dedicated voice event.
+        let joinJSON = """
+        {
+          "type": "ServerMemberUpdate",
+          "id": { "server": "\(serverID.rawValue)", "user": "\(userID.rawValue)" },
+          "data": { "voice_channel": "\(voiceChannelID.rawValue)" },
+          "clear": []
+        }
+        """
+        let joinEvent = try decoder.decode(StoatGatewayEvent.self, from: Data(joinJSON.utf8))
+        let joinUpdate = await store.apply(joinEvent)
+        let joinPublished = await iterator.next()
+
+        let key = ServerMemberKey(serverID: serverID, userID: userID)
+        XCTAssertEqual(joinUpdate.snapshot.membersByServerAndUserID[key]?.voiceChannel, voiceChannelID)
+        XCTAssertEqual(joinPublished?.snapshot.membersByServerAndUserID[key]?.voiceChannel, voiceChannelID)
+
+        // Leaving clears the field via the documented "VoiceChannel" clear key, mirroring
+        // MemberEditRemovedField.voiceChannel.
+        let leaveJSON = """
+        {
+          "type": "ServerMemberUpdate",
+          "id": { "server": "\(serverID.rawValue)", "user": "\(userID.rawValue)" },
+          "data": {},
+          "clear": ["VoiceChannel"]
+        }
+        """
+        let leaveEvent = try decoder.decode(StoatGatewayEvent.self, from: Data(leaveJSON.utf8))
+        let leaveUpdate = await store.apply(leaveEvent)
+
+        XCTAssertNil(leaveUpdate.snapshot.membersByServerAndUserID[key]?.voiceChannel)
+    }
+
     func testBulkDecodesAndClientFlattensEvents() async throws {
         if case let .bulk(events) = try decodeFixture("bulk_messages") {
             XCTAssertEqual(events.count, 2)

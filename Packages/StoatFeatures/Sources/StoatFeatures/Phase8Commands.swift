@@ -87,6 +87,12 @@ public enum AppCommand: Hashable, Sendable {
     case markSelectedChannelRead
     /// Phase 58: verified `CHAT_MARK_SERVER_AS_READ` (Shift-Escape).
     case markSelectedServerRead
+    // MARK: - Phase 75 (voice)
+    case joinVoiceChannel(ChannelID)
+    case leaveVoiceCall
+    case toggleMicrophoneMuted
+    case toggleDeafened
+    case openVoiceSettings
 }
 
 @MainActor
@@ -479,7 +485,11 @@ public final class QuickSwitcherViewModel {
             commandResult(.openAppearanceSettings, title: "Appearance Settings", subtitle: "Adjust Liquid Glass and message density"),
             commandResult(.openNotificationSettings, title: "Notification Settings", subtitle: "Open notification settings"),
             commandResult(.markSelectedChannelRead, title: "Mark Channel Read", subtitle: "Mark the selected channel read and focus the composer"),
-            commandResult(.markSelectedServerRead, title: "Mark Server Read", subtitle: "Mark every channel in the selected server read")
+            commandResult(.markSelectedServerRead, title: "Mark Server Read", subtitle: "Mark every channel in the selected server read"),
+            commandResult(.leaveVoiceCall, title: "Leave Voice Call", subtitle: "Disconnect from the active voice channel"),
+            commandResult(.toggleMicrophoneMuted, title: "Toggle Mute", subtitle: "Mute or unmute your microphone in the active voice call"),
+            commandResult(.toggleDeafened, title: "Toggle Deafen", subtitle: "Deafen or undeafen yourself in the active voice call"),
+            commandResult(.openVoiceSettings, title: "Voice Settings", subtitle: "Open voice input, output, and push-to-talk settings")
         ] + developerCommandResults()
     }
 

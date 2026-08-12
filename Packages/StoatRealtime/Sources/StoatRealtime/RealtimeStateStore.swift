@@ -374,12 +374,18 @@ public actor RealtimeStateStore {
             if let avatar = event.data.avatar { member.avatar = avatar }
             if let roles = event.data.roles { member.roles = roles }
             if let timeout = event.data.timeout { member.timeout = timeout }
+            if let canPublish = event.data.canPublish { member.canPublish = canPublish }
+            if let canReceive = event.data.canReceive { member.canReceive = canReceive }
+            if let voiceChannel = event.data.voiceChannel { member.voiceChannel = voiceChannel }
             for field in event.clear {
                 switch field {
                 case "Nickname": member.nickname = nil
                 case "Avatar": member.avatar = nil
                 case "Roles": member.roles = []
                 case "Timeout": member.timeout = nil
+                case "CanPublish": member.canPublish = true
+                case "CanReceive": member.canReceive = true
+                case "VoiceChannel": member.voiceChannel = nil
                 default: break
                 }
             }

@@ -141,6 +141,9 @@ public struct PartialServerMember: Codable, Hashable, Sendable {
     public var avatar: File?
     public var roles: [RoleID]?
     public var timeout: Date?
+    public var canPublish: Bool?
+    public var canReceive: Bool?
+    public var voiceChannel: ChannelID?
     public var raw: JSONValue?
 
     private enum CodingKeys: String, CodingKey {
@@ -148,6 +151,9 @@ public struct PartialServerMember: Codable, Hashable, Sendable {
         case avatar
         case roles
         case timeout
+        case canPublish = "can_publish"
+        case canReceive = "can_receive"
+        case voiceChannel = "voice_channel"
     }
 
     public init(from decoder: Decoder) throws {
@@ -156,6 +162,9 @@ public struct PartialServerMember: Codable, Hashable, Sendable {
         avatar = try container.decodeIfPresent(File.self, forKey: .avatar)
         roles = try container.decodeIfPresent([RoleID].self, forKey: .roles)
         timeout = try container.decodeIfPresent(Date.self, forKey: .timeout)
+        canPublish = try container.decodeIfPresent(Bool.self, forKey: .canPublish)
+        canReceive = try container.decodeIfPresent(Bool.self, forKey: .canReceive)
+        voiceChannel = try container.decodeIfPresent(ChannelID.self, forKey: .voiceChannel)
         raw = try? JSONValue(from: decoder)
     }
 }

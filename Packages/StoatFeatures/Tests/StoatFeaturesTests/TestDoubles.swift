@@ -13,6 +13,7 @@ import StoatModels
 import StoatPersistence
 import StoatRealtime
 import StoatUI
+import StoatVoice
 @testable import StoatFeatures
 
 public actor StubStoatAPIClient: StoatAPIClient {
@@ -406,6 +407,17 @@ public actor StubStoatAPIClient: StoatAPIClient {
     }
 
     public func ackChannel(channelID: ChannelID, messageID: MessageID) async throws {
+    }
+
+    public var voiceJoinError: (any Error)?
+
+    public func setVoiceJoinError(_ error: (any Error)?) {
+        voiceJoinError = error
+    }
+
+    public func joinVoiceChannel(channelID: ChannelID) async throws -> VoiceJoinResponse {
+        if let voiceJoinError { throw voiceJoinError }
+        return VoiceJoinResponse(token: "stub-token-\(channelID.rawValue)", url: "wss://voice.stub.test")
     }
 
     public func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {
@@ -1349,5 +1361,117 @@ public actor StubAttachmentOpener: AttachmentOpening {
 
     public func openCount() -> Int {
         opened.count
+    }
+}
+
+/// Plain class rather than an actor: `MainShellViewModel.joinVoiceChannel` calls `engine.events`
+/// synchronously right after `await engine.connect(...)` returns, and wiring the continuation
+/// without an actor hop in between means there's no race where an `emit(_:)` from a test lands
+/// before the subscriber is registered.
+public final class StubVoiceEngine: VoiceEngine, @unchecked Sendable {
+    private let lock = NSLock()
+    private var eventContinuation: AsyncStream<VoiceEngineEvent>.Continuation?
+    private var audioLevelContinuation: AsyncStream<Float>.Continuation?
+
+    public private(set) var connectCallCount = 0
+    public private(set) var lastConnectURL: URL?
+    public private(set) var lastConnectToken: String?
+    public private(set) var disconnectCallCount = 0
+    public private(set) var microphoneMutedCalls: [Bool] = []
+    public private(set) var audioProcessingCalls: [(echoCancellation: Bool, noiseSuppression: Bool)] = []
+    public var connectError: (any Error)?
+    public var availableInputDevices: [VoiceAudioDevice]
+    public var availableOutputDevices: [VoiceAudioDevice]
+    public private(set) var selectedInputDeviceID: String?
+    public private(set) var selectedOutputDeviceID: String?
+
+    public init(availableInputDevices: [VoiceAudioDevice] = [], availableOutputDevices: [VoiceAudioDevice] = []) {
+        self.availableInputDevices = availableInputDevices
+        self.availableOutputDevices = availableOutputDevices
+    }
+
+    public var events: AsyncStream<VoiceEngineEvent> {
+        AsyncStream { [weak self] continuation in
+            self?.lock.lock()
+            self?.eventContinuation = continuation
+            self?.lock.unlock()
+        }
+    }
+
+    public var localAudioLevel: AsyncStream<Float> {
+        AsyncStream { [weak self] continuation in
+            self?.lock.lock()
+            self?.audioLevelContinuation = continuation
+            self?.lock.unlock()
+        }
+    }
+
+    public func connect(url: URL, token: String) async throws {
+        if let connectError { throw connectError }
+        connectCallCount += 1
+        lastConnectURL = url
+        lastConnectToken = token
+    }
+
+    public func disconnect() async {
+        disconnectCallCount += 1
+        finishContinuations()
+    }
+
+    // `NSLock.lock()`/`unlock()` are unavailable when called lexically inside an `async` function
+    // body — hence this small synchronous helper, same shape as `LiveKitVoiceEngine`'s `emit`.
+    private func finishContinuations() {
+        lock.lock()
+        eventContinuation?.finish()
+        eventContinuation = nil
+        audioLevelContinuation?.finish()
+        audioLevelContinuation = nil
+        lock.unlock()
+    }
+
+    public func setMicrophoneMuted(_ muted: Bool) async throws {
+        microphoneMutedCalls.append(muted)
+    }
+
+    public func setAudioProcessing(echoCancellation: Bool, noiseSuppression: Bool) {
+        audioProcessingCalls.append((echoCancellation, noiseSuppression))
+    }
+
+    public func selectInputDevice(id: String) { selectedInputDeviceID = id }
+    public func selectOutputDevice(id: String) { selectedOutputDeviceID = id }
+
+    /// Test helper: push an event to the active `events` subscriber, if any.
+    public func emit(_ event: VoiceEngineEvent) {
+        lock.lock()
+        let continuation = eventContinuation
+        lock.unlock()
+        continuation?.yield(event)
+    }
+}
+
+public actor StubMicrophonePermissionManager: MicrophonePermissionManaging {
+    public var currentStatus: MicrophonePermissionStatus
+    public private(set) var requestCount = 0
+
+    public init(status: MicrophonePermissionStatus = .notDetermined) {
+        self.currentStatus = status
+    }
+
+    public func status() async -> MicrophonePermissionStatus {
+        currentStatus
+    }
+
+    public func requestAuthorization() async -> MicrophonePermissionRequestResult {
+        let before = currentStatus
+        requestCount += 1
+        if currentStatus == .notDetermined {
+            currentStatus = .authorized
+        }
+        return MicrophonePermissionRequestResult(
+            statusBefore: before,
+            requestAuthorizationCalled: true,
+            granted: currentStatus == .authorized,
+            statusAfter: currentStatus
+        )
     }
 }

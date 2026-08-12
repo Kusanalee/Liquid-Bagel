@@ -126,6 +126,75 @@ public struct NotificationPreferences: Codable, Hashable, Sendable {
     }
 }
 
+/// Local voice call settings — device selection, capture processing, push-to-talk, and voice
+/// activation. Local-only by design (not part of `SyncedClientPreferences`): device IDs are
+/// per-machine, so syncing them across devices would just make one machine's mic pick fight
+/// another's.
+public struct VoicePreferences: Codable, Hashable, Sendable {
+    public var inputDeviceID: String?
+    public var outputDeviceID: String?
+    public var echoCancellation: Bool
+    public var noiseSuppression: Bool
+    public var pushToTalkEnabled: Bool
+    public var pushToTalkKeyCode: UInt16?
+    /// 0...1 voice-activation threshold, used only when `pushToTalkEnabled == false`.
+    public var inputSensitivity: Double
+
+    public init(
+        inputDeviceID: String? = nil,
+        outputDeviceID: String? = nil,
+        echoCancellation: Bool = true,
+        noiseSuppression: Bool = true,
+        pushToTalkEnabled: Bool = false,
+        pushToTalkKeyCode: UInt16? = nil,
+        inputSensitivity: Double = 0.15
+    ) {
+        self.inputDeviceID = inputDeviceID
+        self.outputDeviceID = outputDeviceID
+        self.echoCancellation = echoCancellation
+        self.noiseSuppression = noiseSuppression
+        self.pushToTalkEnabled = pushToTalkEnabled
+        self.pushToTalkKeyCode = pushToTalkKeyCode
+        self.inputSensitivity = inputSensitivity
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case inputDeviceID
+        case outputDeviceID
+        case echoCancellation
+        case noiseSuppression
+        case pushToTalkEnabled
+        case pushToTalkKeyCode
+        case inputSensitivity
+    }
+
+    /// Decoded key-by-key with per-field fallbacks, same reasoning as `TimelineTuningConfiguration`:
+    /// the synthesized `Decodable` would fail the whole blob on one missing key.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = VoicePreferences()
+        self.init(
+            inputDeviceID: try container.decodeIfPresent(String.self, forKey: .inputDeviceID),
+            outputDeviceID: try container.decodeIfPresent(String.self, forKey: .outputDeviceID),
+            echoCancellation: try container.decodeIfPresent(Bool.self, forKey: .echoCancellation) ?? defaults.echoCancellation,
+            noiseSuppression: try container.decodeIfPresent(Bool.self, forKey: .noiseSuppression) ?? defaults.noiseSuppression,
+            pushToTalkEnabled: try container.decodeIfPresent(Bool.self, forKey: .pushToTalkEnabled) ?? defaults.pushToTalkEnabled,
+            pushToTalkKeyCode: try container.decodeIfPresent(UInt16.self, forKey: .pushToTalkKeyCode),
+            inputSensitivity: try container.decodeIfPresent(Double.self, forKey: .inputSensitivity) ?? defaults.inputSensitivity
+        )
+    }
+
+    public static var defaults: VoicePreferences {
+        VoicePreferences()
+    }
+
+    public func validated() -> VoicePreferences {
+        var copy = self
+        copy.inputSensitivity = min(max(inputSensitivity, 0), 1)
+        return copy
+    }
+}
+
 public struct TimelineTuningConfiguration: Codable, Hashable, Sendable {
     public var nearNewestMessageThreshold: Int
     public var visibleRangeUpdateDebounceMilliseconds: Int
@@ -371,6 +440,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
     public var inlineImagePreviewPolicy: InlineImagePreviewPolicy
     public var timelineTuning: TimelineTuningConfiguration
     public var notificationPreferences: NotificationPreferences
+    public var voicePreferences: VoicePreferences
     public var lastSettingsSyncTimestamp: Int64?
 
     private enum CodingKeys: String, CodingKey {
@@ -386,6 +456,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         case inlineImagePreviewPolicy
         case timelineTuning
         case notificationPreferences
+        case voicePreferences
         case lastSettingsSyncTimestamp
         case offlineCacheRestoreOnLaunch
         case automaticSettingsSyncEnabled
@@ -406,6 +477,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         inlineImagePreviewPolicy: InlineImagePreviewPolicy = .automaticSmallImages,
         timelineTuning: TimelineTuningConfiguration = .defaults,
         notificationPreferences: NotificationPreferences = .defaults,
+        voicePreferences: VoicePreferences = .defaults,
         lastSettingsSyncTimestamp: Int64? = nil
     ) {
         self.lastSelectedEnvironmentID = lastSelectedEnvironmentID
@@ -422,6 +494,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         self.inlineImagePreviewPolicy = inlineImagePreviewPolicy
         self.timelineTuning = timelineTuning.validated()
         self.notificationPreferences = notificationPreferences.validated()
+        self.voicePreferences = voicePreferences.validated()
         self.lastSettingsSyncTimestamp = lastSettingsSyncTimestamp
     }
 
@@ -443,6 +516,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
             inlineImagePreviewPolicy: try container.decodeIfPresent(InlineImagePreviewPolicy.self, forKey: .inlineImagePreviewPolicy) ?? .automaticSmallImages,
             timelineTuning: try container.decodeIfPresent(TimelineTuningConfiguration.self, forKey: .timelineTuning) ?? .defaults,
             notificationPreferences: try container.decodeIfPresent(NotificationPreferences.self, forKey: .notificationPreferences) ?? .defaults,
+            voicePreferences: try container.decodeIfPresent(VoicePreferences.self, forKey: .voicePreferences) ?? .defaults,
             lastSettingsSyncTimestamp: try container.decodeIfPresent(Int64.self, forKey: .lastSettingsSyncTimestamp)
         )
     }
@@ -463,6 +537,7 @@ public struct AppPreferences: Codable, Hashable, Sendable {
         try container.encode(inlineImagePreviewPolicy, forKey: .inlineImagePreviewPolicy)
         try container.encode(timelineTuning.validated(), forKey: .timelineTuning)
         try container.encode(notificationPreferences.validated(), forKey: .notificationPreferences)
+        try container.encode(voicePreferences.validated(), forKey: .voicePreferences)
         try container.encodeIfPresent(lastSettingsSyncTimestamp, forKey: .lastSettingsSyncTimestamp)
     }
 
