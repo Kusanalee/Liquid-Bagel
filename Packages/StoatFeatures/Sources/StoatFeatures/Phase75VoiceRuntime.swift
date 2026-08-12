@@ -319,10 +319,9 @@ public extension MainShellViewModel {
     /// local client has actually joined.
     func voiceParticipants(for channelID: ChannelID) -> [ServerMember] {
         let key = VoiceRosterCacheKey(channelID: channelID, fingerprint: voiceRosterFingerprint(for: channelID))
-        if key == voiceRosterCacheKey { return voiceRosterCache }
+        if let cached = voiceRosterCache[key] { return cached }
         let result = snapshot.membersByServerAndUserID.values.filter { $0.voiceChannel == channelID }
-        voiceRosterCacheKey = key
-        voiceRosterCache = result
+        voiceRosterCache[key] = result
         voiceRosterRevision &+= 1
         return result
     }

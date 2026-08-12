@@ -861,7 +861,9 @@ public final class MainShellViewModel {
     /// gateway-synced roster of who's in which channel and works for channels the user hasn't
     /// joined at all.
     public internal(set) var activeVoiceCallParticipants: [String: VoiceParticipant] = [:]
-    public internal(set) var voiceRosterRevision = 0
+    // Roster lookup is performed while SwiftUI builds channel rows. Keep its cache bookkeeping
+    // out of Observation so a cache fill cannot invalidate the view currently being rendered.
+    @ObservationIgnored public internal(set) var voiceRosterRevision = 0
     public var voicePreferences = VoicePreferences() {
         didSet {
             guard oldValue != voicePreferences else { return }
@@ -870,8 +872,7 @@ public final class MainShellViewModel {
     }
     @ObservationIgnored var voiceCallTask: Task<Void, Never>?
     @ObservationIgnored var cachedRootConfiguration: StoatConfig?
-    @ObservationIgnored var voiceRosterCacheKey: VoiceRosterCacheKey?
-    @ObservationIgnored var voiceRosterCache: [ServerMember] = []
+    @ObservationIgnored var voiceRosterCache: [VoiceRosterCacheKey: [ServerMember]] = [:]
     @ObservationIgnored var pushToTalkKeyMonitor: Any?
     @ObservationIgnored public var communityAPIClient: (any StoatAPIClient)?
     @ObservationIgnored public var notificationRouteCenter: NotificationRouteCenter

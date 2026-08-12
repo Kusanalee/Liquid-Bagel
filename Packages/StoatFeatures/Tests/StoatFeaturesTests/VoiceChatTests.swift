@@ -127,6 +127,13 @@ final class VoiceChatTests: XCTestCase {
 
         // A different channel ID is a different cache key and must not reuse the cached roster.
         XCTAssertTrue(joinedViewModel.voiceParticipants(for: "some-other-channel").isEmpty)
+        let revisionAfterOtherChannel = joinedViewModel.voiceRosterRevision
+
+        // ChannelListView asks for every voice-capable channel during one render. Returning to a
+        // previously visited channel must remain a cache hit; a single-entry cache would thrash
+        // here and, before Phase 77, repeatedly invalidate SwiftUI during startup.
+        XCTAssertEqual(joinedViewModel.voiceParticipants(for: voiceChannelID).map(\.id.userID), [otherUserID])
+        XCTAssertEqual(joinedViewModel.voiceRosterRevision, revisionAfterOtherChannel)
     }
 
     // MARK: - Join / leave / mute / deafen (integration, via StubVoiceEngine)
