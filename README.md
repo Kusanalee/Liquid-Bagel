@@ -60,7 +60,7 @@ Your session token is stored in the macOS Keychain and scoped to Liquid Bagel. I
 
 Liquid Bagel intentionally does not include:
 
-- **Voice, video, or screen share.** Not implemented.
+- **Video or screen share.** Not implemented. Voice chat is supported (join/leave, mute/deafen, push-to-talk, device selection).
 - **Background push notifications.** Notifications are delivered while Liquid Bagel is running; there is no push when the app is quit.
 
 This list is not exhaustive. Because this is an early pre-release, features that exist may still behave incorrectly. Please report reproducible problems through [GitHub Issues](https://github.com/Kusanalee/Liquid-Bagel/issues).
@@ -92,12 +92,13 @@ The check script tests every local Swift package, verifies that test doubles hav
 - `Packages/StoatPersistence`: app preferences, environment profiles, and the local cache repository boundary.
 - `Packages/StoatDesignSystem`: shared styling tokens and components (the app's glass/native visual language).
 - `Packages/StoatUI`: chat shell UI — timeline, composer, markdown rendering, embeds, and shared chat components.
+- `Packages/StoatVoice`: voice call transport — a `VoiceEngine` abstraction backed by the LiveKit Swift SDK, isolated from the rest of the app so the WebRTC dependency doesn't leak into every package's build graph.
 - `Packages/StoatFeatures`: feature layer (view models, coordinators, and screen-level logic) used by the app target.
 - `Docs/Research.md`: Stoat API/protocol research notes.
-- `Docs/PhaseN.md` (phases 1–74): phase-by-phase implementation history and handoff notes.
+- `Docs/PhaseN.md` (phases 1–75): phase-by-phase implementation history and handoff notes.
 - `Docs/QA/`: manual QA pass notes for release gates (freeze/perf, chat presentation, conversation state, notifications, account/identity, community management, native macOS behavior).
 
-See [Docs/Phase74.md](Docs/Phase74.md) for the most recent architecture notes and [Docs/QA/](Docs/QA/) for release-gate QA coverage.
+See [Docs/Phase75.md](Docs/Phase75.md) for the most recent architecture notes and [Docs/QA/](Docs/QA/) for release-gate QA coverage.
 
 ## Contributing
 

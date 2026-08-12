@@ -4098,26 +4098,61 @@ public struct ChannelRow: View {
     private let isSelected: Bool
     private let unreadCount: Int
     private let mentionCount: Int
+    /// Phase 75: voice channels are no longer unconditionally disabled — the caller resolves
+    /// whether the current user can actually join (permissions, connection state) and passes
+    /// the result in, the same way every other gate in this row is caller-supplied.
+    private let isDisabled: Bool
+    private let disabledHint: String?
+    /// Count from the gateway-synced roster (`ServerMember.voiceChannel`), shown next to a
+    /// voice channel's name so the sidebar reads like "who's in here" at a glance.
+    private let voiceParticipantCount: Int
+    private let isActiveVoiceCall: Bool
     private let action: () -> Void
 
-    public init(channel: Channel, isSelected: Bool, unreadCount: Int = 0, mentionCount: Int = 0, action: @escaping () -> Void) {
+    public init(
+        channel: Channel,
+        isSelected: Bool,
+        unreadCount: Int = 0,
+        mentionCount: Int = 0,
+        isDisabled: Bool = false,
+        disabledHint: String? = nil,
+        voiceParticipantCount: Int = 0,
+        isActiveVoiceCall: Bool = false,
+        action: @escaping () -> Void
+    ) {
         self.channel = channel
         self.isSelected = isSelected
         self.unreadCount = unreadCount
         self.mentionCount = mentionCount
+        self.isDisabled = isDisabled
+        self.disabledHint = disabledHint
+        self.voiceParticipantCount = voiceParticipantCount
+        self.isActiveVoiceCall = isActiveVoiceCall
         self.action = action
     }
+
+    private var isVoiceChannel: Bool { channel.kind == .voiceChannel }
 
     public var body: some View {
         Button(action: action) {
             HStack(spacing: StoatSpacing.small) {
                 Image(systemName: iconName)
-                    .foregroundStyle(isDisabled ? .tertiary : .secondary)
+                    .foregroundStyle(isActiveVoiceCall ? AnyShapeStyle(Color.accentColor) : (isDisabled ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.secondary)))
                     .frame(width: 18)
                 Text(channel.displayName)
                     .font(isSelected ? StoatTypography.rowSelected : StoatTypography.row)
                     .lineLimit(1)
+                if isVoiceChannel && voiceParticipantCount > 0 {
+                    Text("\(voiceParticipantCount)")
+                        .font(StoatTypography.row)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer(minLength: StoatSpacing.small)
+                if isActiveVoiceCall {
+                    Image(systemName: "waveform")
+                        .foregroundStyle(Color.accentColor)
+                        .accessibilityLabel("You're in this voice channel")
+                }
                 if mentionCount > 0 {
                     MentionBadge(count: mentionCount)
                 } else if unreadCount > 0 {
@@ -4137,10 +4172,8 @@ public struct ChannelRow: View {
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.48 : 1)
         .accessibilityLabel(StoatAccessibility.channelLabel(name: channel.displayName, unreadCount: unreadCount, mentionCount: mentionCount, isSelected: isSelected, isDisabled: isDisabled))
-        .accessibilityHint(isDisabled ? "Voice channels are deferred in this phase" : "Open channel")
+        .accessibilityHint(isDisabled ? (disabledHint ?? "Unavailable") : (isVoiceChannel ? "Join voice channel" : "Open channel"))
     }
-
-    private var isDisabled: Bool { channel.kind == .voiceChannel }
 
     private var iconName: String {
         switch channel.kind {

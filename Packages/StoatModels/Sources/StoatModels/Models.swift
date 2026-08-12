@@ -754,6 +754,20 @@ public struct VoiceInformation: Codable, Hashable, Sendable {
     }
 }
 
+/// Response from `POST /channels/{target}/join_call`: a LiveKit join token, and optionally the
+/// SFU URL to use it against. When `url` is absent, the client resolves a node from
+/// `StoatConfig.features.livekit.nodes` instead. NOTE: this shape has not yet been verified
+/// against a live server — confirm the real field names before relying on `url`/`token` casing.
+public struct VoiceJoinResponse: Codable, Hashable, Sendable {
+    public var token: String
+    public var url: String?
+
+    public init(token: String, url: String? = nil) {
+        self.token = token
+        self.url = url
+    }
+}
+
 public struct MemberCompositeKey: Codable, Hashable, Sendable {
     public var serverID: ServerID
     public var userID: UserID
@@ -778,8 +792,9 @@ public struct ServerMember: Codable, Hashable, Sendable, Identifiable {
     public var timeout: Date?
     public var canPublish: Bool
     public var canReceive: Bool
+    public var voiceChannel: ChannelID?
 
-    public init(id: MemberCompositeKey, joinedAt: Date, nickname: String? = nil, avatar: File? = nil, roles: [RoleID] = [], timeout: Date? = nil, canPublish: Bool = true, canReceive: Bool = true) {
+    public init(id: MemberCompositeKey, joinedAt: Date, nickname: String? = nil, avatar: File? = nil, roles: [RoleID] = [], timeout: Date? = nil, canPublish: Bool = true, canReceive: Bool = true, voiceChannel: ChannelID? = nil) {
         self.id = id
         self.joinedAt = joinedAt
         self.nickname = nickname
@@ -788,6 +803,7 @@ public struct ServerMember: Codable, Hashable, Sendable, Identifiable {
         self.timeout = timeout
         self.canPublish = canPublish
         self.canReceive = canReceive
+        self.voiceChannel = voiceChannel
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -799,6 +815,7 @@ public struct ServerMember: Codable, Hashable, Sendable, Identifiable {
         case timeout
         case canPublish = "can_publish"
         case canReceive = "can_receive"
+        case voiceChannel = "voice_channel"
     }
 
     public init(from decoder: Decoder) throws {
@@ -811,6 +828,7 @@ public struct ServerMember: Codable, Hashable, Sendable, Identifiable {
         timeout = try container.decodeIfPresent(Date.self, forKey: .timeout)
         canPublish = try container.decodeDefault(Bool.self, forKey: .canPublish, default: true)
         canReceive = try container.decodeDefault(Bool.self, forKey: .canReceive, default: true)
+        voiceChannel = try container.decodeIfPresent(ChannelID.self, forKey: .voiceChannel)
     }
 }
 

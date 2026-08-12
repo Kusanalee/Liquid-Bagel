@@ -145,6 +145,7 @@
 				A80000000000000000000005 /* XCLocalSwiftPackageReference "Packages/StoatPersistence" */,
 				A80000000000000000000006 /* XCLocalSwiftPackageReference "Packages/StoatUI" */,
 				A80000000000000000000007 /* XCLocalSwiftPackageReference "Packages/StoatDesignSystem" */,
+				A80000000000000000000008 /* XCLocalSwiftPackageReference "Packages/StoatVoice" */,
 			);
 			productRefGroup = A40000000000000000000005 /* Products */;
 			projectDirPath = "";
@@ -415,6 +416,10 @@
 		A80000000000000000000007 /* XCLocalSwiftPackageReference "Packages/StoatDesignSystem" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Packages/StoatDesignSystem;
+		};
+		A80000000000000000000008 /* XCLocalSwiftPackageReference "Packages/StoatVoice" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/StoatVoice;
 		};
 /* End XCLocalSwiftPackageReference section */
 

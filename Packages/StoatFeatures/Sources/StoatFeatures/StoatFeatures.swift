@@ -7,6 +7,7 @@ import StoatModels
 import StoatPersistence
 import StoatRealtime
 import StoatUI
+import StoatVoice
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -91,6 +92,7 @@ public enum SettingsSectionTab: String, Codable, Hashable, Sendable, CaseIterabl
     case connection
     case appearance
     case notifications
+    case voice
     case developer
 }
 
@@ -840,6 +842,31 @@ public final class MainShellViewModel {
     @ObservationIgnored public var notificationDeliverer: any NotificationDelivering
     @ObservationIgnored public var notificationPermissionManager: any NotificationPermissionManaging
     @ObservationIgnored public var dockBadgeManager: any DockBadgeManaging
+    @ObservationIgnored public var voiceEngine: any VoiceEngine
+    @ObservationIgnored public var microphonePermissionManager: any MicrophonePermissionManaging
+    /// Local relationship to the active call. `.idle` unless the user has joined a voice channel.
+    /// Setter is `internal(set)`: mutated from the Phase 75 voice extension (a separate file
+    /// within this module), read publicly by `App`/SwiftUI.
+    public internal(set) var activeVoiceCall: VoiceCallUIState = .idle
+    public var voiceLocalAudioState = VoiceLocalAudioState()
+    public var microphonePermissionStatus: MicrophonePermissionStatus = .notDetermined
+    /// Live LiveKit-level participant state (speaking/mute) for the active call only, keyed by
+    /// LiveKit identity string. Distinct from `voiceParticipants(for:)`, which is the slower
+    /// gateway-synced roster of who's in which channel and works for channels the user hasn't
+    /// joined at all.
+    public internal(set) var activeVoiceCallParticipants: [String: VoiceParticipant] = [:]
+    public internal(set) var voiceRosterRevision = 0
+    public var voicePreferences = VoicePreferences() {
+        didSet {
+            guard oldValue != voicePreferences else { return }
+            saveVoicePreferences()
+        }
+    }
+    @ObservationIgnored var voiceCallTask: Task<Void, Never>?
+    @ObservationIgnored var cachedRootConfiguration: StoatConfig?
+    @ObservationIgnored var voiceRosterCacheKey: VoiceRosterCacheKey?
+    @ObservationIgnored var voiceRosterCache: [ServerMember] = []
+    @ObservationIgnored var pushToTalkKeyMonitor: Any?
     @ObservationIgnored public var communityAPIClient: (any StoatAPIClient)?
     @ObservationIgnored public var notificationRouteCenter: NotificationRouteCenter
     @ObservationIgnored public var appLifecycleCenter: AppLifecycleCenter
@@ -1048,6 +1075,8 @@ public final class MainShellViewModel {
         notificationDeliverer: (any NotificationDelivering)? = nil,
         notificationPermissionManager: (any NotificationPermissionManaging)? = nil,
         dockBadgeManager: (any DockBadgeManaging)? = nil,
+        voiceEngine: (any VoiceEngine)? = nil,
+        microphonePermissionManager: (any MicrophonePermissionManaging)? = nil,
         communityAPIClient: (any StoatAPIClient)? = nil,
         notificationRouteCenter: NotificationRouteCenter = .shared,
         appLifecycleCenter: AppLifecycleCenter = .shared,
@@ -1076,6 +1105,8 @@ public final class MainShellViewModel {
         self.notificationPermissionManager = notificationPermissionManager ?? UserNotificationsPermissionManager()
         self.notificationAuthorizerKind = String(describing: type(of: self.notificationPermissionManager))
         self.dockBadgeManager = dockBadgeManager ?? AppKitDockBadgeManager()
+        self.voiceEngine = voiceEngine ?? LiveKitVoiceEngine()
+        self.microphonePermissionManager = microphonePermissionManager ?? AVCaptureMicrophonePermissionManager()
         self.communityAPIClient = communityAPIClient
         self.notificationRouteCenter = notificationRouteCenter
         self.appLifecycleCenter = appLifecycleCenter
@@ -6989,6 +7020,7 @@ public final class MainShellViewModel {
         liquidGlassTransparency = AppPreferences.clampedLiquidGlassTransparency(sessionCoordinator.preferences.liquidGlassTransparency)
         inlineImagePreviewPolicy = sessionCoordinator.preferences.inlineImagePreviewPolicy
         timelineTuning = sessionCoordinator.preferences.timelineTuning.validated()
+        voicePreferences = sessionCoordinator.preferences.voicePreferences
         snapshot = snapshotWithHydratedMemberOverlay(sessionCoordinator.snapshot)
         phase51ShellDataRevision &+= 1
         schedulePhase51ShellPresentationRefresh(reason: "session snapshot")
@@ -12731,6 +12763,12 @@ extension MainShellViewModel: AppCommandHandling {
             return selectedConversationChannelID != nil
         case .markSelectedServerRead:
             return selection.serverID != nil
+        case let .joinVoiceChannel(channelID):
+            return canJoinVoiceChannel(channelID)
+        case .leaveVoiceCall, .toggleMicrophoneMuted, .toggleDeafened:
+            return activeVoiceCall.isActive
+        case .openVoiceSettings:
+            return true
         }
     }
 
@@ -12796,6 +12834,10 @@ extension MainShellViewModel: AppCommandHandling {
             return "Select a channel before marking it read."
         case .markSelectedServerRead:
             return "Select a server before marking it read."
+        case let .joinVoiceChannel(channelID):
+            return voiceJoinDisabledReason(channelID)
+        case .leaveVoiceCall, .toggleMicrophoneMuted, .toggleDeafened:
+            return "No active voice call."
         default:
             return "Unavailable."
         }
@@ -12998,6 +13040,16 @@ extension MainShellViewModel: AppCommandHandling {
             markSelectedChannelReadAndFocusComposer()
         case .markSelectedServerRead:
             markSelectedServerRead()
+        case let .joinVoiceChannel(channelID):
+            joinVoiceChannel(channelID)
+        case .leaveVoiceCall:
+            leaveVoiceCall()
+        case .toggleMicrophoneMuted:
+            toggleMicrophoneMuted()
+        case .toggleDeafened:
+            toggleDeafened()
+        case .openVoiceSettings:
+            showVoiceSettings()
         }
     }
 
@@ -15159,6 +15211,9 @@ public struct ChannelListView: View {
                     }
                     .padding(.horizontal, StoatSpacing.small)
                 }
+                if viewModel.activeVoiceCall.isActive {
+                    VoiceCallBar(viewModel: viewModel)
+                }
             }
             .padding(.top, StoatSpacing.large)
         }
@@ -15395,8 +15450,22 @@ public struct ChannelListView: View {
 
     private func channelRow(_ channel: Channel) -> some View {
         let unread = viewModel.unread(for: channel.id)
-        return ChannelRow(channel: channel, isSelected: viewModel.selection.channelID == channel.id, unreadCount: unread == nil ? 0 : 1, mentionCount: unread?.mentions.count ?? 0) {
-            viewModel.selectChannel(channel.id)
+        let isVoice = channel.kind == .voiceChannel
+        return ChannelRow(
+            channel: channel,
+            isSelected: viewModel.selection.channelID == channel.id,
+            unreadCount: unread == nil ? 0 : 1,
+            mentionCount: unread?.mentions.count ?? 0,
+            isDisabled: isVoice && !viewModel.canJoinVoiceChannel(channel.id),
+            disabledHint: isVoice ? viewModel.voiceJoinDisabledReason(channel.id) : nil,
+            voiceParticipantCount: isVoice ? viewModel.voiceParticipants(for: channel.id).count : 0,
+            isActiveVoiceCall: viewModel.activeVoiceCall.channelID == channel.id && viewModel.activeVoiceCall.isActive
+        ) {
+            if isVoice {
+                viewModel.perform(.joinVoiceChannel(channel.id))
+            } else {
+                viewModel.selectChannel(channel.id)
+            }
         }
         .contextMenu {
             ForEach(viewModel.channelContextMenuItems(for: channel)) { item in
@@ -15410,6 +15479,134 @@ public struct ChannelListView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Persistent indicator for the active voice call, shown at the bottom of the channel sidebar
+/// while `viewModel.activeVoiceCall.isActive` — the Discord-style "you're in a call" bar.
+private struct VoiceCallBar: View {
+    let viewModel: MainShellViewModel
+
+    private var channelID: ChannelID? { viewModel.activeVoiceCall.channelID }
+    private var channelName: String {
+        channelID.flatMap { viewModel.snapshot.channelsByID[$0]?.displayName } ?? "Voice"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.small) {
+            HStack(spacing: StoatSpacing.small) {
+                Image(systemName: statusIcon)
+                    .foregroundStyle(statusColor)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(channelName)
+                        .font(StoatTypography.rowSelected)
+                        .lineLimit(1)
+                    Text(statusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: StoatSpacing.small)
+                GlassIconButton(
+                    viewModel.voiceLocalAudioState.isMuted ? "Unmute" : "Mute",
+                    systemImage: viewModel.voiceLocalAudioState.isMuted ? "mic.slash.fill" : "mic.fill"
+                ) {
+                    viewModel.perform(.toggleMicrophoneMuted)
+                }
+                .frame(minWidth: 28, minHeight: 28)
+                GlassIconButton(
+                    viewModel.voiceLocalAudioState.isDeafened ? "Undeafen" : "Deafen",
+                    systemImage: viewModel.voiceLocalAudioState.isDeafened ? "speaker.slash.fill" : "speaker.wave.2.fill"
+                ) {
+                    viewModel.perform(.toggleDeafened)
+                }
+                .frame(minWidth: 28, minHeight: 28)
+                GlassIconButton("Leave Call", systemImage: "phone.down.fill") {
+                    viewModel.perform(.leaveVoiceCall)
+                }
+                .frame(minWidth: 28, minHeight: 28)
+            }
+            if !viewModel.activeVoiceCallParticipants.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: StoatSpacing.small) {
+                        ForEach(sortedParticipants, id: \.identity) { participant in
+                            VoiceParticipantChip(participant: participant)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(StoatSpacing.medium)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+        .padding(.horizontal, StoatSpacing.large)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var sortedParticipants: [VoiceParticipant] {
+        viewModel.activeVoiceCallParticipants.values.sorted { $0.identity < $1.identity }
+    }
+
+    private var statusIcon: String {
+        switch viewModel.activeVoiceCall {
+        case .connecting, .reconnecting: "arrow.triangle.2.circlepath"
+        case .connected: "waveform"
+        case .failed: "exclamationmark.triangle.fill"
+        case .idle: "waveform"
+        }
+    }
+
+    private var statusColor: Color {
+        switch viewModel.activeVoiceCall {
+        case .connected: .green
+        case .failed: .red
+        default: .secondary
+        }
+    }
+
+    private var statusText: String {
+        switch viewModel.activeVoiceCall {
+        case .connecting: "Connecting…"
+        case .connected: "Voice Connected"
+        case .reconnecting: "Reconnecting…"
+        case let .failed(_, reason): reason
+        case .idle: ""
+        }
+    }
+}
+
+private struct VoiceParticipantChip: View {
+    let participant: VoiceParticipant
+
+    var body: some View {
+        VStack(spacing: 2) {
+            ZStack(alignment: .bottomTrailing) {
+                Circle()
+                    .strokeBorder(participant.isSpeaking ? Color.green : Color.clear, lineWidth: 2)
+                    .frame(width: 34, height: 34)
+                    .overlay {
+                        Circle()
+                            .fill(Color.primary.opacity(0.1))
+                            .frame(width: 28, height: 28)
+                            .overlay {
+                                Image(systemName: "person.fill").font(.caption2)
+                            }
+                    }
+                if participant.isMuted {
+                    Image(systemName: "mic.slash.fill")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.white)
+                        .padding(3)
+                        .background(Color.red, in: Circle())
+                }
+            }
+            Text(participant.name ?? participant.identity)
+                .font(.caption2)
+                .lineLimit(1)
+                .frame(maxWidth: 44)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(participant.name ?? participant.identity)\(participant.isSpeaking ? ", speaking" : "")\(participant.isMuted ? ", muted" : "")")
     }
 }
 

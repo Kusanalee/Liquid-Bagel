@@ -70,6 +70,11 @@ public protocol StoatAPIClient: Sendable {
     func fetchServerEmojis(serverID: ServerID) async throws -> [Emoji]
     func createEmoji(uploadID: FileID, draft: EmojiCreateDraft) async throws -> Emoji
     func deleteEmoji(id: EmojiID) async throws
+    /// Requests a LiveKit join token for a voice channel (`POST /channels/{target}/join_call`).
+    /// Leaving a voice call is NOT modeled as a REST call here — it is purely a client-side
+    /// LiveKit room disconnect (`VoiceEngine.disconnect()`); no `leave_call` route has been
+    /// confirmed against a live server, so none is assumed.
+    func joinVoiceChannel(channelID: ChannelID) async throws -> VoiceJoinResponse
 }
 
 public extension StoatAPIClient {
@@ -139,6 +144,10 @@ public extension StoatAPIClient {
 
     func ackChannel(channelID: ChannelID, messageID: MessageID) async throws {
         throw StoatAPIError.unimplementedEndpoint("Channel read acknowledgement is not implemented by this API client.")
+    }
+
+    func joinVoiceChannel(channelID: ChannelID) async throws -> VoiceJoinResponse {
+        throw StoatAPIError.unimplementedEndpoint("Voice channel join is not implemented by this API client.")
     }
 
     func login(request: SessionLoginRequest) async throws -> SessionLoginResponse {
@@ -453,6 +462,15 @@ public actor LiveStoatAPIClient: StoatAPIClient {
             path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/ack/\(messageID.rawValue.stoatPathComponentEscaped)"
         )
         _ = try await perform(request)
+    }
+
+    public func joinVoiceChannel(channelID: ChannelID) async throws -> VoiceJoinResponse {
+        try await perform(
+            StoatRequest<VoiceJoinResponse>(
+                method: .post,
+                path: "/channels/\(channelID.rawValue.stoatPathComponentEscaped)/join_call"
+            )
+        )
     }
 
     public func addReaction(channelID: ChannelID, messageID: MessageID, emoji: String) async throws {

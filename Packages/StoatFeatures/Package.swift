@@ -16,7 +16,8 @@ let package = Package(
         .package(path: "../StoatModels"),
         .package(path: "../StoatPersistence"),
         .package(path: "../StoatRealtime"),
-        .package(path: "../StoatUI")
+        .package(path: "../StoatUI"),
+        .package(path: "../StoatVoice")
     ],
     targets: [
         .target(
@@ -27,9 +28,10 @@ let package = Package(
                 "StoatModels",
                 "StoatPersistence",
                 "StoatRealtime",
-                "StoatUI"
+                "StoatUI",
+                "StoatVoice"
             ]
         ),
-        .testTarget(name: "StoatFeaturesTests", dependencies: ["StoatFeatures", "StoatAPI", "StoatRealtime"])
+        .testTarget(name: "StoatFeaturesTests", dependencies: ["StoatFeatures", "StoatAPI", "StoatRealtime", "StoatVoice"])
     ]
 )

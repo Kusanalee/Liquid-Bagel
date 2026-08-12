@@ -26,5 +26,7 @@
 	<string>Copyright © 2026 Liquid Bagel contributors.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Liquid Bagel uses your microphone to let you speak in voice channels.</string>
 </dict>
 </plist>

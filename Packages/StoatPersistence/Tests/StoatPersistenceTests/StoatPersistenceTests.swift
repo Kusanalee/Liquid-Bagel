@@ -168,6 +168,79 @@ final class StoatPersistenceTests: XCTestCase {
         XCTAssertEqual(decoded.liquidGlassTransparency, 1.0)
     }
 
+    func testPhase75VoicePreferencesDefaults() throws {
+        let preferences = AppPreferences.defaults.voicePreferences
+
+        XCTAssertNil(preferences.inputDeviceID)
+        XCTAssertNil(preferences.outputDeviceID)
+        XCTAssertTrue(preferences.echoCancellation)
+        XCTAssertTrue(preferences.noiseSuppression)
+        XCTAssertFalse(preferences.pushToTalkEnabled)
+        XCTAssertNil(preferences.pushToTalkKeyCode)
+        XCTAssertEqual(preferences.inputSensitivity, 0.15, accuracy: 0.0001)
+    }
+
+    func testPhase75VoicePreferencesValidatedClampsSensitivity() throws {
+        let tooHigh = VoicePreferences(inputSensitivity: 4.2).validated()
+        let tooLow = VoicePreferences(inputSensitivity: -1.5).validated()
+
+        XCTAssertEqual(tooHigh.inputSensitivity, 1.0, accuracy: 0.0001)
+        XCTAssertEqual(tooLow.inputSensitivity, 0.0, accuracy: 0.0001)
+    }
+
+    func testPhase75VoicePreferencesDecodeOlderPayloadMissingVoiceKey() throws {
+        let json = """
+        {
+          "environmentProfiles": [
+            {
+              "id": "production",
+              "name": "Stoat Production",
+              "environment": {
+                "apiBaseURL": "https://api.stoat.chat",
+                "eventsURL": "wss://events.stoat.chat"
+              },
+              "isProduction": true,
+              "createdAt": "2026-01-01T00:00:00.000Z",
+              "updatedAt": "2026-01-01T00:00:00.000Z"
+            }
+          ],
+          "showDeveloperRuntimeControls": true,
+          "memberPanelVisible": true,
+          "messageDensity": "comfortable",
+          "reduceGlassIntensity": false
+        }
+        """
+
+        let decoded = try JSONDecoder.stoat.decode(AppPreferences.self, from: Data(json.utf8))
+
+        XCTAssertEqual(decoded.voicePreferences, .defaults)
+    }
+
+    func testPhase75VoicePreferencesRoundTripThroughUserDefaultsStore() async throws {
+        let store = UserDefaultsAppPreferencesStore(suiteName: "LiquidBagelTests.\(UUID().uuidString)")
+        var preferences = AppPreferences.defaults
+        preferences.voicePreferences = VoicePreferences(
+            inputDeviceID: "mic-1",
+            outputDeviceID: "speaker-1",
+            echoCancellation: false,
+            noiseSuppression: false,
+            pushToTalkEnabled: true,
+            pushToTalkKeyCode: 49,
+            inputSensitivity: 0.4
+        )
+
+        try await store.savePreferences(preferences)
+        let loaded = try await store.loadPreferences()
+
+        XCTAssertEqual(loaded.voicePreferences.inputDeviceID, "mic-1")
+        XCTAssertEqual(loaded.voicePreferences.outputDeviceID, "speaker-1")
+        XCTAssertFalse(loaded.voicePreferences.echoCancellation)
+        XCTAssertFalse(loaded.voicePreferences.noiseSuppression)
+        XCTAssertTrue(loaded.voicePreferences.pushToTalkEnabled)
+        XCTAssertEqual(loaded.voicePreferences.pushToTalkKeyCode, 49)
+        XCTAssertEqual(loaded.voicePreferences.inputSensitivity, 0.4, accuracy: 0.0001)
+    }
+
     func testLegacyReducedGlassPreferenceMigratesToLowTransparency() throws {
         let json = """
         {

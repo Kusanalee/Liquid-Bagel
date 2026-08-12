@@ -185,6 +185,27 @@ final class StoatModelsTests: XCTestCase {
         XCTAssertEqual(result.bans.last?.reason, "spam")
     }
 
+    func testPhase75ServerMemberDecodesAndEncodesVoiceChannel() throws {
+        let data = Data(#"{"_id":{"server":"server-1","user":"user-1"},"joined_at":"2026-01-01T00:00:00.000Z","voice_channel":"voice-1","can_publish":false,"can_receive":true}"#.utf8)
+        let member = try JSONDecoder.stoat.decode(ServerMember.self, from: data)
+
+        XCTAssertEqual(member.voiceChannel, "voice-1")
+        XCTAssertFalse(member.canPublish)
+        XCTAssertTrue(member.canReceive)
+
+        let object = try encodedJSONObject(member)
+        XCTAssertEqual(object["voice_channel"] as? String, "voice-1")
+    }
+
+    func testPhase75ServerMemberDefaultsVoiceChannelToNilWhenAbsent() throws {
+        let data = Data(#"{"_id":{"server":"server-1","user":"user-1"},"joined_at":"2026-01-01T00:00:00.000Z"}"#.utf8)
+        let member = try JSONDecoder.stoat.decode(ServerMember.self, from: data)
+
+        XCTAssertNil(member.voiceChannel)
+        XCTAssertTrue(member.canPublish)
+        XCTAssertTrue(member.canReceive)
+    }
+
     func testPhase42BanCreateDraftEncodesVerifiedCompatibilityFields() throws {
         let object = try encodedJSONObject(BanCreateDraft(reason: "spam", deleteMessageSeconds: 3600))
 
