@@ -208,11 +208,37 @@ final class VoiceChatTests: XCTestCase {
             return false
         }
 
-        if case let .failed(channelID, _) = viewModel.activeVoiceCall {
+        if case let .failed(channelID, reason) = viewModel.activeVoiceCall {
             XCTAssertEqual(channelID, voiceChannelID)
+            // A `URLError` thrown from `engine.connect` must keep its specific,
+            // already-good message rather than being swallowed into generic copy.
+            XCTAssertEqual(reason, "You're offline. Check your connection and try again.")
         } else {
             XCTFail("Expected .failed state")
         }
+    }
+
+    /// `VoiceCallError` conforms to `UserPresentableError`, so its message must survive
+    /// `UserFacingError.message(for:)` verbatim instead of collapsing to generic copy.
+    func testPhase75VoiceCallErrorMessagesSurviveUserFacingErrorMapping() {
+        XCTAssertEqual(
+            UserFacingError.message(for: VoiceCallError.noAvailableNode, context: .voiceJoin),
+            "No voice server is available right now."
+        )
+        XCTAssertEqual(
+            UserFacingError.message(for: VoiceCallError.invalidJoinResponse, context: .voiceJoin),
+            "Stoat sent back an invalid voice server address."
+        )
+    }
+
+    /// An error type `UserFacingError` doesn't specifically recognize (standing in for an opaque
+    /// LiveKit SDK error) must fall back to voice-specific copy, not the fully generic string.
+    func testPhase75UnrecognizedVoiceJoinErrorFallsBackToVoiceSpecificCopy() {
+        struct OpaqueError: Error {}
+        XCTAssertEqual(
+            UserFacingError.message(for: OpaqueError(), context: .voiceJoin),
+            "Couldn't connect to the voice server. Try again."
+        )
     }
 
     @MainActor

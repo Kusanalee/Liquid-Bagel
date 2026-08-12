@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import StoatAPI
 import StoatModels
 import StoatPersistence
@@ -238,12 +239,19 @@ public struct AVCaptureCameraPermissionManager: CameraPermissionManaging {
 
 // MARK: - Errors
 
-public enum VoiceCallError: Error, LocalizedError {
+/// Conforms to `UserPresentableError` so these messages survive `UserFacingError.message(for:)`
+/// verbatim instead of being discarded in favour of the generic "Something went wrong" copy —
+/// see the join-failure diagnosis in Docs/Phase75.md.
+public enum VoiceCallError: Error, LocalizedError, UserPresentableError {
     case noAvailableNode
+    /// `join_call` succeeded but returned a `url` that isn't a valid URL — distinct from
+    /// `noAvailableNode` (no node to try in the first place), which it used to be conflated with.
+    case invalidJoinResponse
 
     public var errorDescription: String? {
         switch self {
         case .noAvailableNode: "No voice server is available right now."
+        case .invalidJoinResponse: "Stoat sent back an invalid voice server address."
         }
     }
 }
@@ -340,6 +348,10 @@ public extension MainShellViewModel {
 
     // MARK: Call lifecycle
 
+    /// Diagnostics for the join/connect path only — never used to build user-facing copy, so it's
+    /// free to include the raw error (see `UserFacingError`'s "no diagnostics in user copy" rule).
+    private static let voiceLogger = Logger(subsystem: "LiquidBagel", category: "Voice")
+
     func joinVoiceChannel(_ channelID: ChannelID) {
         guard let channel = snapshot.channelsByID[channelID], channel.isVoiceCapable else { return }
         guard let apiClient = apiClientForVoice() else {
@@ -361,7 +373,7 @@ public extension MainShellViewModel {
                     throw VoiceCallError.noAvailableNode
                 }
                 let response = try await apiClient.joinVoiceChannel(channelID: channelID, request: VoiceJoinRequest(node: node.name))
-                guard let url = URL(string: response.url) else { throw VoiceCallError.noAvailableNode }
+                guard let url = URL(string: response.url) else { throw VoiceCallError.invalidJoinResponse }
                 engine.setAudioProcessing(
                     echoCancellation: self.voicePreferences.echoCancellation,
                     noiseSuppression: self.voicePreferences.noiseSuppression
@@ -378,7 +390,8 @@ public extension MainShellViewModel {
                 }
             } catch {
                 guard !Task.isCancelled else { return }
-                let message = UserFacingError.message(for: error)
+                Self.voiceLogger.error("Voice join failed for channel \(channelID.rawValue, privacy: .public): \(String(describing: error), privacy: .public)")
+                let message = UserFacingError.message(for: error, context: .voiceJoin)
                 self.activeVoiceCall = .failed(channelID, reason: message)
                 self.presentNotice("Couldn't join voice channel: \(message)", severity: .error)
             }
