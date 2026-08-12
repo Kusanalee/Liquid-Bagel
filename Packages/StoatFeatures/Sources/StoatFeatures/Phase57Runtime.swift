@@ -202,6 +202,7 @@ public enum UserFacingError {
         case members
         case search
         case signIn
+        case voiceJoin
 
         var genericFailure: String {
             switch self {
@@ -211,12 +212,13 @@ public enum UserFacingError {
             case .members: "Couldn't refresh members."
             case .search: "Search didn't work. Try again."
             case .signIn: "Couldn't sign in. Try again."
+            case .voiceJoin: "Couldn't connect to the voice server. Try again."
             }
         }
 
         var notFound: String {
             switch self {
-            case .general, .signIn: "That's no longer available."
+            case .general, .signIn, .voiceJoin: "That's no longer available."
             case .sendMessage: "This channel is no longer available."
             case .attachment: "That attachment is no longer available."
             case .members: "This server is no longer available."

@@ -1,11 +1,14 @@
 import Foundation
 import LiveKit
 import AVFoundation
+import OSLog
 
 /// Real `VoiceEngine` implementation backed by the LiveKit Swift SDK. Wraps a single `Room` for
 /// the lifetime of one call; callers are expected to `disconnect()` before `connect()`-ing again
 /// for a different channel (matches the app's one-active-call-at-a-time model).
 public final class LiveKitVoiceEngine: NSObject, VoiceEngine, @unchecked Sendable {
+    private static let logger = Logger(subsystem: "LiquidBagel", category: "Voice")
+
     private let room: Room
     private let lock = NSLock()
     private var eventContinuations: [UUID: AsyncStream<VoiceEngineEvent>.Continuation] = [:]
@@ -56,6 +59,7 @@ public final class LiveKitVoiceEngine: NSObject, VoiceEngine, @unchecked Sendabl
             _ = try? await room.localParticipant.setMicrophone(enabled: true, captureOptions: captureOptions)
             startAudioLevelPolling()
         } catch {
+            Self.logger.error("LiveKit room.connect failed: \(String(describing: error), privacy: .public)")
             emit(.error(error.localizedDescription))
             throw error
         }
