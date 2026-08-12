@@ -3,6 +3,24 @@ import StoatModels
 @testable import StoatAPI
 
 final class StoatAPITests: XCTestCase {
+    func testPhase76JoinCallSendsSelectedNodeAndDecodesCredentials() async throws {
+        let transport = RecordingHTTPTransport(data: Data(#"{"token":"voice-token","url":"wss://voice.example"}"#.utf8))
+        let client = LiveStoatAPIClient(
+            credentialProvider: StaticCredentialProvider(.sessionToken("secret")),
+            transport: transport
+        )
+
+        let response = try await client.joinVoiceChannel(channelID: "channel-1", request: VoiceJoinRequest(node: "singapore"))
+        let capturedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(capturedRequest)
+        let body = try XCTUnwrap(request.httpBody)
+
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/channels/channel-1/join_call")
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: body) as? [String: String], ["node": "singapore"])
+        XCTAssertEqual(response, VoiceJoinResponse(token: "voice-token", url: "wss://voice.example"))
+    }
+
     func testProductionEnvironmentUsesCurrentDocumentedDefaults() throws {
         let environment = StoatAPIEnvironment.production
 

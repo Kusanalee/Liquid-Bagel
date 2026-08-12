@@ -51,6 +51,7 @@ Your session token is stored in the macOS Keychain and scoped to Liquid Bagel. I
 - **Moderation**: kicks, bans, slowmode, and server/channel administration.
 - **Media**: attachment upload, clipboard paste/drag-and-drop, inline image previews, avatars, server icons and banners, and custom emoji (including cross-server emoji).
 - **Notifications**: native macOS notifications, dock badges, and per-server/channel notification preferences.
+- **Calls**: server voice channels and voice-enabled text channels with audio, camera video, display/window sharing, participant tiles, and a persistent call bar.
 - **Offline mode**: your servers, channels, and recent messages are saved on-device and available immediately at launch, even with no connection. Content is encrypted at rest and removed when you sign out.
 - **Settings sync**: appearance and notification preferences follow your account across devices automatically.
 - **Account & identity**: profile and account editing, session/account management, and status.
@@ -60,7 +61,7 @@ Your session token is stored in the macOS Keychain and scoped to Liquid Bagel. I
 
 Liquid Bagel intentionally does not include:
 
-- **Video or screen share.** Not implemented. Voice chat is supported (join/leave, mute/deafen, push-to-talk, device selection).
+- **DM/group calls, system-audio sharing, recording, video backgrounds, and global push-to-talk.** Server calls support audio, camera, and video-only display/window sharing; push-to-talk works while Liquid Bagel is focused.
 - **Background push notifications.** Notifications are delivered while Liquid Bagel is running; there is no push when the app is quit.
 
 This list is not exhaustive. Because this is an early pre-release, features that exist may still behave incorrectly. Please report reproducible problems through [GitHub Issues](https://github.com/Kusanalee/Liquid-Bagel/issues).
@@ -95,10 +96,10 @@ The check script tests every local Swift package, verifies that test doubles hav
 - `Packages/StoatVoice`: voice call transport — a `VoiceEngine` abstraction backed by the LiveKit Swift SDK, isolated from the rest of the app so the WebRTC dependency doesn't leak into every package's build graph.
 - `Packages/StoatFeatures`: feature layer (view models, coordinators, and screen-level logic) used by the app target.
 - `Docs/Research.md`: Stoat API/protocol research notes.
-- `Docs/PhaseN.md` (phases 1–75): phase-by-phase implementation history and handoff notes.
+- `Docs/PhaseN.md` (phases 1–76): phase-by-phase implementation history and handoff notes.
 - `Docs/QA/`: manual QA pass notes for release gates (freeze/perf, chat presentation, conversation state, notifications, account/identity, community management, native macOS behavior).
 
-See [Docs/Phase75.md](Docs/Phase75.md) for the most recent architecture notes and [Docs/QA/](Docs/QA/) for release-gate QA coverage.
+See [Docs/Phase76.md](Docs/Phase76.md) for the most recent architecture notes and [Docs/QA/](Docs/QA/) for release-gate QA coverage.
 
 ## Contributing
 

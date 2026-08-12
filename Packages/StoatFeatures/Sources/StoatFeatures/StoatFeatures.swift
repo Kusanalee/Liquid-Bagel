@@ -844,12 +844,18 @@ public final class MainShellViewModel {
     @ObservationIgnored public var dockBadgeManager: any DockBadgeManaging
     @ObservationIgnored public var voiceEngine: any VoiceEngine
     @ObservationIgnored public var microphonePermissionManager: any MicrophonePermissionManaging
+    @ObservationIgnored public var cameraPermissionManager: any CameraPermissionManaging
     /// Local relationship to the active call. `.idle` unless the user has joined a voice channel.
     /// Setter is `internal(set)`: mutated from the Phase 75 voice extension (a separate file
     /// within this module), read publicly by `App`/SwiftUI.
     public internal(set) var activeVoiceCall: VoiceCallUIState = .idle
     public var voiceLocalAudioState = VoiceLocalAudioState()
     public var microphonePermissionStatus: MicrophonePermissionStatus = .notDetermined
+    public var cameraPermissionStatus: MicrophonePermissionStatus = .notDetermined
+    public var voiceMediaState = VoiceMediaState()
+    public var voiceCameraDevices: [VoiceCameraDevice] = []
+    public var screenShareSources: [VoiceScreenShareSource] = []
+    public var isScreenSharePickerPresented = false
     /// Live LiveKit-level participant state (speaking/mute) for the active call only, keyed by
     /// LiveKit identity string. Distinct from `voiceParticipants(for:)`, which is the slower
     /// gateway-synced roster of who's in which channel and works for channels the user hasn't
@@ -1077,6 +1083,7 @@ public final class MainShellViewModel {
         dockBadgeManager: (any DockBadgeManaging)? = nil,
         voiceEngine: (any VoiceEngine)? = nil,
         microphonePermissionManager: (any MicrophonePermissionManaging)? = nil,
+        cameraPermissionManager: (any CameraPermissionManaging)? = nil,
         communityAPIClient: (any StoatAPIClient)? = nil,
         notificationRouteCenter: NotificationRouteCenter = .shared,
         appLifecycleCenter: AppLifecycleCenter = .shared,
@@ -1107,6 +1114,7 @@ public final class MainShellViewModel {
         self.dockBadgeManager = dockBadgeManager ?? AppKitDockBadgeManager()
         self.voiceEngine = voiceEngine ?? LiveKitVoiceEngine()
         self.microphonePermissionManager = microphonePermissionManager ?? AVCaptureMicrophonePermissionManager()
+        self.cameraPermissionManager = cameraPermissionManager ?? AVCaptureCameraPermissionManager()
         self.communityAPIClient = communityAPIClient
         self.notificationRouteCenter = notificationRouteCenter
         self.appLifecycleCenter = appLifecycleCenter
@@ -13796,6 +13804,9 @@ public struct MainShellView: View {
         .sheet(isPresented: $viewModel.isServerOverviewPresented) {
             ServerOverviewView(viewModel: viewModel)
         }
+        .sheet(isPresented: $viewModel.isScreenSharePickerPresented) {
+            ScreenSharePickerView(viewModel: viewModel)
+        }
         .sheet(isPresented: $viewModel.isCreateChannelPresented) {
             CreateChannelView(viewModel: viewModel)
         }
@@ -15307,12 +15318,9 @@ public struct ChannelListView: View {
             ) {
                 viewModel.openFriends(tab: .online)
             }
+            SavedNotesEntryButton(viewModel: viewModel)
             section("Direct Messages") {
-                let items = viewModel.directMessageItems
-                if !items.contains(where: { $0.channel.kind == .savedMessages }) {
-                    SavedNotesEntryButton(viewModel: viewModel)
-                        .padding(.horizontal, StoatSpacing.medium)
-                }
+                let items = viewModel.directMessageItems.filter { $0.channel.kind != .savedMessages }
                 if items.isEmpty {
                     Text("No direct messages")
                         .font(.caption)
@@ -15340,6 +15348,7 @@ public struct ChannelListView: View {
             ) {
                 viewModel.openFriends(tab: .online)
             }
+            SavedNotesEntryButton(viewModel: viewModel)
             section("Direct Messages") {
                 HStack(spacing: StoatSpacing.small) {
                     Button {
@@ -15364,11 +15373,7 @@ public struct ChannelListView: View {
                     Spacer()
                 }
                 .padding(.horizontal, StoatSpacing.medium)
-                let items = viewModel.directMessageItems
-                if !items.contains(where: { $0.channel.kind == .savedMessages }) {
-                    SavedNotesEntryButton(viewModel: viewModel)
-                        .padding(.horizontal, StoatSpacing.medium)
-                }
+                let items = viewModel.directMessageItems.filter { $0.channel.kind != .savedMessages }
                 if items.isEmpty {
                     Text("No direct messages")
                         .font(.caption)
@@ -15450,22 +15455,18 @@ public struct ChannelListView: View {
 
     private func channelRow(_ channel: Channel) -> some View {
         let unread = viewModel.unread(for: channel.id)
-        let isVoice = channel.kind == .voiceChannel
+        let isVoice = channel.isVoiceCapable
         return ChannelRow(
             channel: channel,
             isSelected: viewModel.selection.channelID == channel.id,
             unreadCount: unread == nil ? 0 : 1,
             mentionCount: unread?.mentions.count ?? 0,
-            isDisabled: isVoice && !viewModel.canJoinVoiceChannel(channel.id),
-            disabledHint: isVoice ? viewModel.voiceJoinDisabledReason(channel.id) : nil,
+            isDisabled: channel.kind == .voiceChannel && !viewModel.canJoinVoiceChannel(channel.id),
+            disabledHint: channel.kind == .voiceChannel ? viewModel.voiceJoinDisabledReason(channel.id) : nil,
             voiceParticipantCount: isVoice ? viewModel.voiceParticipants(for: channel.id).count : 0,
             isActiveVoiceCall: viewModel.activeVoiceCall.channelID == channel.id && viewModel.activeVoiceCall.isActive
         ) {
-            if isVoice {
-                viewModel.perform(.joinVoiceChannel(channel.id))
-            } else {
-                viewModel.selectChannel(channel.id)
-            }
+            viewModel.selectChannel(channel.id)
         }
         .contextMenu {
             ForEach(viewModel.channelContextMenuItems(for: channel)) { item in
@@ -15635,13 +15636,23 @@ public struct ChatPlaceholderView: View {
         self.viewModel = viewModel
     }
 
-    public var body: some View {
+    @ViewBuilder public var body: some View {
+        if viewModel.selectedChannel?.kind == .voiceChannel {
+            VoiceCallStage(viewModel: viewModel, channel: viewModel.selectedChannel!)
+                .padding(StoatSpacing.xLarge)
+        } else {
         // The timeline owns the flexible region directly. Toolbar and composer consume safe area
         // instead of joining every live-resize stack negotiation. Never add layoutPriority here:
         // an ideal-height proposal measures the entire loaded LazyVStack (the Phase 64 freeze).
         MessageTimelineView(viewModel: viewModel)
             .safeAreaInset(edge: .top, spacing: 0) {
-                chatToolbar
+                VStack(spacing: 0) {
+                    chatToolbar
+                    if let channel = viewModel.selectedChannel, channel.isVoiceCapable {
+                        VoiceCallStage(viewModel: viewModel, channel: channel)
+                            .padding([.horizontal, .bottom], StoatSpacing.large)
+                    }
+                }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 if let channelID = viewModel.selectedConversationChannelID {
@@ -15652,6 +15663,7 @@ public struct ChatPlaceholderView: View {
                 loadDroppedFileURLs(from: providers)
                 return true
             }
+        }
     }
 
     private var chatToolbar: some View {
@@ -15699,6 +15711,141 @@ public struct ChatPlaceholderView: View {
                 }
             }
         }
+    }
+}
+
+private struct VoiceCallStage: View {
+    @Bindable var viewModel: MainShellViewModel
+    let channel: Channel
+
+    private var tracks: [VoiceVideoTrack] { Array(viewModel.voiceMediaState.tracksByID.values) }
+    private var shares: [VoiceVideoTrack] { tracks.filter { $0.source == .screenShare } }
+    private var cameras: [VoiceVideoTrack] { tracks.filter { $0.source == .camera } }
+    private var isThisCall: Bool { viewModel.activeVoiceCall.channelID == channel.id && viewModel.activeVoiceCall.isActive }
+
+    var body: some View {
+        GlassPanel {
+            VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                HStack {
+                    Label(channel.displayName, systemImage: "speaker.wave.2.fill")
+                        .font(.headline)
+                    Text("\(viewModel.voiceParticipants(for: channel.id).count) connected")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    controls
+                }
+                if isThisCall {
+                    if let share = shares.first {
+                        mediaTile(share, height: 260)
+                    }
+                    if !cameras.isEmpty {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: StoatSpacing.medium)], spacing: StoatSpacing.medium) {
+                            ForEach(cameras) { mediaTile($0, height: 150) }
+                        }
+                    }
+                    if tracks.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: StoatSpacing.medium) {
+                                ForEach(viewModel.activeVoiceCallParticipants.values.sorted { $0.identity < $1.identity }, id: \.identity) {
+                                    VoiceParticipantChip(participant: $0)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Text("Join the call when you're ready. Text remains available in voice-enabled text channels.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var controls: some View {
+        if isThisCall {
+            GlassIconButton(viewModel.voiceLocalAudioState.isMuted ? "Unmute" : "Mute", systemImage: viewModel.voiceLocalAudioState.isMuted ? "mic.slash.fill" : "mic.fill") {
+                viewModel.perform(.toggleMicrophoneMuted)
+            }
+            GlassIconButton(viewModel.voiceMediaState.isCameraEnabled ? "Turn Camera Off" : "Turn Camera On", systemImage: viewModel.voiceMediaState.isCameraEnabled ? "video.fill" : "video") {
+                viewModel.toggleCamera()
+            }
+            .disabled(viewModel.callVideoDisabledReason(channelID: channel.id) != nil)
+            .help(viewModel.callVideoDisabledReason(channelID: channel.id) ?? "Share your camera")
+            GlassIconButton(viewModel.voiceMediaState.isScreenShareEnabled ? "Stop Sharing" : "Share Screen", systemImage: "rectangle.on.rectangle") {
+                viewModel.voiceMediaState.isScreenShareEnabled ? viewModel.stopScreenShare() : viewModel.prepareScreenSharePicker()
+            }
+            .disabled(viewModel.callVideoDisabledReason(channelID: channel.id) != nil)
+            .help(viewModel.callVideoDisabledReason(channelID: channel.id) ?? "Share a display or window")
+            GlassIconButton("Leave Call", systemImage: "phone.down.fill") { viewModel.leaveVoiceCall() }
+        } else {
+            Button {
+                viewModel.joinVoiceChannel(channel.id)
+            } label: {
+                Label(viewModel.activeVoiceCall.channelID == channel.id ? "Retry" : "Join", systemImage: "phone.fill")
+            }
+            .buttonStyle(GlassButtonStyle())
+            .disabled(!viewModel.canJoinVoiceChannel(channel.id))
+            .help(viewModel.canJoinVoiceChannel(channel.id) ? "Join call" : viewModel.voiceJoinDisabledReason(channel.id))
+        }
+    }
+
+    private func mediaTile(_ track: VoiceVideoTrack, height: CGFloat) -> some View {
+        ZStack(alignment: .bottomLeading) {
+            VoiceVideoView(handle: track.handle, mirrored: track.isLocal && track.source == .camera)
+                .frame(maxWidth: .infinity)
+                .frame(height: height)
+                .background(Color.black)
+            Text(track.participantName ?? track.participantIdentity)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(StoatSpacing.small)
+                .background(.black.opacity(0.55), in: Capsule())
+                .padding(StoatSpacing.small)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: StoatRadius.control, style: .continuous))
+    }
+}
+
+private struct ScreenSharePickerView: View {
+    @Bindable var viewModel: MainShellViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.large) {
+            HStack {
+                Text("Share a Screen or Window").font(.title2.weight(.semibold))
+                Spacer()
+                Button("Cancel") { viewModel.isScreenSharePickerPresented = false }
+            }
+            Text("Liquid Bagel windows are excluded. Audio is not shared.")
+                .font(.callout).foregroundStyle(.secondary)
+            if viewModel.screenShareSources.isEmpty {
+                EmptyStateView(title: "No sources available", message: "Allow Screen Recording access, then try again.", systemImage: "rectangle.slash")
+                #if canImport(AppKit)
+                Button("Open Screen Recording Settings") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                }
+                #endif
+            } else {
+                List(viewModel.screenShareSources) { source in
+                    Button {
+                        viewModel.startScreenShare(sourceID: source.id)
+                    } label: {
+                        Label {
+                            VStack(alignment: .leading) {
+                                Text(source.name)
+                                if let detail = source.detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
+                            }
+                        } icon: {
+                            Image(systemName: source.kind == .display ? "display" : "macwindow")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(StoatSpacing.xLarge)
+        .frame(width: 620, height: 480)
     }
 }
 
@@ -17026,9 +17173,15 @@ public struct HomeView: View {
                     quickActions
                 }
 
-                HStack(alignment: .top, spacing: StoatSpacing.large) {
-                    recentDMsPanel
-                    friendRequestsPanel
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: StoatSpacing.large) {
+                        recentDMsPanel
+                        friendRequestsPanel
+                    }
+                    VStack(alignment: .leading, spacing: StoatSpacing.large) {
+                        recentDMsPanel
+                        friendRequestsPanel
+                    }
                 }
             }
             .padding(StoatSpacing.xxLarge)
@@ -17077,10 +17230,7 @@ public struct HomeView: View {
         GlassPanel {
             VStack(alignment: .leading, spacing: StoatSpacing.medium) {
                 Text("Recent DMs").font(.headline)
-                let items = viewModel.directMessageItems
-                if !items.contains(where: { $0.channel.kind == .savedMessages }) {
-                    SavedNotesEntryButton(viewModel: viewModel)
-                }
+                let items = viewModel.directMessageItems.filter { $0.channel.kind != .savedMessages }
                 if items.isEmpty {
                     EmptyStateView(title: "No DMs", message: viewModel.canRefreshDMs ? "Existing direct messages will appear after Ready or refresh." : "Connect before refreshing direct messages.", systemImage: "bubble.left.and.bubble.right")
                     Button {
@@ -17103,7 +17253,7 @@ public struct HomeView: View {
                 }
             }
         }
-        .frame(maxWidth: 360, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     private var friendRequestsPanel: some View {
@@ -17120,7 +17270,7 @@ public struct HomeView: View {
                 .buttonStyle(GlassButtonStyle())
             }
         }
-        .frame(maxWidth: 280, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     private var quickActions: some View {
@@ -17288,17 +17438,14 @@ public struct FriendsPlaceholderView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: StoatSpacing.large) {
-            HStack {
-                Text("Friends")
-                    .font(.title2.weight(.semibold))
-                Spacer()
-                Picker("Friend filter", selection: $viewModel.friendsTab) {
-                    ForEach(filterTabs, id: \.self) { tab in
-                        Text(tab.title).tag(tab)
-                    }
+            HStack(alignment: .center, spacing: StoatSpacing.medium) {
+                Text("Friends").font(.title2.weight(.semibold))
+                ForEach(filterTabs, id: \.self) { tab in
+                    Button("\(tab.title)  \(count(for: tab))") { viewModel.friendsTab = tab }
+                        .buttonStyle(.bordered)
+                        .tint(viewModel.friendsTab == tab ? .accentColor : .secondary)
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 340)
+                Spacer()
                 Button {
                     viewModel.openFriends(tab: .addFriend)
                 } label: {
@@ -17311,23 +17458,25 @@ public struct FriendsPlaceholderView: View {
             if viewModel.friendsTab == .addFriend {
                 addFriendPanel
             } else {
-                GlassPanel {
-                    VStack(alignment: .leading, spacing: StoatSpacing.medium) {
+                VStack(alignment: .leading, spacing: 0) {
                         if viewModel.friendItems.isEmpty {
                             EmptyStateView(title: emptyTitle, message: emptyMessage, systemImage: emptyIcon)
+                                .padding(.vertical, StoatSpacing.xLarge)
                         } else if viewModel.friendsTab == .pending {
                             pendingSection(title: "Incoming", items: viewModel.friendItems.filter { $0.relationshipStatus == .incoming })
                             pendingSection(title: "Outgoing", items: viewModel.friendItems.filter { $0.relationshipStatus == .outgoing })
                         } else {
                             ForEach(viewModel.friendItems) { item in
                                 FriendItemRow(viewModel: viewModel, item: item)
+                                Divider()
                             }
                         }
-                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
         .padding(compact ? 0 : StoatSpacing.xxLarge)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var addFriendPanel: some View {
@@ -17353,6 +17502,16 @@ public struct FriendsPlaceholderView: View {
 
     private var filterTabs: [FriendsTab] {
         FriendsTab.allCases.filter { $0 != .addFriend }
+    }
+
+    private func count(for tab: FriendsTab) -> Int {
+        switch tab {
+        case .online: viewModel.allFriendItems.filter { $0.relationshipStatus == .friend && $0.user.online }.count
+        case .all: viewModel.allFriendItems.filter { $0.relationshipStatus == .friend }.count
+        case .pending: viewModel.allFriendItems.filter { $0.relationshipStatus == .incoming || $0.relationshipStatus == .outgoing }.count
+        case .blocked: viewModel.allFriendItems.filter { $0.relationshipStatus == .blocked }.count
+        case .addFriend: 0
+        }
     }
 
     private func pendingSection(title: String, items: [FriendListItem]) -> some View {
@@ -17481,45 +17640,27 @@ private struct SavedNotesEntryButton: View {
         Button {
             Task { await viewModel.openSavedNotes() }
         } label: {
-            HStack(spacing: StoatSpacing.medium) {
-                AvatarView(title: "Saved Notes", size: StoatSize.compactAvatar, imageData: nil)
-                VStack(alignment: .leading, spacing: StoatSpacing.xxSmall) {
-                    Text("Saved Notes")
-                        .font(.callout.weight(.medium))
-                        .lineLimit(1)
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+            HStack(spacing: StoatSpacing.small) {
+                Image(systemName: "note.text")
+                    .frame(width: 18)
+                Text("Saved Notes").lineLimit(1)
                 Spacer()
                 if case .opening = viewModel.dmDiagnostics.savedNotesState {
                     ProgressView()
                         .controlSize(.small)
                 }
             }
-            .padding(StoatSpacing.small)
+            .padding(.horizontal, StoatSpacing.medium)
+            .frame(minHeight: StoatSize.minimumRowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
-            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
+            .background(viewModel.selectedConversationChannel?.kind == .savedMessages ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: StoatRadius.row, style: .continuous))
         }
         .buttonStyle(.plain)
         .help("Open Saved Notes")
         .accessibilityLabel("Open Saved Notes")
     }
 
-    private var subtitle: String {
-        switch viewModel.dmDiagnostics.savedNotesState {
-        case .opening:
-            return "Opening"
-        case let .failed(category):
-            return "Unavailable: \(category.rawValue)"
-        case .available:
-            return "Ready"
-        case .unavailable:
-            return "Open or refresh"
-        }
-    }
 }
 
 private struct FriendItemRow: View {
@@ -18724,30 +18865,28 @@ public struct ServerOverviewView: View {
     }
 
     public var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: StoatSpacing.large) {
-                HStack {
-                    Text("Server Settings")
-                        .font(.title2.weight(.semibold))
-                    Spacer()
-                    Button("Close") { viewModel.isServerOverviewPresented = false }
-                }
-
-                switch viewModel.serverSettingsPresentationState {
-                case .idle:
-                    EmptyStateView(title: "No server selected", message: "Select a server to review settings.", systemImage: "server.rack")
-                case .loading:
-                    ProgressView("Loading server details")
-                case let .failed(message):
-                    EmptyStateView(title: "Server settings unavailable", message: message, systemImage: "exclamationmark.triangle")
-                case let .loaded(presentation):
-                    settings(presentation)
-                }
+        VStack(spacing: 0) {
+            HStack {
+                Text("Server Settings").font(.title2.weight(.semibold))
+                Spacer()
+                Button("Close") { viewModel.isServerOverviewPresented = false }
             }
             .padding(StoatSpacing.xLarge)
+            Divider()
+            switch viewModel.serverSettingsPresentationState {
+            case .idle:
+                EmptyStateView(title: "No server selected", message: "Select a server to review settings.", systemImage: "server.rack")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .loading:
+                ProgressView("Loading server details").frame(maxWidth: .infinity, maxHeight: .infinity)
+            case let .failed(message):
+                EmptyStateView(title: "Server settings unavailable", message: message, systemImage: "exclamationmark.triangle")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case let .loaded(presentation):
+                settings(presentation)
+            }
         }
-        .frame(width: 680)
-        .frame(minHeight: 620)
+        .frame(width: 900, height: 680)
         .accessibilityLabel("Server settings")
         .confirmationDialog(
             "Delete server emoji?",
@@ -18770,34 +18909,56 @@ public struct ServerOverviewView: View {
 
     private func settings(_ presentation: ServerSettingsPresentationSnapshot) -> some View {
         let details = presentation.details
-        return VStack(alignment: .leading, spacing: StoatSpacing.large) {
-            Picker("Section", selection: $viewModel.selectedServerSettingsTab) {
-                ForEach(ServerSettingsTab.allCases, id: \.self) { tab in
-                    Text(tab.title).tag(tab)
+        return HStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: StoatSpacing.large) {
+                    settingsGroup("General", tabs: [.overview, .appearance, .categories, .emojis])
+                    settingsGroup("People & Access", tabs: [.roles, .permissions, .members])
+                    settingsGroup("Moderation", tabs: [.moderation])
+                    settingsGroup("Danger Zone", tabs: [.danger])
                 }
+                .padding(StoatSpacing.large)
             }
-            .pickerStyle(.segmented)
-            .accessibilityHint("Choose a server settings section")
+            .frame(width: 210)
+            .background(Color.primary.opacity(0.035))
+            Divider()
+            ScrollView {
+                Group {
+                    switch viewModel.selectedServerSettingsTab {
+                    case .overview: overview(details)
+                    case .appearance: appearance(details)
+                    case .categories: categories(details)
+                    case .emojis: emojis(presentation)
+                    case .roles: roles(presentation)
+                    case .permissions: permissions(presentation)
+                    case .members: members(presentation)
+                    case .moderation: moderation(presentation)
+                    case .danger:
+                        EmptyStateView(title: "Server deletion deferred", message: "Danger Zone is intentionally disabled.", systemImage: "lock.shield")
+                    }
+                }
+                .frame(maxWidth: 620, alignment: .topLeading)
+                .padding(StoatSpacing.xLarge)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
 
-            switch viewModel.selectedServerSettingsTab {
-            case .overview:
-                overview(details)
-            case .appearance:
-                appearance(details)
-            case .categories:
-                categories(details)
-            case .emojis:
-                emojis(presentation)
-            case .roles:
-                roles(presentation)
-            case .permissions:
-                permissions(presentation)
-            case .members:
-                members(presentation)
-            case .moderation:
-                moderation(presentation)
-            case .danger:
-                EmptyStateView(title: "Server deletion deferred", message: "Danger Zone is intentionally disabled in Phase 25.", systemImage: "lock.shield")
+    private func settingsGroup(_ title: String, tabs: [ServerSettingsTab]) -> some View {
+        VStack(alignment: .leading, spacing: StoatSpacing.xSmall) {
+            Text(title.uppercased()).font(StoatTypography.section).foregroundStyle(.secondary)
+            ForEach(tabs, id: \.self) { tab in
+                Button {
+                    viewModel.selectedServerSettingsTab = tab
+                } label: {
+                    Text(tab.title)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, StoatSpacing.medium)
+                        .frame(minHeight: StoatSize.minimumRowHeight)
+                        .background(viewModel.selectedServerSettingsTab == tab ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: StoatRadius.row))
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Open \(tab.title) server settings")
             }
         }
     }

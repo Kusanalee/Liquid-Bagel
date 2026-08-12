@@ -133,6 +133,7 @@ public struct NotificationPreferences: Codable, Hashable, Sendable {
 public struct VoicePreferences: Codable, Hashable, Sendable {
     public var inputDeviceID: String?
     public var outputDeviceID: String?
+    public var cameraDeviceID: String?
     public var echoCancellation: Bool
     public var noiseSuppression: Bool
     public var pushToTalkEnabled: Bool
@@ -143,6 +144,7 @@ public struct VoicePreferences: Codable, Hashable, Sendable {
     public init(
         inputDeviceID: String? = nil,
         outputDeviceID: String? = nil,
+        cameraDeviceID: String? = nil,
         echoCancellation: Bool = true,
         noiseSuppression: Bool = true,
         pushToTalkEnabled: Bool = false,
@@ -151,6 +153,7 @@ public struct VoicePreferences: Codable, Hashable, Sendable {
     ) {
         self.inputDeviceID = inputDeviceID
         self.outputDeviceID = outputDeviceID
+        self.cameraDeviceID = cameraDeviceID
         self.echoCancellation = echoCancellation
         self.noiseSuppression = noiseSuppression
         self.pushToTalkEnabled = pushToTalkEnabled
@@ -161,6 +164,7 @@ public struct VoicePreferences: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case inputDeviceID
         case outputDeviceID
+        case cameraDeviceID
         case echoCancellation
         case noiseSuppression
         case pushToTalkEnabled
@@ -176,6 +180,7 @@ public struct VoicePreferences: Codable, Hashable, Sendable {
         self.init(
             inputDeviceID: try container.decodeIfPresent(String.self, forKey: .inputDeviceID),
             outputDeviceID: try container.decodeIfPresent(String.self, forKey: .outputDeviceID),
+            cameraDeviceID: try container.decodeIfPresent(String.self, forKey: .cameraDeviceID),
             echoCancellation: try container.decodeIfPresent(Bool.self, forKey: .echoCancellation) ?? defaults.echoCancellation,
             noiseSuppression: try container.decodeIfPresent(Bool.self, forKey: .noiseSuppression) ?? defaults.noiseSuppression,
             pushToTalkEnabled: try container.decodeIfPresent(Bool.self, forKey: .pushToTalkEnabled) ?? defaults.pushToTalkEnabled,

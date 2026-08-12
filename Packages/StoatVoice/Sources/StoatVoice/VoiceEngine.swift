@@ -45,12 +45,90 @@ public struct VoiceAudioDevice: Sendable, Hashable, Identifiable {
     }
 }
 
+public struct VoiceCameraDevice: Sendable, Hashable, Identifiable {
+    public var id: String
+    public var name: String
+
+    public init(id: String, name: String) {
+        self.id = id
+        self.name = name
+    }
+}
+
+public enum VoiceScreenShareSourceKind: String, Sendable, Hashable {
+    case display
+    case window
+}
+
+public struct VoiceScreenShareSource: Sendable, Hashable, Identifiable {
+    public var id: String
+    public var name: String
+    public var detail: String?
+    public var kind: VoiceScreenShareSourceKind
+
+    public init(id: String, name: String, detail: String? = nil, kind: VoiceScreenShareSourceKind) {
+        self.id = id
+        self.name = name
+        self.detail = detail
+        self.kind = kind
+    }
+}
+
+public enum VoiceVideoSource: String, Sendable, Hashable {
+    case camera
+    case screenShare
+}
+
+/// Opaque media handle. LiveKit stays private to StoatVoice while the package-owned video view
+/// can still render the underlying track.
+public final class VoiceVideoTrackHandle: @unchecked Sendable, Hashable, Identifiable {
+    public let id: String
+    let storage: AnyObject?
+
+    public init(id: String) {
+        self.id = id
+        storage = nil
+    }
+
+    init(id: String, storage: AnyObject) {
+        self.id = id
+        self.storage = storage
+    }
+
+    public static func == (lhs: VoiceVideoTrackHandle, rhs: VoiceVideoTrackHandle) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    public func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+public struct VoiceVideoTrack: Sendable, Hashable, Identifiable {
+    public var id: String { handle.id }
+    public var participantIdentity: String
+    public var participantName: String?
+    public var source: VoiceVideoSource
+    public var isLocal: Bool
+    public var handle: VoiceVideoTrackHandle
+
+    public init(participantIdentity: String, participantName: String? = nil, source: VoiceVideoSource, isLocal: Bool, handle: VoiceVideoTrackHandle) {
+        self.participantIdentity = participantIdentity
+        self.participantName = participantName
+        self.source = source
+        self.isLocal = isLocal
+        self.handle = handle
+    }
+}
+
 public enum VoiceEngineEvent: Sendable {
     case connectionStateChanged(VoiceConnectionState)
     case participantConnected(VoiceParticipant)
     case participantDisconnected(identity: String)
     case speakingParticipantsChanged(identities: Set<String>)
     case participantMuteChanged(identity: String, isMuted: Bool)
+    case videoTrackAdded(VoiceVideoTrack)
+    case videoTrackRemoved(id: String)
+    case localCameraChanged(Bool)
+    case localScreenShareChanged(Bool)
     /// The room connection ended, whether cleanly (`reason == nil`) or due to an error.
     case disconnected(reason: String?)
     case error(String)
@@ -70,6 +148,8 @@ public protocol VoiceEngine: Sendable {
     func connect(url: URL, token: String) async throws
     func disconnect() async
     func setMicrophoneMuted(_ muted: Bool) async throws
+    func setCameraEnabled(_ enabled: Bool, deviceID: String?, maxWidth: Int?, maxHeight: Int?) async throws
+    func setScreenShareEnabled(_ enabled: Bool, sourceID: String?, maxWidth: Int?, maxHeight: Int?) async throws
     /// Sets echo cancellation / noise suppression for the next time the microphone track is
     /// (re)published — LiveKit does not support hot-swapping capture options on a live track.
     func setAudioProcessing(echoCancellation: Bool, noiseSuppression: Bool)
@@ -80,4 +160,6 @@ public protocol VoiceEngine: Sendable {
     var selectedOutputDeviceID: String? { get }
     func selectInputDevice(id: String)
     func selectOutputDevice(id: String)
+    func availableCameraDevices() async -> [VoiceCameraDevice]
+    func availableScreenShareSources() async throws -> [VoiceScreenShareSource]
 }

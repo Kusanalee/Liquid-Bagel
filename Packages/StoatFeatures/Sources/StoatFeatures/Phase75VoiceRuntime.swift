@@ -35,8 +35,8 @@ public enum VoiceCallUIState: Hashable, Sendable {
 
     public var isActive: Bool {
         switch self {
-        case .idle: false
-        default: true
+        case .connecting, .connected, .reconnecting: true
+        case .idle, .failed: false
         }
     }
 }
@@ -59,6 +59,18 @@ public func canSpeak(permissions: Permissions) -> Bool {
 /// when `connect` is granted, but modeled distinctly since the server exposes it distinctly.
 public func canListen(permissions: Permissions) -> Bool {
     permissions.contains(.connect) && permissions.contains(.listen)
+}
+
+public func canPublishVideo(permissions: Permissions, limits: UserLimits?) -> Bool {
+    permissions.contains(.connect) && permissions.contains(.video) && limits?.video == true
+}
+
+public struct VoiceMediaState: Hashable, Sendable {
+    public var isCameraEnabled = false
+    public var isScreenShareEnabled = false
+    public var tracksByID: [String: VoiceVideoTrack] = [:]
+
+    public init() {}
 }
 
 // MARK: - Mute / deafen / push-to-talk
@@ -191,6 +203,39 @@ public struct AVCaptureMicrophonePermissionManager: MicrophonePermissionManaging
     }
 }
 
+public protocol CameraPermissionManaging: Sendable {
+    func status() async -> MicrophonePermissionStatus
+    func requestAuthorization() async -> MicrophonePermissionRequestResult
+}
+
+public struct AVCaptureCameraPermissionManager: CameraPermissionManaging {
+    public init() {}
+
+    public func status() async -> MicrophonePermissionStatus {
+        #if canImport(AVFoundation)
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .notDetermined: return .notDetermined
+        case .restricted: return .restricted
+        case .denied: return .denied
+        case .authorized: return .authorized
+        @unknown default: return .unknown
+        }
+        #else
+        return .unknown
+        #endif
+    }
+
+    public func requestAuthorization() async -> MicrophonePermissionRequestResult {
+        let before = await status()
+        #if canImport(AVFoundation)
+        let granted = await AVCaptureDevice.requestAccess(for: .video)
+        return MicrophonePermissionRequestResult(statusBefore: before, requestAuthorizationCalled: true, granted: granted, statusAfter: await status())
+        #else
+        return MicrophonePermissionRequestResult(statusBefore: before, requestAuthorizationCalled: false, statusAfter: .unknown)
+        #endif
+    }
+}
+
 // MARK: - Errors
 
 public enum VoiceCallError: Error, LocalizedError {
@@ -200,6 +245,25 @@ public enum VoiceCallError: Error, LocalizedError {
         switch self {
         case .noAvailableNode: "No voice server is available right now."
         }
+    }
+}
+
+public func selectVoiceNode(
+    nodes: [VoiceNode],
+    probe: @escaping @Sendable (VoiceNode) async -> Bool
+) async -> VoiceNode? {
+    guard let fallback = nodes.first else { return nil }
+    return await withTaskGroup(of: (Int, VoiceNode)?.self) { group in
+        for (index, node) in nodes.enumerated() {
+            group.addTask { await probe(node) ? (index, node) : nil }
+        }
+        while let result = await group.next() {
+            if let (_, node) = result {
+                group.cancelAll()
+                return node
+            }
+        }
+        return fallback
     }
 }
 
@@ -227,13 +291,13 @@ public extension MainShellViewModel {
     }
 
     func canJoinVoiceChannel(_ channelID: ChannelID) -> Bool {
-        guard let channel = snapshot.channelsByID[channelID], channel.kind == .voiceChannel else { return false }
+        guard let channel = snapshot.channelsByID[channelID], channel.isVoiceCapable else { return false }
         guard apiClientForVoice() != nil else { return false }
         return canJoinVoice(permissions: voicePermissions(for: channelID))
     }
 
     func voiceJoinDisabledReason(_ channelID: ChannelID) -> String {
-        guard snapshot.channelsByID[channelID]?.kind == .voiceChannel else { return "Not a voice channel." }
+        guard snapshot.channelsByID[channelID]?.isVoiceCapable == true else { return "This channel does not support calls." }
         guard apiClientForVoice() != nil else {
             return "Reconnect before joining a voice channel."
         }
@@ -278,7 +342,7 @@ public extension MainShellViewModel {
     // MARK: Call lifecycle
 
     func joinVoiceChannel(_ channelID: ChannelID) {
-        guard let channel = snapshot.channelsByID[channelID], channel.kind == .voiceChannel else { return }
+        guard let channel = snapshot.channelsByID[channelID], channel.isVoiceCapable else { return }
         guard let apiClient = apiClientForVoice() else {
             presentNotice("Reconnect before joining a voice channel.", severity: .warning)
             return
@@ -293,8 +357,12 @@ public extension MainShellViewModel {
         voiceCallTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let response = try await apiClient.joinVoiceChannel(channelID: channelID)
-                let url = try await self.resolveVoiceURL(from: response, apiClient: apiClient)
+                let config = try await self.cachedOrFetchedRootConfiguration(apiClient: apiClient)
+                guard let node = await selectVoiceNode(nodes: config.features.livekit.nodes, probe: Self.probeVoiceNode) else {
+                    throw VoiceCallError.noAvailableNode
+                }
+                let response = try await apiClient.joinVoiceChannel(channelID: channelID, request: VoiceJoinRequest(node: node.name))
+                guard let url = URL(string: response.url) else { throw VoiceCallError.noAvailableNode }
                 engine.setAudioProcessing(
                     echoCancellation: self.voicePreferences.echoCancellation,
                     noiseSuppression: self.voicePreferences.noiseSuppression
@@ -324,8 +392,94 @@ public extension MainShellViewModel {
         let engine = voiceEngine
         activeVoiceCall = .idle
         activeVoiceCallParticipants = [:]
+        voiceMediaState = VoiceMediaState()
         removePushToTalkMonitor()
         Task { await engine.disconnect() }
+    }
+
+    func toggleCamera() {
+        guard let channelID = activeVoiceCall.channelID, canUseCallVideo(channelID: channelID) else { return }
+        let enable = !voiceMediaState.isCameraEnabled
+        Task { [weak self, engine = voiceEngine] in
+            guard let self else { return }
+            if enable {
+                let result = await cameraPermissionManager.requestAuthorization()
+                cameraPermissionStatus = result.statusAfter
+                guard result.statusAfter == .authorized else {
+                    presentNotice("Camera access is turned off in System Settings.", severity: .warning)
+                    return
+                }
+            }
+            do {
+                let dimensions = activeVideoLimits()?.videoResolution ?? []
+                try await engine.setCameraEnabled(enable, deviceID: voicePreferences.cameraDeviceID, maxWidth: dimensions.first, maxHeight: dimensions.dropFirst().first)
+                voiceMediaState.isCameraEnabled = enable
+            } catch {
+                presentNotice("Couldn't update camera: \(UserFacingError.message(for: error))", severity: .error)
+            }
+        }
+    }
+
+    func prepareScreenSharePicker() {
+        guard let channelID = activeVoiceCall.channelID, canUseCallVideo(channelID: channelID) else { return }
+        Task { [weak self, engine = voiceEngine] in
+            guard let self else { return }
+            do {
+                screenShareSources = try await engine.availableScreenShareSources()
+                isScreenSharePickerPresented = true
+            } catch {
+                presentNotice("Screen Recording access is required to list displays and windows.", severity: .warning)
+            }
+        }
+    }
+
+    func startScreenShare(sourceID: String) {
+        guard let channelID = activeVoiceCall.channelID, canUseCallVideo(channelID: channelID) else { return }
+        let dimensions = activeVideoLimits()?.videoResolution ?? []
+        Task { [weak self, engine = voiceEngine] in
+            guard let self else { return }
+            do {
+                try await engine.setScreenShareEnabled(true, sourceID: sourceID, maxWidth: dimensions.first, maxHeight: dimensions.dropFirst().first)
+                voiceMediaState.isScreenShareEnabled = true
+                isScreenSharePickerPresented = false
+            } catch {
+                presentNotice("Couldn't share that source: \(UserFacingError.message(for: error))", severity: .error)
+            }
+        }
+    }
+
+    func stopScreenShare() {
+        Task { [weak self, engine = voiceEngine] in
+            do {
+                try await engine.setScreenShareEnabled(false, sourceID: nil, maxWidth: nil, maxHeight: nil)
+                self?.voiceMediaState.isScreenShareEnabled = false
+            } catch {
+                self?.presentNotice("Couldn't stop sharing: \(UserFacingError.message(for: error))", severity: .error)
+            }
+        }
+    }
+
+    func canUseCallVideo(channelID: ChannelID) -> Bool {
+        guard activeVoiceCall.channelID == channelID,
+              case .connected = activeVoiceCall
+        else { return false }
+        return canPublishVideo(permissions: voicePermissions(for: channelID), limits: activeVideoLimits())
+    }
+
+    func callVideoDisabledReason(channelID: ChannelID) -> String? {
+        guard activeVoiceCall.channelID == channelID,
+              case .connected = activeVoiceCall
+        else { return "Join the call first." }
+        guard voicePermissions(for: channelID).contains(.video) else { return "You don't have permission to publish video." }
+        guard activeVideoLimits()?.video == true else { return "Video is unavailable for this account or server." }
+        return nil
+    }
+
+    func activeVideoLimits(now: Date = Date()) -> UserLimits? {
+        guard let config = cachedRootConfiguration else { return nil }
+        guard let user = currentUser, let created = Message.dateFromULID(user.id.rawValue) else { return config.features.limits.default }
+        let newUserWindow = TimeInterval(config.features.limits.global.newUserHours * 3_600)
+        return now.timeIntervalSince(created) < newUserWindow ? config.features.limits.newUser : config.features.limits.default
     }
 
     // MARK: Push-to-talk (in-app-focused only — see Docs/Phase75.md)
@@ -398,6 +552,12 @@ public extension MainShellViewModel {
         installPushToTalkMonitorIfNeeded()
     }
 
+    func refreshCameraDevices() {
+        Task { [weak self, engine = voiceEngine] in
+            self?.voiceCameraDevices = await engine.availableCameraDevices()
+        }
+    }
+
     // MARK: Microphone permission (mirrors requestNotificationPermission/refreshNotificationPermissionStatus)
 
     func refreshMicrophonePermissionStatus() {
@@ -463,10 +623,19 @@ public extension MainShellViewModel {
             }
         case let .participantMuteChanged(identity, isMuted):
             activeVoiceCallParticipants[identity]?.isMuted = isMuted
+        case let .videoTrackAdded(track):
+            voiceMediaState.tracksByID[track.id] = track
+        case let .videoTrackRemoved(id):
+            voiceMediaState.tracksByID.removeValue(forKey: id)
+        case let .localCameraChanged(enabled):
+            voiceMediaState.isCameraEnabled = enabled
+        case let .localScreenShareChanged(enabled):
+            voiceMediaState.isScreenShareEnabled = enabled
         case let .disconnected(reason):
             guard activeVoiceCall.channelID == channelID else { return }
             activeVoiceCall = .idle
             activeVoiceCallParticipants = [:]
+            voiceMediaState = VoiceMediaState()
             removePushToTalkMonitor()
             if let reason {
                 presentNotice("Voice call ended: \(reason)", severity: .warning)
@@ -476,19 +645,24 @@ public extension MainShellViewModel {
         }
     }
 
-    private func resolveVoiceURL(from response: VoiceJoinResponse, apiClient: any StoatAPIClient) async throws -> URL {
-        if let urlString = response.url, let url = URL(string: urlString) { return url }
-        let config = try await cachedOrFetchedRootConfiguration(apiClient: apiClient)
-        guard let node = config.features.livekit.nodes.first, let url = URL(string: node.publicURL) else {
-            throw VoiceCallError.noAvailableNode
-        }
-        return url
-    }
-
     private func cachedOrFetchedRootConfiguration(apiClient: any StoatAPIClient) async throws -> StoatConfig {
         if let cachedRootConfiguration { return cachedRootConfiguration }
         let config = try await apiClient.fetchRootConfiguration()
         cachedRootConfiguration = config
         return config
+    }
+
+    private static func probeVoiceNode(_ node: VoiceNode) async -> Bool {
+        guard var components = URLComponents(string: node.publicURL) else { return false }
+        components.scheme = components.scheme == "wss" ? "https" : "http"
+        guard let url = components.url else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.5
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return (response as? HTTPURLResponse).map { (200..<500).contains($0.statusCode) } ?? true
+        } catch {
+            return false
+        }
     }
 }

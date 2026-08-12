@@ -85,7 +85,7 @@ final class VoiceChatTests: XCTestCase {
         XCTAssertFalse(VoiceCallUIState.idle.isActive)
         XCTAssertEqual(VoiceCallUIState.connecting(channelID).channelID, channelID)
         XCTAssertTrue(VoiceCallUIState.connected(channelID).isActive)
-        XCTAssertTrue(VoiceCallUIState.failed(channelID, reason: "boom").isActive)
+        XCTAssertFalse(VoiceCallUIState.failed(channelID, reason: "boom").isActive)
     }
 
     // MARK: - Roster (gateway-synced ServerMember.voiceChannel)
@@ -139,6 +139,36 @@ final class VoiceChatTests: XCTestCase {
 
         XCTAssertTrue(viewModel.canJoinVoiceChannel(voiceChannelID))
         XCTAssertFalse(viewModel.canJoinVoiceChannel(textChannelID))
+    }
+
+    @MainActor
+    func testPhase76VoiceEnabledTextChannelCanJoinWithoutLosingTextShape() {
+        let textChannelID: ChannelID = "01HX0000000000000000000101"
+        var snapshot = TestShellData.makeSnapshot()
+        snapshot.channelsByID[textChannelID]?.voice = VoiceInformation(maxUsers: 8)
+        let viewModel = MainShellViewModel(
+            snapshot: snapshot,
+            runtimeMode: .mock,
+            sessionState: .mock,
+            currentUser: snapshot.usersByID[TestShellData.currentUserID],
+            messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID),
+            communityAPIClient: StubStoatAPIClient()
+        )
+
+        XCTAssertEqual(viewModel.snapshot.channelsByID[textChannelID]?.kind, .textChannel)
+        XCTAssertTrue(viewModel.canJoinVoiceChannel(textChannelID))
+        viewModel.selectChannel(textChannelID)
+        XCTAssertEqual(viewModel.selectedConversationChannelID, textChannelID)
+    }
+
+    func testPhase76NodeSelectionUsesFastestSuccessAndFallsBackDeterministically() async {
+        let first = VoiceNode(name: "first", lat: 0, lon: 0, publicURL: "https://first")
+        let fast = VoiceNode(name: "fast", lat: 0, lon: 0, publicURL: "https://fast")
+        let selected = await selectVoiceNode(nodes: [first, fast]) { node in node.name == "fast" }
+        XCTAssertEqual(selected?.name, "fast")
+
+        let fallback = await selectVoiceNode(nodes: [first, fast]) { _ in false }
+        XCTAssertEqual(fallback?.name, "first")
     }
 
     @MainActor
@@ -234,6 +264,26 @@ final class VoiceChatTests: XCTestCase {
         try await Self.waitUntil { viewModel.activeVoiceCallParticipants["remote-1"] == nil }
     }
 
+    @MainActor
+    func testPhase76CameraAndScreenShareCanRunTogetherAndTeardown() async throws {
+        let engine = StubVoiceEngine()
+        let viewModel = Self.makeViewModel(voiceEngine: engine)
+        let channelID: ChannelID = "01HX0000000000000000000104"
+        viewModel.joinVoiceChannel(channelID)
+        try await Self.waitUntilConnected(viewModel)
+
+        viewModel.toggleCamera()
+        try await Self.waitUntil { engine.cameraEnabledCalls.last == true }
+        viewModel.startScreenShare(sourceID: "display:1")
+        try await Self.waitUntil { engine.screenShareEnabledCalls.last == true }
+
+        XCTAssertTrue(viewModel.voiceMediaState.isCameraEnabled)
+        XCTAssertTrue(viewModel.voiceMediaState.isScreenShareEnabled)
+        viewModel.leaveVoiceCall()
+        XCTAssertEqual(viewModel.voiceMediaState, VoiceMediaState())
+        try await Self.waitUntil { engine.disconnectCallCount > 0 }
+    }
+
     // MARK: - Helpers
 
     @MainActor
@@ -247,6 +297,7 @@ final class VoiceChatTests: XCTestCase {
             messageActionHandler: StubMessageActionHandler(currentUserID: TestShellData.currentUserID),
             voiceEngine: voiceEngine,
             microphonePermissionManager: StubMicrophonePermissionManager(),
+            cameraPermissionManager: StubMicrophonePermissionManager(),
             communityAPIClient: StubStoatAPIClient()
         )
     }

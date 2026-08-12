@@ -173,6 +173,7 @@ final class StoatPersistenceTests: XCTestCase {
 
         XCTAssertNil(preferences.inputDeviceID)
         XCTAssertNil(preferences.outputDeviceID)
+        XCTAssertNil(preferences.cameraDeviceID)
         XCTAssertTrue(preferences.echoCancellation)
         XCTAssertTrue(preferences.noiseSuppression)
         XCTAssertFalse(preferences.pushToTalkEnabled)
@@ -222,6 +223,7 @@ final class StoatPersistenceTests: XCTestCase {
         preferences.voicePreferences = VoicePreferences(
             inputDeviceID: "mic-1",
             outputDeviceID: "speaker-1",
+            cameraDeviceID: "camera-1",
             echoCancellation: false,
             noiseSuppression: false,
             pushToTalkEnabled: true,
@@ -234,6 +236,7 @@ final class StoatPersistenceTests: XCTestCase {
 
         XCTAssertEqual(loaded.voicePreferences.inputDeviceID, "mic-1")
         XCTAssertEqual(loaded.voicePreferences.outputDeviceID, "speaker-1")
+        XCTAssertEqual(loaded.voicePreferences.cameraDeviceID, "camera-1")
         XCTAssertFalse(loaded.voicePreferences.echoCancellation)
         XCTAssertFalse(loaded.voicePreferences.noiseSuppression)
         XCTAssertTrue(loaded.voicePreferences.pushToTalkEnabled)
