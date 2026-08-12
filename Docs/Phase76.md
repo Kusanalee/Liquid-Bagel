@@ -1,6 +1,6 @@
 # Phase 76 - Voice, Video, and Interface Polish
 
-Phase 76 repairs the v1.2 call path and adds camera video, display/window sharing, and an inline call stage. It also restructures Server Settings, Home, Friends, and Saved Notes navigation. This phase does not change the app version or ship a release.
+Phase 76 repairs the v1.2 call path and adds camera video, display/window sharing, and an inline call stage. It also restructures Server Settings, Home, Friends, and Saved Notes navigation. These changes ship as the v1.2.1 incremental release.
 
 ## Call architecture
 
