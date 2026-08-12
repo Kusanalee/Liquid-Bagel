@@ -4131,7 +4131,7 @@ public struct ChannelRow: View {
         self.action = action
     }
 
-    private var isVoiceChannel: Bool { channel.kind == .voiceChannel }
+    private var isVoiceChannel: Bool { channel.isVoiceCapable }
 
     public var body: some View {
         Button(action: action) {
@@ -4181,6 +4181,7 @@ public struct ChannelRow: View {
         case .group: "person.2"
         case .savedMessages: "tray"
         case .voiceChannel: "speaker.wave.2"
+        case .textChannel where channel.isVoiceCapable: "speaker.wave.2"
         default: "number"
         }
     }

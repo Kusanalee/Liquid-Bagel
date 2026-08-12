@@ -1,5 +1,6 @@
 import Foundation
 import LiveKit
+import AVFoundation
 
 /// Real `VoiceEngine` implementation backed by the LiveKit Swift SDK. Wraps a single `Room` for
 /// the lifetime of one call; callers are expected to `disconnect()` before `connect()`-ing again
@@ -11,6 +12,7 @@ public final class LiveKitVoiceEngine: NSObject, VoiceEngine, @unchecked Sendabl
     private var audioLevelContinuations: [UUID: AsyncStream<Float>.Continuation] = [:]
     private var captureOptions = AudioCaptureOptions()
     private var audioLevelTask: Task<Void, Never>?
+    private var screenSources: [String: any MacOSScreenCaptureSource] = [:]
 
     public override init() {
         room = Room()
@@ -69,6 +71,38 @@ public final class LiveKitVoiceEngine: NSObject, VoiceEngine, @unchecked Sendabl
         _ = try await room.localParticipant.setMicrophone(enabled: !muted, captureOptions: captureOptions)
     }
 
+    public func setCameraEnabled(_ enabled: Bool, deviceID: String?, maxWidth: Int?, maxHeight: Int?) async throws {
+        let devices = try await CameraCapturer.captureDevices()
+        let device = deviceID.flatMap { id in devices.first(where: { $0.uniqueID == id }) }
+        let dimensions = mediaDimensions(maxWidth: maxWidth, maxHeight: maxHeight, fallbackWidth: 1280, fallbackHeight: 720)
+        _ = try await room.localParticipant.setCamera(
+            enabled: enabled,
+            captureOptions: CameraCaptureOptions(device: device, dimensions: dimensions, fps: 30)
+        )
+        emit(.localCameraChanged(enabled))
+    }
+
+    public func setScreenShareEnabled(_ enabled: Bool, sourceID: String?, maxWidth: Int?, maxHeight: Int?) async throws {
+        guard enabled else {
+            _ = try await room.localParticipant.setScreenShare(enabled: false)
+            emit(.localScreenShareChanged(false))
+            return
+        }
+        guard let sourceID, let source = screenSources[sourceID] else {
+            throw VoiceMediaError.screenSourceUnavailable
+        }
+        let options = ScreenShareCaptureOptions(
+            dimensions: mediaDimensions(maxWidth: maxWidth, maxHeight: maxHeight, fallbackWidth: 1280, fallbackHeight: 720),
+            fps: 30,
+            showCursor: true,
+            appAudio: false,
+            includeCurrentApplication: false
+        )
+        let track = LocalVideoTrack.createMacOSScreenShareTrack(source: source, options: options)
+        _ = try await room.localParticipant.publish(videoTrack: track)
+        emit(.localScreenShareChanged(true))
+    }
+
     public func setAudioProcessing(echoCancellation: Bool, noiseSuppression: Bool) {
         captureOptions = AudioCaptureOptions(echoCancellation: echoCancellation, noiseSuppression: noiseSuppression)
     }
@@ -92,6 +126,48 @@ public final class LiveKitVoiceEngine: NSObject, VoiceEngine, @unchecked Sendabl
     public func selectOutputDevice(id: String) {
         guard let device = AudioManager.shared.outputDevices.first(where: { $0.deviceId == id }) else { return }
         AudioManager.shared.outputDevice = device
+    }
+
+    public func availableCameraDevices() async -> [VoiceCameraDevice] {
+        (try? await CameraCapturer.captureDevices())?.map {
+            VoiceCameraDevice(id: $0.uniqueID, name: $0.localizedName)
+        } ?? []
+    }
+
+    public func availableScreenShareSources() async throws -> [VoiceScreenShareSource] {
+        let sources = try await MacOSScreenCapturer.sources(for: .any, includeCurrentApplication: false)
+        var mapped: [VoiceScreenShareSource] = []
+        var storage: [String: any MacOSScreenCaptureSource] = [:]
+        for source in sources {
+            if let display = source as? MacOSDisplay {
+                let id = "display:\(display.displayID)"
+                storage[id] = display
+                mapped.append(VoiceScreenShareSource(
+                    id: id,
+                    name: "Display \(mapped.filter { $0.kind == .display }.count + 1)",
+                    detail: "\(display.width) × \(display.height)",
+                    kind: .display
+                ))
+            } else if let window = source as? MacOSWindow {
+                let id = "window:\(window.windowID)"
+                storage[id] = window
+                mapped.append(VoiceScreenShareSource(
+                    id: id,
+                    name: window.title?.isEmpty == false ? window.title! : "Untitled Window",
+                    detail: window.owningApplication?.applicationName,
+                    kind: .window
+                ))
+            }
+        }
+        screenSources = storage
+        return mapped
+    }
+
+    private func mediaDimensions(maxWidth: Int?, maxHeight: Int?, fallbackWidth: Int, fallbackHeight: Int) -> Dimensions {
+        Dimensions(
+            width: Int32(max(16, maxWidth ?? fallbackWidth)),
+            height: Int32(max(16, maxHeight ?? fallbackHeight))
+        )
     }
 
     // MARK: - Event plumbing
@@ -133,6 +209,14 @@ public final class LiveKitVoiceEngine: NSObject, VoiceEngine, @unchecked Sendabl
     }
 }
 
+public enum VoiceMediaError: Error, LocalizedError {
+    case screenSourceUnavailable
+
+    public var errorDescription: String? {
+        "The selected screen or window is no longer available."
+    }
+}
+
 extension LiveKitVoiceEngine: RoomDelegate {
     public func room(_ room: Room, didUpdateConnectionState connectionState: ConnectionState, from oldConnectionState: ConnectionState) {
         let mapped: VoiceConnectionState
@@ -169,7 +253,42 @@ extension LiveKitVoiceEngine: RoomDelegate {
         emit(.participantMuteChanged(identity: identity, isMuted: isMuted))
     }
 
+    public func room(_ room: Room, participant: LocalParticipant, didPublishTrack publication: LocalTrackPublication) {
+        emitVideoTrack(publication, participant: participant, isLocal: true)
+    }
+
+    public func room(_ room: Room, participant: LocalParticipant, didUnpublishTrack publication: LocalTrackPublication) {
+        emit(.videoTrackRemoved(id: publication.sid.stringValue))
+    }
+
+    public func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
+        emitVideoTrack(publication, participant: participant, isLocal: false)
+    }
+
+    public func room(_ room: Room, participant: RemoteParticipant, didUnsubscribeTrack publication: RemoteTrackPublication) {
+        emit(.videoTrackRemoved(id: publication.sid.stringValue))
+    }
+
     public func room(_ room: Room, didDisconnectWithError error: LiveKitError?) {
         emit(.disconnected(reason: error?.localizedDescription))
+    }
+}
+
+private extension LiveKitVoiceEngine {
+    func emitVideoTrack(_ publication: TrackPublication, participant: Participant, isLocal: Bool) {
+        guard let track = publication.track as? VideoTrack else { return }
+        let source: VoiceVideoSource
+        switch publication.source {
+        case .camera: source = .camera
+        case .screenShareVideo: source = .screenShare
+        default: return
+        }
+        emit(.videoTrackAdded(VoiceVideoTrack(
+            participantIdentity: participant.identity?.stringValue ?? "local",
+            participantName: participant.name,
+            source: source,
+            isLocal: isLocal,
+            handle: VoiceVideoTrackHandle(id: publication.sid.stringValue, storage: track)
+        )))
     }
 }

@@ -171,8 +171,14 @@ public actor StubStoatAPIClient: StoatAPIClient {
                 inviteOnly: false,
                 autumn: FeatureConfiguration(enabled: true, url: "https://cdn.stoatusercontent.com"),
                 january: FeatureConfiguration(enabled: true, url: "https://proxy.stoatusercontent.com"),
-                livekit: VoiceFeature(enabled: true, nodes: []),
-                limits: LimitsConfig(global: GlobalLimits(), newUser: UserLimits(), default: UserLimits()),
+                livekit: VoiceFeature(enabled: true, nodes: [
+                    VoiceNode(name: "stub", lat: 0, lon: 0, publicURL: "https://voice.stub.test")
+                ]),
+                limits: LimitsConfig(
+                    global: GlobalLimits(),
+                    newUser: UserLimits(video: true, videoResolution: [1280, 720]),
+                    default: UserLimits(video: true, videoResolution: [1280, 720])
+                ),
                 legalLinks: LegalLinks()
             ),
             ws: "wss://events.stoat.chat",
@@ -415,8 +421,11 @@ public actor StubStoatAPIClient: StoatAPIClient {
         voiceJoinError = error
     }
 
-    public func joinVoiceChannel(channelID: ChannelID) async throws -> VoiceJoinResponse {
+    public private(set) var lastVoiceJoinRequest: VoiceJoinRequest?
+
+    public func joinVoiceChannel(channelID: ChannelID, request: VoiceJoinRequest) async throws -> VoiceJoinResponse {
         if let voiceJoinError { throw voiceJoinError }
+        lastVoiceJoinRequest = request
         return VoiceJoinResponse(token: "stub-token-\(channelID.rawValue)", url: "wss://voice.stub.test")
     }
 
@@ -1378,10 +1387,14 @@ public final class StubVoiceEngine: VoiceEngine, @unchecked Sendable {
     public private(set) var lastConnectToken: String?
     public private(set) var disconnectCallCount = 0
     public private(set) var microphoneMutedCalls: [Bool] = []
+    public private(set) var cameraEnabledCalls: [Bool] = []
+    public private(set) var screenShareEnabledCalls: [Bool] = []
     public private(set) var audioProcessingCalls: [(echoCancellation: Bool, noiseSuppression: Bool)] = []
     public var connectError: (any Error)?
     public var availableInputDevices: [VoiceAudioDevice]
     public var availableOutputDevices: [VoiceAudioDevice]
+    public var cameraDevices: [VoiceCameraDevice] = []
+    public var screenShareSources: [VoiceScreenShareSource] = []
     public private(set) var selectedInputDeviceID: String?
     public private(set) var selectedOutputDeviceID: String?
 
@@ -1433,12 +1446,22 @@ public final class StubVoiceEngine: VoiceEngine, @unchecked Sendable {
         microphoneMutedCalls.append(muted)
     }
 
+    public func setCameraEnabled(_ enabled: Bool, deviceID: String?, maxWidth: Int?, maxHeight: Int?) async throws {
+        cameraEnabledCalls.append(enabled)
+    }
+
+    public func setScreenShareEnabled(_ enabled: Bool, sourceID: String?, maxWidth: Int?, maxHeight: Int?) async throws {
+        screenShareEnabledCalls.append(enabled)
+    }
+
     public func setAudioProcessing(echoCancellation: Bool, noiseSuppression: Bool) {
         audioProcessingCalls.append((echoCancellation, noiseSuppression))
     }
 
     public func selectInputDevice(id: String) { selectedInputDeviceID = id }
     public func selectOutputDevice(id: String) { selectedOutputDeviceID = id }
+    public func availableCameraDevices() async -> [VoiceCameraDevice] { cameraDevices }
+    public func availableScreenShareSources() async throws -> [VoiceScreenShareSource] { screenShareSources }
 
     /// Test helper: push an event to the active `events` subscriber, if any.
     public func emit(_ event: VoiceEngineEvent) {
@@ -1475,3 +1498,5 @@ public actor StubMicrophonePermissionManager: MicrophonePermissionManaging {
         )
     }
 }
+
+extension StubMicrophonePermissionManager: CameraPermissionManaging {}

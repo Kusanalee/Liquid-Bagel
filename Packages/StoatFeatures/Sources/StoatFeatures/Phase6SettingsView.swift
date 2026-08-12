@@ -1274,6 +1274,12 @@ private struct VoiceSettingsTab: View {
                         Text(device.name).tag(String?.some(device.id))
                     }
                 }
+                Picker("Camera", selection: cameraDeviceBinding) {
+                    Text("System Default").tag(String?.none)
+                    ForEach(viewModel.voiceCameraDevices) { device in
+                        Text(device.name).tag(String?.some(device.id))
+                    }
+                }
                 if viewModel.voiceInputDevices.isEmpty && viewModel.voiceOutputDevices.isEmpty {
                     Text("No audio devices found yet. The list populates once macOS reports connected devices.")
                         .font(.caption)
@@ -1323,6 +1329,7 @@ private struct VoiceSettingsTab: View {
         .formStyle(.grouped)
         .task {
             viewModel.refreshMicrophonePermissionStatus()
+            viewModel.refreshCameraDevices()
         }
         .task(id: viewModel.activeVoiceCall.isActive) {
             await observeLocalAudioLevel()
@@ -1347,6 +1354,13 @@ private struct VoiceSettingsTab: View {
         Binding(
             get: { viewModel.voicePreferences.outputDeviceID },
             set: { viewModel.voicePreferences.outputDeviceID = $0 }
+        )
+    }
+
+    private var cameraDeviceBinding: Binding<String?> {
+        Binding(
+            get: { viewModel.voicePreferences.cameraDeviceID },
+            set: { viewModel.voicePreferences.cameraDeviceID = $0 }
         )
     }
 

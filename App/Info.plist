@@ -28,5 +28,9 @@
 	<string>NSApplication</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Liquid Bagel uses your microphone to let you speak in voice channels.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Liquid Bagel uses your camera when you explicitly enable video in a call.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Liquid Bagel captures a display or window only when you explicitly start screen sharing.</string>
 </dict>
 </plist>

@@ -41,6 +41,19 @@ final class StoatModelsTests: XCTestCase {
         XCTAssertEqual(dm.recipients.count, 2)
     }
 
+    func testPhase76VoiceCapabilityCoversBothStoatChannelShapes() {
+        XCTAssertTrue(Channel(id: "voice", kind: .voiceChannel).isVoiceCapable)
+        XCTAssertTrue(Channel(id: "hybrid", kind: .textChannel, voice: VoiceInformation(maxUsers: 12)).isVoiceCapable)
+        XCTAssertFalse(Channel(id: "text", kind: .textChannel).isVoiceCapable)
+    }
+
+    func testPhase76VoiceJoinModelsEncodeNodeAndRequireURL() throws {
+        let encoded = try JSONEncoder.stoat.encode(VoiceJoinRequest(node: "singapore"))
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: encoded) as? [String: String], ["node": "singapore"])
+        XCTAssertThrowsError(try JSONDecoder.stoat.decode(VoiceJoinResponse.self, from: Data(#"{"token":"token"}"#.utf8)))
+        XCTAssertEqual(try JSONDecoder.stoat.decode(VoiceJoinResponse.self, from: Data(#"{"token":"token","url":"wss://voice"}"#.utf8)).url, "wss://voice")
+    }
+
     func testDecodeMessagesAndFileMetadata() throws {
         let basic = try decodeFixture(Message.self, named: "message_basic")
         let attachment = try decodeFixture(Message.self, named: "message_with_attachments")

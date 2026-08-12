@@ -602,6 +602,12 @@ public struct Channel: Codable, Hashable, Sendable, Identifiable {
         }()
     }
 
+    /// Stoat can attach voice metadata to a text channel instead of emitting the dedicated
+    /// `VoiceChannel` discriminator. Both wire shapes represent a channel that can host a call.
+    public var isVoiceCapable: Bool {
+        kind == .voiceChannel || (kind == .textChannel && voice != nil)
+    }
+
     public init(
         id: ChannelID,
         kind: ChannelKind,
@@ -754,17 +760,23 @@ public struct VoiceInformation: Codable, Hashable, Sendable {
     }
 }
 
-/// Response from `POST /channels/{target}/join_call`: a LiveKit join token, and optionally the
-/// SFU URL to use it against. When `url` is absent, the client resolves a node from
-/// `StoatConfig.features.livekit.nodes` instead. NOTE: this shape has not yet been verified
-/// against a live server — confirm the real field names before relying on `url`/`token` casing.
+/// Required LiveKit credentials returned by `POST /channels/{target}/join_call`.
 public struct VoiceJoinResponse: Codable, Hashable, Sendable {
     public var token: String
-    public var url: String?
+    public var url: String
 
-    public init(token: String, url: String? = nil) {
+    public init(token: String, url: String) {
         self.token = token
         self.url = url
+    }
+}
+
+/// Body accepted by `POST /channels/{target}/join_call`.
+public struct VoiceJoinRequest: Codable, Hashable, Sendable {
+    public var node: String
+
+    public init(node: String) {
+        self.node = node
     }
 }
 
