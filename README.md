@@ -6,6 +6,9 @@
 
 Liquid Bagel is an unofficial, native macOS client for [Stoat](https://stoat.chat). It is built with SwiftUI and connects directly to Stoat's REST and realtime APIs—no Electron and no webview.
 
+> [!IMPORTANT]
+> **Liquid Bagel is archived and no longer maintained.** I am taking an indefinite break from this project to focus on my relationships, my life, and the people who matter to me. The source code and existing releases will remain available, but users should not expect updates, support, or issue and pull request review. Thank you to everyone who tried the app, contributed, or followed its development.
+
 > [!WARNING]
 > **Liquid Bagel is a pre-release and is still unpolished.** Expect missing features, rough edges, and bugs. Do not rely on it as your only way to access Stoat.
 
@@ -64,7 +67,7 @@ Liquid Bagel intentionally does not include:
 - **DM/group calls, system-audio sharing, recording, video backgrounds, and global push-to-talk.** Server calls support audio, camera, and video-only display/window sharing; push-to-talk works while Liquid Bagel is focused.
 - **Background push notifications.** Notifications are delivered while Liquid Bagel is running; there is no push when the app is quit.
 
-This list is not exhaustive. Because this is an early pre-release, features that exist may still behave incorrectly. Please report reproducible problems through [GitHub Issues](https://github.com/Kusanalee/Liquid-Bagel/issues).
+This list is not exhaustive. Because this is an early pre-release, features that exist may still behave incorrectly. The project is archived, so new bug reports and support requests are not being reviewed.
 
 ## Build from Source
 
@@ -103,11 +106,9 @@ See [Docs/Phase76.md](Docs/Phase76.md) for the most recent architecture notes an
 
 ## Contributing
 
-This project is under active development (see `Docs/Phase*.md` for history). Before opening a PR:
+This project is archived and is not accepting contributions. The historical development notes remain in `Docs/Phase*.md` for anyone interested in studying or forking the code.
 
-1. Run `Scripts/check.sh` locally — it must pass (all package tests, the test-double gate, and the app build).
-2. Keep test doubles inside test targets; don't add `Mock`/`Stub`/`Fake` types to `Packages/*/Sources` or `App`.
-3. Add a short `Docs/PhaseN.md` note for notable changes, following the existing phase-log convention.
+If you continue the project in a fork, run `Scripts/check.sh` locally before publishing changes. It covers all package tests, the test-double gate, and the app build.
 
 ## License
 
